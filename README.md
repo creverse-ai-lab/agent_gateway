@@ -1,4 +1,4 @@
-# ACP Gateway v1.3.1
+# ACP Gateway v1.3.2
 
 혹시 여러 AI 에이전트를 쓰고 계신가요?
 
@@ -267,6 +267,12 @@ flowchart LR
 4. **ACP 작업 전달** — prompt, 파일 작업, tool event와 중간 결과가 ACP를 통해 오갑니다.
 5. **권한·질문 처리** — Worker의 permission 요청이나 질문은 Gateway Inbox를 거쳐 오케스트레이터에게 전달되고, 그 응답이 다시 Worker로 돌아갑니다.
 6. **결과 회수·재사용** — 오케스트레이터는 MCP Task 또는 poll로 상태와 결과를 받고, 필요하면 같은 세션을 다시 호출하거나 복구합니다.
+
+## v1.3.2 변경 사항
+
+- **최종 결과 중심 poll** — 기본 poll은 진행 메시지·thought·tool 이벤트를 전달하지 않고, 종료 시 최종 `result`와 Main이 처리해야 하는 permission·질문만 보냅니다. 중간 증거는 `eventTypes`, `includeThoughts`, `includeToolEvents`, `includeInspection`으로 명시 요청해야 합니다.
+- **usage 이벤트 차단** — 반복되는 ACP `usage_update`는 Gateway에 저장하거나 poll을 깨우지 않습니다. provider 계측 신호가 frontdoor tool call과 컨텍스트 소비로 증폭되는 경로를 제거했습니다.
+- **간결한 Worker 반환 기본** — `agent-delegator`가 상세 보고서가 필요하지 않은 요청에 결론·필수 근거·변경 경로·테스트 상태만 간결히 반환하도록 지시합니다.
 
 ## v1.3.1 변경 사항
 

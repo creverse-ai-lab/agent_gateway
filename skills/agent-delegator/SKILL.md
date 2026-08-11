@@ -72,7 +72,7 @@ Use `agent_acp_config` with `action: list` when quality, behavior, or cost depen
 
 ### 3. Prompt directly or as an MCP Task
 
-Send one bounded Task Contract with `agent_acp_prompt` and require a compact Result Packet. Do not run concurrent prompts in one session; use separate sessions for independent work.
+Send one bounded Task Contract with `agent_acp_prompt` and require a compact Result Packet. Unless the task specifically needs a detailed report, instruct the Worker to return only the requested conclusion, essential evidence, changed paths, and test status — no progress narration, reasoning recap, or repeated prompt. Do not run concurrent prompts in one session; use separate sessions for independent work.
 
 Use a string prompt normally. Use an ACP content array only when the provider's `promptCapabilities` support the required embedded context, image, or audio content type.
 
@@ -95,8 +95,8 @@ When no Task handle is returned, monitor the session with `agent_acp_poll`.
 2. Use a bounded `waitMs` while the session is active. A completed wait is not a Worker deadline.
 3. Treat `running`, `waiting_permission`, `waiting_input`, `cancelling`, and `restoring` as active states.
 4. Handle `idle`, `error`, `cancelled`, `disconnected`, and `unavailable` as non-active outcomes. Collect the automatically included result/artifact before deciding whether to accept, restore, retry, or report failure.
-5. Do not request `includeResult` during normal active polling. Set it true only when cumulative partial transcript is necessary.
-6. Opt into `includeThoughts`, `includeToolEvents`, or `includeInspection` only for required review evidence.
+5. The default poll response carries no progress events: it waits for terminal status and then returns the final `result`, while still delivering permission and elicitation requests that Main must answer. Do not request `includeResult` during normal active polling; set it true only when cumulative partial transcript is necessary.
+6. Opt into `eventTypes`, `includeThoughts`, `includeToolEvents`, or `includeInspection` only for required review evidence. `usage_update` is intentionally not delivered or retained.
 7. Page with `maxEvents` when needed (v1.3.x defaults to 200 and caps it at 1000; trust the live schema after upgrades). It counts delivered events, while `nextCursor` also advances over filtered events; continue until the cursor reaches the intended live or `toCursor` boundary.
 8. Expect an empty `events` array with `filteredCount > 0` and an advancing cursor. The wait wakes only for a deliverable event or status change.
 9. Treat `cursorTruncated: true` as a retained-history gap. Do not reconstruct evidence that the Gateway no longer holds.

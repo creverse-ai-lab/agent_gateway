@@ -15,6 +15,10 @@ const ACTIVE_STATUSES = new Set(["running", "waiting_permission", "waiting_input
 // mid-answer would amputate the text before it, and a trailing one would
 // erase the final answer.
 const SEGMENT_BOUNDARY_TYPES = new Set(["tool_call", "permission_request", "elicitation_request"]);
+// A normal Main needs only a terminal result or a request it must answer.
+// Progress is available through explicit evidence options, but must not make
+// every streamed chunk into another frontdoor tool result.
+const DEFAULT_POLL_EVENT_TYPES = new Set(["permission_request", "elicitation_request"]);
 const EVENT_PAYLOAD_CAP_BYTES = 4000;
 const CLOSED_STATUSES = new Set(["closed"]);
 const CONTROL_SERVER_PATTERN = /(?:acp-gateway-control|acp-mcp-bridge|gateway-daemon|control-mcp)/i;
@@ -682,9 +686,10 @@ export class GatewayService {
     const deliverable = (event) => {
       if (event.i < effectiveCursor || event.i >= toCursor) return false;
       if (matchesEventType) return matchesEventType(event.type);
-      if (args.includeThoughts !== true && event.type === "agent_thought_chunk") return false;
-      if (args.includeToolEvents !== true && event.type.startsWith("tool_call")) return false;
-      return true;
+      if (DEFAULT_POLL_EVENT_TYPES.has(event.type)) return true;
+      if (args.includeThoughts === true && event.type === "agent_thought_chunk") return true;
+      if (args.includeToolEvents === true && event.type.startsWith("tool_call")) return true;
+      return false;
     };
     // A bounded window is a retrospective inspection read; only open-ended
     // polls wait, and only for an event the caller would actually receive.
@@ -878,6 +883,10 @@ export class GatewayService {
 
   handleUpdate(session, update) {
     const type = update.sessionUpdate ?? update.type ?? "unknown";
+    // Usage is provider bookkeeping, not an actionable Main event. Some ACP
+    // adapters stream it repeatedly, so retaining it would repeatedly wake
+    // long polls and turn accounting chatter into frontdoor token usage.
+    if (type === "usage_update") return;
     if (type === "agent_message_chunk") {
       const text = extractText(update);
       this.store.appendResultText(session, text);

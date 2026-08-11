@@ -103,7 +103,7 @@ test("Gateway poll omits the cumulative result object when includeResult is fals
       { rootId: "main-a" }
     );
     assert.equal(Object.hasOwn(withoutResult, "result"), false);
-    assert.ok(Array.isArray(withoutResult.events) && withoutResult.events.length > 0);
+    assert.deepEqual(withoutResult.events, []);
     assert.equal(typeof withoutResult.nextCursor, "number");
     assert.equal(withoutResult.status, "idle");
   } finally {
@@ -303,7 +303,7 @@ test("Gateway task result returns only the final answer segment", async () => {
   }
 });
 
-test("Gateway poll wait ignores events the caller would filter out", async () => {
+test("Gateway poll defaults to terminal results and ignores progress or usage updates", async () => {
   const service = new GatewayService({ gcIntervalMs: 0 });
   try {
     const session = service.store.create({
@@ -317,11 +317,23 @@ test("Gateway poll wait ignores events the caller would filter out", async () =>
       service.handleUpdate(session, { sessionUpdate: "tool_call", toolCallId: "noisy", title: "Read", kind: "read" });
     }, 30);
     setTimeout(() => {
-      service.handleUpdate(session, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "visible" } });
+      service.handleUpdate(session, { sessionUpdate: "usage_update", usage: { inputTokens: 10, outputTokens: 5 } });
     }, 120);
+    setTimeout(() => {
+      service.handleUpdate(session, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "progress" } });
+    }, 210);
+    setTimeout(() => {
+      service.handleUpdate(session, {
+        sessionUpdate: "permission_request",
+        requestId: 7,
+        toolCall: { toolCallId: "need-input", title: "Edit", kind: "edit" },
+        options: [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }]
+      });
+    }, 300);
     const response = await pending;
-    assert.ok(Date.now() - startedAt < 4_000);
-    assert.deepEqual(response.events.map((event) => event.type), ["agent_message_chunk"]);
+    assert.ok(Date.now() - startedAt >= 250, "progress and usage must not wake the default poll");
+    assert.deepEqual(response.events.map((event) => event.type), ["permission_request"]);
+    assert.equal(session.events.some((event) => event.type === "usage_update"), false);
 
     const filteredOnly = service.call(
       "poll",
@@ -335,6 +347,13 @@ test("Gateway poll wait ignores events the caller would filter out", async () =>
     const quiet = await filteredOnly;
     assert.ok(Date.now() - quietStart >= 250, "poll should sleep through filtered-out events");
     assert.deepEqual(quiet.events, []);
+
+    const explicitMessages = await service.call(
+      "poll",
+      { sessionId: session.id, cursor: 0, eventTypes: ["agent_message_chunk"] },
+      { rootId: "main-a" }
+    );
+    assert.deepEqual(explicitMessages.events.map((event) => event.text), ["progress"]);
 
     // A status change without any new event must still wake a filtered poll.
     const statusWatch = service.call(
@@ -438,7 +457,12 @@ test("Gateway caps chunk and permission payload copies while keeping full data r
     });
     const poll = await service.call(
       "poll",
-      { sessionId: session.id, cursor: 0, includeResult: false },
+      {
+        sessionId: session.id,
+        cursor: 0,
+        includeResult: false,
+        eventTypes: ["agent_message_chunk", "permission_request"]
+      },
       { rootId: "main-a" }
     );
     const chunk = poll.events.find((event) => event.type === "agent_message_chunk");
@@ -488,6 +512,12 @@ test("Gateway poll supports bounded retrospective reads by cursor range and even
       ["tool_call", "tool_call_update"]
     );
     assert.ok(evidence.filteredCount > 0);
+    const messages = await service.call(
+      "poll",
+      { sessionId: opened.sessionId, cursor: 0, toCursor: done.nextCursor, eventTypes: ["agent_message_chunk"] },
+      { rootId: "main-a" }
+    );
+    assert.ok(messages.events.some((event) => event.type === "agent_message_chunk"));
     await assert.rejects(
       service.call("poll", { sessionId: opened.sessionId, eventTypes: [] }, { rootId: "main-a" }),
       /eventTypes must be/

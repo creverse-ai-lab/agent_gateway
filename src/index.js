@@ -180,16 +180,16 @@ function controlTools() {
     },
     {
       name: "agent_acp_poll",
-      description: "Poll normalized events and preserve nextCursor.",
+      description: "Poll status and final results with minimal token use; opt into progress evidence only when needed.",
       inputSchema: {
         type: "object",
         properties: {
           sessionId: { type: "string" },
           cursor: { type: "integer", minimum: 0 },
           toCursor: { type: "integer", minimum: 0, description: "Exclusive upper bound for a retrospective range read. Bounded reads never wait." },
-          eventTypes: { type: "array", items: { type: "string", minLength: 1 }, description: "Deliver only events whose type matches an entry exactly; a trailing * matches by prefix (e.g. tool_call*). Overrides the default thought/tool filters." },
+          eventTypes: { type: "array", items: { type: "string", minLength: 1 }, description: "Deliver only events whose type matches an entry exactly; a trailing * matches by prefix (e.g. tool_call*). Overrides the minimal default, which emits only permission and elicitation requests." },
           waitMs: { type: "integer", minimum: 0, maximum: 120000 },
-          includeThoughts: { type: "boolean" },
+          includeThoughts: { type: "boolean", description: "Deliver reasoning chunks. Defaults to false." },
           includeToolEvents: { type: "boolean", description: "Deliver tool_call events. Defaults to false." },
           includeResult: { type: "boolean", description: "Include the result object. Defaults to true only after the turn has finished; pass true to include it while the turn is still active. After the turn ends result.text carries only the final message segment; the full narrated transcript stays readable via agent_acp_session get." },
           includeInspection: { type: "boolean", description: "Include closed narration segments (each preview capped to 4KB of UTF-8; full text via each segment's artifact pointer; inspectionDropped counts evicted segments) inside the result object. Defaults to false." },
