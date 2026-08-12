@@ -7,10 +7,37 @@ import { ArtifactStore, defaultArtifactRoot } from "./artifacts.js";
 import { utf8ByteHead } from "./bounded-utf8.js";
 import { ERROR_CODES, GatewayError } from "./errors.js";
 import { currentModelId, detectProviders, providerConfig } from "./providers.js";
+import { SessionQueue } from "./session-queue.js";
 import { publicSession, SessionStore } from "./sessions.js";
 import { GATEWAY_API_VERSION, GATEWAY_VERSION, STATE_SCHEMA_VERSION } from "./version.js";
 
 const ACTIVE_STATUSES = new Set(["running", "waiting_permission", "waiting_input", "cancelling", "restoring"]);
+// The only legal status moves. Every assignment goes through #setStatus, so a
+// late callback cannot walk a session backwards into a state its owner already
+// left. "closed" is the single true terminal.
+const STATUS_TRANSITIONS = {
+  idle: new Set(["running", "restoring", "disconnected", "closed"]),
+  running: new Set([
+    "waiting_permission", "waiting_input", "cancelling", "idle", "cancelled", "error",
+    "disconnected", "closed"
+  ]),
+  waiting_permission: new Set([
+    "running", "waiting_input", "cancelling", "idle", "cancelled", "error", "disconnected", "closed"
+  ]),
+  waiting_input: new Set([
+    "running", "waiting_permission", "cancelling", "idle", "cancelled", "error", "disconnected", "closed"
+  ]),
+  // A cancel that was already notified only moves terminal-ward: see #setStatus
+  // for the coerce and drop rules that keep it there.
+  cancelling: new Set(["cancelled", "error", "disconnected", "closed"]),
+  // Never "running": a turn must not start underneath an in-flight restore.
+  restoring: new Set(["idle", "unavailable", "disconnected", "closed"]),
+  disconnected: new Set(["restoring", "closed"]),
+  unavailable: new Set(["restoring", "disconnected", "closed"]),
+  error: new Set(["running", "restoring", "disconnected", "closed"]),
+  cancelled: new Set(["running", "restoring", "disconnected", "closed"]),
+  closed: new Set()
+};
 // Only the start of new work closes a message segment. Progress updates
 // (tool_call_update), thoughts, and bookkeeping types never do — a boundary
 // mid-answer would amputate the text before it, and a trailing one would
@@ -22,6 +49,9 @@ const SEGMENT_BOUNDARY_TYPES = new Set(["tool_call", "permission_request", "elic
 const DEFAULT_POLL_EVENT_TYPES = new Set(["permission_request", "elicitation_request"]);
 const EVENT_PAYLOAD_CAP_BYTES = 4000;
 const CLOSED_STATUSES = new Set(["closed"]);
+// A live client is not enough to start work in these states: the record is
+// known to be out of sync with the worker, so it has to be resumed first.
+const RESTORE_REQUIRED_STATUSES = new Set(["disconnected", "unavailable"]);
 const CONTROL_SERVER_PATTERN = /(?:acp-gateway-control|acp-mcp-bridge|gateway-daemon|control-mcp)/i;
 const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "cancelled"]);
 const DURABLE_EVENT_TYPES = new Set([
@@ -57,6 +87,10 @@ export class GatewayService {
     this.statePath = statePath;
     this.clients = new Map();
     this.clientStarts = new Map();
+    this.stopped = false;
+    // Counts transitions the table rejected. Zero is the invariant; the strict
+    // env turns each one into a throw for the race suite.
+    this.illegalTransitions = 0;
     this.persistChain = Promise.resolve();
     this.persistDirty = false;
     this.persistTimer = null;
@@ -187,6 +221,72 @@ export class GatewayService {
       session.orphanedAt ??= disconnectedAt;
     }
     this.schedulePersist();
+  }
+
+  // The mailbox is created on first use: sessions built straight through the
+  // store (restore-from-disk, tests) must not need to know about it.
+  #queueFor(session) {
+    session._queue ??= new SessionQueue({ id: session.id });
+    return session._queue;
+  }
+
+  // Single choke point for session.status. Returns false when the move was
+  // refused, so callers can skip the bookkeeping that belonged to it.
+  #setStatus(session, next, reason) {
+    const from = session.status;
+    if (from === next) return true;
+    if (STATUS_TRANSITIONS[from]?.has(next)) {
+      session.status = next;
+      return true;
+    }
+    // A fire-and-forget finalizer that lost the race stays silent: the session
+    // is closed or already gone, which is exactly the outcome it wanted.
+    if (from === "closed" || !this.store.get(session.id)) return false;
+    // A notified cancel outranks a normal turn end, and a late worker request
+    // must not pull it back into an input wait.
+    if (from === "cancelling") {
+      if (next === "idle") {
+        session.status = "cancelled";
+        return true;
+      }
+      if (next === "waiting_permission" || next === "waiting_input") return false;
+    }
+    session._illegalTransitions = (session._illegalTransitions ?? 0) + 1;
+    this.illegalTransitions += 1;
+    if (process.env.ACP_GATEWAY_STRICT_FSM) {
+      throw new Error(`Illegal session status transition ${from} -> ${next} (${reason})`);
+    }
+    return false;
+  }
+
+  // Claims the current turn for the caller that is finalizing it. Every
+  // finalizer seals, so the terminal callback that arrives later is a no-op.
+  #sealTurn(session) {
+    if (session.turnId == null || session.turnSeal === session.turnId) return false;
+    session.turnSeal = session.turnId;
+    return true;
+  }
+
+  // True while a turn is still this session's outstanding work. Anything that
+  // mirrors turn state back onto the record has to ask first, or a finalized
+  // turn gets walked back into an active status nobody will ever leave.
+  #turnLive(session) {
+    return session.turnId != null
+      && session.turnSeal !== session.turnId
+      && !CLOSED_STATUSES.has(session.status)
+      && this.store.get(session.id) != null;
+  }
+
+  // A synchronous intent reservation. It closes the window between admitting a
+  // command and the command actually changing status, so a second prompt is
+  // rejected in the caller's first tick instead of minting a rival turn.
+  #reserve(session, intent) {
+    session._reserved = intent;
+    return session;
+  }
+
+  #release(session, intent) {
+    if (session._reserved === intent) session._reserved = null;
   }
 
   async call(method, args = {}, context = {}) {
@@ -396,8 +496,15 @@ export class GatewayService {
     const configured = await this.configureSessionModel(client, restored, requestedModel, acpSessionId);
 
     if (existing) {
+      // The record can disappear while the ACP resume is in flight (close,
+      // retention). Re-attaching here would revive a session Main was told is
+      // gone, and leave a live ACP session nobody owns.
+      if (!this.store.get(existing.id) || CLOSED_STATUSES.has(existing.status)) {
+        client.clearSession(acpSessionId);
+        throw new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${existing.id} is closed`);
+      }
       existing.client = client;
-      existing.status = "idle";
+      this.#setStatus(existing, "idle", "session_restored");
       existing.error = null;
       existing.permissionPolicy = permissionPolicy;
       existing.model = configured.model;
@@ -463,18 +570,36 @@ export class GatewayService {
     };
   }
 
-  async ensureConnected(session, context) {
+  // Runs inside a session command (R1): it must never touch the mailbox, or the
+  // command holding the mailbox would wait on itself.
+  ensureConnected(session, context) {
     requireOwnedSession(session, context);
-    if (session.client?.alive && session.status !== "disconnected") return session;
-    session.status = "restoring";
+    if (session.client?.alive && !RESTORE_REQUIRED_STATUSES.has(session.status)) return Promise.resolve(session);
+    // One resume per session, mirroring the client-start dedupe: two callers
+    // must never hand the same ACP session two session/resume requests.
+    if (session._restoring) return session._restoring;
+    const start = this.#restoreLocked(session, context).finally(() => {
+      if (session._restoring === start) session._restoring = null;
+    });
+    session._restoring = start;
+    return start;
+  }
+
+  async #restoreLocked(session, context) {
+    this.#setStatus(session, "restoring", "session_restore_start");
     this.store.push(session, { type: "session_restore_start" });
     try {
       await this.sessionRestore({}, context, session);
       return session;
     } catch (error) {
-      session.status = "unavailable";
-      session.error = error?.message ?? String(error);
-      this.store.push(session, { type: "session_restore_failed", text: session.error });
+      // The record can be gone (closed, retention) by the time the resume
+      // fails. Reporting a restore failure on it would push an event for a
+      // session Main has already been told is finished.
+      if (this.store.get(session.id) && !CLOSED_STATUSES.has(session.status)) {
+        this.#setStatus(session, "unavailable", "session_restore_failed");
+        session.error = error?.message ?? String(error);
+        this.store.push(session, { type: "session_restore_failed", text: session.error });
+      }
       throw error;
     }
   }
@@ -514,8 +639,25 @@ export class GatewayService {
     if (action !== "list" && action !== "set") {
       throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `Unknown config action: ${action}`);
     }
-    if (action === "set" && (session.promptStarting || ACTIVE_STATUSES.has(session.status))) {
+    if (action !== "set") {
+      return this.#queueFor(session).run("config_list", () => this.#configLocked(session, args, context, action));
+    }
+    // A queued config set already owns the session: a prompt that arrives now
+    // must be refused, not silently applied to a reconfigured worker.
+    if (session._reserved || ACTIVE_STATUSES.has(session.status)) {
       throw new GatewayError(ERROR_CODES.SESSION_ACTIVE, `Session ${session.id} is still active`);
+    }
+    this.#reserve(session, "config");
+    try {
+      return await this.#queueFor(session).run("config_set", () => this.#configLocked(session, args, context, action));
+    } finally {
+      this.#release(session, "config");
+    }
+  }
+
+  async #configLocked(session, args, context, action) {
+    if (CLOSED_STATUSES.has(session.status) || !this.store.get(session.id)) {
+      throw new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`);
     }
     await this.ensureConnected(session, context);
     const configOptions = session.capabilities?.configOptions ?? [];
@@ -561,9 +703,12 @@ export class GatewayService {
     };
   }
 
-  async sessionPrompt(args, context) {
+  // Admission runs in the caller's first tick, before any await: a rival prompt
+  // has to be refused while this one is still only an intention, which is what
+  // the reservation records. Every check here reuses its original error.
+  #admitTurn(args, context) {
     const session = requireOwnedSession(this.requireSession(args.sessionId), context);
-    if (session.promptStarting || ACTIVE_STATUSES.has(session.status)) {
+    if (session._reserved || ACTIVE_STATUSES.has(session.status)) {
       throw new GatewayError(ERROR_CODES.SESSION_ACTIVE, `Session ${session.id} is still active`);
     }
     if (CLOSED_STATUSES.has(session.status)) {
@@ -572,33 +717,48 @@ export class GatewayService {
     if (typeof args.prompt !== "string" && !Array.isArray(args.prompt)) {
       throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "prompt must be a string or ACP content array");
     }
-    session.promptStarting = true;
+    return this.#reserve(session, "prompt");
+  }
+
+  async sessionPrompt(args, context) {
+    const session = this.#admitTurn(args, context);
     try {
-      await this.ensureConnected(session, context);
-      const requestedModel = optionalString(args.model, "model");
-      if (requestedModel && requestedModel !== session.model) {
-        if (session.client.config.modelScope === "process") {
-          throw new GatewayError(
-            ERROR_CODES.INVALID_ARGUMENT,
-            `Provider ${session.provider} selects model per process; open a new session with model=${requestedModel}`
-          );
-        }
-        const configured = await this.configureSessionModel(
-          session.client,
-          session.capabilities ?? {},
-          requestedModel,
-          session.acpSessionId
+      return await this.#queueFor(session).run("prompt", () => this.#promptLocked(session, args, context));
+    } finally {
+      // Always, including the synchronous-throw path that used to leave the
+      // session permanently unpromptable.
+      this.#release(session, "prompt");
+    }
+  }
+
+  // Registers a turn and returns. It must never await the turn itself: that one
+  // rule is what keeps the mailbox from being held for a whole worker turn.
+  async #promptLocked(session, args, context) {
+    if (CLOSED_STATUSES.has(session.status) || !this.store.get(session.id)) {
+      throw new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`);
+    }
+    await this.ensureConnected(session, context);
+    const requestedModel = optionalString(args.model, "model");
+    if (requestedModel && requestedModel !== session.model) {
+      if (session.client.config.modelScope === "process") {
+        throw new GatewayError(
+          ERROR_CODES.INVALID_ARGUMENT,
+          `Provider ${session.provider} selects model per process; open a new session with model=${requestedModel}`
         );
-        session.model = configured.model;
-        session.capabilities = configured.response;
-        this.store.push(session, { type: "model_changed", model: session.model });
       }
-    } catch (error) {
-      session.promptStarting = false;
-      throw error;
+      const configured = await this.configureSessionModel(
+        session.client,
+        session.capabilities ?? {},
+        requestedModel,
+        session.acpSessionId
+      );
+      session.model = configured.model;
+      session.capabilities = configured.response;
+      this.store.push(session, { type: "model_changed", model: session.model });
     }
     session.turnId = `turn-${randomUUID()}`;
-    session.status = "running";
+    session.turnSeal = null;
+    this.#setStatus(session, "running", "turn_start");
     session.stopReason = null;
     session.cancelRequested = false;
     session.error = null;
@@ -609,37 +769,51 @@ export class GatewayService {
     session.completedAt = null;
     session.transientClearedAt = null;
     this.store.push(session, { type: "turn_start", turnId: session.turnId });
+    // The token freezes which turn this callback may finalize; the ACP read
+    // loop hands the outcome to the mailbox instead of applying it inline.
+    const token = session.turnId;
+    const queue = this.#queueFor(session);
     void session.client
       .sessionPrompt({ sessionId: session.acpSessionId, prompt: args.prompt })
-      .then((result) => {
-        session.status = session.cancelRequested || result?.stopReason === "cancelled" ? "cancelled" : "idle";
-        session.stopReason = session.cancelRequested ? "cancelled" : result?.stopReason ?? "end_turn";
-        session.completedAt = new Date(this.now()).toISOString();
-        session.cancelRequested = false;
-        this.store.finalizeResult(session);
-        this.store.push(session, { type: "turn_end", stopReason: session.stopReason });
-        this.finishTaskForSession(session);
-      })
-      .catch((error) => {
-        session.status = session.client?.alive ? "error" : "disconnected";
-        session.error = error?.message ?? String(error);
-        session.completedAt = new Date(this.now()).toISOString();
-        this.store.finalizeResult(session);
-        this.store.push(session, { type: "error", text: session.error });
-        this.finishTaskForSession(session);
-      });
-    session.promptStarting = false;
+      .then(
+        (result) => queue.post("turn_end", () => this.#finishTurn(session, token, { result })),
+        (error) => queue.post("turn_fail", () => this.#finishTurn(session, token, { error }))
+      );
     return { ok: true, sessionId: session.id, turnId: session.turnId, status: session.status };
   }
 
+  // The single terminal transition for a turn. Four guards, one per way the
+  // turn can stop being this callback's business between request and reply.
+  #finishTurn(session, token, outcome) {
+    if (session.turnId !== token) return;
+    if (session.turnSeal === token) return;
+    if (CLOSED_STATUSES.has(session.status)) return;
+    if (!this.store.get(session.id)) return;
+    session.turnSeal = token;
+    session.completedAt = new Date(this.now()).toISOString();
+    if (outcome.error) {
+      this.#setStatus(session, session.client?.alive ? "error" : "disconnected", "turn_failed");
+      session.error = outcome.error?.message ?? String(outcome.error);
+      this.store.finalizeResult(session);
+      this.store.push(session, { type: "error", text: session.error });
+      this.finishTaskForSession(session);
+      return;
+    }
+    const stopReason = outcome.result?.stopReason;
+    this.#setStatus(
+      session,
+      session.cancelRequested || stopReason === "cancelled" ? "cancelled" : "idle",
+      "turn_end"
+    );
+    session.stopReason = session.cancelRequested ? "cancelled" : stopReason ?? "end_turn";
+    session.cancelRequested = false;
+    this.store.finalizeResult(session);
+    this.store.push(session, { type: "turn_end", stopReason: session.stopReason });
+    this.finishTaskForSession(session);
+  }
+
   async taskPrompt(args, context) {
-    const session = requireOwnedSession(this.requireSession(args.sessionId), context);
-    if (session.promptStarting || ACTIVE_STATUSES.has(session.status)) {
-      throw new GatewayError(ERROR_CODES.SESSION_ACTIVE, `Session ${session.id} is still active`);
-    }
-    if (CLOSED_STATUSES.has(session.status)) {
-      throw new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`);
-    }
+    const session = this.#admitTurn(args, context);
     const now = new Date(this.now()).toISOString();
     const task = {
       taskId: `task-${randomUUID()}`,
@@ -655,18 +829,26 @@ export class GatewayService {
       result: null
     };
     this.tasks.set(task.taskId, task);
+    session.activeTaskId = task.taskId;
     this.schedulePersist();
     try {
-      session.activeTaskId = task.taskId;
-      const started = await this.sessionPrompt(args, context);
-      task.turnId = started.turnId;
-      this.touchTask(task, "working", "Prompt running");
-      return this.publicTask(task);
+      // One command covers starting the turn and recording the handle. Split
+      // across two, the turn could already have finished and this bookkeeping
+      // would drag a terminal task back to "working", so its result could never
+      // be collected.
+      return await this.#queueFor(session).run("task_prompt", async () => {
+        const started = await this.#promptLocked(session, args, context);
+        task.turnId = started.turnId;
+        if (!TERMINAL_TASK_STATUSES.has(task.status)) this.touchTask(task, "working", "Prompt running");
+        return this.publicTask(task);
+      });
     } catch (error) {
       if (session.activeTaskId === task.taskId) session.activeTaskId = null;
       this.tasks.delete(task.taskId);
       this.schedulePersist();
       throw error;
+    } finally {
+      this.#release(session, "prompt");
     }
   }
 
@@ -816,6 +998,13 @@ export class GatewayService {
     if (session.status !== "waiting_permission") {
       throw new GatewayError(ERROR_CODES.SESSION_NOT_WAITING, "Session is not waiting for permission");
     }
+    return this.#queueFor(session).run("permission", () => this.#permissionLocked(session, args));
+  }
+
+  async #permissionLocked(session, args) {
+    if (CLOSED_STATUSES.has(session.status) || !this.store.get(session.id)) {
+      throw new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`);
+    }
     await session.client.respondPermission(Number(args.requestId), args.optionId ?? null, session.acpSessionId);
     this.store.push(session, {
       type: "permission_response",
@@ -832,6 +1021,13 @@ export class GatewayService {
     if (session.status !== "waiting_input") {
       throw new GatewayError(ERROR_CODES.SESSION_NOT_WAITING, "Session is not waiting for input");
     }
+    return this.#queueFor(session).run("answer", () => this.#answerLocked(session, args));
+  }
+
+  #answerLocked(session, args) {
+    if (CLOSED_STATUSES.has(session.status) || !this.store.get(session.id)) {
+      throw new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`);
+    }
     const requestId = Number(args.requestId);
     const action = args.action ?? "accept";
     const response = action === "accept"
@@ -846,14 +1042,26 @@ export class GatewayService {
 
   async sessionCancel(args, context) {
     const session = requireOwnedSession(this.requireSession(args.sessionId), context);
-    this.interruptSessionInbox(session, "Main cancelled the worker session");
-    if (!ACTIVE_STATUSES.has(session.status)) {
+    return this.#queueFor(session).run("cancel", () => this.#cancelLocked(session));
+  }
+
+  #cancelLocked(session) {
+    // Only an unsealed turn on a live worker can be cancelled. Asking a
+    // restoring or already-finalized session to cancel used to raise a bare
+    // TypeError and leave cancelRequested set, which pre-cancelled the next turn.
+    const cancellable = this.#turnLive(session)
+      && ACTIVE_STATUSES.has(session.status)
+      && session.client?.alive === true;
+    if (!cancellable) {
       this.schedulePersist();
       return { ok: true, ...publicSession(session) };
     }
+    // Inside the active branch: a cancel that decides to do nothing must not
+    // still interrupt Main's outstanding worker requests.
+    this.interruptSessionInbox(session, "Main cancelled the worker session");
     session.cancelRequested = true;
-    session.client.cancelSession(session.acpSessionId);
-    session.status = "cancelling";
+    session.client?.cancelSession(session.acpSessionId);
+    this.#setStatus(session, "cancelling", "cancel_requested");
     this.store.push(session, { type: "cancel_requested" });
     this.updateTaskForSession(session, "working", "Cancellation requested");
     return { ok: true, ...publicSession(session) };
@@ -896,9 +1104,11 @@ export class GatewayService {
     if (args.action === "clean") {
       const closed = [];
       for (const item of this.store.list().filter((candidate) => candidate.ownerRootId === root)) {
-        if (ACTIVE_STATUSES.has(item.status) || item.status === "idle") continue;
-        await this.closeSession(item);
-        closed.push(item.id);
+        // The list was a snapshot; by the time the n-th session is reached the
+        // earlier awaits have let it start a turn or disappear entirely.
+        if (!this.store.get(item.id) || ACTIVE_STATUSES.has(item.status) || item.status === "idle") continue;
+        if (item._reserved) continue;
+        if (await this.closeSession(item)) closed.push(item.id);
       }
       return { ok: true, closed };
     }
@@ -906,29 +1116,75 @@ export class GatewayService {
   }
 
   async closeSession(session) {
-    this.interruptSessionInbox(session, "Main closed the worker session");
-    if (ACTIVE_STATUSES.has(session.status)) session.client?.cancelSession(session.acpSessionId);
-    if (session.client?.alive && session.client.initResult?.agentCapabilities?.sessionCapabilities?.close) {
-      await session.client.request("session/close", { sessionId: session.acpSessionId }, 30_000);
+    return this.#queueFor(session).run("close", () => this.#closeLocked(session));
+  }
+
+  async #closeLocked(session) {
+    // Idempotent: a second close must not interrupt the inbox again, push a
+    // second session_closed, or delete a record someone else already replaced.
+    if (CLOSED_STATUSES.has(session.status) || !this.store.get(session.id)) return false;
+    const queue = this.#queueFor(session);
+    // Seal before the await. A turn that completes underneath this close would
+    // otherwise revive the session to idle and report a turn_end to Main after
+    // it had already been told the session was gone.
+    if (this.#sealTurn(session)) {
+      // The sealed turn's reply will be dropped, so this close owes the task its
+      // terminal state; otherwise the handle waits for a result that can never
+      // arrive.
+      session.completedAt = new Date(this.now()).toISOString();
+      this.store.finalizeResult(session);
+      this.updateTaskForSession(session, "cancelled", "Session closed before the turn completed", {
+        ok: true,
+        sessionId: session.id,
+        turnId: session.turnId,
+        status: "cancelled",
+        result: {
+          text: session.resultFinalText ?? session.resultText,
+          transcriptBytes: Buffer.byteLength(session.resultText),
+          artifact: session.resultArtifact ?? null,
+          ...(session.resultFinalArtifact ? { textArtifact: session.resultFinalArtifact } : {}),
+          stopReason: "cancelled"
+        }
+      });
     }
-    session.client?.clearSession(session.acpSessionId);
-    session.status = "closed";
+    this.interruptSessionInbox(session, "Main closed the worker session");
+    const client = session.client;
+    if (ACTIVE_STATUSES.has(session.status)) client?.cancelSession(session.acpSessionId);
+    try {
+      if (client?.alive && client.initResult?.agentCapabilities?.sessionCapabilities?.close) {
+        await client.request("session/close", { sessionId: session.acpSessionId }, 30_000);
+      }
+    } catch {
+      // The worker is allowed to die instead of answering. Closing is the
+      // gateway's own bookkeeping, so it completes either way.
+    }
+    client?.clearSession(session.acpSessionId);
+    this.#setStatus(session, "closed", "session_closed");
     session.client = null;
     this.store.push(session, { type: "session_closed" });
     this.store.delete(session.id);
+    // Anything still queued behind this close was written for a session that
+    // now does not exist; waking it up would act on the deleted record.
+    queue.closeWith(new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`));
+    return true;
   }
 
   syncSessionInputState(session) {
     const pending = session.client?.pendingSessionInput?.(session.acpSessionId)
       ?? { permissions: 0, elicitations: 0 };
     if (pending.permissions > 0) {
-      session.status = "waiting_permission";
-      this.updateTaskForSession(session, "input_required", "Waiting for Main permission");
+      if (this.#setStatus(session, "waiting_permission", "input_state_sync")) {
+        this.updateTaskForSession(session, "input_required", "Waiting for Main permission");
+      }
     } else if (pending.elicitations > 0) {
-      session.status = "waiting_input";
-      this.updateTaskForSession(session, "input_required", "Waiting for Main input");
-    } else {
-      session.status = "running";
+      if (this.#setStatus(session, "waiting_input", "input_state_sync")) {
+        this.updateTaskForSession(session, "input_required", "Waiting for Main input");
+      }
+    } else if (this.#turnLive(session)) {
+      // Mirroring "running" onto a turn that already ended is the one write here
+      // that cannot be undone by anything: ACTIVE_STATUSES makes the session
+      // skip every retention path and refuse every later prompt, forever.
+      this.#setStatus(session, "running", "input_state_sync");
       this.updateTaskForSession(session, "working", "Main response sent");
     }
     // Status changed without an event push; pollers filtering out the
@@ -956,7 +1212,10 @@ export class GatewayService {
     }
     if (SEGMENT_BOUNDARY_TYPES.has(type)) this.store.markSegmentBoundary(session, String(type));
     if (type === "permission_request") {
-      session.status = "waiting_permission";
+      // A cancel Main has already been notified of outranks a late worker
+      // request: the event stays on the record, but it must not pull the session
+      // back into an input wait or grow a new obligation Main cannot discharge.
+      const admitted = this.#setStatus(session, "waiting_permission", type);
       const cappedToolCall = this.capStructuredField(session, `${type}-toolCall`, "toolCall", update.toolCall);
       this.store.push(session, {
         type,
@@ -972,12 +1231,13 @@ export class GatewayService {
         } : {}),
         options: update.options
       });
+      if (!admitted) return;
       this.createPermissionInbox(session, update);
       this.updateTaskForSession(session, "input_required", "Waiting for Main permission");
       return;
     }
     if (type === "elicitation_request") {
-      session.status = "waiting_input";
+      const admitted = this.#setStatus(session, "waiting_input", type);
       this.store.push(session, {
         type,
         requestId: update.requestId,
@@ -988,6 +1248,7 @@ export class GatewayService {
         ...this.capStructuredField(session, `${type}-schema`, "requestedSchema", update.requestedSchema),
         toolCallId: update.toolCallId
       });
+      if (!admitted) return;
       this.createElicitationInbox(session, update);
       this.updateTaskForSession(session, "input_required", "Waiting for Main input");
       return;
@@ -1056,17 +1317,12 @@ export class GatewayService {
       maxPendingRequestsPerSession: this.resourceLimits.maxPendingRequestsPerSession,
       maxFrameBytes: this.resourceLimits.maxFrameBytes,
       onExit: (error) => {
+        const text = error?.message ?? String(error);
+        // Through each session's mailbox: a close already in flight has to finish
+        // its own bookkeeping, otherwise the worker dying mid-close leaves the
+        // record stuck at "disconnected" with its inbox already interrupted.
         for (const session of this.store.list().filter((item) => item.client === client)) {
-          session.client = null;
-          session.status = "disconnected";
-          session.error = error?.message ?? String(error);
-          this.store.push(session, { type: "provider_disconnected", text: session.error });
-          for (const item of this.inbox.values()) {
-            if (item.sessionId !== session.id || item.status !== "pending") continue;
-            item.status = "interrupted";
-            item.resolution = "ACP provider exited before this worker request was answered";
-            item.resolvedAt = new Date(this.now()).toISOString();
-          }
+          this.#queueFor(session).post("provider_exit", () => this.#providerExitLocked(session, text));
         }
         this.schedulePersist();
       }
@@ -1306,29 +1562,13 @@ export class GatewayService {
       const orphanExpired = !session.pinned && abandonmentAt
         && isExpired(abandonmentAt, this.lifecycle.orphanGraceMs, now);
       if (orphanExpired && ACTIVE_STATUSES.has(session.status) && !session.orphanCancelRequested) {
-        session.orphanCancelRequested = true;
-        session.cancelRequested = true;
-        session.client?.cancelSession(session.acpSessionId);
-        session.status = "cancelling";
-        this.store.push(session, { type: "orphan_cancel_requested" });
-        this.interruptSessionInbox(session, "Main did not reconnect before the orphan grace period expired");
-        // Snapshot through the result model, not the raw transcript: the task
-        // result must honor the final-segment split and the inline cap.
-        this.store.finalizeResult(session);
-        this.updateTaskForSession(session, "cancelled", "Cancelled after Main disconnect", {
-          ok: true,
-          sessionId: session.id,
-          turnId: session.turnId,
-          status: "cancelled",
-          result: {
-            text: session.resultFinalText ?? session.resultText,
-            transcriptBytes: Buffer.byteLength(session.resultText),
-            artifact: session.resultArtifact ?? null,
-            ...(session.resultFinalArtifact ? { textArtifact: session.resultFinalArtifact } : {}),
-            stopReason: "cancelled"
+        try {
+          if (await this.#queueFor(session).run("orphan_cancel", () => this.#orphanCancelLocked(session))) {
+            changed = true;
           }
-        });
-        changed = true;
+        } catch {
+          // The session closed while this was queued; there is nothing to cancel.
+        }
       }
 
       // Never clear a session whose current turn is still active: completedAt
@@ -1351,8 +1591,13 @@ export class GatewayService {
       }
 
       const recordSince = session.completedAt ?? session.updatedAt;
-      if (!session.pinned && !ACTIVE_STATUSES.has(session.status)
+      if (!session.pinned && !ACTIVE_STATUSES.has(session.status) && this.#sessionQuiet(session)
         && isExpired(recordSince, this.lifecycle.sessionRetentionMs, now)) {
+        // Whatever is queued for this session was written against a record that
+        // is about to stop existing.
+        session._queue?.closeWith(
+          new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`)
+        );
         if (session.client) {
           session.client.clearSession(session.acpSessionId);
           session.client = null;
@@ -1375,6 +1620,59 @@ export class GatewayService {
     return { ok: true, sessions: this.store.list().length, tasks: this.tasks.size, inbox: this.inbox.size };
   }
 
+  // Main is gone for good, so the gateway stops waiting on the worker and
+  // finalizes the turn itself rather than leaving it mid-cancel. Being the
+  // finalizer is the point: the real turn end lands later and must be a no-op,
+  // or the result gets spilled and reported a second time.
+  #orphanCancelLocked(session) {
+    if (!this.store.get(session.id) || session.orphanCancelRequested) return false;
+    if (!ACTIVE_STATUSES.has(session.status) || session.status === "restoring") return false;
+    session.orphanCancelRequested = true;
+    session.cancelRequested = true;
+    session.client?.cancelSession(session.acpSessionId);
+    this.store.push(session, { type: "orphan_cancel_requested" });
+    this.interruptSessionInbox(session, "Main did not reconnect before the orphan grace period expired");
+    this.#sealTurn(session);
+    this.#setStatus(session, "cancelled", "orphan_cancelled");
+    session.stopReason = "cancelled";
+    session.completedAt = new Date(this.now()).toISOString();
+    // Snapshot through the result model, not the raw transcript: the task
+    // result must honor the final-segment split and the inline cap.
+    this.store.finalizeResult(session);
+    this.updateTaskForSession(session, "cancelled", "Cancelled after Main disconnect", {
+      ok: true,
+      sessionId: session.id,
+      turnId: session.turnId,
+      status: "cancelled",
+      result: {
+        text: session.resultFinalText ?? session.resultText,
+        transcriptBytes: Buffer.byteLength(session.resultText),
+        artifact: session.resultArtifact ?? null,
+        ...(session.resultFinalArtifact ? { textArtifact: session.resultFinalArtifact } : {}),
+        stopReason: "cancelled"
+      }
+    });
+    this.store.push(session, { type: "turn_end", stopReason: "cancelled" });
+    return true;
+  }
+
+  // The worker process is gone, so this is the last word on any turn it owed.
+  #providerExitLocked(session, text) {
+    if (CLOSED_STATUSES.has(session.status) || !this.store.get(session.id)) return;
+    const finalizing = this.#sealTurn(session);
+    session.client = null;
+    this.#setStatus(session, "disconnected", "provider_disconnected");
+    session.error = text;
+    this.store.push(session, { type: "provider_disconnected", text: session.error });
+    this.interruptSessionInbox(session, "ACP provider exited before this worker request was answered");
+    if (finalizing) {
+      session.completedAt = new Date(this.now()).toISOString();
+      this.store.finalizeResult(session);
+      this.finishTaskForSession(session);
+    }
+    this.schedulePersist();
+  }
+
   interruptSessionInbox(session, resolution) {
     const resolvedAt = new Date(this.now()).toISOString();
     for (const item of this.inbox.values()) {
@@ -1385,12 +1683,19 @@ export class GatewayService {
     }
   }
 
+  // No command owns this session right now, so background work may take its
+  // client away without pulling it out from under a caller mid-flight.
+  #sessionQuiet(session) {
+    return !session._reserved && session._queue?.idle !== false;
+  }
+
   async unloadSession(session) {
     const client = session.client;
     if (!client || !canRestoreSession(client.initResult)) return false;
+    if (!this.#sessionQuiet(session)) return false;
     client.clearSession(session.acpSessionId);
     session.client = null;
-    session.status = "disconnected";
+    this.#setStatus(session, "disconnected", "session_unloaded");
     session.error = null;
     if (!this.store.list().some((item) => item.client === client)) {
       await client.stop().catch(() => {});
@@ -1404,7 +1709,10 @@ export class GatewayService {
   schedulePersist() {
     if (!this.statePath) return;
     this.persistDirty = true;
-    if (this.persistTimer) return;
+    // After shutdown the final flush is the only writer left. A timer armed here
+    // by a late callback would fire against a service that is already gone, and
+    // write state back out after the daemon believed it had finished.
+    if (this.stopped || this.persistTimer) return;
     this.persistTimer = setTimeout(() => {
       this.persistTimer = null;
       void this.flushPersist().catch((error) => {
@@ -1446,6 +1754,7 @@ export class GatewayService {
   }
 
   async shutdown() {
+    this.stopped = true;
     await this.agentUpdateManager?.stop();
     if (this.gcTimer) clearInterval(this.gcTimer);
     this.gcTimer = null;
@@ -1453,6 +1762,13 @@ export class GatewayService {
     this.persistTimer = null;
     this.subscriptions.clear();
     await Promise.allSettled(this.clientStarts.values());
+    // Let in-flight commands land before the transport dies. Stopping a client
+    // first would strand their callbacks, so the last thing to touch the state
+    // file would be a half-applied command. Bounded because no command waits on
+    // a worker turn.
+    await Promise.allSettled(
+      this.store.list().map((session) => session._queue?.drain(5_000) ?? Promise.resolve(true))
+    );
     await Promise.all([...this.clients.values()].map((client) => client.stop()));
     await this.flushPersist();
   }
