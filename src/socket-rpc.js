@@ -5,7 +5,15 @@ import { createConnection } from "node:net";
 import { fileURLToPath } from "node:url";
 import { gatewayLifecycleConfig, gatewaySocketPath, gatewayStatePath } from "./config.js";
 import { readNdjson } from "./ndjson.js";
+import { LANE_HIGH, LANE_NORMAL, NdjsonChannel } from "./ndjson-channel.js";
 import { statePaths } from "./state-store.js";
+
+// Lane B has no droppable traffic: every frame here has a pending promise behind
+// it. The one thing lanes buy is that a cancel never queues behind a
+// megabyte-sized prompt.
+const HIGH_LANE_METHODS = new Set([
+  "cancel", "permission", "answer", "subscribe", "unsubscribe", "daemon_shutdown", "request_cancel"
+]);
 
 // A daemon that halted in state recovery cannot answer, and its stderr went
 // nowhere (autostart ignores stdio). The marker file is the only channel it had,
@@ -42,6 +50,7 @@ export class GatewayRpcClient {
     this.rootId = rootId;
     this.autoStart = autoStart;
     this.socket = null;
+    this.channel = null;
     this.pending = new Map();
     this.subscriptions = new Map();
     this.serverSubscriptions = new Map();
@@ -51,7 +60,10 @@ export class GatewayRpcClient {
     this.reconnectTimer = null;
     this.reconnectAttempt = 0;
     this.closed = false;
-    this.maxFrameBytes = gatewayLifecycleConfig().maxFrameBytes;
+    const lifecycle = gatewayLifecycleConfig();
+    this.maxFrameBytes = lifecycle.maxFrameBytes;
+    this.maxQueueBytes = lifecycle.maxQueueBytes;
+    this.writeTimeoutMs = lifecycle.writeTimeoutMs;
   }
 
   async call(method, args = {}, timeoutMs = 30_000, options = {}) {
@@ -64,13 +76,19 @@ export class GatewayRpcClient {
   async subscribe(args = {}, onEvent, timeoutMs = 30_000) {
     if (typeof onEvent !== "function") throw new Error("Subscription event handler is required");
     await this.connect();
-    const result = await this.#requestConnected("subscribe", args, timeoutMs);
+    // This client understands subscription_gap and lowers its cursor to the start
+    // of a reported gap, so it opts into being shed rather than disconnected.
+    const subscribeArgs = { ...args, acceptsGaps: true };
+    const result = await this.#requestConnected("subscribe", subscribeArgs, timeoutMs);
     const stableId = result.subscriptionId;
     const record = {
       stableId,
       serverId: result.subscriptionId,
-      args: structuredClone(args),
+      args: structuredClone(subscribeArgs),
       cursors: { ...(args.cursors ?? {}) },
+      // Lowest sequence known to be missing per session. Left behind by a gap
+      // marker and consumed by the next resubscribe.
+      gapFloor: {},
       onEvent,
       timeoutMs
     };
@@ -143,6 +161,14 @@ export class GatewayRpcClient {
           onLine: (line) => this.#onLine(line),
           onOverflow: (overflowError) => socket.destroy(overflowError)
         });
+        this.channel = new NdjsonChannel(socket, {
+          maxFrameBytes: this.maxFrameBytes,
+          maxQueueBytes: this.maxQueueBytes,
+          writeTimeoutMs: this.writeTimeoutMs,
+          // The existing disconnect machine is the recovery: it rejects every
+          // pending call and reconnects with the subscription cursors intact.
+          onFatal: (error) => this.#disconnect(error, socket)
+        });
         this.socket = socket;
         resolve();
       });
@@ -150,7 +176,9 @@ export class GatewayRpcClient {
   }
 
   #requestConnected(method, args, timeoutMs, options = {}) {
-    if (!this.socket || this.socket.destroyed) throw new Error("Gateway socket is not connected");
+    if (!this.socket || this.socket.destroyed || !this.channel) {
+      throw new Error("Gateway socket is not connected");
+    }
     const id = randomUUID();
     const signal = options?.signal;
     return new Promise((resolve, reject) => {
@@ -163,19 +191,31 @@ export class GatewayRpcClient {
         callback(value);
       };
       const cancelRemote = () => {
-        if (!this.socket || this.socket.destroyed) return;
-        this.socket.write(`${JSON.stringify({
-          method: "request_cancel",
-          args: { requestId: id },
-          token: this.token,
-          rootId: this.rootId
-        })}\n`);
+        if (!this.socket || this.socket.destroyed || !this.channel) return;
+        try {
+          this.channel.write(LANE_HIGH, {
+            method: "request_cancel",
+            args: { requestId: id },
+            token: this.token,
+            rootId: this.rootId
+          });
+        } catch {
+          // The original wait is already being rejected. Channel fatal handling
+          // owns any transport teardown caused by a cancellation write failure.
+        }
       };
       const onAbort = () => {
         this.pending.delete(id);
         cancelRemote();
         finish(reject, waitAbortedError(method));
       };
+      // Registered only after the frame is on its way. A write that throws must
+      // reject this promise rather than orphan a pending entry that no response
+      // will ever arrive for.
+      this.channel.write(
+        HIGH_LANE_METHODS.has(method) ? LANE_HIGH : LANE_NORMAL,
+        { id, method, args, token: this.token, rootId: this.rootId }
+      );
       const timer = setTimeout(() => {
         this.pending.delete(id);
         cancelRemote();
@@ -186,17 +226,27 @@ export class GatewayRpcClient {
         reject: (error) => finish(reject, error)
       });
       signal?.addEventListener("abort", onAbort, { once: true });
-      this.socket.write(`${JSON.stringify({ id, method, args, token: this.token, rootId: this.rootId })}\n`);
     });
   }
 
   async #restoreSubscriptions() {
     this.serverSubscriptions.clear();
     for (const record of this.subscriptions.values()) {
-      const result = await this.#requestConnected("subscribe", {
-        ...record.args,
-        cursors: { ...(record.args.cursors ?? {}), ...record.cursors }
-      }, record.timeoutMs);
+      const cursors = { ...(record.args.cursors ?? {}), ...record.cursors };
+      // The replay does the real repair work: rewinding to the gap floor asks the
+      // ring for everything from the first dropped sequence on. Outside the ring
+      // the existing cursorTruncated path reports it, as it always has.
+      for (const [sessionId, floor] of Object.entries(record.gapFloor ?? {})) {
+        const rewound = Math.min(cursors[sessionId] ?? Infinity, floor);
+        cursors[sessionId] = rewound;
+        // The local delivery filter has to move with it, or #deliver would discard
+        // the very replay this asked for. Some events therefore arrive twice:
+        // at-least-once is the right trade against losing them silently.
+        record.cursors[sessionId] = rewound;
+      }
+      const result = await this.#requestConnected("subscribe", { ...record.args, cursors }, record.timeoutMs);
+      // Cleared only once the resubscribe carrying it succeeded.
+      record.gapFloor = {};
       record.serverId = result.subscriptionId;
       this.serverSubscriptions.set(record.serverId, record.stableId);
       const truncated = Object.entries(result.cursorTruncated ?? {})
@@ -233,14 +283,14 @@ export class GatewayRpcClient {
       return;
     }
     if (message.type === "event" && message.subscriptionId) {
-      const stableId = this.serverSubscriptions.get(message.subscriptionId);
-      const record = stableId ? this.subscriptions.get(stableId) : null;
-      if (record) this.#deliver(record, message.event);
-      else {
-        const events = this.earlyEvents.get(message.subscriptionId) ?? [];
-        if (events.length < 1000) events.push(message.event);
-        this.earlyEvents.set(message.subscriptionId, events);
-      }
+      this.#route(message.subscriptionId, message.event);
+      return;
+    }
+    // A gap marker is a record about the subscription rather than a session event,
+    // so it arrives as its own frame. It travels the same delivery path because it
+    // has to be seen in order relative to the events around it.
+    if (message.type === "subscription_gap" && message.subscriptionId) {
+      this.#route(message.subscriptionId, message);
       return;
     }
     if (message.type === "subscription_error" && message.subscriptionId) {
@@ -265,7 +315,32 @@ export class GatewayRpcClient {
     }
   }
 
+  // Events can arrive before the subscribe response has been awaited, so an
+  // unknown subscription buffers instead of discarding.
+  #route(serverId, event) {
+    const stableId = this.serverSubscriptions.get(serverId);
+    const record = stableId ? this.subscriptions.get(stableId) : null;
+    if (record) {
+      this.#deliver(record, event);
+      return;
+    }
+    const events = this.earlyEvents.get(serverId) ?? [];
+    if (events.length < 1000) events.push(event);
+    this.earlyEvents.set(serverId, events);
+  }
+
   #deliver(record, event) {
+    // A gap marker carries no sequence on purpose, so it can never advance a
+    // cursor. What it does is pull the resubscribe cursor back to the start of
+    // what was dropped: without this the events the daemon shed would be lost
+    // silently forever, which is worse than the noisy error it replaced.
+    if (event?.type === "subscription_gap" && event.sessionId != null && Number.isFinite(event.fromSequence)) {
+      const floor = record.gapFloor ??= {};
+      floor[event.sessionId] = Math.min(floor[event.sessionId] ?? Infinity, event.fromSequence);
+      // Reported under the id the caller subscribed with, never the server's.
+      record.onEvent({ ...event, subscriptionId: record.stableId });
+      return;
+    }
     if (event?.sessionId && Number.isFinite(event.sequence)) {
       const cursor = record.cursors[event.sessionId] ?? 0;
       if (event.sequence < cursor) return;
@@ -302,6 +377,11 @@ export class GatewayRpcClient {
   #disconnect(error, socket) {
     if (this.socket !== socket) return;
     this.socket = null;
+    this.channel?.destroy(error);
+    this.channel = null;
+    // A congested or stalled socket is still open here: nothing will drain it, so
+    // the reconnect needs the old one actually gone.
+    socket.destroy();
     this.serverSubscriptions.clear();
     this.earlyEvents.clear();
     this.earlySubscriptionErrors.clear();
@@ -325,6 +405,8 @@ export class GatewayRpcClient {
     this.closed = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
+    this.channel?.destroy();
+    this.channel = null;
     this.socket?.end();
     this.socket = null;
     this.serverSubscriptions.clear();

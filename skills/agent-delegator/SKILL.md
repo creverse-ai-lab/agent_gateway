@@ -48,7 +48,7 @@ For the current routing prior, run `grok-4.5` through ACP as a read-only red-tea
 4. Read the live response instead of assuming defaults:
    - `persistence`: whether durable state is healthy;
    - `lifecycle`: unload, orphan, and result/inbox/session retention behavior;
-   - `resourceLimits`: event, text, artifact, terminal, request, and frame bounds;
+   - `resourceLimits`: event, text, artifact, terminal, request, and frame bounds, plus the connection (queue bytes, write timeout), session (prompt, file read, terminal output bytes) and per-Main (sessions, inbox history) budgets;
    - `metrics`: cumulative poll traffic since daemon start;
    - provider capabilities, reported model, adapter/update status, and alerts.
 5. Treat the live MCP schema and setup response as authoritative. Refresh the front-door MCP connection after a Gateway update when its cached schema is stale.

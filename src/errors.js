@@ -38,6 +38,18 @@ export const ERROR_CODES = Object.freeze({
   STATE_SNAPSHOT_CORRUPT: "STATE_SNAPSHOT_CORRUPT",
   STATE_VERSION_UNSUPPORTED: "STATE_VERSION_UNSUPPORTED",
   STATE_DIR_LOCKED: "STATE_DIR_LOCKED",
+  // Bounded transport (NdjsonChannel): the write side of an NDJSON connection.
+  // A frame nobody can send, a backlog nobody is draining, or a peer that
+  // stopped taking bytes at all.
+  TRANSPORT_CLOSED: "TRANSPORT_CLOSED",
+  TRANSPORT_CONGESTED: "TRANSPORT_CONGESTED",
+  TRANSPORT_WRITE_TIMEOUT: "TRANSPORT_WRITE_TIMEOUT",
+  FRAME_TOO_LARGE: "FRAME_TOO_LARGE",
+  // Admission budgets. Each is refused before any work is dispatched, so a
+  // caller that sees one has spent nothing but the round trip.
+  TOO_MANY_INFLIGHT_REQUESTS: "TOO_MANY_INFLIGHT_REQUESTS",
+  PROMPT_TOO_LARGE: "PROMPT_TOO_LARGE",
+  SESSION_LIMIT_EXCEEDED: "SESSION_LIMIT_EXCEEDED",
   // Fallback for an error that has no more specific code yet.
   GATEWAY_ERROR: "GATEWAY_ERROR"
 });

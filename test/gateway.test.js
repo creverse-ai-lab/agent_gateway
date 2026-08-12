@@ -473,8 +473,30 @@ test("Gateway caps chunk and permission payload copies while keeping full data r
     assert.deepEqual(permission.toolCall, { toolCallId: "tool-big", title: "Edit file", kind: "edit" });
     assert.equal(JSON.parse(await readFile(permission.dataArtifact.path, "utf8")).rawInput.length, 10_000);
     assert.deepEqual(permission.options, [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }]);
+    // GOLDEN DIFF (1.4.0 PR 5): the inbox row no longer keeps its own full copy of
+    // an oversized tool call. The event path already spilled this exact payload to
+    // an artifact at this exact threshold, so the row keeps the head Main needs and
+    // points at that file. One threshold, one artifact, two consumers.
     const inbox = await service.call("inbox", { action: "list", status: "pending" }, { rootId: "main-a" });
-    assert.equal(inbox.items[0].toolCall.rawInput.length, 10_000, "inbox keeps the full tool call");
+    const row = inbox.items[0];
+    assert.equal(row.toolCall.rawInput, undefined, "inbox stops holding the oversized payload");
+    assert.deepEqual(row.toolCall, { toolCallId: "tool-big", title: "Edit file", kind: "edit" });
+    assert.equal(row.toolCallTruncated, true);
+    assert.ok(row.toolCallBytes > 10_000);
+    assert.equal(row.toolCallArtifact.path, permission.dataArtifact.path, "both consumers share one artifact");
+    // get() returns the pointer rather than rehydrating it, like every other
+    // artifact reference in the API.
+    const got = await service.call("inbox", { action: "get", inboxId: row.inboxId }, { rootId: "main-a" });
+    assert.equal(got.item.toolCallArtifact.path, row.toolCallArtifact.path);
+    assert.equal(got.item.toolCall.rawInput, undefined);
+    assert.equal(
+      JSON.parse(await readFile(row.toolCallArtifact.path, "utf8")).rawInput.length,
+      10_000,
+      "and the full tool call is still recoverable through it"
+    );
+    // The options Main chooses between are always inline: they are small, and they
+    // are the whole point of the row.
+    assert.deepEqual(row.options, [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }]);
     const detail = await service.call(
       "session",
       { action: "get", sessionId: session.id, includeTranscript: true },
