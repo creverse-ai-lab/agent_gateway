@@ -5,6 +5,7 @@ import { chmod, open, readFile, unlink } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import { controlToken, gatewayAgentUpdateConfig, gatewayLifecycleConfig, gatewaySocketPath, gatewayStatePath } from "./config.js";
 import { AgentUpdateManager } from "./agent-updates.js";
+import { ERROR_CODES, GatewayError } from "./errors.js";
 import { checkGatewaySource } from "./gateway-source-monitor.js";
 import { GatewayService } from "./gateway-service.js";
 import { readNdjson } from "./ndjson.js";
@@ -47,10 +48,18 @@ const server = createServer((socket) => {
         request = JSON.parse(line);
         const isGuide = request.method === "guide";
         if (!isGuide) {
-          if (!tokenMatches(request.token, expectedToken)) throw new Error("Control access denied");
-          if (typeof request.rootId !== "string" || !request.rootId) throw new Error("rootId is required");
-          if (expectedRootId && request.rootId !== expectedRootId) throw new Error("Control root identity mismatch");
-          if (boundRootId && request.rootId !== boundRootId) throw new Error("Socket is already bound to another Main");
+          if (!tokenMatches(request.token, expectedToken)) {
+            throw new GatewayError(ERROR_CODES.CONTROL_ACCESS_DENIED, "Control access denied");
+          }
+          if (typeof request.rootId !== "string" || !request.rootId) {
+            throw new GatewayError(ERROR_CODES.ROOT_REQUIRED, "rootId is required");
+          }
+          if (expectedRootId && request.rootId !== expectedRootId) {
+            throw new GatewayError(ERROR_CODES.ROOT_MISMATCH, "Control root identity mismatch");
+          }
+          if (boundRootId && request.rootId !== boundRootId) {
+            throw new GatewayError(ERROR_CODES.SOCKET_ALREADY_BOUND, "Socket is already bound to another Main");
+          }
           if (!boundRootId) {
             boundRootId = request.rootId;
             service.attachRoot(boundRootId);
@@ -78,7 +87,16 @@ const server = createServer((socket) => {
         const result = isGuide ? await service.guide() : await service.call(request.method, request.args, { rootId: request.rootId });
         send({ id: request.id, ok: true, result });
       } catch (error) {
-        if (!socket.destroyed) send({ id: request?.id ?? null, ok: false, error: error?.message ?? String(error) });
+        // error stays byte-identical for existing callers; errorCode is additive
+        // so a Main can branch on a stable code instead of message text.
+        if (!socket.destroyed) {
+          send({
+            id: request?.id ?? null,
+            ok: false,
+            error: error?.message ?? String(error),
+            ...(typeof error?.code === "string" && error.code ? { errorCode: error.code } : {})
+          });
+        }
       }
     }
   });

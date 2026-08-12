@@ -59,7 +59,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         : 30_000;
     return toolResult(await rpc.call(method, args, timeoutMs));
   } catch (error) {
-    return toolResult({ ok: false, error: error?.message ?? String(error) }, true);
+    return toolResult({
+      ok: false,
+      error: error?.message ?? String(error),
+      ...(typeof error?.code === "string" ? { errorCode: error.code } : {})
+    }, true);
   }
 });
 

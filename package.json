@@ -23,6 +23,7 @@
     "guide": "node src/guide.js",
     "bootstrap": "node src/bootstrap.js",
     "test": "sh -c 'export ACP_GATEWAY_DISABLE_DYNAMIC_PROVIDERS=1 ACP_GATEWAY_ARTIFACTS=\"$(mktemp -d)\"; node --test test/*.test.js; s=$?; rm -rf \"$ACP_GATEWAY_ARTIFACTS\"; exit $s'",
+    "bench:payload": "node scripts/bench-payload.js",
     "smoke": "node test/live-smoke.js",
     "smoke:subagents": "node test/live-subagent-smoke.js",
     "ci": "node scripts/ci-check.js && node scripts/acp-upstream-monitor.js --validate && npm test",

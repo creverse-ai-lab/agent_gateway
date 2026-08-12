@@ -204,7 +204,13 @@ export class GatewayRpcClient {
     if (!pending) return;
     this.pending.delete(message.id);
     if (message.ok) pending.resolve(message.result);
-    else pending.reject(new Error(message.error || "Gateway request failed"));
+    else {
+      const error = new Error(message.error || "Gateway request failed");
+      // Carry the Gateway's stable error code across the socket so callers can
+      // branch on it instead of matching message text.
+      if (typeof message.errorCode === "string" && message.errorCode) error.code = message.errorCode;
+      pending.reject(error);
+    }
   }
 
   #deliver(record, event) {

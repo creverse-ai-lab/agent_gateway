@@ -1,0 +1,11 @@
+{
+  "gatewayVersion": "1.3.2",
+  "flows": {
+    "empty_active_poll": 483,
+    "active_poll_permission": 814,
+    "idle_poll_result": 644,
+    "setup_no_provider": 1506,
+    "inbox_list_one_permission": 508,
+    "task_get": 326
+  }
+}
