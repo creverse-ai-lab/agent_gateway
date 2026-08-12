@@ -96,6 +96,9 @@ export class TaskStore {
   #onChange;
   #tasks = new Map(); // taskId -> plain, JSON-serializable record
   #waiters = new Map(); // taskId -> Set<waiter> (never serialized)
+  // taskIds whose terminal fan-out is held back until flushWaiters(). Empty in
+  // every synchronous-commit path; see transition({deferWaiters}).
+  #deferredTerminal = new Set();
   #sweeping = false;
 
   constructor(options = {}) {
@@ -127,6 +130,27 @@ export class TaskStore {
     // Reads sweep first so a zombie past its TTL is never counted.
     this.expireSweep();
     return this.#tasks.size;
+  }
+
+  // The live record map. Deliberately narrow set of callers: the gateway's
+  // legacy `service.tasks` alias (characterization tests inject fabricated
+  // records through it) and, from PR 4, WAL replay — which must rebuild records
+  // as plain data rather than walk them through transition(), because replaying
+  // a working->failed conversion would make a later durable result_committed
+  // lose to terminal-first-wins and silently discard a result that is on disk.
+  // Nothing on a request path may write through this.
+  get records() {
+    return this.#tasks;
+  }
+
+  // Non-throwing lookup for bookkeeping that must not turn a missing handle into
+  // an error: owner-activity touches and post-restart reconciliation both run on
+  // ids that may legitimately have expired.
+  find(taskId) {
+    if (typeof taskId !== "string" || taskId.trim() === "") return null;
+    this.expireSweep();
+    const record = this.#tasks.get(taskId);
+    return record ? snapshot(record) : null;
   }
 
   create(options = {}) {
@@ -214,14 +238,77 @@ export class TaskStore {
     if (options?.result !== undefined) record.result = options.result;
     record.lastUpdatedAt = new Date(this.#now()).toISOString();
     this.#emit("updated", record);
-    if (TERMINAL_TASK_STATUSES.has(status)) this.#resolveWaiters(record);
+    if (TERMINAL_TASK_STATUSES.has(status)) {
+      // deferWaiters splits "the record is terminal" from "the outcome may be
+      // handed out". A committer that still owes durability work (PR 4: artifact
+      // fsync, then the WAL barrier) defers, then calls flushWaiters() once the
+      // result can survive a crash. Without it a blocking reader consumes a
+      // result that a crash could take back. Non-blocking reads (get/result) are
+      // deliberately NOT gated: they are retryable polls, not consumption.
+      if (options?.deferWaiters === true) this.#deferredTerminal.add(record.taskId);
+      else this.#resolveWaiters(record);
+    }
+    return snapshot(record);
+  }
+
+  // Releases a terminal fan-out that transition() deferred, and returns how many
+  // waiters it woke. Idempotent and safe to call unconditionally (a task that
+  // never deferred, already flushed, or vanished is a no-op), so a committer can
+  // put it in a finally block.
+  flushWaiters(taskId) {
+    requireNonEmptyString(taskId, "taskId");
+    if (!this.#deferredTerminal.delete(taskId)) return 0;
+    const record = this.#tasks.get(taskId);
+    if (!record) return 0;
+    const released = this.#waiters.get(taskId)?.size ?? 0;
+    this.#resolveWaiters(record);
+    return released;
+  }
+
+  // Deletes a record outright, as opposed to expiring or terminating it. Callers:
+  // a prompt that failed to start (the handle never described real work) and, in
+  // PR 4, the compensating rollback when the durable write behind create() fails.
+  // Waiters are rejected as UNKNOWN_TASK because that is exactly what the id
+  // becomes. Returns false when there was nothing to delete.
+  remove(taskId) {
+    requireNonEmptyString(taskId, "taskId");
+    const record = this.#tasks.get(taskId);
+    if (!record) return false;
+    // Delete first: a waiter's rejection handler may re-read the store, and it
+    // must not see a record this call has already promised is gone.
+    this.#tasks.delete(taskId);
+    this.#deferredTerminal.delete(taskId);
+    this.#rejectWaiters(taskId, () => taskError("UNKNOWN_TASK", `Unknown taskId: ${taskId}`));
+    this.#emit("removed", record);
+    return true;
+  }
+
+  // turnId is provenance, not state: it becomes knowable only after the queued
+  // command has actually started the ACP turn, and it never goes stale
+  // afterwards. That is why — unlike status, statusMessage and result — it is
+  // legal to record on an already-terminal record: the turn that produced the
+  // outcome is still the turn that produced it. It carries no lastUpdatedAt bump
+  // for the same reason.
+  attachTurn(taskId, turnId, options = {}) {
+    if (turnId != null && typeof turnId !== "string") {
+      throw taskError("INVALID_ARGUMENT", "turnId must be a string or null");
+    }
+    const record = this.#requireRecord(taskId, options?.ownerRootId);
+    if (record.turnId === turnId) return snapshot(record);
+    record.turnId = turnId;
+    this.#emit("updated", record);
     return snapshot(record);
   }
 
   async waitForTerminal(taskId, options = {}) {
     const { ownerRootId, timeoutMs = 120_000, signal } = options ?? {};
     const record = this.#requireRecord(taskId, ownerRootId);
-    if (TERMINAL_TASK_STATUSES.has(record.status)) return snapshot(record);
+    // A deferred terminal record is not releasable yet: its committer has not
+    // finished making the outcome durable, so even a waiter that arrives after
+    // the commit queues until flushWaiters().
+    if (TERMINAL_TASK_STATUSES.has(record.status) && !this.#deferredTerminal.has(record.taskId)) {
+      return snapshot(record);
+    }
     if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
       throw taskError("INVALID_ARGUMENT", "timeoutMs must be a finite number greater than 0");
     }
@@ -330,6 +417,7 @@ export class TaskStore {
         }
         this.#rejectWaiters(taskId, () => taskError("TASK_TTL_EXPIRED", `Task ${taskId} expired before completion`));
         this.#tasks.delete(taskId);
+        this.#deferredTerminal.delete(taskId);
         removed += 1;
         this.#emit("removed", record);
       }
@@ -384,6 +472,7 @@ export class TaskStore {
       this.#rejectWaiters(taskId, () => taskError("TASK_STORE_CLOSED", "TaskStore was cleared while waiting for a result"));
     }
     this.#tasks.clear();
+    this.#deferredTerminal.clear();
     this.#emit("cleared", null);
   }
 

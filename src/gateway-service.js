@@ -9,6 +9,7 @@ import { ERROR_CODES, GatewayError } from "./errors.js";
 import { currentModelId, detectProviders, providerConfig } from "./providers.js";
 import { SessionQueue } from "./session-queue.js";
 import { publicSession, SessionStore } from "./sessions.js";
+import { TaskStore, TERMINAL_TASK_STATUSES } from "./task-store.js";
 import { GATEWAY_API_VERSION, GATEWAY_VERSION, STATE_SCHEMA_VERSION } from "./version.js";
 
 const ACTIVE_STATUSES = new Set(["running", "waiting_permission", "waiting_input", "cancelling", "restoring"]);
@@ -54,7 +55,6 @@ const CLOSED_STATUSES = new Set(["closed"]);
 // known to be out of sync with the worker, so it has to be resumed first.
 const RESTORE_REQUIRED_STATUSES = new Set(["disconnected", "unavailable"]);
 const CONTROL_SERVER_PATTERN = /(?:acp-gateway-control|acp-mcp-bridge|gateway-daemon|control-mcp)/i;
-const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "cancelled"]);
 const DURABLE_EVENT_TYPES = new Set([
   "session_created", "session_restored", "session_restore_start", "session_restore_failed",
   "turn_start", "turn_end", "error", "permission_request", "permission_response",
@@ -96,13 +96,19 @@ export class GatewayService {
     this.persistDirty = false;
     this.persistTimer = null;
     this.persistError = null;
-    this.tasks = new Map();
     this.inbox = new Map();
     this.subscriptions = new Map();
     this.rootPresence = new Map();
     this.createClient = createClient;
     this.agentUpdateManager = agentUpdateManager;
     this.now = now;
+    // Task semantics (TTL from createdAt, budgets, waiters, keyset pagination)
+    // live in the store. Budgets stay module defaults on purpose: they are a
+    // safety valve, not a per-deployment knob, so they are not on the wire.
+    this.taskStore = new TaskStore({
+      now: this.now,
+      onChange: () => this.schedulePersist()
+    });
     this.artifactStore = artifactStore ?? new ArtifactStore({
       root: artifactRoot,
       maxFileBytes: maxArtifactBytes,
@@ -164,18 +170,9 @@ export class GatewayService {
           _ownerActivityPersistedAt: Date.parse(record.lastOwnerActivityAt ?? record.updatedAt)
         });
       }
-      for (const record of parsed.tasks ?? []) {
-        // An in-flight ACP request cannot safely survive a daemon restart. Keep
-        // the durable handle, but make the restart visible to the caller.
-        const task = { ...record };
-        if (["working", "input_required"].includes(task.status)) {
-          task.status = "failed";
-          task.statusMessage = "Gateway restarted before this task completed";
-          task.result = { ok: false, error: task.statusMessage };
-          task.lastUpdatedAt = new Date(this.now()).toISOString();
-        }
-        this.tasks.set(task.taskId, task);
-      }
+      // The store owns the restart conversion (in-flight -> failed with the
+      // legacy message) and drops handles whose TTL elapsed while we were down.
+      this.taskStore.recover(parsed.tasks ?? []);
       for (const record of parsed.inbox ?? []) {
         const item = { ...record };
         // An ACP permission request is tied to the old worker process. It cannot
@@ -188,8 +185,8 @@ export class GatewayService {
         this.inbox.set(item.inboxId, item);
       }
       for (const session of this.store.list()) {
-        const task = session.activeTaskId ? this.tasks.get(session.activeTaskId) : null;
-        if (task && ["completed", "failed", "cancelled"].includes(task.status)) session.activeTaskId = null;
+        const task = session.activeTaskId ? this.taskStore.find(session.activeTaskId) : null;
+        if (task && TERMINAL_TASK_STATUSES.has(task.status)) session.activeTaskId = null;
       }
       await this.runMaintenance();
     } catch (error) {
@@ -305,7 +302,7 @@ export class GatewayService {
       session: () => this.sessionManage(args, context),
       task_prompt: () => this.taskPrompt(args, context),
       task_get: () => this.taskGet(args, context),
-      task_list: () => this.taskList(context),
+      task_list: () => this.taskList(args, context),
       task_result: () => this.taskResult(args, context),
       task_cancel: () => this.taskCancel(args, context),
       inbox: () => this.inboxManage(args, context)
@@ -815,72 +812,110 @@ export class GatewayService {
 
   async taskPrompt(args, context) {
     const session = this.#admitTurn(args, context);
-    const now = new Date(this.now()).toISOString();
-    const task = {
-      taskId: `task-${randomUUID()}`,
-      sessionId: session.id,
-      ownerRootId: requireRoot(context),
-      turnId: null,
-      status: "working",
-      ttl: Number.isFinite(args.ttl) ? Math.max(0, args.ttl) : 3_600_000,
-      pollInterval: Number.isFinite(args.pollInterval) ? Math.max(100, args.pollInterval) : 1_000,
-      createdAt: now,
-      lastUpdatedAt: now,
-      statusMessage: "Prompt accepted",
-      result: null
-    };
-    this.tasks.set(task.taskId, task);
-    session.activeTaskId = task.taskId;
-    this.schedulePersist();
+    // Everything past admission is inside the finally: a budget rejection must
+    // release the reservation, or one refused task would leave the session
+    // permanently unpromptable.
     try {
-      // One command covers starting the turn and recording the handle. Split
-      // across two, the turn could already have finished and this bookkeeping
-      // would drag a terminal task back to "working", so its result could never
-      // be collected.
-      return await this.#queueFor(session).run("task_prompt", async () => {
-        const started = await this.#promptLocked(session, args, context);
-        task.turnId = started.turnId;
-        if (!TERMINAL_TASK_STATUSES.has(task.status)) this.touchTask(task, "working", "Prompt running");
-        return this.publicTask(task);
-      });
-    } catch (error) {
-      if (session.activeTaskId === task.taskId) session.activeTaskId = null;
-      this.tasks.delete(task.taskId);
-      this.schedulePersist();
-      throw error;
+      const task = this.#storeCall(() => this.taskStore.create({
+        sessionId: session.id,
+        ownerRootId: requireRoot(context),
+        ttl: args.ttl,
+        pollInterval: args.pollInterval
+      }));
+      session.activeTaskId = task.taskId;
+      try {
+        // One command covers starting the turn and recording the handle. Split
+        // across two, the turn could already have finished and this bookkeeping
+        // would drag a terminal task back to "working", so its result could never
+        // be collected. The store enforces that itself now (terminal is final),
+        // but the single command is still what keeps turnId and status agreeing.
+        return await this.#queueFor(session).run("task_prompt", async () => {
+          const started = await this.#promptLocked(session, args, context);
+          // The handle can already be gone: ttl=0 expires on the first read after
+          // create. The turn is running either way, so the ack reports the handle
+          // that was minted instead of failing work that has already started.
+          if (!this.taskStore.find(task.taskId)) {
+            return this.publicTask({ ...task, turnId: started.turnId });
+          }
+          this.taskStore.attachTurn(task.taskId, started.turnId);
+          return this.publicTask(this.taskStore.transition(task.taskId, "working", "Prompt running"));
+        });
+      } catch (error) {
+        if (session.activeTaskId === task.taskId) session.activeTaskId = null;
+        this.taskStore.remove(task.taskId);
+        throw error;
+      }
     } finally {
       this.#release(session, "prompt");
     }
   }
 
   async taskGet(args, context) {
-    return this.publicTask(requireOwnedTask(this.requireTask(args.taskId), context));
+    const ownerRootId = requireRoot(context);
+    return this.publicTask(this.#storeCall(() => this.taskStore.get(args.taskId, { ownerRootId })));
   }
 
-  async taskList(context) {
-    const root = requireRoot(context);
-    this.pruneTasks();
-    return { tasks: [...this.tasks.values()].filter((task) => task.ownerRootId === root).map((task) => this.publicTask(task)) };
+  async taskList(args = {}, context = {}) {
+    const ownerRootId = requireRoot(context);
+    const paged = args?.cursor != null || args?.limit != null || args?.status != null;
+    if (paged) {
+      const page = this.#storeCall(() => this.taskStore.listPage({
+        ownerRootId,
+        cursor: args.cursor ?? null,
+        limit: args.limit,
+        status: args.status
+      }));
+      return { tasks: page.tasks.map((task) => this.publicTask(task)), nextCursor: page.nextCursor };
+    }
+    // No arguments keeps the 1.3.2 contract exactly: the full array for this
+    // root, and no nextCursor key at all (AgenLynk's monitor reads it unpaged).
+    // Draining the keyset pages leaves ONE ordering and filtering implementation
+    // instead of a second full-scan path that could disagree with the paged one.
+    const tasks = [];
+    let cursor = null;
+    do {
+      const page = this.#storeCall(() => this.taskStore.listPage({ ownerRootId, cursor, limit: 200 }));
+      for (const task of page.tasks) tasks.push(this.publicTask(task));
+      cursor = page.nextCursor;
+    } while (cursor);
+    return { tasks };
   }
 
   async taskResult(args, context) {
-    const task = requireOwnedTask(this.requireTask(args.taskId), context);
-    if (["working", "input_required"].includes(task.status)) {
-      throw new GatewayError(
-        ERROR_CODES.TASK_NOT_COMPLETE,
-        `Task ${task.taskId} is not complete; use tasks/get and retry after its pollInterval`
-      );
-    }
-    return task.result ?? { ok: false, error: task.statusMessage ?? "Task completed without a result" };
+    const ownerRootId = requireRoot(context);
+    return this.#storeCall(() => {
+      const task = this.taskStore.get(args.taskId, { ownerRootId });
+      // The store hands back the stored payload as-is, possibly null, so it never
+      // invents an envelope. The legacy fallback is the caller's, and it stays
+      // here: a future agent_acp_run reuses this method, not a second copy.
+      return this.taskStore.result(args.taskId, { ownerRootId })
+        ?? { ok: false, error: task.statusMessage ?? "Task completed without a result" };
+    });
   }
 
   async taskCancel(args, context) {
-    const task = requireOwnedTask(this.requireTask(args.taskId), context);
-    if (["working", "input_required"].includes(task.status)) {
-      await this.sessionCancel({ sessionId: task.sessionId }, context);
-      this.touchTask(task, "working", "Cancellation requested");
+    const ownerRootId = requireRoot(context);
+    const task = this.#storeCall(() => this.taskStore.get(args.taskId, { ownerRootId }));
+    if (TERMINAL_TASK_STATUSES.has(task.status)) return this.publicTask(task);
+    await this.sessionCancel({ sessionId: task.sessionId }, context);
+    // The real terminal state lands when the ACP turn actually ends; until then
+    // the handle only records that cancellation was asked for.
+    return this.publicTask(this.#storeCall(() => this.taskStore.markCancelling(args.taskId, { ownerRootId })));
+  }
+
+  // TaskStore is dependency-free and raises plain Errors tagged with a code.
+  // Every gateway-facing throw is re-raised as the GatewayError the wire envelope
+  // and Main-side branching have always seen, with the message unchanged.
+  #storeCall(operation) {
+    try {
+      return operation();
+    } catch (error) {
+      if (error instanceof GatewayError) throw error;
+      const code = typeof error?.code === "string" && ERROR_CODES[error.code]
+        ? ERROR_CODES[error.code]
+        : ERROR_CODES.GATEWAY_ERROR;
+      throw new GatewayError(code, error?.message ?? String(error));
     }
-    return this.publicTask(task);
   }
 
   inboxManage(args, context) {
@@ -1372,12 +1407,11 @@ export class GatewayService {
     return session;
   }
 
-  requireTask(id) {
-    requireString(id, "taskId");
-    this.pruneTasks();
-    const task = this.tasks.get(id);
-    if (!task) throw new GatewayError(ERROR_CODES.UNKNOWN_TASK, `Unknown taskId: ${id}`);
-    return task;
+  // Legacy alias for the hand-rolled Map that TaskStore replaced. A live view,
+  // not a copy: the 1.3.2 characterization tests inject and inspect raw records
+  // through it. Production paths go through this.taskStore.
+  get tasks() {
+    return this.taskStore.records;
   }
 
   publicTask(task) {
@@ -1394,19 +1428,15 @@ export class GatewayService {
     };
   }
 
-  touchTask(task, status, statusMessage, result = undefined) {
-    task.status = status;
-    task.statusMessage = statusMessage;
-    task.lastUpdatedAt = new Date(this.now()).toISOString();
-    if (result !== undefined) task.result = result;
-    this.schedulePersist();
-  }
-
   updateTaskForSession(session, status, statusMessage, result = undefined) {
-    const task = session.activeTaskId ? this.tasks.get(session.activeTaskId) : null;
-    if (!task) return;
-    this.touchTask(task, status, statusMessage, result);
-    if (["completed", "failed", "cancelled"].includes(status)) session.activeTaskId = null;
+    const taskId = session.activeTaskId;
+    // The handle can be gone (TTL sweep, session retention) by the time a turn
+    // callback reports its outcome; that is a silent no-op, as it always was.
+    if (!taskId || !this.taskStore.find(taskId)) return;
+    this.taskStore.transition(taskId, status, statusMessage, result === undefined ? {} : { result });
+    // Keyed off the requested status, not the resulting one: a terminal report
+    // that lost to an earlier terminal writer still ends this session's claim.
+    if (TERMINAL_TASK_STATUSES.has(status)) session.activeTaskId = null;
   }
 
   finishTaskForSession(session) {
@@ -1496,26 +1526,12 @@ export class GatewayService {
     this.schedulePersist();
   }
 
-  pruneTasks() {
-    const now = this.now();
-    let changed = false;
-    for (const [id, task] of this.tasks) {
-      if (!TERMINAL_TASK_STATUSES.has(task.status) || task.ttl == null) continue;
-      if (Date.parse(task.lastUpdatedAt) + task.ttl <= now) {
-        this.tasks.delete(id);
-        changed = true;
-      }
-    }
-    if (changed) this.schedulePersist();
-    return changed;
-  }
-
   touchOwnerActivity(args, context) {
     const rootId = context?.rootId;
     if (!rootId) return;
     let session = typeof args?.sessionId === "string" ? this.store.get(args.sessionId) : null;
     if (!session && typeof args?.taskId === "string") {
-      const task = this.tasks.get(args.taskId);
+      const task = this.taskStore.find(args.taskId);
       session = task ? this.store.get(task.sessionId) : null;
     }
     if (session?.ownerRootId === rootId) this.touchSessionOwner(session);
@@ -1543,7 +1559,9 @@ export class GatewayService {
   }
 
   async #runMaintenance(now) {
-    let changed = this.pruneTasks();
+    // TTL now bounds a handle's whole lifetime, not just its retention: the sweep
+    // commits an over-TTL active task as failed and then removes it.
+    let changed = this.taskStore.expireSweep() > 0;
     // Artifacts still referenced by a live session outlive the age-based
     // prune; they disappear when their session record does.
     const keepPaths = new Set();
@@ -1614,7 +1632,9 @@ export class GatewayService {
           session.client = null;
         }
         this.store.delete(session.id);
-        for (const [id, task] of this.tasks) if (task.sessionId === session.id) this.tasks.delete(id);
+        for (const task of [...this.taskStore.records.values()]) {
+          if (task.sessionId === session.id) this.taskStore.remove(task.taskId);
+        }
         for (const [id, item] of this.inbox) if (item.sessionId === session.id) this.inbox.delete(id);
         changed = true;
       }
@@ -1628,7 +1648,7 @@ export class GatewayService {
     }
 
     if (changed) this.schedulePersist();
-    return { ok: true, sessions: this.store.list().length, tasks: this.tasks.size, inbox: this.inbox.size };
+    return { ok: true, sessions: this.store.list().length, tasks: this.taskStore.size, inbox: this.inbox.size };
   }
 
   // Main is gone for good, so the gateway stops waiting on the worker and
@@ -1759,7 +1779,9 @@ export class GatewayService {
       `${JSON.stringify({
         version: STATE_SCHEMA_VERSION,
         sessions: this.store.checkpoints(),
-        tasks: [...this.tasks.values()].filter((task) => ["working", "input_required"].includes(task.status)),
+        // v4 wire shape unchanged: terminal handles stay out of the snapshot and
+        // live in memory until TTL. Disk durability for them arrives in PR 4.
+        tasks: this.taskStore.toPersistedRecords({ includeTerminal: false }),
         inbox: [...this.inbox.values()].filter((item) => ["pending", "interrupted"].includes(item.status))
       })}\n`,
       { mode: 0o600 }
@@ -1785,6 +1807,10 @@ export class GatewayService {
     );
     await Promise.all([...this.clients.values()].map((client) => client.stop()));
     await this.flushPersist();
+    // After the final write: a blocked reader must be told the gateway is gone
+    // rather than hang on a waiter timer nobody will ever resolve. Clearing
+    // before the flush would persist an empty task set instead.
+    this.taskStore.clear();
   }
 }
 
@@ -1862,13 +1888,6 @@ function requireOwnedSession(session, context) {
     throw new GatewayError(ERROR_CODES.NOT_SESSION_OWNER, "Session belongs to another Main");
   }
   return session;
-}
-
-function requireOwnedTask(task, context) {
-  if (task.ownerRootId !== requireRoot(context)) {
-    throw new GatewayError(ERROR_CODES.NOT_TASK_OWNER, "Task belongs to another Main");
-  }
-  return task;
 }
 
 function requireRoot(context) {

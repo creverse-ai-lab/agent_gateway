@@ -654,6 +654,187 @@ test("a throwing onChange listener cannot corrupt an applied mutation", () => {
   assert.deepEqual(store.result(task.taskId), { ok: true });
 });
 
+// --- PR 3 additions: the deferred fan-out, removal and turn provenance that
+// PR 4 (durable result commit) and PR 7 (agent_acp_run) depend on. -------------
+
+// Lets the microtask and immediate queues drain so "still pending" means pending
+// for reasons other than scheduling.
+async function quiesce() {
+  await Promise.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+}
+
+test("deferWaiters holds the terminal fan-out until flushWaiters releases it", async () => {
+  const { store, clock } = makeStore();
+  const task = store.create({ sessionId: "session-1", ownerRootId: "rootA" });
+  const settled = [];
+  const early = store.waitForTerminal(task.taskId, { timeoutMs: 30_000 })
+    .then((record) => {
+      settled.push(record.status);
+      return record;
+    });
+
+  clock.t = 10;
+  store.transition(task.taskId, "completed", "end_turn", { result: { ok: true, text: "durable" }, deferWaiters: true });
+  await quiesce();
+  assert.deepEqual(settled, [], "a deferred commit must not wake the waiter that was already parked");
+
+  // A waiter that arrives after the deferred commit queues too: the outcome is
+  // recorded but not yet releasable.
+  const late = store.waitForTerminal(task.taskId, { timeoutMs: 30_000 });
+  await quiesce();
+
+  // Documented asymmetry: only the blocking path is gated. Non-blocking reads are
+  // retryable polls, not consumption, so they see the record immediately.
+  assert.equal(store.get(task.taskId).status, "completed");
+  assert.deepEqual(store.result(task.taskId), { ok: true, text: "durable" });
+
+  assert.equal(store.flushWaiters(task.taskId), 2, "flushWaiters reports how many waiters it woke");
+  assert.equal((await early).status, "completed");
+  assert.equal((await late).statusMessage, "end_turn");
+  assert.deepEqual(settled, ["completed"]);
+
+  // Once flushed, the record behaves like any other terminal record again.
+  assert.equal((await store.waitForTerminal(task.taskId, { timeoutMs: 1 })).status, "completed");
+  assert.equal(store.get(task.taskId).lastUpdatedAt, iso(10), "deferral changes delivery, never the record");
+});
+
+test("flushWaiters is a no-op unless a deferred commit is outstanding", async () => {
+  const { store } = makeStore();
+  const task = store.create({ sessionId: "session-1", ownerRootId: "rootA" });
+  assert.equal(store.flushWaiters(task.taskId), 0, "nothing deferred yet");
+  assert.equal(store.flushWaiters("task-missing"), 0, "unknown ids never throw");
+
+  const waiting = store.waitForTerminal(task.taskId, { timeoutMs: 30_000 });
+  store.transition(task.taskId, "cancelled", "cancelled", { result: { ok: true }, deferWaiters: true });
+  assert.equal(store.flushWaiters(task.taskId), 1);
+  // Idempotent: a committer may flush unconditionally in a finally block.
+  assert.equal(store.flushWaiters(task.taskId), 0);
+  assert.equal((await waiting).status, "cancelled");
+  assert.throws(() => store.flushWaiters(""), assertCode("INVALID_ARGUMENT"));
+});
+
+test("a deferred terminal record that expires rejects its waiters instead of stranding them", async () => {
+  const { store, clock } = makeStore();
+  const task = store.create({ sessionId: "session-1", ownerRootId: "rootA", ttl: 1_000 });
+  const waiting = store.waitForTerminal(task.taskId, { timeoutMs: 30_000 });
+  store.transition(task.taskId, "completed", "end_turn", { result: { ok: true }, deferWaiters: true });
+
+  clock.t = 1_000;
+  assert.equal(store.expireSweep(), 1);
+  await assert.rejects(waiting, assertCode("TASK_TTL_EXPIRED"));
+  // The deferral died with the record: a stale marker would swallow the fan-out
+  // of the next task that happened to reuse the id.
+  assert.equal(store.flushWaiters(task.taskId), 0);
+});
+
+test("remove deletes a record and rejects its waiters as UNKNOWN_TASK", async () => {
+  const events = [];
+  const { store } = makeStore({ onChange: (event) => events.push(event) });
+  const task = store.create({ sessionId: "session-1", ownerRootId: "rootA" });
+  const waiting = store.waitForTerminal(task.taskId, { timeoutMs: 30_000 });
+
+  assert.equal(store.remove(task.taskId), true);
+  await assert.rejects(waiting, (error) => {
+    assert.equal(error.code, "UNKNOWN_TASK");
+    assert.equal(error.message, `Unknown taskId: ${task.taskId}`);
+    return true;
+  });
+  assert.equal(store.size, 0);
+  assert.throws(() => store.get(task.taskId), assertCode("UNKNOWN_TASK"));
+  assert.equal(events.at(-1).type, "removed");
+  assert.equal(events.at(-1).taskId, task.taskId);
+
+  assert.equal(store.remove(task.taskId), false, "removing twice is not an error");
+  assert.equal(store.remove("task-missing"), false);
+  assert.throws(() => store.remove(undefined), assertCode("INVALID_ARGUMENT"));
+});
+
+test("remove frees the per-root budget a failed create should never have spent", () => {
+  const { store } = makeStore({ maxTasksPerRoot: 1, maxConcurrentTasksPerRoot: 1 });
+  const first = store.create({ sessionId: "session-1", ownerRootId: "rootA" });
+  assert.throws(() => store.create({ sessionId: "session-2", ownerRootId: "rootA" }), assertCode("TASK_LIMIT_EXCEEDED"));
+  store.remove(first.taskId);
+  assert.equal(store.create({ sessionId: "session-2", ownerRootId: "rootA" }).status, "working");
+});
+
+test("attachTurn records turn provenance, terminal records included", () => {
+  const events = [];
+  const { store, clock } = makeStore({ onChange: (event) => events.push(event) });
+  const task = store.create({ sessionId: "session-1", ownerRootId: "rootA" });
+  assert.equal(task.turnId, null);
+
+  clock.t = 5;
+  const attached = store.attachTurn(task.taskId, "turn-1");
+  assert.equal(attached.turnId, "turn-1");
+  assert.equal(attached.lastUpdatedAt, iso(0), "provenance is not a status change, so it does not bump lastUpdatedAt");
+  assert.equal(events.filter((event) => event.type === "updated").length, 1);
+
+  // Re-attaching the same turn is inert.
+  store.attachTurn(task.taskId, "turn-1");
+  assert.equal(events.filter((event) => event.type === "updated").length, 1);
+
+  // The race this exists for: the turn ended before the queued command got to
+  // record which turn it was. status/statusMessage/result stay frozen, but the
+  // turn that produced the outcome is still the turn that produced it.
+  clock.t = 10;
+  store.transition(task.taskId, "completed", "end_turn", { result: { ok: true } });
+  const late = store.attachTurn(task.taskId, "turn-2");
+  assert.equal(late.turnId, "turn-2");
+  assert.equal(late.status, "completed");
+  assert.equal(late.statusMessage, "end_turn");
+  assert.equal(late.lastUpdatedAt, iso(10));
+
+  assert.throws(() => store.attachTurn(task.taskId, 7), assertCode("INVALID_ARGUMENT"));
+  assert.throws(() => store.attachTurn("task-missing", "turn-1"), assertCode("UNKNOWN_TASK"));
+  assert.throws(
+    () => store.attachTurn(task.taskId, "turn-3", { ownerRootId: "rootB" }),
+    assertCode("NOT_TASK_OWNER")
+  );
+});
+
+test("find is a non-throwing lookup that still evaluates expiry", () => {
+  const { store, clock } = makeStore();
+  const task = store.create({ sessionId: "session-1", ownerRootId: "rootA", ttl: 100 });
+  assert.equal(store.find(task.taskId).status, "working");
+  assert.equal(store.find("task-missing"), null);
+  assert.equal(store.find(undefined), null, "bookkeeping callers pass whatever they hold");
+  assert.equal(store.find(""), null);
+
+  clock.t = 100;
+  assert.equal(store.find(task.taskId), null, "an expired handle is not found, not returned stale");
+  assert.equal(store.size, 0);
+
+  const other = store.create({ sessionId: "session-2", ownerRootId: "rootA" });
+  const found = store.find(other.taskId);
+  found.status = "completed";
+  assert.equal(store.get(other.taskId).status, "working", "find returns a snapshot, not the live record");
+});
+
+test("records exposes the raw map for legacy and replay ingress only", () => {
+  const { store } = makeStore();
+  // The two sanctioned writers: the gateway's legacy `service.tasks` alias and
+  // PR 4's WAL replay, which must rebuild plain records without walking them
+  // through transition().
+  store.records.set("task-replayed", {
+    taskId: "task-replayed",
+    sessionId: "session-1",
+    ownerRootId: "rootA",
+    turnId: "turn-1",
+    status: "completed",
+    ttl: 60_000,
+    pollInterval: 1_000,
+    createdAt: iso(0),
+    lastUpdatedAt: iso(0),
+    statusMessage: "end_turn",
+    result: { ok: true, text: "replayed" }
+  });
+  assert.equal(store.size, 1);
+  assert.equal(store.get("task-replayed").status, "completed");
+  assert.deepEqual(store.result("task-replayed"), { ok: true, text: "replayed" });
+  assert.deepEqual(store.listPage({ ownerRootId: "rootA" }).tasks.map((task) => task.taskId), ["task-replayed"]);
+});
+
 test("returned records are snapshots, not live store state", () => {
   const { store } = makeStore();
   const task = store.create({ sessionId: "session-1", ownerRootId: "rootA" });
