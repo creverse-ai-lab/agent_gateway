@@ -62,6 +62,19 @@ export function gatewayLifecycleConfig() {
   };
 }
 
+// What the gateway keeps about a turn beyond the turn's own answer. Separate
+// from lifecycle on purpose: lifecycle maps 1:1 onto a frozen setup() table, and
+// an observability knob is a policy about retention detail, not a resource bound.
+export function gatewayObservabilityConfig() {
+  return {
+    // tail is the default because full is the only per-session cost with no
+    // artifact escape hatch: reasoning text has no spill writer, so "keep it all"
+    // silently means "keep 1MB per session". 8KB still answers what the worker
+    // was thinking when it stopped.
+    thoughtCapture: enumEnv("ACP_GATEWAY_THOUGHT_CAPTURE", "tail", ["none", "tail", "full"])
+  };
+}
+
 // Durability knobs live apart from lifecycle and resourceLimits on purpose: they
 // describe how the state store writes, not what the gateway retains or admits.
 export function gatewayPersistenceConfig() {

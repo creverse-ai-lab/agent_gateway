@@ -1136,7 +1136,11 @@ test("Gateway preserves historical turn IDs and reports truncated subscription c
     for (let index = 0; index < 25; index += 1) service.store.push(session, { type: "test_event", index });
     const replay = service.subscribe({ sessionIds: [opened.sessionId], cursors: { [opened.sessionId]: 0 } }, { rootId: "main-a" }, () => {});
     assert.equal(replay.cursorTruncated[opened.sessionId], true);
-    assert.ok(replay.events.every((event) => event.turnId === first.turnId || event.turnId === second.turnId));
+    // session_created survives the flood now that control keeps slots of its own,
+    // and it happened before any turn existed: null is the turn it belongs to,
+    // which is the point — a stored event is never re-tagged with a later turn.
+    assert.ok(replay.events.every((event) =>
+      event.turnId === null || event.turnId === first.turnId || event.turnId === second.turnId));
   } finally {
     await service.shutdown().catch(() => {});
   }

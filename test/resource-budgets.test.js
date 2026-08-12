@@ -463,13 +463,12 @@ test("an artifact a pending inbox row points at survives the retention sweep", a
       assert.equal(row.status, "pending");
       const artifactPath = row.toolCallArtifact.path;
       assert.equal(JSON.parse(await readFile(artifactPath, "utf8")).rawInput.length, 10_000);
-      // Push the permission event out of the 200-entry ring, so the artifact is
-      // reachable only through the inbox row.
-      for (let index = 0; index < 260; index += 1) {
-        service.handleUpdate(session, {
-          sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: `filler-${index}` }
-        });
+      // Push the permission event out of the ring, so the artifact is reachable
+      // only through the inbox row. Streamed chunks can no longer do this: a
+      // control event is only ever evicted by newer control past its own slots,
+      // which is what this floods.
+      for (let index = 0; index < 300; index += 1) {
+        service.store.push(session, { type: "turn_end", stopReason: "end_turn" });
       }
       assert.equal(
         session.events.some((event) => event.type === "permission_request"),

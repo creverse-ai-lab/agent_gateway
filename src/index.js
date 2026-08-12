@@ -159,7 +159,8 @@ function controlTools() {
           title: { type: "string" },
           pinned: { type: "boolean" },
           additionalDirectories: { type: "array", items: { type: "string" } },
-          mcpServers: { type: "array", items: { type: "object" } }
+          mcpServers: { type: "array", items: { type: "object" } },
+          thoughtCapture: { type: "string", enum: ["none", "tail", "full"], description: "How much worker reasoning this session retains: none keeps nothing, tail keeps the last 8KB (default), full keeps up to maxTextBytes. Live delivery of thought chunks is unaffected in every mode." }
         },
         required: ["provider", "cwd"]
       }
@@ -179,7 +180,8 @@ function controlTools() {
           title: { type: "string" },
           pinned: { type: "boolean" },
           additionalDirectories: { type: "array", items: { type: "string" } },
-          mcpServers: { type: "array", items: { type: "object" } }
+          mcpServers: { type: "array", items: { type: "object" } },
+          thoughtCapture: { type: "string", enum: ["none", "tail", "full"], description: "How much worker reasoning this session retains: none keeps nothing, tail keeps the last 8KB (default), full keeps up to maxTextBytes. Keeps the stored setting when omitted." }
         },
         required: ["provider", "acpSessionId", "cwd"]
       }
@@ -226,6 +228,7 @@ function controlTools() {
           includeToolEvents: { type: "boolean", description: "Deliver tool_call events. Defaults to false." },
           includeResult: { type: "boolean", description: "Include the result object. Defaults to true only after the turn has finished; pass true to include it while the turn is still active. After the turn ends result.text carries only the final message segment; the full narrated transcript stays readable via agent_acp_session get." },
           includeInspection: { type: "boolean", description: "Include closed narration segments (each preview capped to 4KB of UTF-8; full text via each segment's artifact pointer; inspectionDropped counts evicted segments) inside the result object. Defaults to false." },
+          includeUsage: { type: "boolean", description: "Include result.usageSummary: the {turn, session} token, context and cost totals the worker reported. Defaults to false; requires the result object (see includeResult)." },
           maxEvents: { type: "integer", minimum: 1, maximum: 1000 }
         },
         required: ["sessionId"]

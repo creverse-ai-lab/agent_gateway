@@ -4,8 +4,8 @@ import { timingSafeEqual } from "node:crypto";
 import { chmod, open, readFile, unlink, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import {
-  controlToken, gatewayAgentUpdateConfig, gatewayLifecycleConfig, gatewayPersistenceConfig,
-  gatewaySocketPath, gatewayStatePath
+  controlToken, gatewayAgentUpdateConfig, gatewayLifecycleConfig, gatewayObservabilityConfig,
+  gatewayPersistenceConfig, gatewaySocketPath, gatewayStatePath
 } from "./config.js";
 import { AgentUpdateManager } from "./agent-updates.js";
 import { ERROR_CODES, GatewayError, errorEnvelope } from "./errors.js";
@@ -36,6 +36,7 @@ const service = new GatewayService({
   statePath,
   agentUpdateManager,
   ...gatewayConfig,
+  ...gatewayObservabilityConfig(),
   persistence: gatewayPersistenceConfig()
 });
 const clients = new Set();
