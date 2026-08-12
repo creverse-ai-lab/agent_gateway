@@ -974,6 +974,62 @@ test("Gateway cancels active sessions after the disconnected owner grace period"
   }
 });
 
+// Telling the worker is a write to a bounded channel now, and a congested or
+// closed one refuses the frame instead of dropping it. The cancellation intent is
+// already recorded by the time that happens, and the flag that records it
+// suppresses every later attempt — so a throw escaping here left the session
+// wedged mid-cancel forever: no seal, no finalized result, no terminal status, and
+// nothing that would ever try again.
+test("a worker that cannot be told about a cancel is still sealed and finalized", async () => {
+  let clock = Date.now();
+  const makeClient = (_provider, options) =>
+    new AcpClient({ provider: "mock", command: process.execPath, args: [capabilityAgent], permissionPolicy: "auto_approve" }, options);
+  const service = new GatewayService({ createClient: makeClient, gcIntervalMs: 0, orphanGraceMs: 10, now: () => clock });
+  try {
+    service.attachRoot("main-a");
+    const opened = await service.call("session_open", { provider: "claude", cwd: process.cwd(), permissionPolicy: "auto_approve" }, { rootId: "main-a" });
+    const task = await service.call("task_prompt", { sessionId: opened.sessionId, prompt: "long-terminal" }, { rootId: "main-a" });
+    await waitForTerminalCount(service, opened.sessionId, 1);
+    const session = service.requireSession(opened.sessionId);
+    session.client.cancelSession = () => {
+      throw new Error("Transport normal lane exceeded 1500000 queued bytes");
+    };
+    clock += 11;
+    await service.runMaintenance();
+    await waitForStatus(service, opened.sessionId, "cancelled");
+    assert.equal(session.orphanCancelRequested, true);
+    assert.equal(session.stopReason, "cancelled");
+    // The task is the handle Main is holding: without the terminal state it waits
+    // on a result that can never arrive.
+    assert.equal((await service.call("task_get", { taskId: task.taskId }, { rootId: "main-a" })).status, "cancelled");
+    assert.equal(session.events.some((event) => event.type === "turn_end"), true);
+  } finally {
+    await service.shutdown().catch(() => {});
+  }
+});
+
+test("an explicit cancel a worker cannot be told about still moves the session", async () => {
+  const makeClient = (_provider, options) =>
+    new AcpClient({ provider: "mock", command: process.execPath, args: [capabilityAgent], permissionPolicy: "auto_approve" }, options);
+  const service = new GatewayService({ createClient: makeClient, gcIntervalMs: 0 });
+  try {
+    service.attachRoot("main-a");
+    const opened = await service.call("session_open", { provider: "claude", cwd: process.cwd(), permissionPolicy: "auto_approve" }, { rootId: "main-a" });
+    await service.call("task_prompt", { sessionId: opened.sessionId, prompt: "long-terminal" }, { rootId: "main-a" });
+    await waitForTerminalCount(service, opened.sessionId, 1);
+    const session = service.requireSession(opened.sessionId);
+    session.client.cancelSession = () => {
+      throw new Error("Transport is closed");
+    };
+    const result = await service.call("cancel", { sessionId: opened.sessionId }, { rootId: "main-a" });
+    assert.equal(result.ok, true);
+    assert.equal(session.status, "cancelling");
+    assert.equal(session.cancelRequested, true);
+  } finally {
+    await service.shutdown().catch(() => {});
+  }
+});
+
 test("Gateway clears the orphan lease when Main reconnects before grace expires", async () => {
   let clock = Date.now();
   const makeClient = (_provider, options) =>

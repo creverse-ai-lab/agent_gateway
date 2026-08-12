@@ -11,9 +11,13 @@ export const MAX_SOCKET_BUFFER_BYTES = 1_000_000;
 // Lane policy for the daemon -> Main connection, the only transport with
 // droppable traffic. NdjsonChannel is subscription-ignorant on purpose, so this
 // layer owns the type table, the gap record and the gap-tolerance registry.
-const HIGH_EVENT_TYPES = new Set(["subscription_error"]);
-
-// Anything not named here is droppable. Default-deny is deliberate: a new event
+//
+// No event type rides HIGH. HIGH is the reservation for this connection's control
+// traffic — RPC replies, shutdown acks and subscription_error — and every one of
+// those goes out through send() below, never through an event frame. A table
+// naming event types for HIGH only looked like it did something.
+//
+// Anything not named durable is droppable. Default-deny is deliberate: a new event
 // type arrives on LOW and gets promoted knowingly, instead of quietly acquiring
 // the right to congest a connection. Control events ride NORMAL rather than HIGH
 // because HIGH is a reservation for correctness traffic, and the authoritative
@@ -21,7 +25,6 @@ const HIGH_EVENT_TYPES = new Set(["subscription_error"]);
 function laneForEvent(event) {
   const type = event?.type;
   if (typeof type !== "string") return LANE_LOW;
-  if (HIGH_EVENT_TYPES.has(type)) return LANE_HIGH;
   if (DURABLE_EVENT_TYPES.has(type)) return LANE_NORMAL;
   return LANE_LOW;
 }
@@ -66,6 +69,11 @@ export function createSocketSender(socket, {
       if (item.lane !== LANE_LOW) continue;
       const { subscriptionId, sessionId, sequence } = item.meta ?? {};
       if (subscriptionId == null || !Number.isFinite(sequence)) continue;
+      // A subscriber that never opted in must never be handed a record it cannot
+      // interpret. Nothing of its own reaches the droppable lane, so this is a
+      // backstop rather than the gate — but the gate has to exist here too, or
+      // the opt-in only covers the shed decision and not the marker itself.
+      if (subscriptions.get(subscriptionId)?.acceptsGaps !== true) continue;
       const coalesceKey = `gap:${subscriptionId}:${sessionId}`;
       // Widen the marker that is still queued instead of queueing another one, so
       // an arbitrarily long drop run costs one frame on a lane that cannot shed.
@@ -86,47 +94,70 @@ export function createSocketSender(socket, {
     }
   }
 
-  // Verbatim: the OS-side buffer gate stays a separate check from the channel's
-  // own queue accounting. The two are never summed — that would double-count the
-  // same backpressure and halve the real budget.
+  // How far behind this connection is. Which buffer counts had to move with the
+  // backlog: before the channel existed everything not yet on the wire sat in the
+  // socket, so writableLength was the whole answer; now the channel stops feeding
+  // the socket at its high-water mark and holds the rest, so the socket alone
+  // would never reach a megabyte again and the gates below would be unreachable.
+  // A max, never a sum — summing counts the same backpressure twice and halves
+  // the real budget.
+  const backlog = () => Math.max(socket.writableLength, channel.queuedBytes);
+
   const send = (message) => {
     if (socket.destroyed) throw new Error("Gateway socket closed");
-    if (socket.writableLength > maxQueueBytes) {
+    if (backlog() > maxQueueBytes) {
       socket.destroy(new Error("Gateway connection buffer exceeded"));
       throw new Error("Gateway connection buffer exceeded");
     }
     channel.write(LANE_HIGH, message);
   };
 
+  // Lane priority reorders a session's own events under backpressure: a reserved
+  // frame published after a run of droppable ones leaves ahead of them. The
+  // receiver filters on a monotonic cursor, so those droppable frames — which were
+  // transmitted, and therefore never reported as dropped — are discarded on
+  // arrival and lost for good, with no marker and no floor to rewind to. The one
+  // honest resolution is to make the overtaking visible: retract the frames that
+  // are about to be jumped, which folds them into the coalesced gap marker on the
+  // same reserved lane, ahead of the frame that overtook them. Recovery is then
+  // the path that already exists — gapFloor plus ring replay.
+  function retractOvertaken(subscriptionId, event) {
+    const sessionId = event?.sessionId;
+    const sequence = event?.sequence;
+    if (sessionId == null || !Number.isFinite(sequence)) return;
+    channel.dropWhere(LANE_LOW, (item) => item.meta?.subscriptionId === subscriptionId
+      && item.meta?.sessionId === sessionId
+      // A queued frame without a finite sequence is not subject to the receiver's
+      // cursor filter, so arriving late is all that happens to it. Only frames the
+      // receiver would silently discard are worth retracting.
+      && Number.isFinite(item.meta?.sequence)
+      && item.meta.sequence < sequence);
+  }
+
   return {
     channel,
     send,
     sendEvent(subscriptionId, event) {
       if (socket.destroyed) throw new Error("Gateway socket closed");
-      // A subscriber that did not opt in keeps today's behavior exactly: too far
-      // behind means the subscription is removed and told why. A vendored old
-      // client can therefore never receive a gap marker, so its cursor can never
-      // be poisoned by one.
-      //
-      // Which buffer counts as "behind" had to move with the backlog. Before this
-      // channel existed, everything not yet on the wire sat in the socket, so
-      // writableLength was the whole answer; now the channel stops feeding the
-      // socket at its high-water mark and holds the rest, so the socket alone
-      // would never reach a megabyte again and this subscriber would be shed in
-      // silence instead of being told. Either buffer passing the threshold means
-      // this connection is a megabyte behind — a max, never a sum, because summing
-      // the two would count the same backpressure twice.
+      // A subscriber that did not opt in keeps 1.3.2 behavior exactly: no
+      // coalescing, no gap markers, no drops, in-order delivery until it is a
+      // megabyte behind, and then the subscription is removed and told why. Its
+      // events therefore ride the reserved lane rather than the droppable one —
+      // on LOW the channel could shed a frame that nothing is allowed to report,
+      // which is the silent loss the opt-in exists to prevent.
       if (subscriptions.get(subscriptionId)?.acceptsGaps !== true) {
-        if (socket.writableLength > maxSubscriptionBytes || channel.queuedBytes > maxSubscriptionBytes) {
+        if (backlog() > maxSubscriptionBytes) {
           unsubscribe(subscriptionId);
           removeSubscription(subscriptionId);
-          if (socket.writableLength <= maxQueueBytes) {
+          if (backlog() <= maxQueueBytes) {
             send({ type: "subscription_error", subscriptionId, error: "Gateway subscriber is too slow" });
           }
           return false;
         }
+        return channel.write(LANE_NORMAL, { type: "event", subscriptionId, event });
       }
       const lane = laneForEvent(event);
+      if (lane !== LANE_LOW) retractOvertaken(subscriptionId, event);
       return channel.write(lane, { type: "event", subscriptionId, event }, {
         coalesceKey: lane === LANE_LOW ? coalesceKeyForEvent(event) : null,
         // What reportGaps needs to describe the loss. The channel never reads it.

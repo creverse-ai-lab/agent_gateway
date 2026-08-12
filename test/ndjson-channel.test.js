@@ -226,6 +226,74 @@ test("a coalesced frame replaces its predecessor in place", () => {
   assert.equal(channel.snapshot().coalesced, 1);
 });
 
+// Coalescing replaces a frame; it does not buy an exemption from the lane budget.
+// The early return used to sit above the budget check entirely, so an update that
+// grew on every revision walked the lane arbitrarily far past its share — measured
+// at 415x — while reporting itself as a saving.
+test("a coalesced update is still bounded by its lane budget", () => {
+  const stream = new MockStream({ credits: 0 });
+  const drops = [];
+  const channel = new NdjsonChannel(stream, {
+    maxQueueBytes: 4_000,
+    writeTimeoutMs: 0,
+    onDrop: (items) => drops.push(...items),
+    onFatal: () => assert.fail("a saturated LOW lane must never be fatal")
+  });
+  channel.write(LANE_LOW, { tag: "inline" });
+  channel.write(LANE_LOW, { tag: "ballast", pad: "b".repeat(1_800) });
+  channel.write(LANE_LOW, { tag: "update", version: 0 }, { coalesceKey: "tool-1" });
+  // The lane share of 4000 bytes is 2000, and the ballast already holds most of
+  // it. A megabyte-sized revision of a queued frame is refused like any other
+  // frame that does not fit.
+  assert.equal(
+    channel.write(LANE_LOW, { tag: "update", version: 1, pad: "x".repeat(1_000_000) },
+      { coalesceKey: "tool-1", meta: { sessionId: "acp-1", sequence: 9 } }),
+    false
+  );
+  assert.ok(channel.snapshot().lanes.low.bytes <= channel.snapshot().lanes.low.budget);
+  // The queued frame keeps its place, so the refused revision is what never
+  // arrives — and that is what the drop names.
+  assert.equal(drops.at(-1).meta.sequence, 9);
+  assert.equal(channel.pending(LANE_LOW, "tool-1").version, 0);
+  // A revision that fits still coalesces: the budget bounds the lane, it does not
+  // turn coalescing off.
+  assert.equal(channel.write(LANE_LOW, { tag: "update", version: 2 }, { coalesceKey: "tool-1" }), true);
+  assert.equal(channel.pending(LANE_LOW, "tool-1").version, 2);
+});
+
+test("a reserved lane refuses to grow past its budget through coalescing", () => {
+  const stream = new MockStream({ credits: 0 });
+  const fatals = [];
+  const channel = new NdjsonChannel(stream, {
+    maxQueueBytes: 8_000,
+    writeTimeoutMs: 0,
+    onFatal: (error) => fatals.push(error)
+  });
+  channel.write(LANE_NORMAL, { tag: "inline" });
+  channel.write(LANE_NORMAL, { tag: "ballast", pad: "b".repeat(2_500) });
+  channel.write(LANE_NORMAL, { tag: "marker", range: 1 }, { coalesceKey: "gap-1" });
+  assert.throws(
+    () => channel.write(LANE_NORMAL, { tag: "marker", pad: "x".repeat(4_000) }, { coalesceKey: "gap-1" }),
+    isCode(ERROR_CODES.TRANSPORT_CONGESTED)
+  );
+  assert.equal(fatals.length, 1);
+});
+
+test("the single-frame exemption survives coalescing", () => {
+  const stream = new MockStream({ credits: 0 });
+  const channel = new NdjsonChannel(stream, { maxQueueBytes: 4_000, writeTimeoutMs: 0 });
+  channel.write(LANE_NORMAL, { tag: "inline" });
+  channel.write(LANE_LOW, { tag: "only", version: 1 }, { coalesceKey: "tool-1" });
+  // The lane holds exactly the frame being replaced, so replacing it still leaves
+  // one frame in the lane: the load-bearing invariant is about the count, not the
+  // path that got there.
+  assert.equal(
+    channel.write(LANE_LOW, { tag: "only", version: 2, pad: "x".repeat(100_000) }, { coalesceKey: "tool-1" }),
+    true
+  );
+  assert.equal(channel.pending(LANE_LOW, "tool-1").version, 2);
+});
+
 test("the write deadline is armed only while blocked and restarts on progress", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const stream = new MockStream({ credits: 0 });

@@ -133,11 +133,25 @@ export class AcpClient {
   }
 
   async stop() {
+    // Best effort, and first because it is the courtesy: a worker blocked on a
+    // permission gets an answer before its transport goes away. Each response is
+    // a write to a bounded channel that can refuse the frame, and a throw here
+    // used to escape stop() entirely — before close, before SIGTERM — leaking the
+    // child process for a reply that no longer matters. Stopping must always
+    // reach the kill.
     for (const rpcId of this.pendingPermissions.keys()) {
-      this.respondPermission(rpcId, null);
+      try {
+        this.respondPermission(rpcId, null);
+      } catch {
+        // The channel is congested or closed; the SIGTERM below is the answer.
+      }
     }
     for (const rpcId of this.pendingElicitations.keys()) {
-      this.respondElicitation(rpcId, { action: "cancel" });
+      try {
+        this.respondElicitation(rpcId, { action: "cancel" });
+      } catch {
+        // Same: the process is going away regardless.
+      }
     }
     const stopped = new Error("ACP client stopped");
     // Synchronous, and before anything can await: stop() clears `alive`, so the

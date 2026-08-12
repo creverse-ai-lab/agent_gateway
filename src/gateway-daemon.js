@@ -155,12 +155,23 @@ const server = createServer((socket) => {
       } catch (error) {
         // error stays byte-identical for existing callers; errorCode is additive
         // so a Main can branch on a stable code instead of message text.
-        if (!socket.destroyed) {
-          send({
-            id: request?.id ?? null,
-            ok: false,
-            ...errorEnvelope(error)
-          });
+        //
+        // Best effort, and it has to be: the send itself can throw now. A closed
+        // or congested channel refuses the write without the socket ever being
+        // destroyed, so `!socket.destroyed` is not the guard it reads as, and the
+        // throw would escape this async line handler as an unhandled rejection —
+        // taking the daemon down over a reply nobody is waiting for any more.
+        try {
+          if (!socket.destroyed) {
+            send({
+              id: request?.id ?? null,
+              ok: false,
+              ...errorEnvelope(error)
+            });
+          }
+        } catch {
+          // The connection is already gone or failing; its own close handler and
+          // the channel's onFatal own the teardown.
         }
       }
     }

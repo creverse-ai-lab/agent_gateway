@@ -80,8 +80,31 @@ export class NdjsonChannel {
       const index = state.frames.findIndex((item) => item.coalesceKey === coalesceKey);
       if (index >= 0) {
         const previous = state.frames[index];
-        state.bytes += frame.length - previous.frame.length;
-        this.queuedBytes += frame.length - previous.frame.length;
+        const delta = frame.length - previous.frame.length;
+        // Coalescing replaces a frame; it does not buy an exemption from the lane
+        // budget. Without this check an update that grows on every revision walks
+        // the lane arbitrarily far past its share while reporting itself as a
+        // saving. The single-frame exemption still applies: when the superseded
+        // frame is the only one in the lane, the lane is still admitting exactly
+        // one frame, however large.
+        if (delta > 0 && state.frames.length > 1 && state.bytes + delta > state.budget) {
+          if (lane === LANE_LOW) {
+            // The queued frame keeps its place, so the update is the one that
+            // never arrives and the one the gap has to name.
+            this.stats.dropped += 1;
+            this.stats.droppedBytes += frame.length;
+            this.onDrop?.([{ lane, bytes: frame.length, coalesceKey, meta }]);
+            return false;
+          }
+          const error = new GatewayError(
+            ERROR_CODES.TRANSPORT_CONGESTED,
+            `Transport ${lane} lane exceeded ${state.budget} queued bytes`
+          );
+          this.#fail(error);
+          throw error;
+        }
+        state.bytes += delta;
+        this.queuedBytes += delta;
         // Keeps the older queue position: a superseded frame must not be able to
         // walk itself to the back of the lane by being updated.
         state.frames[index] = { frame, coalesceKey, meta, message };
@@ -123,6 +146,37 @@ export class NdjsonChannel {
   pending(lane, coalesceKey) {
     const found = this.lanes.get(lane)?.frames.find((item) => item.coalesceKey === coalesceKey);
     return found ? found.message : null;
+  }
+
+  // Lets a policy layer retract frames it has decided must not be delivered. The
+  // daemon uses it for the one case lane priority creates: a reserved frame is
+  // about to overtake droppable frames that were published before it, and a
+  // receiver filtering on a monotonic cursor would discard those on arrival with
+  // nothing to announce the loss. Retracting them reports them like any other
+  // shed frame, which is what turns overtaking into an honest gap.
+  dropWhere(lane, predicate) {
+    const state = this.lanes.get(lane);
+    if (!state || state.frames.length === 0) return 0;
+    const kept = [];
+    const dropped = [];
+    for (const item of state.frames) {
+      if (predicate(item)) dropped.push(item);
+      else kept.push(item);
+    }
+    if (dropped.length === 0) return 0;
+    let bytes = 0;
+    for (const item of dropped) bytes += item.frame.length;
+    state.frames = kept;
+    state.bytes -= bytes;
+    this.queuedBytes -= bytes;
+    this.stats.dropped += dropped.length;
+    this.stats.droppedBytes += bytes;
+    // After the accounting is settled, never during it: onDrop writes the gap
+    // marker back into this same channel.
+    this.onDrop?.(dropped.map((item) => ({
+      lane, bytes: item.frame.length, coalesceKey: item.coalesceKey, meta: item.meta
+    })));
+    return dropped.length;
   }
 
   whenFlushed() {

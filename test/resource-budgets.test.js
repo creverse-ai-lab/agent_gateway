@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
+import { readdirSync } from "node:fs";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { AcpClient } from "../src/acp-client.js";
-import { readTextHead, readTextLines, trimIncompleteUtf8 } from "../src/bounded-utf8.js";
+import { readInto, readTextHead, readTextLines, trimIncompleteUtf8 } from "../src/bounded-utf8.js";
 import { ERROR_CODES } from "../src/errors.js";
 import { GatewayService } from "../src/gateway-service.js";
 
@@ -406,8 +407,85 @@ test("a small elicitation row stays fully inline", async () => {
       assert.equal(big.messageTruncated, true);
       assert.equal(big.messageBytes, 9_000);
       assert.ok(Buffer.byteLength(big.message) <= 4_000);
+      // The part that was cut has to be somewhere. Recording messageBytes without
+      // a pointer told Main exactly how much of the question it was not being
+      // shown and gave it no way to read it.
+      assert.equal(typeof big.messageArtifact.path, "string");
+      assert.equal(await readFile(big.messageArtifact.path, "utf8"), "m".repeat(9_000));
+      // get() hands back the same pointer rather than rehydrating it, like every
+      // other artifact reference the inbox returns.
+      const fetched = (await service.call("inbox", { action: "get", inboxId: big.inboxId }, MAIN)).item;
+      assert.deepEqual(fetched.messageArtifact, big.messageArtifact);
+      assert.equal(fetched.message, big.message);
+      // And it outlives the event that wrote it: the row is still pending.
+      for (let index = 0; index < 260; index += 1) {
+        service.handleUpdate(session, {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: `filler-${index}` }
+        });
+      }
+      await service.runMaintenance(Date.now() + 25 * 60 * 60_000);
+      assert.equal(await readFile(big.messageArtifact.path, "utf8"), "m".repeat(9_000));
     } finally {
       await service.shutdown().catch(() => {});
     }
+  });
+});
+
+// A single handle.read() is not a whole file. On a network or FUSE filesystem a
+// short read is ordinary, and treating the first one as EOF reports a cut-short
+// head as complete — silent truncation, with truncated:false on it.
+test("a head read keeps reading until the file ends, not until the first short read", async () => {
+  const source = Buffer.from("가".repeat(64), "utf8");
+  const handle = {
+    reads: 0,
+    async read(buffer, offset, length, position) {
+      this.reads += 1;
+      // Seven bytes at a time: never aligned to the 3-byte characters, so a loop
+      // that stops early also cuts one in half.
+      const bytesRead = Math.max(0, Math.min(7, length, source.length - position));
+      source.copy(buffer, offset, position, position + bytesRead);
+      return { bytesRead };
+    }
+  };
+  const buffer = Buffer.alloc(source.length + 3);
+  const bytesRead = await readInto(handle, buffer);
+  assert.equal(bytesRead, source.length);
+  assert.ok(handle.reads > 1, "the fixture really did answer short");
+  assert.equal(buffer.subarray(0, bytesRead).toString("utf8"), "가".repeat(64));
+});
+
+// Matching 1.3.2, which sliced an array with NaN bounds and got an empty window.
+// Math.floor(NaN) - 1 leaves skip = NaN, every comparison against it is false, and
+// the read starts at line 1: the caller asked for a line that does not exist and
+// was handed the top of the file instead.
+test("a non-numeric line or limit returns the empty window, not the head of the file", async () => {
+  await withDirectory("window-invalid", async (directory) => {
+    const path = join(directory, "lines.txt");
+    await writeFile(path, "one\ntwo\nthree", "utf8");
+    for (const options of [
+      { line: "abc" }, { line: NaN }, { line: Infinity }, { line: -Infinity },
+      { limit: "many" }, { limit: NaN }, { limit: 0 }
+    ]) {
+      const read = await readTextLines(path, { limit: 10, ...options });
+      assert.deepEqual(read, { text: "", bytes: 0, truncated: false }, JSON.stringify(options));
+    }
+    // Numeric strings still coerce, exactly as they always did, and so does the
+    // null the caller turns into line 1 before it ever gets here.
+    assert.equal((await readTextLines(path, { line: "2", limit: "1" })).text, "two");
+    assert.equal((await readTextLines(path, { line: null, limit: 1 })).text, "one");
+  });
+});
+
+test("a window read that cannot allocate its buffer still closes the file", async () => {
+  await withDirectory("window-alloc", async (directory) => {
+    const path = join(directory, "lines.txt");
+    await writeFile(path, "one\ntwo", "utf8");
+    // The open file descriptors of this process. The allocation used to sit
+    // between open() and the try block, so throwing there leaked the handle.
+    const openDescriptors = () => readdirSync("/dev/fd").length;
+    const before = openDescriptors();
+    await assert.rejects(readTextLines(path, { line: 1, limit: 1, chunkBytes: Number.MAX_SAFE_INTEGER }));
+    assert.equal(openDescriptors(), before, "the handle opened before the allocation is released");
   });
 });

@@ -52,14 +52,30 @@ export function readHeadBytes(path, maxBytes) {
   }
 }
 
-// The async sibling, for a request path that must not block the event loop and
-// must report why a read failed rather than swallow it. Allocates maxBytes, never
-// the file size: a 2GB file costs the cap.
+// Fills a buffer from the start of a file, one read at a time. One read is not
+// one file: a short read is ordinary on a network or FUSE filesystem, and taking
+// it for EOF reports a cut-short head as the complete file — a truncation the
+// caller has no way to detect. Only bytesRead === 0 means there is nothing more.
+// Exported as the seam for that case: no local filesystem will produce a partial
+// read on request, so the test supplies the handle.
+export async function readInto(handle, buffer) {
+  let bytesRead = 0;
+  while (bytesRead < buffer.length) {
+    const chunk = await handle.read(buffer, bytesRead, buffer.length - bytesRead, bytesRead);
+    if (chunk.bytesRead === 0) break;
+    bytesRead += chunk.bytesRead;
+  }
+  return bytesRead;
+}
+
+// The async sibling of readHeadBytes, for a request path that must not block the
+// event loop and must report why a read failed rather than swallow it. Allocates
+// maxBytes, never the file size: a 2GB file costs the cap.
 export async function readTextHead(path, maxBytes) {
   const handle = await open(path, "r");
   try {
     const buffer = Buffer.alloc(maxBytes + 3);
-    const { bytesRead } = await handle.read(buffer, 0, maxBytes + 3, 0);
+    const bytesRead = await readInto(handle, buffer);
     if (bytesRead <= maxBytes) {
       return { text: buffer.subarray(0, bytesRead).toString("utf8"), bytes: bytesRead, truncated: false };
     }
@@ -79,17 +95,30 @@ export async function readTextLines(path, {
   maxBytes = Infinity,
   chunkBytes = 64 * 1024
 } = {}) {
+  // Validated before anything is opened, and matching what 1.3.2 did with the
+  // same input: a non-numeric line or limit made Array#slice compute NaN bounds,
+  // which returned an empty window rather than the whole file. Without the check
+  // Math.floor(NaN) - 1 leaves skip = NaN, every comparison against it is false,
+  // and the read silently starts at line 1 — the caller asked for line "abc" and
+  // got the top of the file.
+  const requestedLine = Number(line);
+  const requestedLimit = Number(limit);
+  if (!Number.isFinite(requestedLine) || Number.isNaN(requestedLimit) || !(requestedLimit > 0)) {
+    return { text: "", bytes: 0, truncated: false };
+  }
   const handle = await open(path, "r");
-  const buffer = Buffer.allocUnsafe(chunkBytes);
-  const skip = Math.max(0, Math.floor(line) - 1);
+  const skip = Math.max(0, Math.floor(requestedLine) - 1);
   const chunks = [];
   let skipped = 0;
   let completed = 0;
   let bytes = 0;
   let truncated = false;
   let position = 0;
-  let done = !(limit > 0);
+  let done = false;
   try {
+    // Inside the try: an allocation between open() and it leaks the handle when
+    // it throws, and a caller-supplied chunk size can throw.
+    const buffer = Buffer.allocUnsafe(chunkBytes);
     while (!done) {
       const { bytesRead } = await handle.read(buffer, 0, chunkBytes, position);
       if (bytesRead === 0) break;
@@ -110,7 +139,7 @@ export async function readTextLines(path, {
         completed += 1;
         // The newline that ends the last requested line is a terminator, not
         // content: joining the window never produced a trailing separator either.
-        if (completed >= limit) {
+        if (completed >= requestedLimit) {
           done = true;
           break;
         }

@@ -237,7 +237,13 @@ export class GatewayRpcClient {
       // ring for everything from the first dropped sequence on. Outside the ring
       // the existing cursorTruncated path reports it, as it always has.
       for (const [sessionId, floor] of Object.entries(record.gapFloor ?? {})) {
-        const rewound = Math.min(cursors[sessionId] ?? Infinity, floor);
+        // Only ever lowers an existing cursor. A session with no cursor at all is
+        // already asking for everything the ring holds, and writing the floor in
+        // as a new one would raise its effective start from 0 to the floor —
+        // skipping every sequence below it on both sides of the socket, which is
+        // the loss this rewind exists to repair.
+        if (cursors[sessionId] == null) continue;
+        const rewound = Math.min(cursors[sessionId], floor);
         cursors[sessionId] = rewound;
         // The local delivery filter has to move with it, or #deliver would discard
         // the very replay this asked for. Some events therefore arrive twice:

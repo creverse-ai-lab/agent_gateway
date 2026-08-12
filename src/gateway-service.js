@@ -1248,11 +1248,29 @@ export class GatewayService {
     // still interrupt Main's outstanding worker requests.
     this.interruptSessionInbox(session, "Main cancelled the worker session");
     session.cancelRequested = true;
-    session.client?.cancelSession(session.acpSessionId);
+    this.#tellWorkerToCancel(session);
     this.#setStatus(session, "cancelling", "cancel_requested");
     this.store.push(session, { type: "cancel_requested" });
     this.updateTaskForSession(session, "working", "Cancellation requested");
     return { ok: true, ...publicSession(session) };
+  }
+
+  // Telling the worker is best effort, and it has to be: the notify underneath
+  // writes to a bounded channel that can refuse the frame outright — a congested
+  // or already-closed child transport throws instead of dropping. Every caller
+  // records the cancellation intent before it gets here and owes the session a
+  // state transition after it: sealing the turn, finalizing the result, setting a
+  // terminal status. Letting the throw out skipped all of that while leaving the
+  // guard flag set, so the retry was suppressed forever and the session stayed
+  // wedged mid-cancel. A worker that never hears the cancel is a case these paths
+  // already handle — one that never gets finalized is not.
+  #tellWorkerToCancel(session) {
+    try {
+      session.client?.cancelSession(session.acpSessionId);
+    } catch {
+      // The transport is gone or refusing frames. The turn is being finalized by
+      // this side either way, and the worker's own exit path reconciles the rest.
+    }
   }
 
   async sessionManage(args, context) {
@@ -1337,7 +1355,7 @@ export class GatewayService {
     }
     this.interruptSessionInbox(session, "Main closed the worker session");
     const client = session.client;
-    if (ACTIVE_STATUSES.has(session.status)) client?.cancelSession(session.acpSessionId);
+    if (ACTIVE_STATUSES.has(session.status)) this.#tellWorkerToCancel(session);
     try {
       if (client?.alive && client.initResult?.agentCapabilities?.sessionCapabilities?.close) {
         await client.request("session/close", { sessionId: session.acpSessionId }, 30_000);
@@ -1443,7 +1461,15 @@ export class GatewayService {
       const message = typeof update.message === "string"
         ? utf8ByteHead(update.message, EVENT_PAYLOAD_CAP_BYTES)
         : update.message;
-      if (admitted) this.createElicitationInbox(session, update, { schema, message });
+      // A worker question Main can read is a bounded one, but the part that was
+      // cut has to be somewhere: the durable inbox row keeps a pointer to the full
+      // text through the same spill the schema and the tool call already use.
+      // Only the oversized case pays for a file, and only an admitted request —
+      // an unadmitted one has no row to point at it.
+      const messageArtifact = admitted && message !== update.message
+        ? this.store.spillText(session.id, `${type}-message`, update.message)
+        : null;
+      if (admitted) this.createElicitationInbox(session, update, { schema, message, messageArtifact });
       this.store.push(session, {
         type,
         requestId: update.requestId,
@@ -1874,7 +1900,10 @@ export class GatewayService {
         ? {
             message: projection.message,
             messageTruncated: true,
-            messageBytes: typeof update.message === "string" ? Buffer.byteLength(update.message) : null
+            messageBytes: typeof update.message === "string" ? Buffer.byteLength(update.message) : null,
+            // Returned as a pointer, never rehydrated, exactly like every other
+            // artifact reference the inbox hands out.
+            messageArtifact: projection.messageArtifact ?? null
           }
         : { message: update.message }),
       ...(projection?.schema?.truncated
@@ -1999,6 +2028,7 @@ export class GatewayService {
     for (const item of this.inbox.values()) {
       if (item.toolCallArtifact?.path) keepPaths.add(item.toolCallArtifact.path);
       if (item.requestedSchemaArtifact?.path) keepPaths.add(item.requestedSchemaArtifact.path);
+      if (item.messageArtifact?.path) keepPaths.add(item.messageArtifact.path);
     }
     if (this.artifactStore.prune(this.lifecycle.resultRetentionMs, now, keepPaths) > 0) changed = true;
 
@@ -2102,7 +2132,7 @@ export class GatewayService {
     if (!ACTIVE_STATUSES.has(session.status) || session.status === "restoring") return false;
     session.orphanCancelRequested = true;
     session.cancelRequested = true;
-    session.client?.cancelSession(session.acpSessionId);
+    this.#tellWorkerToCancel(session);
     this.store.push(session, { type: "orphan_cancel_requested" });
     this.interruptSessionInbox(session, "Main did not reconnect before the orphan grace period expired");
     this.#sealTurn(session);
@@ -2418,7 +2448,7 @@ function toolCallHead(toolCall) {
 // get() does not rehydrate an artifact, exactly like every other dataArtifact.
 const INBOX_PROJECTION_KEYS = [
   "toolCallTruncated", "toolCallBytes", "toolCallArtifact",
-  "messageTruncated", "messageBytes",
+  "messageTruncated", "messageBytes", "messageArtifact",
   "requestedSchemaTruncated", "requestedSchemaBytes", "requestedSchemaArtifact"
 ];
 

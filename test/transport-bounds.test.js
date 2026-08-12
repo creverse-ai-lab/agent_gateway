@@ -165,6 +165,55 @@ test("a real daemon delivers a live turn's events through the lane channel", asy
   }
 });
 
+// The reply to a peer that hung up mid-request is best effort, and the guard that
+// used to stand in for that was `if (!socket.destroyed)`. The channel refuses a
+// write as soon as the stream stops being writable, which happens on the peer's
+// FIN, well before the socket is destroyed — so the write goes ahead, throws, and
+// the throw escapes the async line handler as an unhandled rejection. There is no
+// handler for those: the daemon exits, taking every other connection with it, over
+// a reply nobody is waiting for.
+// A survival guard, and honest about what it is: the crash window itself (write
+// side gone, socket not yet destroyed, a reply still to come) is a few
+// microtasks wide and cannot be forced from outside the process. What it does
+// cover is that a burst abandoned mid-flight never takes the daemon with it. The
+// premise underneath — that a refused write does not imply a destroyed socket —
+// is asserted deterministically in test/socket-flow.test.js.
+test("a reply to a peer that hung up mid-request cannot take the daemon down", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-daemon-halfclose-"));
+  const daemon = await startDaemon({ directory });
+  try {
+    for (let round = 0; round < 5; round += 1) {
+      const socket = createConnection(daemon.socketPath);
+      await once(socket, "connect");
+      // Pipelined, so replies are still owed when the half-close is processed.
+      let frames = "";
+      for (let index = 0; index < 200; index += 1) {
+        frames += `${JSON.stringify({ id: `guide-${round}-${index}`, method: "guide" })}\n`;
+      }
+      socket.write(frames);
+      socket.end();
+      await once(socket, "close");
+    }
+    assert.equal(daemon.child.exitCode, null, "the daemon is still running");
+    // And still serving, which a dead one cannot fake.
+    const client = new GatewayRpcClient({
+      socketPath: daemon.socketPath,
+      token: daemon.token,
+      rootId: daemon.rootId,
+      statePath: daemon.statePath,
+      autoStart: false
+    });
+    try {
+      assert.equal((await client.call("guide")).ok, true);
+    } finally {
+      client.close();
+    }
+  } finally {
+    await daemon.stop({ signal: "SIGKILL" });
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 // One raw write of every frame, so the daemon reads the burst as a single chunk
 // and the admission counter is what decides the outcome.
 test("a control connection refuses requests past its in-flight bound without dispatching them", async () => {
