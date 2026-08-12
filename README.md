@@ -114,7 +114,7 @@ Control·Guide MCP 등록은 Codex, Claude, Grok, Auggie를 지원합니다. 기
 
 ### ACP 상류 버전 모니터링
 
-저장소는 ACP 공식 protocol 저장소와 registry 전체를 매일 확인합니다. Protocol release·공개 wire version, registry agent의 추가·삭제·버전·배포 정보가 바뀌면 `automation/acp-upstream-monitor` 브랜치에서 `dev` 대상 검토 PR을 생성하거나 기존 PR을 갱신합니다. npm과 GitHub Actions의 일반 버전 업데이트는 Dependabot이 별도의 `dev` 대상 PR로 관리합니다. 보안 업데이트는 GitHub 정책에 따라 기본 브랜치인 `main`을 대상으로 합니다.
+ACP 공식 protocol 저장소와 registry 확인은 maintainer가 아래 명령으로 수동 수행합니다. Protocol release·공개 wire version, registry agent의 추가·삭제·버전·배포 정보가 바뀌면 snapshot을 갱신해 검토 후 `dev`에 커밋합니다. npm과 GitHub Actions의 일반 버전 업데이트는 Dependabot이 별도의 `dev` 대상 PR로 관리합니다. 보안 업데이트는 GitHub 정책에 따라 기본 브랜치인 `main`을 대상으로 합니다.
 
 ```bash
 npm run monitor:check   # 변경이 있으면 보고서를 출력하고 종료 코드 2 반환
@@ -123,15 +123,15 @@ npm run monitor:sync-dependencies  # 저장소가 직접 포함한 ACP adapter �
 npm run update:upstream  # 위 갱신과 전체 CI를 한 번에 실행하는 수동 유지보수 경로
 ```
 
-GitHub Actions의 write/PR 권한을 사용할 수 없는 저장소에서는 maintainer가 `npm run update:upstream`을 실행하면 예약 workflow가 하던 snapshot 갱신, 관리 대상 ACP adapter pin·lockfile 동기화와 전체 CI를 로컬에서 한 번에 수행할 수 있습니다. 이 명령은 커밋이나 push를 자동으로 하지 않습니다. `git diff`로 protocol·registry 변경과 테스트 결과를 검토한 뒤 `dev`에 커밋하면 됩니다. 일반 사용자의 `acp-gateway-bootstrap --update`는 저장소 파일을 임의로 수정하지 않고 상류 변경을 보고한 뒤 runtime adapter만 안전하게 갱신합니다.
+maintainer가 `npm run update:upstream`을 실행하면 snapshot 갱신, 관리 대상 ACP adapter pin·lockfile 동기화와 전체 CI를 로컬에서 한 번에 수행할 수 있습니다. 이 명령은 커밋이나 push를 자동으로 하지 않습니다. `git diff`로 protocol·registry 변경과 테스트 결과를 검토한 뒤 `dev`에 커밋하면 됩니다. 일반 사용자의 `acp-gateway-bootstrap --update`는 저장소 파일을 임의로 수정하지 않고 상류 변경을 보고한 뒤 runtime adapter만 안전하게 갱신합니다.
 
 두 업데이트 경로는 역할이 다릅니다.
 
 - **ACP agent/adapter 버전:** daemon이 공식 registry의 고정 버전을 주기적으로 확인해 자동 갱신합니다. `acp-gateway-bootstrap --update`를 실행할 때도 즉시 registry를 새로 읽고 같은 갱신을 수행합니다.
-- **ACP protocol wire version:** 새 major를 감지해 PR에 경고하지만 자동 적용하지 않습니다. 호환성 테스트 후 `src/acp-version.js`와 monitor 설정을 함께 바꿔야 합니다.
+- **ACP protocol wire version:** 새 major를 감지해 `monitor:check` 보고서에 경고하지만 자동 적용하지 않습니다. 호환성 테스트 후 `src/acp-version.js`와 monitor 설정을 함께 바꿔야 합니다.
 - **Gateway npm 의존성:** Dependabot PR에서 lockfile과 CI 결과를 확인한 뒤 병합합니다.
 
-현재 runtime은 ACP wire version 1을 사용합니다. 공식 저장소의 `schema/v2`도 감지되지만, v2 지원으로 표시하거나 자동 전환하지 않습니다. Snapshot PR은 알림과 검토 시작점이며 자동 병합 또는 Gateway release를 수행하지 않습니다.
+현재 runtime은 ACP wire version 1을 사용합니다. 공식 저장소의 `schema/v2`도 감지되지만, v2 지원으로 표시하거나 자동 전환하지 않습니다. Snapshot 갱신은 알림과 검토 시작점이며 자동 병합 또는 Gateway release를 수행하지 않습니다.
 
 v1.1.0부터 daemon은 시작 시점과 이후 24시간마다 ACP 공식 registry를 확인합니다. 발견된 `npx`·`uvx` adapter가 새 버전이면 자동으로 설치하고 provider 정의를 갱신합니다. 이미 실행 중인 Worker process는 중단하지 않으며, 새 process나 session부터 갱신된 adapter가 적용됩니다. 직접 설치해야 하는 binary 배포는 자동 교체하지 않고 health 경고로 남깁니다.
 
@@ -149,7 +149,7 @@ acp-gateway-bootstrap --agent-auto-update on
 acp-gateway-bootstrap --agent-update-notifications on
 ```
 
-예약 실행과 Dependabot 설정은 GitHub의 기본 브랜치에 존재해야 활성화됩니다. 따라서 `dev` 검증이 끝나면 monitoring workflow 자체는 `main`에 병합하고 원격 `dev` 브랜치를 유지해야 합니다. 또한 저장소의 **Settings → Actions → General → Workflow permissions**에서 GitHub Actions의 PR 생성을 허용해야 자동 PR이 생성됩니다.
+Dependabot 설정은 GitHub의 기본 브랜치에 존재해야 활성화되며, `dev` 대상 PR을 위해 원격 `dev` 브랜치를 유지해야 합니다.
 
 ## 사용 방법
 
