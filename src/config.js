@@ -31,6 +31,10 @@ export function gatewayLifecycleConfig() {
     orphanGraceMs: numberEnv("ACP_GATEWAY_ORPHAN_GRACE_MS", 24 * 60 * 60_000, 0),
     resultRetentionMs: numberEnv("ACP_GATEWAY_RESULT_RETENTION_MS", 24 * 60 * 60_000, 0),
     inboxRetentionMs: numberEnv("ACP_GATEWAY_INBOX_RETENTION_MS", 24 * 60 * 60_000, 0),
+    // Separate from a task's ttl: ttl bounds how long a handle answers, this
+    // bounds how long its bytes survive. A handle with ttl=null (legacy records
+    // opt out of expiry) would otherwise live in the snapshot forever.
+    taskRetentionMs: numberEnv("ACP_GATEWAY_TASK_RETENTION_MS", 24 * 60 * 60_000, 0),
     sessionRetentionMs: numberEnv("ACP_GATEWAY_SESSION_RETENTION_MS", 7 * 24 * 60 * 60_000, 0),
     maxEvents: numberEnv("ACP_GATEWAY_MAX_EVENTS", 200, 1),
     maxTextBytes: numberEnv("ACP_GATEWAY_MAX_TEXT_BYTES", 1_000_000, 1),
@@ -39,6 +43,27 @@ export function gatewayLifecycleConfig() {
     maxTerminalsPerSession: numberEnv("ACP_GATEWAY_MAX_TERMINALS_PER_SESSION", 16, 1),
     maxPendingRequestsPerSession: numberEnv("ACP_GATEWAY_MAX_PENDING_REQUESTS_PER_SESSION", 64, 1),
     maxFrameBytes: numberEnv("ACP_GATEWAY_MAX_FRAME_BYTES", 32 * 1024 * 1024, 1024)
+  };
+}
+
+// Durability knobs live apart from lifecycle and resourceLimits on purpose: they
+// describe how the state store writes, not what the gateway retains or admits.
+export function gatewayPersistenceConfig() {
+  return {
+    // The first-class fallback. Off keeps the same barrier() promise by writing a
+    // synchronous snapshot per critical mutation, so a bad WAL day is a config
+    // flip rather than a revert.
+    wal: booleanEnv("ACP_GATEWAY_WAL", true),
+    walGroupCommitMs: numberEnv("ACP_GATEWAY_WAL_GROUP_COMMIT_MS", 5, 0),
+    walRotateBytes: numberEnv("ACP_GATEWAY_WAL_ROTATE_BYTES", 4 * 1024 * 1024, 1024),
+    walRotateRecords: numberEnv("ACP_GATEWAY_WAL_ROTATE_RECORDS", 10_000, 1),
+    walRotateIntervalMs: numberEnv("ACP_GATEWAY_WAL_ROTATE_INTERVAL_MS", 15 * 60_000, 0),
+    // Mirrors EVENT_PAYLOAD_CAP: a result larger than this goes to an artifact and
+    // the WAL keeps a reference plus a preview.
+    walInlineResultBytes: numberEnv("ACP_GATEWAY_WAL_INLINE_RESULT_BYTES", 4096, 64),
+    fsync: enumEnv("ACP_GATEWAY_FSYNC", "normal", ["normal", "off"]),
+    // Opt-in recovery overrides. Absent means "halt and tell the operator".
+    stateRecovery: enumEnv("ACP_GATEWAY_STATE_RECOVERY", null, ["truncate", "snapshot-drop", "cold"])
   };
 }
 
@@ -69,6 +94,13 @@ function numberEnv(name, fallback, minimum) {
   const value = Number(raw);
   if (!Number.isFinite(value) || value < minimum) throw new Error(`${name} must be a number >= ${minimum}`);
   return value;
+}
+
+function enumEnv(name, fallback, allowed) {
+  const raw = process.env[name];
+  if (raw == null || raw === "") return fallback;
+  if (!allowed.includes(raw)) throw new Error(`${name} must be one of: ${allowed.join(", ")}`);
+  return raw;
 }
 
 function booleanEnv(name, fallback) {

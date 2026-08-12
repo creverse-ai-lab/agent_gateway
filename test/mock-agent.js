@@ -1,6 +1,10 @@
+import { appendFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 const rl = createInterface({ input: process.stdin });
+// Crash-matrix evidence for P4 ("a turn that was never made durable was never
+// started"). Off unless a test asks for it, so no existing behaviour changes.
+const promptLog = process.env.ACP_MOCK_PROMPT_LOG || null;
 let nextId = 100;
 const pending = new Map();
 const sessionConfigs = new Map();
@@ -104,6 +108,7 @@ rl.on("line", (line) => {
   }
   if (message.method === "session/prompt") {
     const prompt = message.params.prompt?.[0]?.text;
+    if (promptLog) appendFileSync(promptLog, `${JSON.stringify({ prompt, at: Date.now() })}\n`);
     if (prompt === "large-result") {
       send({
         jsonrpc: "2.0",

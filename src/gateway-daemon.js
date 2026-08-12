@@ -1,31 +1,51 @@
 #!/usr/bin/env node
 
 import { timingSafeEqual } from "node:crypto";
-import { chmod, open, readFile, unlink } from "node:fs/promises";
+import { chmod, open, readFile, unlink, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
-import { controlToken, gatewayAgentUpdateConfig, gatewayLifecycleConfig, gatewaySocketPath, gatewayStatePath } from "./config.js";
+import {
+  controlToken, gatewayAgentUpdateConfig, gatewayLifecycleConfig, gatewayPersistenceConfig,
+  gatewaySocketPath, gatewayStatePath
+} from "./config.js";
 import { AgentUpdateManager } from "./agent-updates.js";
 import { ERROR_CODES, GatewayError, errorEnvelope } from "./errors.js";
 import { checkGatewaySource } from "./gateway-source-monitor.js";
 import { GatewayService } from "./gateway-service.js";
 import { readNdjson } from "./ndjson.js";
 import { createSocketSender } from "./socket-flow.js";
+import { statePaths } from "./state-store.js";
 import { GATEWAY_VERSION } from "./version.js";
 
+// A start that dies in init() is invisible: autostart spawns this process with
+// stdio ignored, so the only thing a Main ever sees is a socket that never
+// appears. Recovery failures leave their reason in a file the client reads.
+const STATE_RECOVERY_EXIT_CODE = 78; // EX_CONFIG: operator action required
 const socketPath = gatewaySocketPath();
+const statePath = gatewayStatePath();
 const expectedToken = controlToken();
 const expectedRootId = process.env.ACP_GATEWAY_ROOT_ID || null;
 const gatewayConfig = gatewayLifecycleConfig();
 const agentUpdateManager = new AgentUpdateManager({ ...gatewayAgentUpdateConfig(), sourceChecker: checkGatewaySource });
-const service = new GatewayService({ statePath: gatewayStatePath(), agentUpdateManager, ...gatewayConfig });
+const service = new GatewayService({
+  statePath,
+  agentUpdateManager,
+  ...gatewayConfig,
+  persistence: gatewayPersistenceConfig()
+});
 const clients = new Set();
 let shutdownPromise = null;
 const daemonLock = await acquireDaemonLock(socketPath);
 try {
   await service.init();
+  await unlink(statePaths(statePath).marker).catch(() => {});
   await removeStaleSocket(socketPath);
 } catch (error) {
   await releaseDaemonLock(daemonLock);
+  if (typeof error?.code === "string" && error.code.startsWith("STATE_")) {
+    await writeRecoveryMarker(error);
+    process.stderr.write(`acp-gateway-daemon: ${error.message}\n`);
+    process.exit(STATE_RECOVERY_EXIT_CODE);
+  }
   throw error;
 }
 
@@ -149,6 +169,18 @@ async function shutdown() {
 
 process.once("SIGTERM", () => void shutdown().finally(() => process.exit(0)));
 process.once("SIGINT", () => void shutdown().finally(() => process.exit(0)));
+
+async function writeRecoveryMarker(error) {
+  const marker = statePaths(statePath).marker;
+  const document = {
+    at: new Date().toISOString(),
+    pid: process.pid,
+    gatewayVersion: GATEWAY_VERSION,
+    errorCode: error.code,
+    error: error.message
+  };
+  await writeFile(marker, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 }).catch(() => {});
+}
 
 function tokenMatches(actual, expected) {
   if (typeof actual !== "string") return false;

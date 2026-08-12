@@ -1,13 +1,43 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { fileURLToPath } from "node:url";
-import { gatewayLifecycleConfig, gatewaySocketPath } from "./config.js";
+import { gatewayLifecycleConfig, gatewaySocketPath, gatewayStatePath } from "./config.js";
 import { readNdjson } from "./ndjson.js";
+import { statePaths } from "./state-store.js";
+
+// A daemon that halted in state recovery cannot answer, and its stderr went
+// nowhere (autostart ignores stdio). The marker file is the only channel it had,
+// so a connect failure checks for one and reports the real reason instead of
+// "socket not found".
+function recoveryError(error, statePath) {
+  let marker = null;
+  try {
+    marker = JSON.parse(readFileSync(statePaths(statePath).marker, "utf8"));
+  } catch {
+    return error;
+  }
+  if (!marker?.error) return error;
+  const halted = new Error(
+    `Gateway could not start: ${marker.error} (recorded ${marker.at}). `
+    + "Resolve it, then remove the recovery-required marker file."
+  );
+  halted.code = marker.errorCode ?? "STATE_RECOVERY_REQUIRED";
+  return halted;
+}
 
 export class GatewayRpcClient {
-  constructor({ socketPath = gatewaySocketPath(), token = null, rootId = null, autoStart = true } = {}) {
+  constructor({
+    socketPath = gatewaySocketPath(),
+    token = null,
+    rootId = null,
+    autoStart = true,
+    // Only used to find the recovery marker a halted daemon left behind.
+    statePath = gatewayStatePath()
+  } = {}) {
     this.socketPath = socketPath;
+    this.statePath = statePath;
     this.token = token;
     this.rootId = rootId;
     this.autoStart = autoStart;
@@ -77,7 +107,7 @@ export class GatewayRpcClient {
     try {
       await this.#connectOnce();
     } catch (error) {
-      if (!this.autoStart || !["ENOENT", "ECONNREFUSED"].includes(error?.code)) throw error;
+      if (!this.autoStart || !["ENOENT", "ECONNREFUSED"].includes(error?.code)) throw recoveryError(error, this.statePath);
       this.#startDaemon();
       let lastError = error;
       for (let attempt = 0; attempt < 40; attempt += 1) {
@@ -90,7 +120,7 @@ export class GatewayRpcClient {
           lastError = retryError;
         }
       }
-      if (lastError) throw lastError;
+      if (lastError) throw recoveryError(lastError, this.statePath);
     }
     await this.#restoreSubscriptions();
     this.reconnectAttempt = 0;

@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,17 +21,38 @@ export function daemonPaths(directory) {
   };
 }
 
+// A providers.json pointed at the mock ACP agent, so a real daemon can run a
+// real task end to end with no worker installed. Returns the env additions.
+export async function writeMockProviders(directory, { permissionPolicy = "read_only" } = {}) {
+  const providersPath = join(directory, "providers.json");
+  await writeFile(providersPath, JSON.stringify({
+    version: 1,
+    providers: {
+      mock: {
+        command: process.execPath,
+        args: [fileURLToPath(new URL("../mock-agent.js", import.meta.url))],
+        permissionPolicy
+      }
+    }
+  }));
+  return { ACP_GATEWAY_PROVIDERS: providersPath };
+}
+
 export async function startDaemon({
   directory,
   env = {},
+  execArgv = [],
   token = HARNESS_TOKEN,
   rootId = HARNESS_ROOT_ID,
-  attempts = 120
+  attempts = 120,
+  // Startup failures are a first-class outcome for recovery tests: the daemon is
+  // expected to write its marker file and exit instead of serving a socket.
+  expectExit = false
 } = {}) {
   if (!directory) throw new Error("startDaemon requires a directory");
   await mkdir(directory, { recursive: true });
   const { socketPath, statePath } = daemonPaths(directory);
-  const child = spawn(process.execPath, [DAEMON_PATH], {
+  const child = spawn(process.execPath, [...execArgv, DAEMON_PATH], {
     stdio: ["ignore", "ignore", "pipe"],
     env: {
       ...process.env,
@@ -55,13 +76,7 @@ export async function startDaemon({
     await exited;
     return { exitCode: child.exitCode, signalCode: child.signalCode };
   };
-  try {
-    await waitForSocket(socketPath, child, readStderr, attempts);
-  } catch (error) {
-    await stop({ signal: "SIGKILL" }).catch(() => {});
-    throw error;
-  }
-  return {
+  const handle = {
     socketPath,
     statePath,
     token,
@@ -69,8 +84,22 @@ export async function startDaemon({
     child,
     stderr: readStderr,
     stop,
-    killHard: () => stop({ signal: "SIGKILL" })
+    killHard: () => stop({ signal: "SIGKILL" }),
+    // Resolves when the daemon process is gone, whether it exited on its own
+    // (recovery halt) or was killed from inside (fault injection).
+    waitForExit: async () => {
+      await exited;
+      return { exitCode: child.exitCode, signalCode: child.signalCode, stderr: readStderr() };
+    }
   };
+  if (expectExit) return handle;
+  try {
+    await waitForSocket(socketPath, child, readStderr, attempts);
+  } catch (error) {
+    await stop({ signal: "SIGKILL" }).catch(() => {});
+    throw error;
+  }
+  return handle;
 }
 
 async function waitForSocket(socketPath, child, readStderr, attempts) {
