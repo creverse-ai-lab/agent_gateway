@@ -70,6 +70,18 @@ test("socket Gateway separates public guide access from Main control", async () 
     });
     assert.equal(viaMcp.isError, false);
     assert.deepEqual(viaMcp.structuredContent.sessions, []);
+
+    const viaMcpError = await mcpClient.callTool({
+      name: "agent_acp_session",
+      arguments: { action: "get", sessionId: "session-missing" }
+    });
+    assert.equal(viaMcpError.isError, true);
+    assert.deepEqual(viaMcpError.structuredContent, {
+      ok: false,
+      error: "Unknown sessionId: session-missing",
+      errorCode: "UNKNOWN_SESSION",
+      details: { sessionId: "session-missing" }
+    });
   } finally {
     await mcpClient?.close();
     guide.close();

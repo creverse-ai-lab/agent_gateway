@@ -9,6 +9,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { AcpClient } from "../src/acp-client.js";
+import { ERROR_CODES, GatewayError, errorEnvelope } from "../src/errors.js";
 import { GatewayService } from "../src/gateway-service.js";
 import { GatewayRpcClient } from "../src/socket-rpc.js";
 import { GATEWAY_VERSION } from "../src/version.js";
@@ -318,7 +319,20 @@ test("characterization: task_result rejects a working task and task_list has no 
   }
 });
 
-test("characterization: the socket error envelope carries a stable error code", async () => {
+test("characterization: structured errors retain optional details", () => {
+  const details = { method: "nope", retryable: false };
+  assert.deepEqual(
+    errorEnvelope(new GatewayError(ERROR_CODES.UNKNOWN_METHOD, "Unknown gateway method: nope", details)),
+    {
+      error: "Unknown gateway method: nope",
+      errorCode: ERROR_CODES.UNKNOWN_METHOD,
+      details
+    }
+  );
+  assert.deepEqual(errorEnvelope(new Error("plain failure")), { error: "plain failure" });
+});
+
+test("characterization: the socket error envelope carries a stable error code and details", async () => {
   const directory = await mkdtemp(join(tmpdir(), "acp-characterization-wire-"));
   let daemon = null;
   let main = null;
@@ -334,6 +348,7 @@ test("characterization: the socket error envelope carries a stable error code", 
     await assert.rejects(main.call("nope"), (error) => {
       assert.equal(error.message, "Unknown gateway method: nope");
       assert.equal(error.code, "UNKNOWN_METHOD");
+      assert.deepEqual(error.details, { method: "nope" });
       return true;
     });
 
@@ -346,6 +361,7 @@ test("characterization: the socket error envelope carries a stable error code", 
     await assert.rejects(wrong.call("session", { action: "list" }), (error) => {
       assert.equal(error.message, "Control access denied");
       assert.equal(error.code, "CONTROL_ACCESS_DENIED");
+      assert.equal(Object.hasOwn(error, "details"), false);
       return true;
     });
   } finally {

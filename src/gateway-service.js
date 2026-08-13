@@ -210,7 +210,9 @@ export class GatewayService {
       inbox: () => this.inboxManage(args, context)
     };
     const handler = handlers[method];
-    if (!handler) throw new GatewayError(ERROR_CODES.UNKNOWN_METHOD, `Unknown gateway method: ${method}`);
+    if (!handler) {
+      throw new GatewayError(ERROR_CODES.UNKNOWN_METHOD, `Unknown gateway method: ${method}`, { method });
+    }
     return handler();
   }
 
@@ -1074,7 +1076,9 @@ export class GatewayService {
   requireSession(id) {
     requireString(id, "sessionId");
     const session = this.store.get(id);
-    if (!session) throw new GatewayError(ERROR_CODES.UNKNOWN_SESSION, `Unknown sessionId: ${id}`);
+    if (!session) {
+      throw new GatewayError(ERROR_CODES.UNKNOWN_SESSION, `Unknown sessionId: ${id}`, { sessionId: id });
+    }
     return session;
   }
 

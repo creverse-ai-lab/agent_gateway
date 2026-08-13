@@ -35,3 +35,13 @@ export class GatewayError extends Error {
     if (details !== undefined) this.details = details;
   }
 }
+
+// Keep the legacy wire field names while preserving optional structured
+// context for callers that can make use of it.
+export function errorEnvelope(error) {
+  return {
+    error: error?.message ?? String(error),
+    ...(typeof error?.code === "string" && error.code ? { errorCode: error.code } : {}),
+    ...(error != null && Object.hasOwn(error, "details") ? { details: error.details } : {})
+  };
+}

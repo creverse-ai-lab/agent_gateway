@@ -11,6 +11,7 @@ import {
   ListToolsRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
 import { controlToken, rootId } from "./config.js";
+import { errorEnvelope } from "./errors.js";
 import { GatewayRpcClient } from "./socket-rpc.js";
 import { PERMISSION_POLICIES } from "./acp-client.js";
 import { GATEWAY_VERSION } from "./version.js";
@@ -61,8 +62,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   } catch (error) {
     return toolResult({
       ok: false,
-      error: error?.message ?? String(error),
-      ...(typeof error?.code === "string" ? { errorCode: error.code } : {})
+      ...errorEnvelope(error)
     }, true);
   }
 });

@@ -5,7 +5,7 @@ import { chmod, open, readFile, unlink } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import { controlToken, gatewayAgentUpdateConfig, gatewayLifecycleConfig, gatewaySocketPath, gatewayStatePath } from "./config.js";
 import { AgentUpdateManager } from "./agent-updates.js";
-import { ERROR_CODES, GatewayError } from "./errors.js";
+import { ERROR_CODES, GatewayError, errorEnvelope } from "./errors.js";
 import { checkGatewaySource } from "./gateway-source-monitor.js";
 import { GatewayService } from "./gateway-service.js";
 import { readNdjson } from "./ndjson.js";
@@ -93,8 +93,7 @@ const server = createServer((socket) => {
           send({
             id: request?.id ?? null,
             ok: false,
-            error: error?.message ?? String(error),
-            ...(typeof error?.code === "string" && error.code ? { errorCode: error.code } : {})
+            ...errorEnvelope(error)
           });
         }
       }

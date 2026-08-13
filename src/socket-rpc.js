@@ -209,6 +209,7 @@ export class GatewayRpcClient {
       // Carry the Gateway's stable error code across the socket so callers can
       // branch on it instead of matching message text.
       if (typeof message.errorCode === "string" && message.errorCode) error.code = message.errorCode;
+      if (Object.hasOwn(message, "details")) error.details = message.details;
       pending.reject(error);
     }
   }
