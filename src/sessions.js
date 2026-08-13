@@ -1,27 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, openSync, readSync } from "node:fs";
-import { BoundedUtf8Text, utf8ByteHead } from "./bounded-utf8.js";
-
-// Reads the first maxBytes of a text artifact without splitting a character;
-// returns null when the file cannot be read.
-function readHeadBytes(path, maxBytes) {
-  let fd = null;
-  try {
-    fd = openSync(path, "r");
-    // Over-read a few bytes to tell "file fits entirely" apart from "cut
-    // mid-character at exactly maxBytes".
-    const buffer = Buffer.alloc(maxBytes + 3);
-    const read = readSync(fd, buffer, 0, maxBytes + 3, 0);
-    if (read <= maxBytes) return buffer.subarray(0, read).toString("utf8");
-    let end = maxBytes;
-    while (end > 0 && (buffer[end] & 0xc0) === 0x80) end -= 1;
-    return buffer.subarray(0, end).toString("utf8");
-  } catch {
-    return null;
-  } finally {
-    if (fd != null) closeSync(fd);
-  }
-}
+import { BoundedUtf8Text, readHeadBytes, utf8ByteHead } from "./bounded-utf8.js";
 
 const textAccumulators = new WeakMap();
 

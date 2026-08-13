@@ -248,6 +248,8 @@ rl.on("line", (line) => {
         toolCall: { toolCallId: "tool-1", title: "Edit file", kind: "edit" },
         options: prompt === "allow-always-only"
           ? [{ optionId: "allow-always", name: "Always allow", kind: "allow_always" }]
+          : prompt === "huge-permission"
+            ? [{ optionId: "allow-once", name: "x".repeat(5_000), kind: "allow_once" }]
           : [
               { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
               { optionId: "reject-once", name: "Reject", kind: "reject_once" }

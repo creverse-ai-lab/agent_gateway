@@ -21,6 +21,7 @@ export class ArtifactStore {
     this.maxFileBytes = maxFileBytes;
     this.maxTotalBytes = maxTotalBytes;
     this.usedBytes = directoryBytes(root);
+    this.activePaths = new Set();
   }
 
   create(sessionId, kind) {
@@ -33,7 +34,7 @@ export class ArtifactStore {
     for (const entry of safeEntries(this.root)) {
       if (!entry.isFile() || !entry.name.startsWith(ARTIFACT_PREFIX)) continue;
       const path = join(this.root, entry.name);
-      if (keepPaths?.has(path)) continue;
+      if (keepPaths?.has(path) || this.activePaths.has(path)) continue;
       try {
         const info = statSync(path);
         if (info.mtimeMs + retentionMs > now) continue;
@@ -68,6 +69,14 @@ export class ArtifactStore {
       this.maxFileBytes - fileBytes,
       this.maxTotalBytes - this.usedBytes
     ));
+  }
+
+  markActive(path) {
+    this.activePaths.add(path);
+  }
+
+  markInactive(path) {
+    if (path) this.activePaths.delete(path);
   }
 }
 
@@ -149,6 +158,7 @@ class ArtifactWriter {
     const path = join(this.store.root, `${ARTIFACT_PREFIX}${this.sessionId}-${this.kind}-${randomUUID()}.txt`);
     this.fd = openSync(path, "wx", 0o600);
     this.path = path;
+    this.store.markActive(path);
   }
 
   #close({ sync = false } = {}) {
@@ -170,6 +180,7 @@ class ArtifactWriter {
       this.error ??= error?.message ?? String(error);
     }
     this.fd = null;
+    this.store.markInactive(this.path);
   }
 }
 

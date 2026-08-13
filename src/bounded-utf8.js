@@ -1,3 +1,6 @@
+import { closeSync, openSync, readSync } from "node:fs";
+import { open } from "node:fs/promises";
+
 // Truncates text to at most maxBytes of UTF-8 without splitting a multi-byte
 // character. Length checks on JavaScript strings count code units, not bytes,
 // so byte caps must go through here.
@@ -7,6 +10,161 @@ export function utf8ByteHead(text, maxBytes) {
   let end = maxBytes;
   while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1;
   return bytes.subarray(0, end).toString("utf8");
+}
+
+// Removes an incomplete UTF-8 sequence from the end of a buffer. A read that
+// stops at an arbitrary byte offset would otherwise decode to U+FFFD, which is
+// corruption a caller cannot detect.
+export function trimIncompleteUtf8(buffer) {
+  let index = buffer.length - 1;
+  let continuations = 0;
+  while (index >= 0 && (buffer[index] & 0xc0) === 0x80) {
+    continuations += 1;
+    index -= 1;
+  }
+  if (index < 0) return buffer.subarray(0, 0);
+  const lead = buffer[index];
+  const needed = lead < 0x80 ? 0 : lead < 0xe0 ? 1 : lead < 0xf0 ? 2 : 3;
+  // Only an actually incomplete sequence is cut. Malformed input (more
+  // continuations than the lead byte announces) is left exactly as it was read.
+  return needed > continuations ? buffer.subarray(0, index) : buffer;
+}
+
+// Reads the first maxBytes of a text file without splitting a character; returns
+// null when the file cannot be read. Moved here from the session store so the
+// async sibling below can share its contract.
+export function readHeadBytes(path, maxBytes) {
+  let fd = null;
+  try {
+    fd = openSync(path, "r");
+    // Over-read a few bytes to tell "file fits entirely" apart from "cut
+    // mid-character at exactly maxBytes".
+    const buffer = Buffer.alloc(maxBytes + 3);
+    const read = readSync(fd, buffer, 0, maxBytes + 3, 0);
+    if (read <= maxBytes) return buffer.subarray(0, read).toString("utf8");
+    let end = maxBytes;
+    while (end > 0 && (buffer[end] & 0xc0) === 0x80) end -= 1;
+    return buffer.subarray(0, end).toString("utf8");
+  } catch {
+    return null;
+  } finally {
+    if (fd != null) closeSync(fd);
+  }
+}
+
+// Fills a buffer from the start of a file, one read at a time. One read is not
+// one file: a short read is ordinary on a network or FUSE filesystem, and taking
+// it for EOF reports a cut-short head as the complete file — a truncation the
+// caller has no way to detect. Only bytesRead === 0 means there is nothing more.
+// Exported as the seam for that case: no local filesystem will produce a partial
+// read on request, so the test supplies the handle.
+export async function readInto(handle, buffer) {
+  let bytesRead = 0;
+  while (bytesRead < buffer.length) {
+    const chunk = await handle.read(buffer, bytesRead, buffer.length - bytesRead, bytesRead);
+    if (chunk.bytesRead === 0) break;
+    bytesRead += chunk.bytesRead;
+  }
+  return bytesRead;
+}
+
+// The async sibling of readHeadBytes, for a request path that must not block the
+// event loop and must report why a read failed rather than swallow it. Allocates
+// maxBytes, never the file size: a 2GB file costs the cap.
+export async function readTextHead(path, maxBytes) {
+  const handle = await open(path, "r");
+  try {
+    const buffer = Buffer.alloc(maxBytes + 3);
+    const bytesRead = await readInto(handle, buffer);
+    if (bytesRead <= maxBytes) {
+      return { text: buffer.subarray(0, bytesRead).toString("utf8"), bytes: bytesRead, truncated: false };
+    }
+    const head = trimIncompleteUtf8(buffer.subarray(0, maxBytes));
+    return { text: head.toString("utf8"), bytes: head.length, truncated: true };
+  } finally {
+    await handle.close();
+  }
+}
+
+// Reads a line window in one forward pass with a fixed buffer: time is O(bytes
+// scanned), memory is the buffer plus what is actually returned. Nothing
+// proportional to the skipped prefix is ever allocated.
+export async function readTextLines(path, {
+  line = 1,
+  limit = Infinity,
+  maxBytes = Infinity,
+  chunkBytes = 64 * 1024
+} = {}) {
+  // Validated before anything is opened, and matching what 1.3.2 did with the
+  // same input: a non-numeric line or limit made Array#slice compute NaN bounds,
+  // which returned an empty window rather than the whole file. Without the check
+  // Math.floor(NaN) - 1 leaves skip = NaN, every comparison against it is false,
+  // and the read silently starts at line 1 — the caller asked for line "abc" and
+  // got the top of the file.
+  const requestedLine = Number(line);
+  const requestedLimit = Number(limit);
+  if (!Number.isFinite(requestedLine) || Number.isNaN(requestedLimit) || !(requestedLimit > 0)) {
+    return { text: "", bytes: 0, truncated: false };
+  }
+  const handle = await open(path, "r");
+  const skip = Math.max(0, Math.floor(requestedLine) - 1);
+  const chunks = [];
+  let skipped = 0;
+  let completed = 0;
+  let bytes = 0;
+  let truncated = false;
+  let position = 0;
+  let done = false;
+  try {
+    // Inside the try: an allocation between open() and it leaks the handle when
+    // it throws, and a caller-supplied chunk size can throw.
+    const buffer = Buffer.allocUnsafe(chunkBytes);
+    while (!done) {
+      const { bytesRead } = await handle.read(buffer, 0, chunkBytes, position);
+      if (bytesRead === 0) break;
+      position += bytesRead;
+      let index = 0;
+      // Skip to the first byte of the requested line, keeping none of it.
+      while (skipped < skip && index < bytesRead) {
+        if (buffer[index] === 0x0a) skipped += 1;
+        index += 1;
+      }
+      if (skipped < skip) continue;
+      const from = index;
+      while (index < bytesRead) {
+        if (buffer[index] !== 0x0a) {
+          index += 1;
+          continue;
+        }
+        completed += 1;
+        // The newline that ends the last requested line is a terminator, not
+        // content: joining the window never produced a trailing separator either.
+        if (completed >= requestedLimit) {
+          done = true;
+          break;
+        }
+        index += 1;
+      }
+      const room = maxBytes - bytes;
+      const slice = buffer.subarray(from, index);
+      // Strictly greater: a window that ends exactly at the cap is complete, and
+      // must not report itself truncated.
+      if (slice.length > room) {
+        chunks.push(Buffer.from(slice.subarray(0, room)));
+        bytes += room;
+        truncated = true;
+        break;
+      }
+      chunks.push(Buffer.from(slice));
+      bytes += slice.length;
+    }
+  } finally {
+    await handle.close();
+  }
+  const window = truncated
+    ? trimIncompleteUtf8(Buffer.concat(chunks, bytes))
+    : Buffer.concat(chunks, bytes);
+  return { text: window.toString("utf8"), bytes: window.length, truncated };
 }
 
 // Bounded tail accumulator for UTF-8 text: append cost is proportional to the

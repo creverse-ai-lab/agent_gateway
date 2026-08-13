@@ -183,7 +183,7 @@ Gateway는 Worker가 공개하지 않은 `temperature`, `max_tokens` 같은 값�
 
 v1.3.0부터 poll 기본값이 절약형입니다. 턴이 진행 중일 때 `result`는 자동으로 생략되고(`includeResult: true`로 명시할 때만 포함), 종료 후 poll의 `result.text`에는 누적 transcript가 아니라 **최종 답변 세그먼트**(마지막 작업 경계 이후의 메시지 텍스트)만 담깁니다. 진행 narration은 `includeInspection: true`로 조회합니다. `agent_acp_session` `get`의 `includeTranscript: true`는 메모리에 남은 bounded transcript를 반환하며, overflow된 전체 transcript는 `resultArtifact`를 따라 회수합니다. `cursor`/`toCursor`/`eventTypes`로 보존된 이벤트 이력도 범위 조회할 수 있습니다. 자세한 회수 경로는 `agent-delegator` skill의 "Retrieve the correct result" 표를 따르세요.
 
-인라인 상한을 넘는 데이터는 전부 `~/.acp-gateway/artifacts`의 파일로 스필되고 응답에는 잘린 미리보기와 포인터(경로·바이트 수·완료 여부)가 실립니다 — 4KB(UTF-8)를 넘는 tool 이벤트 payload는 `dataArtifact`, 64KB를 넘는 최종 답변은 `textArtifact`, 메모리 상한(1MB)을 넘는 transcript는 `resultArtifact`. 인라인에는 상한 내 내용만 유지하므로 RAM과 오케스트레이터 컨텍스트가 결과 크기에 따라 늘어나지 않습니다. Artifact는 파일당 100MB·전체 512MB이고, 라이브 세션이 참조하는 파일은 24시간 정리에서 보존됩니다. 동시 미응답 권한·질문 요청은 세션당 64개의 안전 상한을 따르며, 큰 설명 chunk는 32MB protocol frame 상한 안에서 그대로 처리합니다.
+인라인 상한을 넘는 데이터는 전부 `~/.acp-gateway/artifacts`의 파일로 스필되고 응답에는 잘린 미리보기와 포인터(경로·바이트 수·완료 여부)가 실립니다 — 4KB(UTF-8)를 넘는 tool 이벤트 payload는 `dataArtifact`, 64KB를 넘는 최종 답변은 `textArtifact`, 메모리 상한(1MB)을 넘는 transcript는 `resultArtifact`. 인라인에는 상한 내 내용만 유지하므로 RAM과 오케스트레이터 컨텍스트가 결과 크기에 따라 늘어나지 않습니다. Artifact는 파일당 100MB·전체 512MB이고, 라이브 세션이 참조하는 파일은 24시간 정리에서 보존됩니다. 동시 미응답 권한·질문 요청은 세션당 64개의 안전 상한을 따르며, 큰 설명 chunk는 32MB protocol frame 상한 안에서 그대로 처리합니다. 전송·세션·Main 단위 예산도 `setup().resourceLimits`에 함께 실립니다 — control 연결당 쓰기 큐 4MB와 10초 무진행 상한(worker stdin 쪽 큐는 동시 요청 상한에서 파생), prompt 1MB, 파일 읽기 500KB(바이트 기준, 초과분은 `_meta["acp-gateway/read"]`로 절단을 알림), terminal 출력 10MB, Main당 세션 64개와 처리 완료 inbox 이력 1000건.
 
 ### 권한 정책
 
@@ -223,6 +223,16 @@ Task 생성과 결과 확정은 응답을 반환하기 전에 WAL에 append + fs
 | `ACP_GATEWAY_FSYNC` | `normal` | `off`는 테스트·임시 볼륨 전용 |
 | `ACP_GATEWAY_STATE_RECOVERY` | (없음) | `truncate`: 손상 직전까지 WAL replay 후 시작 / `snapshot-drop`: snapshot 폐기 후 `state.json`에서 복구 / `cold`: 빈 상태로 시작 |
 | `ACP_GATEWAY_TASK_RETENTION_MS` | `24h` | Task 레코드와 결과 artifact의 디스크 생존 기간(세션 보존과 독립) |
+| `ACP_GATEWAY_MAX_QUEUE_BYTES` | `4000000` | control 연결당 OS+channel 합산 쓰기 예산. HIGH는 전체, NORMAL은 7/8, LOW는 1/2까지 사용 |
+| `ACP_GATEWAY_WRITE_TIMEOUT_MS` | `10000` | 이 시간 동안 OS가 한 바이트도 받지 않으면 해당 연결·프로바이더를 종료 |
+| `ACP_GATEWAY_MAX_PROMPT_BYTES` | `1000000` | 초과 prompt는 턴을 만들기 전에 `PROMPT_TOO_LARGE`로 거부 |
+| `ACP_GATEWAY_MAX_FILE_READ_BYTES` | `500000` | worker의 `fs/read_text_file` 응답 바이트 상한(거부 대신 절단) |
+| `ACP_GATEWAY_MAX_TERMINAL_OUTPUT_BYTES` | `10000000` | terminal 출력 버퍼 상한(기존 하드코딩 값과 동일) |
+| `ACP_GATEWAY_MAX_SESSIONS_PER_ROOT` | `64` | Main당 동시 세션 상한. 초과 시 `SESSION_LIMIT_EXCEEDED` |
+| `ACP_GATEWAY_MAX_INBOX_ITEM_BYTES` | `65536` | worker permission/elicitation 한 건의 보관 바이트 상한 |
+| `ACP_GATEWAY_MAX_PENDING_INBOX_BYTES_PER_SESSION` | `524288` | 세션당 pending inbox 합산 바이트 상한 |
+| `ACP_GATEWAY_MAX_PENDING_INBOX_BYTES_PER_ROOT` | `4194304` | Main당 pending inbox 합산 바이트 상한 |
+| `ACP_GATEWAY_MAX_INBOX_HISTORY_PER_ROOT` | `1000` | Main당 보관하는 처리 완료 inbox 건수(pending은 제거 대상 아님) |
 
 persistence가 불건강해지면 **새 Task 생성만** `PERSISTENCE_UNHEALTHY`로 거부합니다(핸들 = 내구성 약속). `session_open`과 직접 `prompt`는 계속 동작하며, 다음 성공한 write에서 건강 상태가 회복됩니다. `setup().persistence`에 `mode`, `walSeq`, `walBytes`, `snapshotEpoch`, `fsyncCount`, `lastRecovery`가 함께 보고됩니다.
 

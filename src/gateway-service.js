@@ -56,7 +56,9 @@ const CLOSED_STATUSES = new Set(["closed"]);
 // known to be out of sync with the worker, so it has to be resumed first.
 const RESTORE_REQUIRED_STATUSES = new Set(["disconnected", "unavailable"]);
 const CONTROL_SERVER_PATTERN = /(?:acp-gateway-control|acp-mcp-bridge|gateway-daemon|control-mcp)/i;
-const DURABLE_EVENT_TYPES = new Set([
+// Exported for the transport's lane table: an event worth persisting is an event
+// worth never dropping, so one list decides both.
+export const DURABLE_EVENT_TYPES = new Set([
   "session_created", "session_restored", "session_restore_start", "session_restore_failed",
   "turn_start", "turn_end", "error", "permission_request", "permission_response",
   "elicitation_request", "elicitation_response", "cancel_requested", "orphan_cancel_requested",
@@ -73,7 +75,22 @@ export class GatewayService {
     maxArtifactTotalBytes = 512 * 1024 * 1024,
     maxTerminalsPerSession = 16,
     maxPendingRequestsPerSession = 64,
+    maxInboxItemBytes = 64 * 1024,
+    maxPendingInboxBytesPerSession = 512 * 1024,
+    maxPendingInboxBytesPerRoot = 4 * 1024 * 1024,
     maxFrameBytes = 32 * 1024 * 1024,
+    // Transport, session and root budgets. Flat numbers on purpose: setup()
+    // renders these straight into a Main-side table, and a nested object would
+    // print as [object Object].
+    maxQueueBytes = 4_000_000,
+    writeTimeoutMs = 10_000,
+    maxPromptBytes = 1_000_000,
+    maxFileReadBytes = 500_000,
+    maxTerminalOutputBytes = 10_000_000,
+    // The RSS arithmetic behind 64: a live session holds three bounded 1MB text
+    // accumulators, so 64 sessions is ~192MB of transcript state per root.
+    maxSessionsPerRoot = 64,
+    maxInboxHistoryPerRoot = 1_000,
     artifactRoot = statePath ? join(dirname(statePath), "artifacts") : defaultArtifactRoot(),
     artifactStore = null,
     createClient = null,
@@ -142,7 +159,17 @@ export class GatewayService {
       maxArtifactTotalBytes,
       maxTerminalsPerSession,
       maxPendingRequestsPerSession,
-      maxFrameBytes
+      maxInboxItemBytes,
+      maxPendingInboxBytesPerSession,
+      maxPendingInboxBytesPerRoot,
+      maxFrameBytes,
+      maxQueueBytes,
+      writeTimeoutMs,
+      maxPromptBytes,
+      maxFileReadBytes,
+      maxTerminalOutputBytes,
+      maxSessionsPerRoot,
+      maxInboxHistoryPerRoot
     };
     this.lifecycle = {
       gcIntervalMs, idleUnloadMs, orphanGraceMs, resultRetentionMs, inboxRetentionMs,
@@ -203,7 +230,7 @@ export class GatewayService {
     // Replay has already folded the WAL into these records as plain data.
     this.taskStore.recover(loaded.tasks);
     for (const record of loaded.inbox) {
-      const item = { ...record };
+      const item = compactRecoveredInbox(record, this.resourceLimits.maxInboxItemBytes);
       // An ACP permission request is tied to the old worker process. It cannot
       // be answered after a daemon restart, but must remain visible to Main.
       if (item.status === "pending") {
@@ -582,6 +609,17 @@ export class GatewayService {
         { sessionId: duplicate.id, acpSessionId: fields.acpSessionId }
       );
     }
+    // Closed records do not count: they hold no client, no accumulators and cannot
+    // be prompted. Their bytes are retention's problem, not admission's.
+    const live = this.store
+      .list()
+      .filter((item) => item.ownerRootId === fields.ownerRootId && !CLOSED_STATUSES.has(item.status)).length;
+    if (live >= this.resourceLimits.maxSessionsPerRoot) {
+      throw new GatewayError(
+        ERROR_CODES.SESSION_LIMIT_EXCEEDED,
+        `Session limit for this Main exceeded: ${this.resourceLimits.maxSessionsPerRoot}`
+      );
+    }
     const session = this.store.create({
       provider: fields.provider,
       client: fields.client,
@@ -758,6 +796,17 @@ export class GatewayService {
     if (typeof args.prompt !== "string" && !Array.isArray(args.prompt)) {
       throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "prompt must be a string or ACP content array");
     }
+    // Refused in admission, so an oversized prompt costs no turn, no reservation
+    // and no frame on the wire toward the worker.
+    const promptBytes = Buffer.byteLength(
+      typeof args.prompt === "string" ? args.prompt : JSON.stringify(args.prompt)
+    );
+    if (promptBytes > this.resourceLimits.maxPromptBytes) {
+      throw new GatewayError(
+        ERROR_CODES.PROMPT_TOO_LARGE,
+        `prompt exceeds ${this.resourceLimits.maxPromptBytes} bytes: ${promptBytes}`
+      );
+    }
     return this.#reserve(session, "prompt");
   }
 
@@ -823,9 +872,14 @@ export class GatewayService {
     return { ok: true, sessionId: session.id, turnId: session.turnId, status: session.status };
   }
 
-  // The single terminal transition for a turn. Four guards, one per way the
+  // The single terminal transition for a turn. Five guards, one per way the
   // turn can stop being this callback's business between request and reply.
   #finishTurn(session, token, outcome) {
+    // Shutdown does not finalize turns. Stopping a client now rejects its pending
+    // requests (PR2 M7), which would otherwise land here and commit "ACP client
+    // stopped" as the turn's outcome — overwriting the in-flight record whose
+    // conversion on restart is what tells Main the gateway went down under it.
+    if (this.stopped) return;
     if (session.turnId !== token) return;
     if (session.turnSeal === token) return;
     if (CLOSED_STATUSES.has(session.status)) return;
@@ -1200,11 +1254,29 @@ export class GatewayService {
     // still interrupt Main's outstanding worker requests.
     this.interruptSessionInbox(session, "Main cancelled the worker session");
     session.cancelRequested = true;
-    session.client?.cancelSession(session.acpSessionId);
+    this.#tellWorkerToCancel(session);
     this.#setStatus(session, "cancelling", "cancel_requested");
     this.store.push(session, { type: "cancel_requested" });
     this.updateTaskForSession(session, "working", "Cancellation requested");
     return { ok: true, ...publicSession(session) };
+  }
+
+  // Telling the worker is best effort, and it has to be: the notify underneath
+  // writes to a bounded channel that can refuse the frame outright — a congested
+  // or already-closed child transport throws instead of dropping. Every caller
+  // records the cancellation intent before it gets here and owes the session a
+  // state transition after it: sealing the turn, finalizing the result, setting a
+  // terminal status. Letting the throw out skipped all of that while leaving the
+  // guard flag set, so the retry was suppressed forever and the session stayed
+  // wedged mid-cancel. A worker that never hears the cancel is a case these paths
+  // already handle — one that never gets finalized is not.
+  #tellWorkerToCancel(session) {
+    try {
+      session.client?.cancelSession(session.acpSessionId);
+    } catch {
+      // The transport is gone or refusing frames. The turn is being finalized by
+      // this side either way, and the worker's own exit path reconciles the rest.
+    }
   }
 
   async sessionManage(args, context) {
@@ -1289,7 +1361,7 @@ export class GatewayService {
     }
     this.interruptSessionInbox(session, "Main closed the worker session");
     const client = session.client;
-    if (ACTIVE_STATUSES.has(session.status)) client?.cancelSession(session.acpSessionId);
+    if (ACTIVE_STATUSES.has(session.status)) this.#tellWorkerToCancel(session);
     try {
       if (client?.alive && client.initResult?.agentCapabilities?.sessionCapabilities?.close) {
         await client.request("session/close", { sessionId: session.acpSessionId }, 30_000);
@@ -1368,24 +1440,29 @@ export class GatewayService {
       // request: the event stays on the record, but it must not pull the session
       // back into an input wait or grow a new obligation Main cannot discharge.
       const admitted = this.#setStatus(session, "waiting_permission", type);
-      const cappedToolCall = this.capStructuredField(session, `${type}-toolCall`, "toolCall", update.toolCall);
+      // Serialized and, if oversized, spilled exactly once. The inbox row points
+      // at the same artifact the delivered event does instead of keeping a second
+      // full copy of the same tool call.
+      const toolCall = this.#capture(session, `${type}-toolCall`, update.toolCall);
+      const options = this.#capture(session, `${type}-options`, update.options);
       // The durable record is created BEFORE the ring push that makes the request
       // pollable. Reversed (as it was through 1.3.2), a poll could hand Main a
       // requestId whose inbox row does not exist yet.
-      if (admitted) this.createPermissionInbox(session, update);
+      const inboxItem = admitted ? this.createPermissionInbox(session, update, toolCall, options) : null;
+      if (admitted && !inboxItem) {
+        this.syncSessionInputState(session);
+        return;
+      }
       this.store.push(session, {
         type,
         requestId: update.requestId,
-        ...cappedToolCall,
         // Main still needs enough of the tool call to answer the request.
-        ...(cappedToolCall.toolCallTruncated ? {
-          toolCall: {
-            toolCallId: update.toolCall?.toolCallId,
-            title: update.toolCall?.title,
-            kind: update.toolCall?.kind
-          }
-        } : {}),
-        options: update.options
+        ...(toolCall.truncated
+          ? { toolCallTruncated: true, dataArtifact: toolCall.artifact, toolCall: toolCallHead(update.toolCall) }
+          : { toolCall: toolCall.value }),
+        ...(options.truncated
+          ? { optionsTruncated: true, optionsBytes: options.bytes, optionsArtifact: options.artifact, options: optionsHead(update.options) }
+          : { options: options.value })
       });
       if (!admitted) return;
       this.updateTaskForSession(session, "input_required", "Waiting for Main permission");
@@ -1393,15 +1470,33 @@ export class GatewayService {
     }
     if (type === "elicitation_request") {
       const admitted = this.#setStatus(session, "waiting_input", type);
-      if (admitted) this.createElicitationInbox(session, update);
+      const schema = this.#capture(session, `${type}-schema`, update.requestedSchema);
+      const message = typeof update.message === "string"
+        ? utf8ByteHead(update.message, EVENT_PAYLOAD_CAP_BYTES)
+        : update.message;
+      // A worker question Main can read is a bounded one, but the part that was
+      // cut has to be somewhere: the durable inbox row keeps a pointer to the full
+      // text through the same spill the schema and the tool call already use.
+      // Only the oversized case pays for a file, and only an admitted request —
+      // an unadmitted one has no row to point at it.
+      const messageArtifact = admitted && message !== update.message
+        ? this.store.spillText(session.id, `${type}-message`, update.message)
+        : null;
+      const inboxItem = admitted
+        ? this.createElicitationInbox(session, update, { schema, message, messageArtifact })
+        : null;
+      if (admitted && !inboxItem) {
+        this.syncSessionInputState(session);
+        return;
+      }
       this.store.push(session, {
         type,
         requestId: update.requestId,
         mode: update.mode,
-        message: typeof update.message === "string"
-          ? utf8ByteHead(update.message, EVENT_PAYLOAD_CAP_BYTES)
-          : update.message,
-        ...this.capStructuredField(session, `${type}-schema`, "requestedSchema", update.requestedSchema),
+        message,
+        ...(schema.truncated
+          ? { requestedSchemaTruncated: true, dataArtifact: schema.artifact }
+          : { requestedSchema: schema.value }),
         toolCallId: update.toolCallId
       });
       if (!admitted) return;
@@ -1436,15 +1531,25 @@ export class GatewayService {
     return capped === text ? { type, text } : { type, text: capped, textTruncated: true };
   }
 
-  // Caps a structured event field by byte size; the durable inbox record keeps
-  // the full object for answering, only the delivered event copy is bounded.
+  // Caps a structured event field by byte size. Both the delivered event copy and
+  // the durable inbox row are built from one capture, so an oversized field is
+  // serialized once and spilled to one artifact that both of them reference.
   capStructuredField(session, kind, field, value) {
-    if (value == null) return { [field]: value };
+    const captured = this.#capture(session, kind, value);
+    if (!captured.truncated) return { [field]: captured.value };
+    return { [`${field}Truncated`]: true, dataArtifact: captured.artifact };
+  }
+
+  #capture(session, kind, value) {
+    if (value == null) return { value, bytes: 0, truncated: false, artifact: null };
     const serialized = JSON.stringify(value);
-    if (Buffer.byteLength(serialized) <= EVENT_PAYLOAD_CAP_BYTES) return { [field]: value };
+    const bytes = Buffer.byteLength(serialized);
+    if (bytes <= EVENT_PAYLOAD_CAP_BYTES) return { value, bytes, truncated: false, artifact: null };
     return {
-      [`${field}Truncated`]: true,
-      dataArtifact: this.store.spillText(session.id, `event-${kind}`, serialized)
+      value,
+      bytes,
+      truncated: true,
+      artifact: this.store.spillText(session.id, `event-${kind}`, serialized)
     };
   }
 
@@ -1470,7 +1575,11 @@ export class GatewayService {
       artifactStore: this.artifactStore,
       maxTerminalsPerSession: this.resourceLimits.maxTerminalsPerSession,
       maxPendingRequestsPerSession: this.resourceLimits.maxPendingRequestsPerSession,
+      maxInboxItemBytes: this.resourceLimits.maxInboxItemBytes,
       maxFrameBytes: this.resourceLimits.maxFrameBytes,
+      maxFileReadBytes: this.resourceLimits.maxFileReadBytes,
+      maxTerminalOutputBytes: this.resourceLimits.maxTerminalOutputBytes,
+      writeTimeoutMs: this.resourceLimits.writeTimeoutMs,
       onExit: (error) => {
         const text = error?.message ?? String(error);
         // Through each session's mailbox: a close already in flight has to finish
@@ -1721,7 +1830,32 @@ export class GatewayService {
     });
   }
 
-  createPermissionInbox(session, update) {
+  // A count bound on inbox history, per root and resolved only. A pending row is
+  // an obligation Main has not discharged, so it is never evictable; retention
+  // still removes rows by age, this one removes them by depth.
+  #evictInboxHistory() {
+    const limit = this.resourceLimits.maxInboxHistoryPerRoot;
+    const byRoot = new Map();
+    for (const item of this.inbox.values()) {
+      if (item.status === "pending") continue;
+      const rows = byRoot.get(item.ownerRootId) ?? [];
+      rows.push(item);
+      byRoot.set(item.ownerRootId, rows);
+    }
+    let changed = false;
+    for (const rows of byRoot.values()) {
+      if (rows.length <= limit) continue;
+      rows.sort((left, right) => inboxAge(left).localeCompare(inboxAge(right)));
+      for (const item of rows.slice(0, rows.length - limit)) {
+        this.inbox.delete(item.inboxId);
+        this.stateStore?.append(WAL_TYPES.INBOX_REMOVED, item.inboxId, {});
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  createPermissionInbox(session, update, toolCall = null, options = null) {
     const existing = [...this.inbox.values()].find((item) =>
       item.sessionId === session.id && item.turnId === session.turnId
       && item.requestId === update.requestId && item.type === "permission_request" && item.status === "pending"
@@ -1740,16 +1874,35 @@ export class GatewayService {
       resolvedAt: null,
       resolution: null,
       requestId: update.requestId,
-      toolCall: update.toolCall,
-      options: update.options
+      // Under the cap (the ordinary case) the row is exactly what it always was.
+      // Over it, the row keeps the head Main needs to recognize the call and points
+      // at the artifact the event path already wrote, instead of holding megabytes
+      // of tool input that only the artifact is ever read for.
+      ...(toolCall?.truncated
+        ? {
+            toolCall: toolCallHead(update.toolCall),
+            toolCallTruncated: true,
+            toolCallBytes: toolCall.bytes,
+            toolCallArtifact: toolCall.artifact
+          }
+        : { toolCall: update.toolCall }),
+      ...(options?.truncated
+        ? {
+            options: optionsHead(update.options),
+            optionsTruncated: true,
+            optionsBytes: options.bytes,
+            optionsArtifact: options.artifact
+          }
+        : { options: update.options })
     };
+    if (!this.#admitInboxItem(session, item)) return null;
     this.inbox.set(inboxId, item);
     this.#appendInboxCreated(item);
     this.schedulePersist();
     return item;
   }
 
-  createElicitationInbox(session, update) {
+  createElicitationInbox(session, update, projection = null) {
     const existing = [...this.inbox.values()].find((item) =>
       item.sessionId === session.id && item.turnId === session.turnId
       && item.requestId === update.requestId && item.type === "worker_question" && item.status === "pending"
@@ -1768,14 +1921,66 @@ export class GatewayService {
       resolution: null,
       requestId: update.requestId,
       mode: update.mode,
-      message: update.message,
-      requestedSchema: update.requestedSchema,
+      // The same capped projection the event carries. A worker question Main can
+      // read is a bounded one; the full text stays in the artifact.
+      ...(projection && projection.message !== update.message
+        ? {
+            message: projection.message,
+            messageTruncated: true,
+            messageBytes: typeof update.message === "string" ? Buffer.byteLength(update.message) : null,
+            // Returned as a pointer, never rehydrated, exactly like every other
+            // artifact reference the inbox hands out.
+            messageArtifact: projection.messageArtifact ?? null
+          }
+        : { message: update.message }),
+      ...(projection?.schema?.truncated
+        ? {
+            requestedSchemaTruncated: true,
+            requestedSchemaBytes: projection.schema.bytes,
+            requestedSchemaArtifact: projection.schema.artifact
+          }
+        : { requestedSchema: update.requestedSchema }),
       toolCallId: update.toolCallId
     };
+    if (!this.#admitInboxItem(session, item)) return null;
     this.inbox.set(inboxId, item);
     this.#appendInboxCreated(item);
     this.schedulePersist();
     return item;
+  }
+
+  #admitInboxItem(session, item) {
+    setStablePayloadBytes(item);
+    const pending = [...this.inbox.values()].filter((candidate) => candidate.status === "pending");
+    const sessionBytes = pending
+      .filter((candidate) => candidate.sessionId === session.id)
+      .reduce((total, candidate) => total + inboxPayloadBytes(candidate), 0);
+    const rootBytes = pending
+      .filter((candidate) => candidate.ownerRootId === session.ownerRootId)
+      .reduce((total, candidate) => total + inboxPayloadBytes(candidate), 0);
+    const limit = item.payloadBytes > this.resourceLimits.maxInboxItemBytes
+      ? `item ${item.payloadBytes}/${this.resourceLimits.maxInboxItemBytes}`
+      : sessionBytes + item.payloadBytes > this.resourceLimits.maxPendingInboxBytesPerSession
+        ? `session ${sessionBytes + item.payloadBytes}/${this.resourceLimits.maxPendingInboxBytesPerSession}`
+        : rootBytes + item.payloadBytes > this.resourceLimits.maxPendingInboxBytesPerRoot
+          ? `root ${rootBytes + item.payloadBytes}/${this.resourceLimits.maxPendingInboxBytesPerRoot}`
+          : null;
+    if (!limit) return true;
+    try {
+      if (item.type === "permission_request") {
+        session.client?.respondPermission(item.requestId, null, session.acpSessionId);
+      } else {
+        session.client?.respondElicitation(item.requestId, { action: "cancel" }, session.acpSessionId);
+      }
+    } catch {
+      // The provider may have disconnected between admission and rejection.
+    }
+    this.store.push(session, {
+      type: "error",
+      errorCode: ERROR_CODES.INBOX_BUDGET_EXCEEDED,
+      text: `Inbox byte budget exceeded (${limit})`
+    });
+    return false;
   }
 
   resolveInbox(session, requestId, status, resolution) {
@@ -1878,6 +2083,16 @@ export class GatewayService {
         if (event.dataArtifact?.path) keepPaths.add(event.dataArtifact.path);
       }
     }
+    // An inbox row outlives the event it came from: the ring holds 200 events, and
+    // a pending request can easily be pushed out of it. Without this, the artifact
+    // behind an oversized tool call would be deleted under a request Main has not
+    // answered yet.
+    for (const item of this.inbox.values()) {
+      if (item.toolCallArtifact?.path) keepPaths.add(item.toolCallArtifact.path);
+      if (item.optionsArtifact?.path) keepPaths.add(item.optionsArtifact.path);
+      if (item.requestedSchemaArtifact?.path) keepPaths.add(item.requestedSchemaArtifact.path);
+      if (item.messageArtifact?.path) keepPaths.add(item.messageArtifact.path);
+    }
     if (this.artifactStore.prune(this.lifecycle.resultRetentionMs, now, keepPaths) > 0) changed = true;
 
     for (const [id, item] of this.inbox) {
@@ -1888,6 +2103,7 @@ export class GatewayService {
         changed = true;
       }
     }
+    if (this.#evictInboxHistory()) changed = true;
 
     for (const session of [...this.store.list()]) {
       const presence = this.rootPresence.get(session.ownerRootId);
@@ -1979,7 +2195,7 @@ export class GatewayService {
     if (!ACTIVE_STATUSES.has(session.status) || session.status === "restoring") return false;
     session.orphanCancelRequested = true;
     session.cancelRequested = true;
-    session.client?.cancelSession(session.acpSessionId);
+    this.#tellWorkerToCancel(session);
     this.store.push(session, { type: "orphan_cancel_requested" });
     this.interruptSessionInbox(session, "Main did not reconnect before the orphan grace period expired");
     this.#sealTurn(session);
@@ -2279,7 +2495,91 @@ function publicEvent(session, event) {
   };
 }
 
+// Oldest first, by when the row stopped being an obligation.
+function inboxAge(item) {
+  return item.resolvedAt ?? item.createdAt;
+}
+
+// Enough of an oversized tool call to recognize and answer it. The rest is in the
+// artifact both the event and the inbox row point at.
+function toolCallHead(toolCall) {
+  return { toolCallId: toolCall?.toolCallId, title: toolCall?.title, kind: toolCall?.kind };
+}
+
+function optionsHead(options) {
+  if (!Array.isArray(options)) return [];
+  return options.slice(0, 16).map((option) => ({
+    optionId: option?.optionId,
+    name: option?.name,
+    kind: option?.kind
+  }));
+}
+
+function inboxPayloadBytes(item) {
+  return Number.isFinite(item?.payloadBytes)
+    ? item.payloadBytes
+    : Buffer.byteLength(JSON.stringify(item ?? null));
+}
+
+function setStablePayloadBytes(item) {
+  let previous = -1;
+  while (item.payloadBytes !== previous) {
+    previous = item.payloadBytes;
+    item.payloadBytes = Buffer.byteLength(JSON.stringify(item));
+  }
+}
+
+function compactRecoveredInbox(record, maxBytes) {
+  const item = { ...record };
+  setStablePayloadBytes(item);
+  if (item.payloadBytes <= maxBytes) return item;
+  const compact = {
+    inboxId: item.inboxId,
+    ownerRootId: item.ownerRootId,
+    sessionId: item.sessionId,
+    turnId: item.turnId,
+    type: item.type,
+    status: item.status,
+    createdAt: item.createdAt,
+    resolvedAt: item.resolvedAt,
+    resolution: item.resolution,
+    requestId: item.requestId,
+    ...(item.toolCall ? { toolCall: toolCallHead(item.toolCall), toolCallTruncated: true } : {}),
+    ...(item.options ? { options: optionsHead(item.options), optionsTruncated: true } : {}),
+    ...(item.mode != null ? { mode: item.mode } : {}),
+    ...(item.message != null
+      ? { message: utf8ByteHead(String(item.message), EVENT_PAYLOAD_CAP_BYTES), messageTruncated: true }
+      : {}),
+    ...(item.requestedSchema != null ? { requestedSchemaTruncated: true } : {}),
+    ...(item.toolCallId != null ? { toolCallId: item.toolCallId } : {}),
+    recoveredPayloadTruncated: true
+  };
+  setStablePayloadBytes(compact);
+  if (compact.payloadBytes > maxBytes) {
+    delete compact.toolCall;
+    delete compact.options;
+    delete compact.message;
+    setStablePayloadBytes(compact);
+  }
+  return compact;
+}
+
+// Present only when something was actually truncated, so an ordinary row is
+// byte-identical to the one 1.3.2 returned. The pointer is returned as a pointer:
+// get() does not rehydrate an artifact, exactly like every other dataArtifact.
+const INBOX_PROJECTION_KEYS = [
+  "toolCallTruncated", "toolCallBytes", "toolCallArtifact",
+  "optionsTruncated", "optionsBytes", "optionsArtifact", "payloadBytes",
+  "recoveredPayloadTruncated",
+  "messageTruncated", "messageBytes", "messageArtifact",
+  "requestedSchemaTruncated", "requestedSchemaBytes", "requestedSchemaArtifact"
+];
+
 function publicInboxItem(item) {
+  const projection = {};
+  for (const key of INBOX_PROJECTION_KEYS) {
+    if (item[key] !== undefined) projection[key] = item[key];
+  }
   return {
     inboxId: item.inboxId,
     sessionId: item.sessionId,
@@ -2295,7 +2595,8 @@ function publicInboxItem(item) {
     mode: item.mode,
     message: item.message,
     requestedSchema: item.requestedSchema,
-    toolCallId: item.toolCallId
+    toolCallId: item.toolCallId,
+    ...projection
   };
 }
 

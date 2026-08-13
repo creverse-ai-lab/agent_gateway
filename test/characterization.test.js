@@ -50,17 +50,31 @@ const PERSISTENCE_KEYS = sorted([
   "healthy", "error", "stateSchemaVersion", "mode", "walSeq", "walBytes", "snapshotEpoch",
   "fsyncCount", "lastRecovery"
 ]);
+// GOLDEN DIFF (1.4.0 PR 5): resourceLimits grows from 8 fields to 15. Every
+// addition is a budget that was previously either absent or a literal buried in
+// the code, and each one is a flat number because Main renders this object
+// directly. Additive: nothing here was renamed or removed.
 const RESOURCE_LIMIT_KEYS = sorted([
   "maxEvents", "maxTextBytes", "maxInlineResultBytes", "maxArtifactBytes", "maxArtifactTotalBytes",
-  "maxTerminalsPerSession", "maxPendingRequestsPerSession", "maxFrameBytes"
+  "maxTerminalsPerSession", "maxPendingRequestsPerSession", "maxFrameBytes",
+  "maxQueueBytes", "writeTimeoutMs", "maxPromptBytes", "maxFileReadBytes",
+  "maxTerminalOutputBytes", "maxSessionsPerRoot", "maxInboxHistoryPerRoot",
+  "maxInboxItemBytes", "maxPendingInboxBytesPerSession", "maxPendingInboxBytesPerRoot"
 ]);
 const METRICS_KEYS = sorted([
   "startedAt", "pollResponses", "pollBytes", "eventBytes", "resultBytes", "eventsByType"
 ]);
-// publicInboxItem() fields: list returns the same full record as get in 1.3.2.
+// publicInboxItem() fields: list returns the same record as get, and for a row
+// under the payload cap that record is byte-identical to 1.3.2's.
 const INBOX_ITEM_KEYS = sorted([
   "inboxId", "sessionId", "turnId", "type", "status", "createdAt", "resolvedAt", "resolution",
-  "requestId", "toolCall", "options", "mode", "message", "requestedSchema", "toolCallId"
+  "requestId", "toolCall", "options", "mode", "message", "requestedSchema", "toolCallId", "payloadBytes"
+]);
+// GOLDEN DIFF (1.4.0 PR 5, G4): a row whose tool call exceeded the 4000-byte
+// payload cap gains these three, and only then. The truncation is now visible
+// instead of the row silently holding a second copy of the whole payload.
+const INBOX_TRUNCATED_ITEM_KEYS = sorted([
+  ...INBOX_ITEM_KEYS, "toolCallTruncated", "toolCallBytes", "toolCallArtifact"
 ]);
 // publicTask() fields.
 const TASK_KEYS = sorted([
@@ -206,17 +220,37 @@ test("characterization: inbox list returns the same full payload as inbox get", 
       options: [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }]
     });
 
+    // A second request whose tool call is comfortably under the cap: this row is
+    // the one that must not have changed at all.
+    service.handleUpdate(session, {
+      sessionUpdate: "permission_request",
+      requestId: 12,
+      toolCall: { toolCallId: "tool-small", title: "Read file", kind: "read", rawInput: "small" },
+      options: [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }]
+    });
+
+    await waitForInboxCount(service, 2);
     const listed = await service.call("inbox", { action: "list" }, MAIN);
     assert.deepEqual(sorted(Object.keys(listed)), sorted(["ok", "items"]));
-    assert.equal(listed.items.length, 1);
-    const item = listed.items[0];
-    assert.deepEqual(sorted(Object.keys(item)), INBOX_ITEM_KEYS);
+    assert.equal(listed.items.length, 2);
+    const small = listed.items.find((row) => row.toolCall.toolCallId === "tool-small");
+    const item = listed.items.find((row) => row.toolCall.toolCallId === "tool-big");
+    // Unchanged from 1.3.2: an ordinary row is the full record, same key set.
+    assert.deepEqual(sorted(Object.keys(small)), INBOX_ITEM_KEYS);
+    assert.equal(small.toolCall.rawInput, "small");
+    // GOLDEN DIFF (1.4.0 PR 5, G4): the oversized row keeps the head Main needs and
+    // points at the artifact the event path already wrote, rather than carrying a
+    // second full copy of a payload only that artifact is ever read for.
+    assert.deepEqual(sorted(Object.keys(item)), INBOX_TRUNCATED_ITEM_KEYS);
+    assert.equal(item.toolCall.rawInput, undefined);
+    assert.equal(item.toolCallTruncated, true);
+    assert.ok(item.toolCallBytes > rawInput.length);
+    assert.equal(typeof item.toolCallArtifact.path, "string");
     const got = await service.call("inbox", { action: "get", inboxId: item.inboxId }, MAIN);
     assert.deepEqual(sorted(Object.keys(got)), sorted(["ok", "item"]));
-    // 1.3.2 contract: list is not a summary. It hands out the full record,
-    // including the oversized rawInput that the delivered event had to cap.
+    // Preserved: list is not a summary. Whatever get returns, list returned too —
+    // and get returns the pointer rather than rehydrating the artifact.
     assert.deepEqual(item, got.item);
-    assert.equal(item.toolCall.rawInput, rawInput);
     assert.equal(item.status, "pending");
     assert.equal(item.type, "permission_request");
   } finally {
@@ -442,4 +476,13 @@ async function waitForIdle(service, sessionId) {
     if (["error", "unavailable"].includes(poll.status)) throw new Error(poll.error);
   }
   throw new Error("Gateway session did not become idle");
+}
+
+async function waitForInboxCount(service, expected) {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const inbox = await service.call("inbox", { action: "list", status: "pending" }, MAIN);
+    if (inbox.items.length === expected) return inbox.items;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`Gateway inbox did not reach ${expected} pending items`);
 }

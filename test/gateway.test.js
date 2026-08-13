@@ -473,8 +473,30 @@ test("Gateway caps chunk and permission payload copies while keeping full data r
     assert.deepEqual(permission.toolCall, { toolCallId: "tool-big", title: "Edit file", kind: "edit" });
     assert.equal(JSON.parse(await readFile(permission.dataArtifact.path, "utf8")).rawInput.length, 10_000);
     assert.deepEqual(permission.options, [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }]);
+    // GOLDEN DIFF (1.4.0 PR 5): the inbox row no longer keeps its own full copy of
+    // an oversized tool call. The event path already spilled this exact payload to
+    // an artifact at this exact threshold, so the row keeps the head Main needs and
+    // points at that file. One threshold, one artifact, two consumers.
     const inbox = await service.call("inbox", { action: "list", status: "pending" }, { rootId: "main-a" });
-    assert.equal(inbox.items[0].toolCall.rawInput.length, 10_000, "inbox keeps the full tool call");
+    const row = inbox.items[0];
+    assert.equal(row.toolCall.rawInput, undefined, "inbox stops holding the oversized payload");
+    assert.deepEqual(row.toolCall, { toolCallId: "tool-big", title: "Edit file", kind: "edit" });
+    assert.equal(row.toolCallTruncated, true);
+    assert.ok(row.toolCallBytes > 10_000);
+    assert.equal(row.toolCallArtifact.path, permission.dataArtifact.path, "both consumers share one artifact");
+    // get() returns the pointer rather than rehydrating it, like every other
+    // artifact reference in the API.
+    const got = await service.call("inbox", { action: "get", inboxId: row.inboxId }, { rootId: "main-a" });
+    assert.equal(got.item.toolCallArtifact.path, row.toolCallArtifact.path);
+    assert.equal(got.item.toolCall.rawInput, undefined);
+    assert.equal(
+      JSON.parse(await readFile(row.toolCallArtifact.path, "utf8")).rawInput.length,
+      10_000,
+      "and the full tool call is still recoverable through it"
+    );
+    // The options Main chooses between are always inline: they are small, and they
+    // are the whole point of the row.
+    assert.deepEqual(row.options, [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }]);
     const detail = await service.call(
       "session",
       { action: "get", sessionId: session.id, includeTranscript: true },
@@ -947,6 +969,63 @@ test("Gateway cancels active sessions after the disconnected owner grace period"
     await waitForStatus(service, opened.sessionId, "cancelled");
     assert.equal(service.requireSession(opened.sessionId).client.terminals.size, 0);
     assert.equal((await service.call("task_get", { taskId: task.taskId }, { rootId: "main-a" })).status, "cancelled");
+  } finally {
+    await service.shutdown().catch(() => {});
+  }
+});
+
+// Telling the worker is a write to a bounded channel now, and a congested or
+// closed one refuses the frame instead of dropping it. The cancellation intent is
+// already recorded by the time that happens, and the flag that records it
+// suppresses every later attempt — so a throw escaping here left the session
+// wedged mid-cancel forever: no seal, no finalized result, no terminal status, and
+// nothing that would ever try again.
+test("a worker that cannot be told about a cancel is still sealed and finalized", async () => {
+  let clock = Date.now();
+  const makeClient = (_provider, options) =>
+    new AcpClient({ provider: "mock", command: process.execPath, args: [capabilityAgent], permissionPolicy: "auto_approve" }, options);
+  const service = new GatewayService({ createClient: makeClient, gcIntervalMs: 0, orphanGraceMs: 10, now: () => clock });
+  try {
+    service.attachRoot("main-a");
+    const opened = await service.call("session_open", { provider: "claude", cwd: process.cwd(), permissionPolicy: "auto_approve" }, { rootId: "main-a" });
+    const task = await service.call("task_prompt", { sessionId: opened.sessionId, prompt: "long-terminal" }, { rootId: "main-a" });
+    await waitForTerminalCount(service, opened.sessionId, 1);
+    const session = service.requireSession(opened.sessionId);
+    session.client.cancelSession = () => {
+      throw new Error("Transport normal lane exceeded 1500000 queued bytes");
+    };
+    service.detachRoot("main-a");
+    clock += 11;
+    await service.runMaintenance();
+    await waitForStatus(service, opened.sessionId, "cancelled");
+    assert.equal(session.orphanCancelRequested, true);
+    assert.equal(session.stopReason, "cancelled");
+    // The task is the handle Main is holding: without the terminal state it waits
+    // on a result that can never arrive.
+    assert.equal((await service.call("task_get", { taskId: task.taskId }, { rootId: "main-a" })).status, "cancelled");
+    assert.equal(session.events.some((event) => event.type === "turn_end"), true);
+  } finally {
+    await service.shutdown().catch(() => {});
+  }
+});
+
+test("an explicit cancel a worker cannot be told about still moves the session", async () => {
+  const makeClient = (_provider, options) =>
+    new AcpClient({ provider: "mock", command: process.execPath, args: [capabilityAgent], permissionPolicy: "auto_approve" }, options);
+  const service = new GatewayService({ createClient: makeClient, gcIntervalMs: 0 });
+  try {
+    service.attachRoot("main-a");
+    const opened = await service.call("session_open", { provider: "claude", cwd: process.cwd(), permissionPolicy: "auto_approve" }, { rootId: "main-a" });
+    await service.call("task_prompt", { sessionId: opened.sessionId, prompt: "long-terminal" }, { rootId: "main-a" });
+    await waitForTerminalCount(service, opened.sessionId, 1);
+    const session = service.requireSession(opened.sessionId);
+    session.client.cancelSession = () => {
+      throw new Error("Transport is closed");
+    };
+    const result = await service.call("cancel", { sessionId: opened.sessionId }, { rootId: "main-a" });
+    assert.equal(result.ok, true);
+    assert.equal(session.status, "cancelling");
+    assert.equal(session.cancelRequested, true);
   } finally {
     await service.shutdown().catch(() => {});
   }

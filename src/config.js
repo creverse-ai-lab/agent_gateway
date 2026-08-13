@@ -42,7 +42,23 @@ export function gatewayLifecycleConfig() {
     maxArtifactTotalBytes: numberEnv("ACP_GATEWAY_MAX_ARTIFACT_TOTAL_BYTES", 512 * 1024 * 1024, 1),
     maxTerminalsPerSession: numberEnv("ACP_GATEWAY_MAX_TERMINALS_PER_SESSION", 16, 1),
     maxPendingRequestsPerSession: numberEnv("ACP_GATEWAY_MAX_PENDING_REQUESTS_PER_SESSION", 64, 1),
-    maxFrameBytes: numberEnv("ACP_GATEWAY_MAX_FRAME_BYTES", 32 * 1024 * 1024, 1024)
+    maxInboxItemBytes: numberEnv("ACP_GATEWAY_MAX_INBOX_ITEM_BYTES", 64 * 1024, 1024),
+    maxPendingInboxBytesPerSession: numberEnv("ACP_GATEWAY_MAX_PENDING_INBOX_BYTES_PER_SESSION", 512 * 1024, 1024),
+    maxPendingInboxBytesPerRoot: numberEnv("ACP_GATEWAY_MAX_PENDING_INBOX_BYTES_PER_ROOT", 4 * 1024 * 1024, 1024),
+    maxFrameBytes: numberEnv("ACP_GATEWAY_MAX_FRAME_BYTES", 32 * 1024 * 1024, 1024),
+    // Per-connection write budget and stall deadline for every NDJSON transport.
+    // The default is today's MAX_CONNECTION_BUFFER_BYTES, split into lane shares
+    // inside the channel rather than configured lane by lane.
+    maxQueueBytes: numberEnv("ACP_GATEWAY_MAX_QUEUE_BYTES", 4_000_000, 1024),
+    writeTimeoutMs: numberEnv("ACP_GATEWAY_WRITE_TIMEOUT_MS", 10_000, 0),
+    // Session-tier budgets: what one turn, one file read and one terminal answer
+    // may cost.
+    maxPromptBytes: numberEnv("ACP_GATEWAY_MAX_PROMPT_BYTES", 1_000_000, 1024),
+    maxFileReadBytes: numberEnv("ACP_GATEWAY_MAX_FILE_READ_BYTES", 500_000, 1024),
+    maxTerminalOutputBytes: numberEnv("ACP_GATEWAY_MAX_TERMINAL_OUTPUT_BYTES", 10_000_000, 1024),
+    // Root-tier budgets: how much a single Main may hold at once.
+    maxSessionsPerRoot: numberEnv("ACP_GATEWAY_MAX_SESSIONS_PER_ROOT", 64, 1),
+    maxInboxHistoryPerRoot: numberEnv("ACP_GATEWAY_MAX_INBOX_HISTORY_PER_ROOT", 1_000, 1)
   };
 }
 
