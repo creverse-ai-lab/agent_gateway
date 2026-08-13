@@ -58,7 +58,7 @@
         }
       },
       "auggie": {
-        "version": "0.34.0",
+        "version": "0.35.0",
         "distribution": {
           "npx": {
             "args": [
@@ -67,7 +67,7 @@
             "env": {
               "AUGMENT_DISABLE_AUTO_UPDATE": "1"
             },
-            "package": "@augmentcode/auggie@0.34.0"
+            "package": "@augmentcode/auggie@0.35.0"
           }
         }
       },
@@ -80,21 +80,21 @@
         }
       },
       "claude-acp": {
-        "version": "0.64.2",
+        "version": "0.66.0",
         "distribution": {
           "npx": {
-            "package": "@agentclientprotocol/claude-agent-acp@0.64.2"
+            "package": "@agentclientprotocol/claude-agent-acp@0.66.0"
           }
         }
       },
       "cline": {
-        "version": "3.0.49",
+        "version": "3.0.53",
         "distribution": {
           "npx": {
             "args": [
               "--acp"
             ],
-            "package": "cline@3.0.49"
+            "package": "cline@3.0.53"
           }
         }
       },
@@ -110,10 +110,10 @@
         }
       },
       "codex-acp": {
-        "version": "1.1.9",
+        "version": "1.2.0",
         "distribution": {
           "npx": {
-            "package": "@agentclientprotocol/codex-acp@1.1.9"
+            "package": "@agentclientprotocol/codex-acp@1.2.0"
           }
         }
       },
@@ -296,46 +296,46 @@
         }
       },
       "devin": {
-        "version": "3000.3.27",
+        "version": "3000.4.16",
         "distribution": {
           "binary": {
             "darwin-aarch64": {
-              "archive": "https://static.devin.ai/cli/3000.3.27/devin-3000.3.27-aarch64-apple-darwin.tar.gz",
+              "archive": "https://static.devin.ai/cli/3000.4.16/devin-3000.4.16-aarch64-apple-darwin.tar.gz",
               "args": [
                 "acp"
               ],
               "cmd": "./bin/devin"
             },
             "darwin-x86_64": {
-              "archive": "https://static.devin.ai/cli/3000.3.27/devin-3000.3.27-x86_64-apple-darwin.tar.gz",
+              "archive": "https://static.devin.ai/cli/3000.4.16/devin-3000.4.16-x86_64-apple-darwin.tar.gz",
               "args": [
                 "acp"
               ],
               "cmd": "./bin/devin"
             },
             "linux-aarch64": {
-              "archive": "https://static.devin.ai/cli/3000.3.27/devin-3000.3.27-aarch64-unknown-linux.tar.gz",
+              "archive": "https://static.devin.ai/cli/3000.4.16/devin-3000.4.16-aarch64-unknown-linux.tar.gz",
               "args": [
                 "acp"
               ],
               "cmd": "./bin/devin"
             },
             "linux-x86_64": {
-              "archive": "https://static.devin.ai/cli/3000.3.27/devin-3000.3.27-x86_64-unknown-linux.tar.gz",
+              "archive": "https://static.devin.ai/cli/3000.4.16/devin-3000.4.16-x86_64-unknown-linux.tar.gz",
               "args": [
                 "acp"
               ],
               "cmd": "./bin/devin"
             },
             "windows-aarch64": {
-              "archive": "https://static.devin.ai/cli/3000.3.27/devin-3000.3.27-aarch64-pc-windows.zip",
+              "archive": "https://static.devin.ai/cli/3000.4.16/devin-3000.4.16-aarch64-pc-windows.zip",
               "args": [
                 "acp"
               ],
               "cmd": "./bin\\devin.exe"
             },
             "windows-x86_64": {
-              "archive": "https://static.devin.ai/cli/3000.3.27/devin-3000.3.27-x86_64-pc-windows.zip",
+              "archive": "https://static.devin.ai/cli/3000.4.16/devin-3000.4.16-x86_64-pc-windows.zip",
               "args": [
                 "acp"
               ],
@@ -345,29 +345,29 @@
         }
       },
       "dimcode": {
-        "version": "0.3.1",
+        "version": "0.3.11",
         "distribution": {
           "npx": {
             "args": [
               "acp"
             ],
-            "package": "dimcode@0.3.1"
+            "package": "dimcode@0.3.11"
           }
         }
       },
       "dirac": {
-        "version": "0.4.32",
+        "version": "0.4.35",
         "distribution": {
           "npx": {
             "args": [
               "--acp"
             ],
-            "package": "dirac-cli@0.4.32"
+            "package": "dirac-cli@0.4.35"
           }
         }
       },
       "factory-droid": {
-        "version": "0.186.0",
+        "version": "0.195.0",
         "distribution": {
           "npx": {
             "args": [
@@ -379,7 +379,7 @@
               "DROID_DISABLE_AUTO_UPDATE": "true",
               "FACTORY_DROID_AUTO_UPDATE_ENABLED": "false"
             },
-            "package": "droid@0.186.0"
+            "package": "droid@0.195.0"
           }
         }
       },
@@ -395,24 +395,24 @@
         }
       },
       "gemini": {
-        "version": "0.53.1",
+        "version": "0.55.1",
         "distribution": {
           "npx": {
             "args": [
               "--acp"
             ],
-            "package": "@google/gemini-cli@0.53.1"
+            "package": "@google/gemini-cli@0.55.1"
           }
         }
       },
       "github-copilot-cli": {
-        "version": "1.0.77",
+        "version": "1.0.79",
         "distribution": {
           "npx": {
             "args": [
               "--acp"
             ],
-            "package": "@github/copilot@1.0.77"
+            "package": "@github/copilot@1.0.79"
           }
         }
       },
@@ -425,157 +425,157 @@
         }
       },
       "goose": {
-        "version": "1.45.0",
+        "version": "1.46.0",
         "distribution": {
           "binary": {
             "darwin-aarch64": {
-              "archive": "https://github.com/block/goose/releases/download/v1.45.0/goose-aarch64-apple-darwin.tar.bz2",
+              "archive": "https://github.com/block/goose/releases/download/v1.46.0/goose-aarch64-apple-darwin.tar.bz2",
               "args": [
                 "acp"
               ],
               "cmd": "./goose",
-              "sha256": "3a1b41197ff670c36b0b6285f41ccd949966ee037933f38c5e11c9356799ce58"
+              "sha256": "de263fb06839de31345dff08aeba999ba165b023cd3cec7ec3bef20f6f4f7e73"
             },
             "darwin-x86_64": {
-              "archive": "https://github.com/block/goose/releases/download/v1.45.0/goose-x86_64-apple-darwin.tar.bz2",
+              "archive": "https://github.com/block/goose/releases/download/v1.46.0/goose-x86_64-apple-darwin.tar.bz2",
               "args": [
                 "acp"
               ],
               "cmd": "./goose",
-              "sha256": "ab45c8c14ce10a2951b0b1f314a23f297c2206a10af121a01d4e347cc4042ab1"
+              "sha256": "b5b66f5d4966aac74998c63420c98b3e289ae498f0c120463ac0b8dbc2a40083"
             },
             "linux-aarch64": {
-              "archive": "https://github.com/block/goose/releases/download/v1.45.0/goose-aarch64-unknown-linux-gnu.tar.bz2",
+              "archive": "https://github.com/block/goose/releases/download/v1.46.0/goose-aarch64-unknown-linux-gnu.tar.bz2",
               "args": [
                 "acp"
               ],
               "cmd": "./goose",
-              "sha256": "54afad8e160068cb1769ca2ad3e19e36e8472775e68d7bc89cc90e7779c552d1"
+              "sha256": "b56da65ab1004832ce5524ed40ec6fbe38ba84dae654d0a8eb86be9d90086cf6"
             },
             "linux-x86_64": {
-              "archive": "https://github.com/block/goose/releases/download/v1.45.0/goose-x86_64-unknown-linux-gnu.tar.bz2",
+              "archive": "https://github.com/block/goose/releases/download/v1.46.0/goose-x86_64-unknown-linux-gnu.tar.bz2",
               "args": [
                 "acp"
               ],
               "cmd": "./goose",
-              "sha256": "ec5da5f018cf68ea446887d30decf847542035ffcf91536d1d134ed94bb24401"
+              "sha256": "a1cf4856a765d07d6b95689a53c7bca21fcc6e6d65c0dfd064fc704052b85a7b"
             },
             "windows-x86_64": {
-              "archive": "https://github.com/block/goose/releases/download/v1.45.0/goose-x86_64-pc-windows-msvc.zip",
+              "archive": "https://github.com/block/goose/releases/download/v1.46.0/goose-x86_64-pc-windows-msvc.zip",
               "args": [
                 "acp"
               ],
               "cmd": "./goose-package\\goose.exe",
-              "sha256": "6d9853bdc614cdbae41d700075953ddbdc28264f8c0e8f2b7fd3d859ffb1c762"
+              "sha256": "a903273d165c4b2ac3d30aa861f2e00753b07a5d24d24e37b65e36c86f937a76"
             }
           }
         }
       },
       "grok-build": {
-        "version": "0.2.119",
+        "version": "1.0.3",
         "distribution": {
           "npx": {
             "args": [
               "agent",
               "stdio"
             ],
-            "package": "@xai-official/grok@0.2.119"
+            "package": "@xai-official/grok@1.0.3"
           }
         }
       },
       "harn": {
-        "version": "0.10.52",
+        "version": "0.10.87",
         "distribution": {
           "binary": {
             "darwin-aarch64": {
-              "archive": "https://github.com/burin-labs/harn/releases/download/v0.10.52/harn-aarch64-apple-darwin.tar.gz",
+              "archive": "https://github.com/burin-labs/harn/releases/download/v0.10.87/harn-aarch64-apple-darwin.tar.gz",
               "args": [
                 "serve",
                 "acp"
               ],
               "cmd": "./harn",
-              "sha256": "3a895f18773cae88fc33aa038b6e24e9766be2aea760e47f05088b5317ab3df2"
+              "sha256": "1f2122ae5bbeef58e9ec71607b6dfde1ba992e7fad4dd690a8ae12ebf3b268c0"
             },
             "darwin-x86_64": {
-              "archive": "https://github.com/burin-labs/harn/releases/download/v0.10.52/harn-x86_64-apple-darwin.tar.gz",
+              "archive": "https://github.com/burin-labs/harn/releases/download/v0.10.87/harn-x86_64-apple-darwin.tar.gz",
               "args": [
                 "serve",
                 "acp"
               ],
               "cmd": "./harn",
-              "sha256": "cbbe646735848ab72de2590567a4b3a7fb3c7c8206a41790bfd1d03fc6c99a7b"
+              "sha256": "bf9bbcdcab47a1c4edb1b1e1c435c9fdce0e2995476c74ffafeffc0c5aeddfcb"
             },
             "linux-aarch64": {
-              "archive": "https://github.com/burin-labs/harn/releases/download/v0.10.52/harn-aarch64-unknown-linux-gnu.tar.gz",
+              "archive": "https://github.com/burin-labs/harn/releases/download/v0.10.87/harn-aarch64-unknown-linux-gnu.tar.gz",
               "args": [
                 "serve",
                 "acp"
               ],
               "cmd": "./harn",
-              "sha256": "4d0b98dd6a40c4ee3061572527ce65a76a86d44846e55340d262d71087337624"
+              "sha256": "b59bc7c7bdb15746e26623e41a4f7b73f619823bf5c50b089867ed17bb0504e2"
             },
             "linux-x86_64": {
-              "archive": "https://github.com/burin-labs/harn/releases/download/v0.10.52/harn-x86_64-unknown-linux-gnu.tar.gz",
+              "archive": "https://github.com/burin-labs/harn/releases/download/v0.10.87/harn-x86_64-unknown-linux-gnu.tar.gz",
               "args": [
                 "serve",
                 "acp"
               ],
               "cmd": "./harn",
-              "sha256": "aaf517a9c6be0a0daea04171396ba6fe1e06f20f47ae3adc4cf13cf45eae1e56"
+              "sha256": "3d602bc739ed501aa290367d0d9592ba6cb795f9aeaac5d0ad77ccd3ad2b37d1"
             },
             "windows-x86_64": {
-              "archive": "https://github.com/burin-labs/harn/releases/download/v0.10.52/harn-x86_64-pc-windows-msvc.zip",
+              "archive": "https://github.com/burin-labs/harn/releases/download/v0.10.87/harn-x86_64-pc-windows-msvc.zip",
               "args": [
                 "serve",
                 "acp"
               ],
               "cmd": "harn.exe",
-              "sha256": "206ce39b5a51e63bc953c1d9286b4315e7859fcfaedb2e91afad5c065b104aab"
+              "sha256": "9e77d2152775c99351faac90427ec607d820b761a036089700b8349f1f8b20cf"
             }
           }
         }
       },
       "junie": {
-        "version": "2383.10.0",
+        "version": "2783.3.0",
         "distribution": {
           "binary": {
             "darwin-aarch64": {
-              "archive": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-macos-aarch64.zip",
+              "archive": "https://github.com/JetBrains/junie-acp-release/releases/download/2783.3/junie-release-2783.3-macos-aarch64.zip",
               "args": [
                 "--acp=true"
               ],
               "cmd": "./Applications/junie.app/Contents/MacOS/junie"
             },
             "darwin-x86_64": {
-              "archive": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-macos-amd64.zip",
+              "archive": "https://github.com/JetBrains/junie-acp-release/releases/download/2783.3/junie-release-2783.3-macos-amd64.zip",
               "args": [
                 "--acp=true"
               ],
               "cmd": "./Applications/junie.app/Contents/MacOS/junie"
             },
             "linux-aarch64": {
-              "archive": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-linux-aarch64.zip",
+              "archive": "https://github.com/JetBrains/junie-acp-release/releases/download/2783.3/junie-release-2783.3-linux-aarch64.zip",
               "args": [
                 "--acp=true"
               ],
               "cmd": "./junie-app/bin/junie"
             },
             "linux-x86_64": {
-              "archive": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-linux-amd64.zip",
+              "archive": "https://github.com/JetBrains/junie-acp-release/releases/download/2783.3/junie-release-2783.3-linux-amd64.zip",
               "args": [
                 "--acp=true"
               ],
               "cmd": "./junie-app/bin/junie"
             },
             "windows-aarch64": {
-              "archive": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-windows-aarch64.zip",
+              "archive": "https://github.com/JetBrains/junie-acp-release/releases/download/2783.3/junie-release-2783.3-windows-aarch64.zip",
               "args": [
                 "--acp=true"
               ],
               "cmd": "./junie/junie.exe"
             },
             "windows-x86_64": {
-              "archive": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-windows-amd64.zip",
+              "archive": "https://github.com/JetBrains/junie-acp-release/releases/download/2783.3/junie-release-2783.3-windows-amd64.zip",
               "args": [
                 "--acp=true"
               ],
@@ -585,55 +585,55 @@
         }
       },
       "kilo": {
-        "version": "7.4.17",
+        "version": "7.4.21",
         "distribution": {
           "binary": {
             "darwin-aarch64": {
-              "archive": "https://github.com/Kilo-Org/kilocode/releases/download/v7.4.17/kilo-darwin-arm64.zip",
+              "archive": "https://github.com/Kilo-Org/kilocode/releases/download/v7.4.21/kilo-darwin-arm64.zip",
               "args": [
                 "acp"
               ],
               "cmd": "./kilo",
-              "sha256": "b51f33f7c47fb77c6252fcacfc20ba7c90a979ecd757cc9aadb246338f8c266a"
+              "sha256": "adfdd4f116f9680716e1f1e896ac64588cb35b24e38d3c8ab4c77e0b4a21a422"
             },
             "darwin-x86_64": {
-              "archive": "https://github.com/Kilo-Org/kilocode/releases/download/v7.4.17/kilo-darwin-x64.zip",
+              "archive": "https://github.com/Kilo-Org/kilocode/releases/download/v7.4.21/kilo-darwin-x64.zip",
               "args": [
                 "acp"
               ],
               "cmd": "./kilo",
-              "sha256": "4670655e95869ff25b398d5c24b0a9c890ebef18dc23af4c6faa586c97d75cc9"
+              "sha256": "ac31ce4362ef8977d42a1e904be80939cd0adcffd8079ac8835119c7bf2b2eac"
             },
             "linux-aarch64": {
-              "archive": "https://github.com/Kilo-Org/kilocode/releases/download/v7.4.17/kilo-linux-arm64.tar.gz",
+              "archive": "https://github.com/Kilo-Org/kilocode/releases/download/v7.4.21/kilo-linux-arm64.tar.gz",
               "args": [
                 "acp"
               ],
               "cmd": "./kilo",
-              "sha256": "b0342209411e4e16a161541e36b7d01d6972e965abea1c13c2e0eec021acfdf7"
+              "sha256": "c52d02b4851be432b8355be9988036ddb98ae7eb926bfc32cb96b260451f5942"
             },
             "linux-x86_64": {
-              "archive": "https://github.com/Kilo-Org/kilocode/releases/download/v7.4.17/kilo-linux-x64.tar.gz",
+              "archive": "https://github.com/Kilo-Org/kilocode/releases/download/v7.4.21/kilo-linux-x64.tar.gz",
               "args": [
                 "acp"
               ],
               "cmd": "./kilo",
-              "sha256": "8bc8b4918c0634c185e1c54be049b4110b9e37d59f3dc93c6411d63c23b11034"
+              "sha256": "4f5fa03fa5d37f9c3372772d1827fa4271a8598855978bafff194b150efa3a95"
             },
             "windows-x86_64": {
-              "archive": "https://github.com/Kilo-Org/kilocode/releases/download/v7.4.17/kilo-windows-x64.zip",
+              "archive": "https://github.com/Kilo-Org/kilocode/releases/download/v7.4.21/kilo-windows-x64.zip",
               "args": [
                 "acp"
               ],
               "cmd": "./kilo.exe",
-              "sha256": "4313a14a20ab3609702ab3c52e232f28aba52bbd7eb41853297ba947a452d4d2"
+              "sha256": "143d34eb7d9d959f7d6226c6030264a181d6d96222c5ecf42a7528e68111f091"
             }
           },
           "npx": {
             "args": [
               "acp"
             ],
-            "package": "@kilocode/cli@7.4.17"
+            "package": "@kilocode/cli@7.4.21"
           }
         }
       },
@@ -696,99 +696,99 @@
         }
       },
       "mistral-vibe": {
-        "version": "2.23.2",
+        "version": "2.24.1",
         "distribution": {
           "binary": {
             "darwin-aarch64": {
-              "archive": "https://github.com/mistralai/mistral-vibe/releases/download/v2.23.2/vibe-acp-darwin-aarch64-2.23.2.zip",
+              "archive": "https://github.com/mistralai/mistral-vibe/releases/download/v2.24.1/vibe-acp-darwin-aarch64-2.24.1.tar.gz",
               "cmd": "./vibe-acp",
-              "sha256": "548f5aaff1a7a5569ab74952078f54a1ac363500e4dba16e7962f7cf49b30ce5"
+              "sha256": "4faa3ed31454ee739fac2d5ff052c56056b175611a7b7ace0a4191f2bf83ba93"
             },
             "darwin-x86_64": {
-              "archive": "https://github.com/mistralai/mistral-vibe/releases/download/v2.23.2/vibe-acp-darwin-x86_64-2.23.2.zip",
+              "archive": "https://github.com/mistralai/mistral-vibe/releases/download/v2.24.1/vibe-acp-darwin-x86_64-2.24.1.tar.gz",
               "cmd": "./vibe-acp",
-              "sha256": "4576b323f113e1deda3d314abbc7ab8f81562694343deaebba161db2e2c8cdbd"
+              "sha256": "97d512a02e97fb828824cfb7b72734574f086d0442851c5fdfb432d7dabfa88a"
             },
             "linux-aarch64": {
-              "archive": "https://github.com/mistralai/mistral-vibe/releases/download/v2.23.2/vibe-acp-linux-aarch64-2.23.2.zip",
+              "archive": "https://github.com/mistralai/mistral-vibe/releases/download/v2.24.1/vibe-acp-linux-aarch64-2.24.1.tar.gz",
               "cmd": "./vibe-acp",
-              "sha256": "9d32b224a089418e268a87effc6dbe37570c7cc92c0b541ce2c761cc03ab72ae"
+              "sha256": "e43913b43f0666df2a42060cd3bd410805b0ca1218843b0c242edf874a78c31a"
             },
             "linux-x86_64": {
-              "archive": "https://github.com/mistralai/mistral-vibe/releases/download/v2.23.2/vibe-acp-linux-x86_64-2.23.2.zip",
+              "archive": "https://github.com/mistralai/mistral-vibe/releases/download/v2.24.1/vibe-acp-linux-x86_64-2.24.1.tar.gz",
               "cmd": "./vibe-acp",
-              "sha256": "8e8bfef60afc3261caf5962279679d80a1fd916cf9faf3bff68f4d392f0a6915"
+              "sha256": "8e87f581e7c292fbeab7377178e947ddc4e83753c409f1db0760631f11d7083c"
             },
             "windows-x86_64": {
-              "archive": "https://github.com/mistralai/mistral-vibe/releases/download/v2.23.2/vibe-acp-windows-x86_64-2.23.2.zip",
+              "archive": "https://github.com/mistralai/mistral-vibe/releases/download/v2.24.1/vibe-acp-windows-x86_64-2.24.1.zip",
               "cmd": "./vibe-acp.exe",
-              "sha256": "eb2a9043d1693d5ed9c28415567ee9949ff679700a26b96b4cfb5866fbb79a04"
+              "sha256": "a66329ff18845f8e810359910e8da15bb2071648159c13a10838e5ae7a7d9b81"
             }
           }
         }
       },
       "nova": {
-        "version": "1.1.31",
+        "version": "1.1.33",
         "distribution": {
           "npx": {
             "args": [
               "acp"
             ],
-            "package": "@compass-ai/nova@1.1.31"
+            "package": "@compass-ai/nova@1.1.33"
           }
         }
       },
       "opencode": {
-        "version": "1.18.11",
+        "version": "1.18.18",
         "distribution": {
           "binary": {
             "darwin-aarch64": {
-              "archive": "https://github.com/anomalyco/opencode/releases/download/v1.18.11/opencode-darwin-arm64.zip",
+              "archive": "https://github.com/anomalyco/opencode/releases/download/v1.18.18/opencode-darwin-arm64.zip",
               "args": [
                 "acp"
               ],
               "cmd": "./opencode",
-              "sha256": "188ff6a716bcd40e33ac62f17f4aec9bd760164fa6a2cde66f779a5db4abc7ce"
+              "sha256": "7d668bf26496fec8686d4e51ebb1ac2bd2e393f0c1620aa696c4c242a9e5806a"
             },
             "darwin-x86_64": {
-              "archive": "https://github.com/anomalyco/opencode/releases/download/v1.18.11/opencode-darwin-x64.zip",
+              "archive": "https://github.com/anomalyco/opencode/releases/download/v1.18.18/opencode-darwin-x64.zip",
               "args": [
                 "acp"
               ],
               "cmd": "./opencode",
-              "sha256": "95953ab2aca4322b90690bf34697cc9b47b6a7c72f78e7c469056fb589124d31"
+              "sha256": "9581bd7683a7528456179fb11e3377d9ef568e10a935611a2c6722e349454d83"
             },
             "linux-aarch64": {
-              "archive": "https://github.com/anomalyco/opencode/releases/download/v1.18.11/opencode-linux-arm64.tar.gz",
+              "archive": "https://github.com/anomalyco/opencode/releases/download/v1.18.18/opencode-linux-arm64.tar.gz",
               "args": [
                 "acp"
               ],
               "cmd": "./opencode",
-              "sha256": "03e07aa461ac241dfa8c7ab54ed58c7a0e911c62fc3cb490b83e4fb3424eb73b"
+              "sha256": "dcb1b5ec5687b43f87749560021f9203f3809e0ce5ae44ff9be8ae17083fe4ba"
             },
             "linux-x86_64": {
-              "archive": "https://github.com/anomalyco/opencode/releases/download/v1.18.11/opencode-linux-x64.tar.gz",
+              "archive": "https://github.com/anomalyco/opencode/releases/download/v1.18.18/opencode-linux-x64.tar.gz",
               "args": [
                 "acp"
               ],
               "cmd": "./opencode",
-              "sha256": "a4dffcc00a5a93256c6bd06aa0c984320528f564db52a1f4becd5c7de9fb59a1"
+              "sha256": "0cddc222418b8553669905a8980c0cda7088f00da24d83d6ac76b01c9fdb2aaf"
             },
             "windows-aarch64": {
-              "archive": "https://github.com/anomalyco/opencode/releases/download/v1.18.11/opencode-windows-arm64.zip",
+              "archive": "https://github.com/anomalyco/opencode/releases/download/v1.18.18/opencode-windows-arm64.zip",
               "args": [
                 "acp"
               ],
               "cmd": "./opencode",
-              "sha256": "4510ccf446284f5492438c4b40b23895dc7ae78cb5eb4e7f51cbe998c1148d58"
+              "sha256": "0d34d837ea3b5e10349d8550318083040a8b4c061d3faaa4eabd339984aa49b0"
             },
             "windows-x86_64": {
-              "archive": "https://github.com/anomalyco/opencode/releases/download/v1.18.11/opencode-windows-x64.zip",
+              "archive": "https://github.com/anomalyco/opencode/releases/download/v1.18.18/opencode-windows-x64.zip",
               "args": [
                 "acp"
               ],
               "cmd": "./opencode.exe",
-              "sha256": "f3a5ea814aecc692a4e04259d9005283f364225b38456c90f9a47b7a9d83c0e9"
+              "sha256": "c6d265376fdb93164013671b0cf402410184f73c34fc15d82d40a16a745b15f4"
             }
           }
         }
@@ -802,56 +802,56 @@
         }
       },
       "poolside": {
-        "version": "1.0.14",
+        "version": "1.0.15",
         "distribution": {
           "binary": {
             "darwin-aarch64": {
-              "archive": "https://downloads.poolside.ai/pool/v1.0.14/pool-darwin-arm64.tar.gz",
+              "archive": "https://downloads.poolside.ai/pool/v1.0.15/pool-darwin-arm64.tar.gz",
               "args": [
                 "acp"
               ],
               "cmd": "./pool-darwin-arm64",
-              "sha256": "a388ac305da89dfe831e22986c9b78ea10d00347aa5465c398f26c67a4fd3b44"
+              "sha256": "42d971d91611ed22cf2023f05bae53a4d746c015203923b392fe9b170ccb0b71"
             },
             "darwin-x86_64": {
-              "archive": "https://downloads.poolside.ai/pool/v1.0.14/pool-darwin-amd64.tar.gz",
+              "archive": "https://downloads.poolside.ai/pool/v1.0.15/pool-darwin-amd64.tar.gz",
               "args": [
                 "acp"
               ],
               "cmd": "./pool-darwin-amd64",
-              "sha256": "a015560440a7640dd0ba1aad661139c2ed8df658b3945b292e36e473063c27af"
+              "sha256": "508490724fb63a7ff846e9d6f303d9ab9da875f0b18b26308d85cb03c8f43d6b"
             },
             "linux-aarch64": {
-              "archive": "https://downloads.poolside.ai/pool/v1.0.14/pool-linux-arm64.tar.gz",
+              "archive": "https://downloads.poolside.ai/pool/v1.0.15/pool-linux-arm64.tar.gz",
               "args": [
                 "acp"
               ],
               "cmd": "./pool-linux-arm64",
-              "sha256": "76cc0996112ac189b9e377412b51698467e769cbcd5c16ce950e69e4923e8b4c"
+              "sha256": "df3ffd537d46943ae61513b7981df07bc5df79217fc5390b956d06bc81ac8198"
             },
             "linux-x86_64": {
-              "archive": "https://downloads.poolside.ai/pool/v1.0.14/pool-linux-amd64.tar.gz",
+              "archive": "https://downloads.poolside.ai/pool/v1.0.15/pool-linux-amd64.tar.gz",
               "args": [
                 "acp"
               ],
               "cmd": "./pool-linux-amd64",
-              "sha256": "4e178dc0e705df3b23eaff8c609a324a74d8ce3e86c8cab51f0432d32afbac3a"
+              "sha256": "d7d7194bfe0e1e62fc3daa1b6ede8f2d4371691c663bed980eea4f5a7a659e08"
             },
             "windows-aarch64": {
-              "archive": "https://downloads.poolside.ai/pool/v1.0.14/pool-windows-arm64.tar.gz",
+              "archive": "https://downloads.poolside.ai/pool/v1.0.15/pool-windows-arm64.tar.gz",
               "args": [
                 "acp"
               ],
               "cmd": "./pool-windows-arm64.exe",
-              "sha256": "bedc3bd43bb351ad9809057114014d7ce98cbd27176377a812155f09d5bc8c7d"
+              "sha256": "b6e7b204ac6e928fb05a409bfe9327f74945d75f684e4a0e43568cc159647316"
             },
             "windows-x86_64": {
-              "archive": "https://downloads.poolside.ai/pool/v1.0.14/pool-windows-amd64.tar.gz",
+              "archive": "https://downloads.poolside.ai/pool/v1.0.15/pool-windows-amd64.tar.gz",
               "args": [
                 "acp"
               ],
               "cmd": "./pool-windows-amd64.exe",
-              "sha256": "66a9a77f10f12262f9fb633c76bf7f7c108a874489a83d713fd90809e1b3a5a3"
+              "sha256": "296a828390cbc4ff6d6a61410cfd3e25d86ecdf6152b479ab26402ead2c78d4d"
             }
           }
         }
@@ -868,54 +868,54 @@
         }
       },
       "qwen-code": {
-        "version": "0.21.3",
+        "version": "0.21.10",
         "distribution": {
           "npx": {
             "args": [
               "--acp",
               "--experimental-skills"
             ],
-            "package": "@qwen-code/qwen-code@0.21.3"
+            "package": "@qwen-code/qwen-code@0.21.10"
           }
         }
       },
       "sigit": {
-        "version": "1.5.1",
+        "version": "1.5.2",
         "distribution": {
           "binary": {
             "darwin-aarch64": {
-              "archive": "https://github.com/getsigit/sigit/releases/download/v1.5.1/sigit-macos-arm64.tar.gz",
+              "archive": "https://github.com/getsigit/sigit/releases/download/v1.5.2/sigit-macos-arm64.tar.gz",
               "cmd": "./sigit",
-              "sha256": "fd93a72b30d6693babd8948d5004c6d1679cba15492ef0aecd361aacd49caea5"
+              "sha256": "be17cca0bb7341ac43d0ec3769a75aa5ca4a91c6e3c24512a524f3318eccad08"
             },
             "darwin-x86_64": {
-              "archive": "https://github.com/getsigit/sigit/releases/download/v1.5.1/sigit-macos-amd64.tar.gz",
+              "archive": "https://github.com/getsigit/sigit/releases/download/v1.5.2/sigit-macos-amd64.tar.gz",
               "cmd": "./sigit",
-              "sha256": "e65b3ec94b648e49b6ce36bcfa8369fe1cfa1f654e8186fd01b573abaade32e4"
+              "sha256": "dc24791071831e1b6c5b84b09868bb3af62baae71db565d31176becab82744bc"
             },
             "linux-aarch64": {
-              "archive": "https://github.com/getsigit/sigit/releases/download/v1.5.1/sigit-linux-arm64",
+              "archive": "https://github.com/getsigit/sigit/releases/download/v1.5.2/sigit-linux-arm64",
               "cmd": "./sigit-linux-arm64",
-              "sha256": "d11372da905760163208c2b60f0b391908802743130bdd9e67af1dd12bd6eda9"
+              "sha256": "374bf986b88b4736f4b1f7b16948f157002f7737a29a70140ee7036cd4735206"
             },
             "linux-x86_64": {
-              "archive": "https://github.com/getsigit/sigit/releases/download/v1.5.1/sigit-linux-amd64",
+              "archive": "https://github.com/getsigit/sigit/releases/download/v1.5.2/sigit-linux-amd64",
               "cmd": "./sigit-linux-amd64",
-              "sha256": "78c568d45e17e248cc779ed2c7dd2dc3d81622a30b6b34e81efcc9f233a488ad"
+              "sha256": "70bedf5d9459a86c9beea393a81a7a981c0fa07474b5ad0876ee62f6369d0d15"
             },
             "windows-aarch64": {
-              "archive": "https://github.com/getsigit/sigit/releases/download/v1.5.1/sigit-win-arm64.exe",
+              "archive": "https://github.com/getsigit/sigit/releases/download/v1.5.2/sigit-win-arm64.exe",
               "cmd": "./sigit-win-arm64.exe",
-              "sha256": "0108ec8951ea03607da900ddcac46561d73299f163c7086a2d0fab306208c141"
+              "sha256": "8982d36e86976eacec564989f13844ac0005263f3a5651ea7394a2c013d4b610"
             },
             "windows-x86_64": {
-              "archive": "https://github.com/getsigit/sigit/releases/download/v1.5.1/sigit-win-amd64.exe",
+              "archive": "https://github.com/getsigit/sigit/releases/download/v1.5.2/sigit-win-amd64.exe",
               "cmd": "./sigit-win-amd64.exe",
-              "sha256": "5cae0a88569e0bee33fd7e04ed573bec4d73548d5e031b69abe7d944efabb75f"
+              "sha256": "6d1a1f11f7d1e32a5995f9ea413e626f2e47dcc56fb000e30bf60cebb68e4f24"
             }
           },
           "npx": {
-            "package": "@smbcloud/sigit@1.5.1"
+            "package": "@smbcloud/sigit@1.5.2"
           }
         }
       },

@@ -33,7 +33,7 @@
     "update:upstream": "npm run monitor:update && npm run monitor:sync-dependencies && npm run ci"
   },
   "dependencies": {
-    "@agentclientprotocol/claude-agent-acp": "0.64.2",
+    "@agentclientprotocol/claude-agent-acp": "0.66.0",
     "@modelcontextprotocol/sdk": "1.30.0"
   },
   "engines": {
