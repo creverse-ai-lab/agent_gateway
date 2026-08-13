@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { stat } from "node:fs/promises";
 import { AcpClient, PERMISSION_POLICIES, requirePermissionPolicy } from "./acp-client.js";
@@ -9,8 +9,9 @@ import { ERROR_CODES, GatewayError } from "./errors.js";
 import { currentModelId, detectProviders, providerConfig } from "./providers.js";
 import { SessionQueue } from "./session-queue.js";
 import { publicSession, SessionStore } from "./sessions.js";
+import { crashAfter, StateStore, WAL_TYPES } from "./state-store.js";
 import { TaskStore, TERMINAL_TASK_STATUSES } from "./task-store.js";
-import { GATEWAY_API_VERSION, GATEWAY_VERSION, STATE_SCHEMA_VERSION } from "./version.js";
+import { GATEWAY_API_VERSION, GATEWAY_VERSION, LEGACY_STATE_SCHEMA_VERSION, STATE_SCHEMA_VERSION } from "./version.js";
 
 const ACTIVE_STATUSES = new Set(["running", "waiting_permission", "waiting_input", "cancelling", "restoring"]);
 // The only legal status moves. Every assignment goes through #setStatus, so a
@@ -82,6 +83,8 @@ export class GatewayService {
     resultRetentionMs = 24 * 60 * 60_000,
     inboxRetentionMs = 24 * 60 * 60_000,
     sessionRetentionMs = 7 * 24 * 60 * 60_000,
+    taskRetentionMs = 24 * 60 * 60_000,
+    persistence = {},
     agentUpdateManager = null,
     now = () => Date.now()
   } = {}) {
@@ -107,8 +110,25 @@ export class GatewayService {
     // safety valve, not a per-deployment knob, so they are not on the wire.
     this.taskStore = new TaskStore({
       now: this.now,
-      onChange: () => this.schedulePersist()
+      onChange: (change) => this.#onTaskChange(change)
     });
+    // Alerts raised by recovery (downgrade detected, WAL truncated) ride the
+    // setup().alerts array that Main already reads.
+    this.stateAlerts = [];
+    // v5 durability. Absent for the many callers that run without a state path:
+    // then every append is a no-op and nothing is fail-closed.
+    this.stateStore = statePath
+      ? new StateStore({
+          statePath,
+          now: this.now,
+          config: persistence,
+          snapshotProvider: () => this.stateSnapshot(),
+          onAlert: (alert) => this.recordStateAlert(alert),
+          onError: (error) => {
+            this.persistError = error?.message ?? String(error);
+          }
+        })
+      : null;
     this.artifactStore = artifactStore ?? new ArtifactStore({
       root: artifactRoot,
       maxFileBytes: maxArtifactBytes,
@@ -124,7 +144,10 @@ export class GatewayService {
       maxPendingRequestsPerSession,
       maxFrameBytes
     };
-    this.lifecycle = { gcIntervalMs, idleUnloadMs, orphanGraceMs, resultRetentionMs, inboxRetentionMs, sessionRetentionMs };
+    this.lifecycle = {
+      gcIntervalMs, idleUnloadMs, orphanGraceMs, resultRetentionMs, inboxRetentionMs,
+      sessionRetentionMs, taskRetentionMs
+    };
     this.metrics = {
       startedAt: new Date(this.now()).toISOString(),
       pollResponses: 0,
@@ -155,43 +178,46 @@ export class GatewayService {
   async init() {
     this.agentUpdateManager?.start();
     if (!this.statePath) return;
-    try {
-      const parsed = JSON.parse(await readFile(this.statePath, "utf8"));
-      for (const record of parsed.sessions ?? []) {
-        this.store.create({
-          ...record,
-          status: record.status === "closed" ? "closed" : "disconnected",
-          client: null,
-          waiters: new Set(),
-          events: [],
-          resultText: "",
-          thoughtText: "",
-          activeTaskId: null,
-          _ownerActivityPersistedAt: Date.parse(record.lastOwnerActivityAt ?? record.updatedAt)
-        });
-      }
-      // The store owns the restart conversion (in-flight -> failed with the
-      // legacy message) and drops handles whose TTL elapsed while we were down.
-      this.taskStore.recover(parsed.tasks ?? []);
-      for (const record of parsed.inbox ?? []) {
-        const item = { ...record };
-        // An ACP permission request is tied to the old worker process. It cannot
-        // be answered after a daemon restart, but must remain visible to Main.
-        if (item.status === "pending") {
-          item.status = "interrupted";
-          item.resolution = "Gateway restarted before this worker request was answered";
-          item.resolvedAt = new Date(this.now()).toISOString();
-        }
-        this.inbox.set(item.inboxId, item);
-      }
-      for (const session of this.store.list()) {
-        const task = session.activeTaskId ? this.taskStore.find(session.activeTaskId) : null;
-        if (task && TERMINAL_TASK_STATUSES.has(task.status)) session.activeTaskId = null;
-      }
-      await this.runMaintenance();
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
+    // open() repairs, replays and reports. It returns the same {sessions, tasks,
+    // inbox} shape the v4 reader produced, so the restart transformations below
+    // are untouched — and it throws rather than ever hand back a state it could
+    // not read, because a silent empty start is how durable handles disappear.
+    const loaded = this.stateStore.open();
+    for (const record of loaded.sessions) {
+      this.store.create({
+        ...record,
+        status: record.status === "closed" ? "closed" : "disconnected",
+        client: null,
+        waiters: new Set(),
+        events: [],
+        resultText: "",
+        thoughtText: "",
+        // No worker survived the restart, so no session owns a live handle. The
+        // task's own restart conversion below is what the caller observes.
+        activeTaskId: null,
+        _ownerActivityPersistedAt: Date.parse(record.lastOwnerActivityAt ?? record.updatedAt)
+      });
     }
+    // The store owns the restart conversion (in-flight -> failed with the
+    // legacy message) and drops handles whose TTL elapsed while we were down.
+    // Replay has already folded the WAL into these records as plain data.
+    this.taskStore.recover(loaded.tasks);
+    for (const record of loaded.inbox) {
+      const item = { ...record };
+      // An ACP permission request is tied to the old worker process. It cannot
+      // be answered after a daemon restart, but must remain visible to Main.
+      if (item.status === "pending") {
+        item.status = "interrupted";
+        item.resolution = "Gateway restarted before this worker request was answered";
+        item.resolvedAt = new Date(this.now()).toISOString();
+      }
+      this.inbox.set(item.inboxId, item);
+    }
+    // Rotate immediately: the snapshot this writes is the first one that contains
+    // the restart transformations, and it retires the log that produced them, so
+    // a second crash replays nothing instead of re-deriving them.
+    this.#rotateState();
+    await this.runMaintenance();
   }
 
   attachRoot(rootId) {
@@ -409,7 +435,21 @@ export class GatewayService {
       gatewayVersion: GATEWAY_VERSION,
       gatewayApiVersion: GATEWAY_API_VERSION,
       stateSchemaVersion: STATE_SCHEMA_VERSION,
-      persistence: { healthy: this.persistError == null, error: this.persistError },
+      // healthy/error keep their names and meaning (AgenLynk branches on them);
+      // everything else here is additive diagnostics.
+      persistence: {
+        healthy: this.persistError == null,
+        error: this.persistError,
+        ...(this.stateStore?.status() ?? {
+          stateSchemaVersion: STATE_SCHEMA_VERSION,
+          mode: "disabled",
+          walSeq: 0,
+          walBytes: 0,
+          snapshotEpoch: 0,
+          fsyncCount: 0,
+          lastRecovery: null
+        })
+      },
       lifecycle: {
         ...this.lifecycle,
         liveSessions: this.store.list().filter((session) => session.client?.alive).length
@@ -418,7 +458,7 @@ export class GatewayService {
       metrics: { ...this.metrics, eventsByType: { ...this.metrics.eventsByType } },
       agentUpdates,
       gatewayUpdate: agentUpdates?.gatewaySource ?? null,
-      alerts: agentUpdates?.alerts ?? [],
+      alerts: [...(agentUpdates?.alerts ?? []), ...this.stateAlerts],
       detected,
       providers: provider ? await Promise.all(
         names.map(async (name) => {
@@ -560,6 +600,9 @@ export class GatewayService {
     });
     fields.client.onSessionUpdate(fields.acpSessionId, (update) => this.handleUpdate(session, update));
     this.store.push(session, { type: "session_created" });
+    // T1. Losing a registration costs an orphaned child process (a resource leak,
+    // not a correctness failure), which is why session_open is not fail-closed.
+    this.#appendSessionRegistered(session);
     return {
       ok: true,
       ...publicSession(session),
@@ -816,12 +859,33 @@ export class GatewayService {
     // release the reservation, or one refused task would leave the session
     // permanently unpromptable.
     try {
+      // Fail closed, and only here: a Task handle is a promise that the outcome
+      // will still be collectable after a restart, which is a promise an unhealthy
+      // store cannot keep. session_open stays open by design (§8.16).
+      this.#requireHealthyPersistence();
       const task = this.#storeCall(() => this.taskStore.create({
         sessionId: session.id,
         ownerRootId: requireRoot(context),
         ttl: args.ttl,
         pollInterval: args.pollInterval
       }));
+      // The barrier is BEFORE the ACP turn starts. After it, a crash can only
+      // lose work that has a durable handle; before it, only work that was never
+      // started. The other order manufactures the opposite phantom: real worker
+      // activity with no handle to report or cancel it.
+      try {
+        this.stateStore?.appendDurable(WAL_TYPES.TASK_CREATED, task.taskId, task);
+        if (this.stateStore) this.persistError = null;
+      } catch (error) {
+        // Compensate: the handle described work that will never start.
+        this.taskStore.remove(task.taskId);
+        this.persistError = error?.message ?? String(error);
+        throw new GatewayError(
+          ERROR_CODES.PERSISTENCE_UNHEALTHY,
+          `Gateway could not durably record this Task before starting it: ${this.persistError}`
+        );
+      }
+      crashAfter("task_create_durable");
       session.activeTaskId = task.taskId;
       try {
         // One command covers starting the turn and recording the handle. Split
@@ -838,7 +902,11 @@ export class GatewayService {
             return this.publicTask({ ...task, turnId: started.turnId });
           }
           this.taskStore.attachTurn(task.taskId, started.turnId);
-          return this.publicTask(this.taskStore.transition(task.taskId, "working", "Prompt running"));
+          const running = this.taskStore.transition(task.taskId, "working", "Prompt running");
+          // T1: the turn id is provenance the handle should keep across a restart,
+          // but no caller is holding a response for it.
+          this.#appendTaskStatus(running);
+          return this.publicTask(running);
         });
       } catch (error) {
         if (session.activeTaskId === task.taskId) session.activeTaskId = null;
@@ -916,11 +984,13 @@ export class GatewayService {
         stopReason: "cancelled"
       }
     };
-    const cancelled = this.#storeCall(() => this.taskStore.cancel(args.taskId, {
-      ownerRootId,
-      statusMessage: "Task cancelled by Main",
-      result
-    }));
+    const cancelled = this.#commitTaskTerminal(session, task.taskId, "cancelled", "Task cancelled by Main", result);
+    if (!cancelled) {
+      throw new GatewayError(ERROR_CODES.UNKNOWN_TASK, `Unknown taskId: ${task.taskId}`);
+    }
+    if (cancelled && cancelled.status !== "cancelled" && cancelled.status !== "failed") {
+      throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `Cannot cancel task in terminal status: ${cancelled.status}`);
+    }
     if (session?.activeTaskId === task.taskId) session.activeTaskId = null;
     return this.publicTask(cancelled);
   }
@@ -1233,6 +1303,9 @@ export class GatewayService {
     session.client = null;
     this.store.push(session, { type: "session_closed" });
     this.store.delete(session.id);
+    // Replay must not resurrect a session Main was told is gone, even when the
+    // registration record is still in the log ahead of this one.
+    this.stateStore?.append(WAL_TYPES.SESSION_CLOSED, session.id, {});
     // Anything still queued behind this close was written for a session that
     // now does not exist; waking it up would act on the deleted record.
     queue.closeWith(new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`));
@@ -1296,6 +1369,10 @@ export class GatewayService {
       // back into an input wait or grow a new obligation Main cannot discharge.
       const admitted = this.#setStatus(session, "waiting_permission", type);
       const cappedToolCall = this.capStructuredField(session, `${type}-toolCall`, "toolCall", update.toolCall);
+      // The durable record is created BEFORE the ring push that makes the request
+      // pollable. Reversed (as it was through 1.3.2), a poll could hand Main a
+      // requestId whose inbox row does not exist yet.
+      if (admitted) this.createPermissionInbox(session, update);
       this.store.push(session, {
         type,
         requestId: update.requestId,
@@ -1311,12 +1388,12 @@ export class GatewayService {
         options: update.options
       });
       if (!admitted) return;
-      this.createPermissionInbox(session, update);
       this.updateTaskForSession(session, "input_required", "Waiting for Main permission");
       return;
     }
     if (type === "elicitation_request") {
       const admitted = this.#setStatus(session, "waiting_input", type);
+      if (admitted) this.createElicitationInbox(session, update);
       this.store.push(session, {
         type,
         requestId: update.requestId,
@@ -1328,7 +1405,6 @@ export class GatewayService {
         toolCallId: update.toolCallId
       });
       if (!admitted) return;
-      this.createElicitationInbox(session, update);
       this.updateTaskForSession(session, "input_required", "Waiting for Main input");
       return;
     }
@@ -1466,11 +1542,163 @@ export class GatewayService {
     const taskId = session.activeTaskId;
     // The handle can be gone (TTL sweep, session retention) by the time a turn
     // callback reports its outcome; that is a silent no-op, as it always was.
-    if (!taskId || !this.taskStore.find(taskId)) return;
-    this.taskStore.transition(taskId, status, statusMessage, result === undefined ? {} : { result });
+    const before = taskId ? this.taskStore.find(taskId) : null;
+    if (!before) return;
+    if (!TERMINAL_TASK_STATUSES.has(status)) {
+      const task = this.taskStore.transition(taskId, status, statusMessage, result === undefined ? {} : { result });
+      // The WAL's only unbounded producer is this path (input-state sync fires on
+      // every worker request). A move that changed neither status nor message has
+      // nothing durable to say, so it does not get a record.
+      if (task.status !== before.status || task.statusMessage !== before.statusMessage) {
+        this.#appendTaskStatus(task);
+      }
+      return;
+    }
+    this.#commitTaskTerminal(session, taskId, status, statusMessage, result);
     // Keyed off the requested status, not the resulting one: a terminal report
     // that lost to an earlier terminal writer still ends this session's claim.
-    if (TERMINAL_TASK_STATUSES.has(status)) session.activeTaskId = null;
+    session.activeTaskId = null;
+  }
+
+  #commitTaskTerminal(session, taskId, status, statusMessage, result) {
+    const before = this.taskStore.find(taskId);
+    if (!before || TERMINAL_TASK_STATUSES.has(before.status)) return before;
+    const lastUpdatedAt = new Date(this.now()).toISOString();
+    const durable = result === undefined ? null : this.#durableResultRecord(session, taskId, result);
+    let provisional = null;
+    if (this.stateStore?.mode === "snapshot") {
+      provisional = this.taskStore.transition(taskId, status, statusMessage, {
+        lastUpdatedAt,
+        ...(result === undefined ? {} : { result }),
+        deferWaiters: true
+      });
+    }
+    try {
+      this.stateStore?.appendDurable(WAL_TYPES.TASK_RESULT_COMMITTED, taskId, {
+        status,
+        statusMessage,
+        lastUpdatedAt,
+        ...(durable ?? { result: null })
+      });
+      if (this.stateStore) this.persistError = null;
+    } catch (error) {
+      this.persistError = error?.message ?? String(error);
+      // Never publish a success that failed its durability barrier. The created
+      // record remains recoverable and restart will also make it failed; live
+      // waiters receive this explicit failure instead of an unsafe result.
+      const failureMessage = `Task result persistence failed: ${this.persistError}`;
+      const failure = {
+        ok: false,
+        sessionId: session?.id ?? before.sessionId,
+        turnId: before.turnId,
+        status: "failed",
+        error: failureMessage
+      };
+      if (provisional) {
+        return this.taskStore.failDeferredTerminal(taskId, failureMessage, failure, { lastUpdatedAt });
+      }
+      return this.taskStore.transition(taskId, "failed", failureMessage, {
+        lastUpdatedAt,
+        result: failure
+      });
+    }
+    if (provisional) {
+      this.taskStore.flushWaiters(taskId);
+      return provisional;
+    }
+    // Publish only after the WAL barrier. waitForTerminal therefore cannot
+    // observe an outcome that a process restart can take back.
+    return this.taskStore.transition(taskId, status, statusMessage, {
+      lastUpdatedAt,
+      ...(result === undefined ? {} : { result })
+    });
+  }
+
+  // Builds the durable form of one terminal result. Oversized results go to an
+  // artifact that is fsynced BEFORE the WAL record names it: the reverse order
+  // leaves recovery holding a pointer to a file that never landed.
+  #durableResultRecord(session, taskId, result) {
+    if (!this.stateStore) return { result: result ?? null };
+    const json = JSON.stringify(result ?? null);
+    if (this.stateStore.planResult(json).inline) {
+      this.stateStore.rememberResultRef(taskId, null);
+      return { result: result ?? null };
+    }
+    const preview = utf8ByteHead(json, this.stateStore.inlineResultBytes);
+    const writer = this.artifactStore.create(session?.id ?? taskId, "task-result");
+    writer.append(json);
+    writer.finalize(null, { sync: true });
+    const metadata = writer.metadata();
+    if (!metadata?.path || metadata.error || metadata.truncated) {
+      // ArtifactWriter records I/O failures instead of throwing, so this check is
+      // the only thing between a swallowed ENOSPC and a reference to nothing.
+      this.persistError = `Task result artifact failed: ${metadata?.error ?? "result was truncated"}`;
+      this.stateStore.rememberResultRef(taskId, null);
+      return { preview };
+    }
+    this.artifactStore.syncDirectory();
+    const ref = {
+      path: metadata.path,
+      bytes: metadata.bytes,
+      sha256: createHash("sha256").update(json).digest("hex")
+    };
+    this.stateStore.rememberResultRef(taskId, ref);
+    return { ref, preview };
+  }
+
+  #appendTaskStatus(task) {
+    this.stateStore?.append(WAL_TYPES.TASK_STATUS_CHANGED, task.taskId, {
+      status: task.status,
+      statusMessage: task.statusMessage,
+      lastUpdatedAt: task.lastUpdatedAt,
+      turnId: task.turnId ?? null
+    });
+  }
+
+  #onTaskChange(change) {
+    this.schedulePersist();
+    // Without a durable removal, a TTL or retention delete comes back on the next
+    // replay: the create record is still in the log, and nothing contradicts it.
+    if (change?.type === "removed" && change.taskId) {
+      this.stateStore?.forgetTask(change.taskId);
+      this.stateStore?.append(WAL_TYPES.TASK_REMOVED, change.taskId, {});
+    }
+  }
+
+  #requireHealthyPersistence() {
+    if (!this.stateStore || this.persistError == null) return;
+    throw new GatewayError(
+      ERROR_CODES.PERSISTENCE_UNHEALTHY,
+      `Gateway persistence is unhealthy, so a durable Task handle cannot be issued: ${this.persistError}`
+    );
+  }
+
+  #rotateState() {
+    if (!this.stateStore) return null;
+    try {
+      return this.stateStore.rotate();
+    } catch (error) {
+      // A failed rotation is retried on every gc tick; it must not stop startup
+      // or a maintenance pass.
+      this.persistError = error?.message ?? String(error);
+      return null;
+    }
+  }
+
+  recordStateAlert(alert) {
+    if (!alert) return;
+    this.stateAlerts.push(alert);
+    if (this.stateAlerts.length > 16) this.stateAlerts.splice(0, this.stateAlerts.length - 16);
+  }
+
+  stateSnapshot() {
+    return {
+      sessions: this.store.checkpoints(),
+      // v5 keeps terminal handles and answered inbox items: a completed Task
+      // surviving a restart until its TTL is the point of this release.
+      tasks: this.taskStore.toPersistedRecords(),
+      inbox: [...this.inbox.values()]
+    };
   }
 
   finishTaskForSession(session) {
@@ -1516,6 +1744,7 @@ export class GatewayService {
       options: update.options
     };
     this.inbox.set(inboxId, item);
+    this.#appendInboxCreated(item);
     this.schedulePersist();
     return item;
   }
@@ -1544,6 +1773,7 @@ export class GatewayService {
       toolCallId: update.toolCallId
     };
     this.inbox.set(inboxId, item);
+    this.#appendInboxCreated(item);
     this.schedulePersist();
     return item;
   }
@@ -1557,7 +1787,31 @@ export class GatewayService {
     item.status = status;
     item.resolution = resolution;
     item.resolvedAt = new Date(this.now()).toISOString();
+    this.#appendInboxResolved(item);
     this.schedulePersist();
+  }
+
+  // T1 for the whole inbox: a permission request cannot be answered after a
+  // restart anyway (its worker is gone and init rewrites it as interrupted), so
+  // the durable copy is an audit record, not a promise. Making it T0 would put an
+  // fsync on every tool call under an ask policy — the highest-frequency event
+  // in the system — to protect a record nobody can act on.
+  #appendInboxCreated(item) {
+    this.stateStore?.append(WAL_TYPES.INBOX_CREATED, item.inboxId, item);
+  }
+
+  #appendInboxResolved(item) {
+    this.stateStore?.append(WAL_TYPES.INBOX_RESOLVED, item.inboxId, {
+      status: item.status,
+      resolution: item.resolution,
+      resolvedAt: item.resolvedAt
+    });
+  }
+
+  #appendSessionRegistered(session) {
+    if (!this.stateStore) return;
+    const checkpoint = this.store.checkpoints().find((record) => record.id === session.id);
+    if (checkpoint) this.stateStore.append(WAL_TYPES.SESSION_REGISTERED, session.id, checkpoint);
   }
 
   touchOwnerActivity(args, context) {
@@ -1596,9 +1850,24 @@ export class GatewayService {
     // TTL now bounds a handle's whole lifetime, not just its retention: the sweep
     // commits an over-TTL active task as failed and then removes it.
     let changed = this.taskStore.expireSweep() > 0;
+    // Byte retention, separate from the handle's ttl: a record that opted out of
+    // expiry (ttl=null, legacy) would otherwise sit in the snapshot forever.
+    for (const task of [...this.taskStore.records.values()]) {
+      if (!isExpired(task.createdAt, this.lifecycle.taskRetentionMs, now)) continue;
+      this.taskStore.remove(task.taskId);
+      changed = true;
+    }
     // Artifacts still referenced by a live session outlive the age-based
     // prune; they disappear when their session record does.
     const keepPaths = new Set();
+    // A task result outlives its session: the handle answers until its TTL, and
+    // the artifact behind an oversized result is the answer.
+    for (const path of this.stateStore?.resultRefPaths() ?? []) keepPaths.add(path);
+    for (const task of this.taskStore.records.values()) {
+      const inner = task.result?.result;
+      if (inner?.artifact?.path) keepPaths.add(inner.artifact.path);
+      if (inner?.textArtifact?.path) keepPaths.add(inner.textArtifact.path);
+    }
     for (const session of this.store.list()) {
       if (session.resultArtifact?.path) keepPaths.add(session.resultArtifact.path);
       if (session.resultFinalArtifact?.path) keepPaths.add(session.resultFinalArtifact.path);
@@ -1615,6 +1884,7 @@ export class GatewayService {
       if (item.status === "pending") continue;
       if (isExpired(item.resolvedAt ?? item.createdAt, this.lifecycle.inboxRetentionMs, now)) {
         this.inbox.delete(id);
+        this.stateStore?.append(WAL_TYPES.INBOX_REMOVED, id, {});
         changed = true;
       }
     }
@@ -1666,10 +1936,15 @@ export class GatewayService {
           session.client = null;
         }
         this.store.delete(session.id);
-        for (const task of [...this.taskStore.records.values()]) {
-          if (task.sessionId === session.id) this.taskStore.remove(task.taskId);
+        this.stateStore?.append(WAL_TYPES.SESSION_CLOSED, session.id, {});
+        // Task handles deliberately survive their session now: a Task's lifetime
+        // is its own ttl and taskRetentionMs, not its session's retention. Deleting
+        // them here made a completed handle unreadable long before its TTL.
+        for (const [id, item] of this.inbox) {
+          if (item.sessionId !== session.id) continue;
+          this.inbox.delete(id);
+          this.stateStore?.append(WAL_TYPES.INBOX_REMOVED, id, {});
         }
-        for (const [id, item] of this.inbox) if (item.sessionId === session.id) this.inbox.delete(id);
         changed = true;
       }
     }
@@ -1681,6 +1956,13 @@ export class GatewayService {
       changed = true;
     }
 
+    // The gc tick carries the age-based rotation, and is also where a store that
+    // went unhealthy on a failed rotation gets to try again.
+    try {
+      this.stateStore?.rotateIfNeeded();
+    } catch (error) {
+      this.persistError = error?.message ?? String(error);
+    }
     if (changed) this.schedulePersist();
     return { ok: true, sessions: this.store.list().length, tasks: this.taskStore.size, inbox: this.inbox.size };
   }
@@ -1743,12 +2025,18 @@ export class GatewayService {
 
   interruptSessionInbox(session, resolution) {
     const resolvedAt = new Date(this.now()).toISOString();
+    let interrupted = 0;
     for (const item of this.inbox.values()) {
       if (item.sessionId !== session.id || item.status !== "pending") continue;
       item.status = "interrupted";
       item.resolution = resolution;
       item.resolvedAt = resolvedAt;
+      this.#appendInboxResolved(item);
+      interrupted += 1;
     }
+    // Cancelling a session that has no Task used to leave these marks in memory
+    // only: no caller on that path touches the persistence hook.
+    if (interrupted > 0) this.schedulePersist();
   }
 
   // No command owns this session right now, so background work may take its
@@ -1805,16 +2093,32 @@ export class GatewayService {
     return this.persistChain;
   }
 
+  // flushPersist's body, unchanged in name and meaning: the debounced writer. It
+  // barriers the WAL, writes the v5 snapshot (unsynced — same cost the v4 writer
+  // always had) or rotates when the log is due, then dual-writes v4.
   async persist() {
+    if (this.stateStore) {
+      if (!this.stateStore.rotateIfNeeded()) this.stateStore.writeSnapshot({ sync: false });
+    }
+    await this.persistLegacySnapshot();
+  }
+
+  // Downgrade insurance, sunsetting in 1.5.0. Byte-for-byte the 1.3.2 writer plus
+  // two marker fields, so a rolled-back daemon reads it and recovers every
+  // session; writerVersion is also how the next v5 start can tell that an older
+  // daemon wrote here (v4 cannot preserve a field it does not know about).
+  async persistLegacySnapshot() {
     await mkdir(dirname(this.statePath), { recursive: true, mode: 0o700 });
     const temporary = `${this.statePath}.${process.pid}.tmp`;
     await writeFile(
       temporary,
       `${JSON.stringify({
-        version: STATE_SCHEMA_VERSION,
+        version: LEGACY_STATE_SCHEMA_VERSION,
+        writerVersion: GATEWAY_VERSION,
+        epoch: this.stateStore?.status().snapshotEpoch ?? 0,
         sessions: this.store.checkpoints(),
-        // v4 wire shape unchanged: terminal handles stay out of the snapshot and
-        // live in memory until TTL. Disk durability for them arrives in PR 4.
+        // v4 shape: terminal handles and answered requests stay out. The v5
+        // snapshot is where they survive a restart.
         tasks: this.taskStore.toPersistedRecords({ includeTerminal: false }),
         inbox: [...this.inbox.values()].filter((item) => ["pending", "interrupted"].includes(item.status))
       })}\n`,
@@ -1841,6 +2145,10 @@ export class GatewayService {
     );
     await Promise.all([...this.clients.values()].map((client) => client.stop()));
     await this.flushPersist();
+    // Clean shutdown always rotates, so a normal restart replays an empty log.
+    // close() is the last writer: appends after it are silent no-ops, which is
+    // what makes the clear() below safe.
+    this.stateStore?.close();
     // After the final write: a blocked reader must be told the gateway is gone
     // rather than hang on a waiter timer nobody will ever resolve. Clearing
     // before the flush would persist an empty task set instead.

@@ -28,8 +28,16 @@ export const ERROR_CODES = Object.freeze({
   ROOT_REQUIRED: "ROOT_REQUIRED",
   ROOT_MISMATCH: "ROOT_MISMATCH",
   SOCKET_ALREADY_BOUND: "SOCKET_ALREADY_BOUND",
-  // Reserved for the fail-closed persistence path (state durability work).
+  // The fail-closed persistence path: a Task handle is a durability promise, so
+  // it is refused rather than issued while the state store cannot keep it.
   PERSISTENCE_UNHEALTHY: "PERSISTENCE_UNHEALTHY",
+  // Startup-only halts. Each one means "state exists on disk that this process
+  // cannot safely interpret", and each names the opt-in that overrides it. They
+  // never appear on a request path.
+  STATE_WAL_CORRUPT: "STATE_WAL_CORRUPT",
+  STATE_SNAPSHOT_CORRUPT: "STATE_SNAPSHOT_CORRUPT",
+  STATE_VERSION_UNSUPPORTED: "STATE_VERSION_UNSUPPORTED",
+  STATE_DIR_LOCKED: "STATE_DIR_LOCKED",
   // Fallback for an error that has no more specific code yet.
   GATEWAY_ERROR: "GATEWAY_ERROR"
 });

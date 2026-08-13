@@ -37,9 +37,18 @@ const SETUP_KEYS = sorted([
   "ok", "gatewayVersion", "gatewayApiVersion", "stateSchemaVersion", "persistence", "lifecycle",
   "resourceLimits", "metrics", "agentUpdates", "gatewayUpdate", "alerts", "detected", "providers"
 ]);
+// GOLDEN DIFF (1.4.0 PR 4): taskRetentionMs joins lifecycle. A task's bytes now
+// have their own retention, separate from its session's, because a completed
+// handle must stay readable until its own TTL.
 const LIFECYCLE_KEYS = sorted([
   "gcIntervalMs", "idleUnloadMs", "orphanGraceMs", "resultRetentionMs", "inboxRetentionMs",
-  "sessionRetentionMs", "liveSessions"
+  "sessionRetentionMs", "taskRetentionMs", "liveSessions"
+]);
+// GOLDEN DIFF (1.4.0 PR 4): healthy/error keep their names and meaning; the rest
+// is additive durability diagnostics (state v5 snapshot + WAL).
+const PERSISTENCE_KEYS = sorted([
+  "healthy", "error", "stateSchemaVersion", "mode", "walSeq", "walBytes", "snapshotEpoch",
+  "fsyncCount", "lastRecovery"
 ]);
 const RESOURCE_LIMIT_KEYS = sorted([
   "maxEvents", "maxTextBytes", "maxInlineResultBytes", "maxArtifactBytes", "maxArtifactTotalBytes",
@@ -148,9 +157,14 @@ test("characterization: setup reports gateway, API and state schema versions wit
     assert.equal(setup.ok, true);
     assert.equal(setup.gatewayVersion, GATEWAY_VERSION);
     assert.equal(setup.gatewayApiVersion, 1);
-    assert.equal(setup.stateSchemaVersion, 4);
-    assert.deepEqual(sorted(Object.keys(setup.persistence)), sorted(["healthy", "error"]));
+    // GOLDEN DIFF (1.4.0 PR 4): the persisted schema is v5 (snapshot + WAL). The
+    // v4 state.json is still written alongside it as downgrade insurance, which is
+    // why every other assertion about that file is unchanged.
+    assert.equal(setup.stateSchemaVersion, 5);
+    assert.deepEqual(sorted(Object.keys(setup.persistence)), PERSISTENCE_KEYS);
     assert.equal(setup.persistence.healthy, true);
+    // No state path here, so there is nothing to be durable with.
+    assert.equal(setup.persistence.mode, "disabled");
     assert.deepEqual(sorted(Object.keys(setup.lifecycle)), LIFECYCLE_KEYS);
     assert.deepEqual(sorted(Object.keys(setup.resourceLimits)), RESOURCE_LIMIT_KEYS);
     assert.deepEqual(sorted(Object.keys(setup.metrics)), METRICS_KEYS);

@@ -218,6 +218,10 @@ export class TaskStore {
     if (statusMessage != null && typeof statusMessage !== "string") {
       throw taskError("INVALID_ARGUMENT", "statusMessage must be a string");
     }
+    if (options?.lastUpdatedAt != null
+      && (typeof options.lastUpdatedAt !== "string" || !Number.isFinite(Date.parse(options.lastUpdatedAt)))) {
+      throw taskError("INVALID_ARGUMENT", "lastUpdatedAt must be an ISO date string");
+    }
     const record = this.#requireRecord(taskId, options?.ownerRootId);
 
     // Terminal commits are final AND idempotent. Replaying the same terminal
@@ -236,7 +240,7 @@ export class TaskStore {
     record.status = status;
     if (statusMessage != null) record.statusMessage = statusMessage;
     if (options?.result !== undefined) record.result = options.result;
-    record.lastUpdatedAt = new Date(this.#now()).toISOString();
+    record.lastUpdatedAt = options?.lastUpdatedAt ?? new Date(this.#now()).toISOString();
     this.#emit("updated", record);
     if (TERMINAL_TASK_STATUSES.has(status)) {
       // deferWaiters splits "the record is terminal" from "the outcome may be
@@ -263,6 +267,25 @@ export class TaskStore {
     const released = this.#waiters.get(taskId)?.size ?? 0;
     this.#resolveWaiters(record);
     return released;
+  }
+
+  // Snapshot-only durability must stage the terminal value in memory so the
+  // synchronous snapshot can see it. If that barrier fails, replace only that
+  // explicitly deferred provisional terminal with a failure before releasing
+  // readers. Ordinary terminal records remain immutable.
+  failDeferredTerminal(taskId, statusMessage, result, options = {}) {
+    const record = this.#requireRecord(taskId, options?.ownerRootId);
+    if (!this.#deferredTerminal.has(record.taskId) || !TERMINAL_TASK_STATUSES.has(record.status)) {
+      throw taskError("INVALID_ARGUMENT", `Task ${record.taskId} has no deferred terminal commit`);
+    }
+    record.status = "failed";
+    record.statusMessage = statusMessage;
+    record.result = result;
+    record.lastUpdatedAt = options?.lastUpdatedAt ?? new Date(this.#now()).toISOString();
+    this.#deferredTerminal.delete(record.taskId);
+    this.#emit("updated", record);
+    this.#resolveWaiters(record);
+    return snapshot(record);
   }
 
   // Deletes a record outright, as opposed to expiring or terminating it. Callers:

@@ -1,4 +1,4 @@
-import { closeSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -45,6 +45,21 @@ export class ArtifactStore {
       }
     }
     return removed;
+  }
+
+  // Makes the directory entry itself durable. A file whose name a WAL record
+  // points at is only reachable after its parent directory is on disk.
+  syncDirectory() {
+    let fd = null;
+    try {
+      fd = openSync(this.root, "r");
+      fsyncSync(fd);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (fd != null) closeSync(fd);
+    }
   }
 
   reserve(requested, fileBytes) {
@@ -107,10 +122,13 @@ class ArtifactWriter {
     }
   }
 
-  finalize(tail = null) {
+  // sync is for the durable path only (a WAL record that names this file): the
+  // fsync must happen before the close, and the caller must then inspect
+  // metadata().error, because append() records I/O failures instead of throwing.
+  finalize(tail = null, { sync = false } = {}) {
     if (this.complete) return;
     if (this.started && tail != null) this.append(tail);
-    this.#close();
+    this.#close({ sync });
     this.complete = true;
   }
 
@@ -133,8 +151,18 @@ class ArtifactWriter {
     this.path = path;
   }
 
-  #close() {
+  #close({ sync = false } = {}) {
     if (this.fd == null) return;
+    // A failed fsync must still close the descriptor: the error belongs on the
+    // record, not in a leaked fd.
+    if (sync) {
+      try {
+        fsyncSync(this.fd);
+      } catch (error) {
+        this.truncated = true;
+        this.error ??= error?.message ?? String(error);
+      }
+    }
     try {
       closeSync(this.fd);
     } catch (error) {
