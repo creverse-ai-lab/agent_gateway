@@ -288,6 +288,35 @@ test("T5 a prompt queued behind a close is refused instead of running on a dead 
   });
 });
 
+test("T5b a worker request arriving during close cannot leave an orphan inbox row", async () => {
+  await withService({ hold: "close" }, async (service) => {
+    const opened = await open(service);
+    const session = service.requireSession(opened.sessionId);
+    const client = session.client;
+
+    const closing = service.call("session", { action: "close", sessionId: opened.sessionId }, MAIN);
+    await waitForMarker(service, opened.sessionId, "hold:close");
+    await client.request("test/emit", {
+      sessionId: session.acpSessionId,
+      update: {
+        sessionUpdate: "permission_request",
+        requestId: "late-permission",
+        toolCall: { toolCallId: "late-tool", title: "Late edit", kind: "edit" },
+        options: [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }]
+      }
+    });
+
+    await release(client, "close");
+    await closing;
+    assert.equal(service.store.get(opened.sessionId), undefined);
+    assert.equal(
+      [...service.inbox.values()].some((item) => item.sessionId === opened.sessionId),
+      false,
+      "a closed session cannot leave a pending worker request"
+    );
+  });
+});
+
 test("T6 an orphan cancel finalizes the turn exactly once", async () => {
   let clock = Date.now();
   await withService(
@@ -299,6 +328,7 @@ test("T6 an orphan cancel finalizes the turn exactly once", async () => {
       const task = await service.call("task_prompt", { sessionId: opened.sessionId, prompt: "one" }, MAIN);
       await waitForMarker(service, opened.sessionId, "hold:prompt");
 
+      service.detachRoot("main-a");
       clock += 11;
       await service.runMaintenance();
       const session = service.requireSession(opened.sessionId);
@@ -316,6 +346,42 @@ test("T6 an orphan cancel finalizes the turn exactly once", async () => {
       assert.equal(terminal.length, 1, "exactly one terminal event");
       assert.equal((await service.call("task_get", { taskId: task.taskId }, MAIN)).status, "cancelled");
       assert.equal(session.status, "cancelled");
+    }
+  );
+});
+
+test("T6b reconnecting while orphan cancel is queued preserves the live turn", async () => {
+  let clock = Date.now();
+  await withService(
+    { hold: "prompt", orphanGraceMs: 10, now: () => clock },
+    async (service) => {
+      service.attachRoot("main-a");
+      const opened = await open(service);
+      const session = service.requireSession(opened.sessionId);
+      const client = session.client;
+      const task = await service.call("task_prompt", { sessionId: opened.sessionId, prompt: "one" }, MAIN);
+      await waitForMarker(service, opened.sessionId, "hold:prompt");
+
+      let releaseMailbox;
+      const mailboxBlock = session._queue.run("test_block", () => new Promise((resolve) => {
+        releaseMailbox = resolve;
+      }));
+      await until(() => typeof releaseMailbox === "function", "mailbox blocker to start");
+
+      service.detachRoot("main-a");
+      clock += 11;
+      const maintenance = service.runMaintenance();
+      service.attachRoot("main-a");
+      releaseMailbox();
+      await mailboxBlock;
+      await maintenance;
+
+      assert.equal(session.status, "running");
+      assert.notEqual(session.orphanCancelRequested, true);
+      assert.equal((await service.call("task_get", { taskId: task.taskId }, MAIN)).status, "working");
+
+      await release(client, "prompt");
+      await waitForStatus(service, opened.sessionId, "idle");
     }
   );
 });
@@ -596,6 +662,65 @@ test("T16 the mailbox refuses work past its bound instead of growing without lim
       assert.equal(outcome.error.code, "SESSION_ACTIVE");
     }
     assert.equal(session._queue.depth, 0);
+  });
+});
+
+test("T16b a full external mailbox still accepts the worker terminal callback", async () => {
+  await withService({ hold: "prompt" }, async (service) => {
+    const opened = await open(service);
+    const session = service.requireSession(opened.sessionId);
+    const client = session.client;
+    const task = await service.call("task_prompt", { sessionId: opened.sessionId, prompt: "one" }, MAIN);
+    await waitForMarker(service, opened.sessionId, "hold:prompt");
+
+    let releaseMailbox;
+    const mailboxBlock = session._queue.run("test_block", () => new Promise((resolve) => {
+      releaseMailbox = resolve;
+    }));
+    await until(() => typeof releaseMailbox === "function", "mailbox blocker to start");
+    const queued = [];
+    for (let attempt = 1; attempt < SESSION_QUEUE_LIMIT; attempt += 1) {
+      queued.push(session._queue.run(`test_queued_${attempt}`, () => undefined));
+    }
+    assert.equal(session._queue.depth, SESSION_QUEUE_LIMIT);
+
+    await release(client, "prompt");
+    await until(() => session._queue.depth === SESSION_QUEUE_LIMIT + 1, "terminal callback reserve");
+    releaseMailbox();
+    await mailboxBlock;
+    await Promise.all(queued);
+    await waitForStatus(service, opened.sessionId, "idle");
+    assert.equal((await service.call("task_get", { taskId: task.taskId }, MAIN)).status, "completed");
+    assert.equal(eventsOfType(service, opened.sessionId, "turn_end").length, 1);
+  });
+});
+
+test("T16c a full external mailbox still accepts provider exit", async () => {
+  await withService({}, async (service) => {
+    const opened = await open(service);
+    const session = service.requireSession(opened.sessionId);
+    const client = session.client;
+    await service.call("config", { sessionId: opened.sessionId, action: "list" }, MAIN);
+
+    let releaseMailbox;
+    const mailboxBlock = session._queue.run("test_block", () => new Promise((resolve) => {
+      releaseMailbox = resolve;
+    }));
+    await until(() => typeof releaseMailbox === "function", "mailbox blocker to start");
+    const queued = [];
+    for (let attempt = 1; attempt < SESSION_QUEUE_LIMIT; attempt += 1) {
+      queued.push(session._queue.run(`test_queued_${attempt}`, () => undefined));
+    }
+    assert.equal(session._queue.depth, SESSION_QUEUE_LIMIT);
+
+    client.proc.kill("SIGKILL");
+    await until(() => client.alive === false, "provider exit callback");
+    assert.equal(session._queue.depth, SESSION_QUEUE_LIMIT + 1);
+    releaseMailbox();
+    await mailboxBlock;
+    await Promise.all(queued);
+    assert.equal(eventsOfType(service, opened.sessionId, "provider_disconnected").length, 1);
+    assert.equal(session.status, "disconnected");
   });
 });
 

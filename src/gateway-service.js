@@ -43,6 +43,7 @@ const STATUS_TRANSITIONS = {
 // mid-answer would amputate the text before it, and a trailing one would
 // erase the final answer.
 const SEGMENT_BOUNDARY_TYPES = new Set(["tool_call", "permission_request", "elicitation_request"]);
+const ACTOR_UPDATE_TYPES = new Set(["permission_request", "elicitation_request", "config_option_update"]);
 // A normal Main needs only a terminal result or a request it must answer.
 // Progress is available through explicit evidence options, but must not make
 // every streamed chunk into another frontdoor tool result.
@@ -1194,6 +1195,15 @@ export class GatewayService {
 
   handleUpdate(session, update) {
     const type = update.sessionUpdate ?? update.type ?? "unknown";
+    if (ACTOR_UPDATE_TYPES.has(type)) {
+      this.#queueFor(session).post(`update:${type}`, () => this.#handleUpdateLocked(session, update, type));
+      return;
+    }
+    this.#handleUpdateLocked(session, update, type);
+  }
+
+  #handleUpdateLocked(session, update, type) {
+    if (!this.store.get(session.id) || CLOSED_STATUSES.has(session.status)) return;
     // Usage is provider bookkeeping, not an actionable Main event. Some ACP
     // adapters stream it repeatedly, so retaining it would repeatedly wake
     // long polls and turn accounting chatter into frontdoor token usage.
@@ -1558,9 +1568,10 @@ export class GatewayService {
     }
 
     for (const session of [...this.store.list()]) {
-      const abandonmentAt = latestTimestamp(session.orphanedAt, session.lastOwnerActivityAt ?? session.updatedAt);
-      const orphanExpired = !session.pinned && abandonmentAt
-        && isExpired(abandonmentAt, this.lifecycle.orphanGraceMs, now);
+      const presence = this.rootPresence.get(session.ownerRootId);
+      const orphanExpired = !session.pinned && session.orphanedAt
+        && (presence?.connections ?? 0) === 0
+        && isExpired(session.orphanedAt, this.lifecycle.orphanGraceMs, now);
       if (orphanExpired && ACTIVE_STATUSES.has(session.status) && !session.orphanCancelRequested) {
         try {
           if (await this.#queueFor(session).run("orphan_cancel", () => this.#orphanCancelLocked(session))) {
@@ -1626,6 +1637,9 @@ export class GatewayService {
   // or the result gets spilled and reported a second time.
   #orphanCancelLocked(session) {
     if (!this.store.get(session.id) || session.orphanCancelRequested) return false;
+    const presence = this.rootPresence.get(session.ownerRootId);
+    if (session.pinned || !session.orphanedAt || (presence?.connections ?? 0) > 0
+      || !isExpired(session.orphanedAt, this.lifecycle.orphanGraceMs, this.now())) return false;
     if (!ACTIVE_STATUSES.has(session.status) || session.status === "restoring") return false;
     session.orphanCancelRequested = true;
     session.cancelRequested = true;

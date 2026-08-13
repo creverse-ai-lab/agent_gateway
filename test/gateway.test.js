@@ -931,7 +931,7 @@ test("Gateway keeps a non-resumable provider live until final session retention 
   }
 });
 
-test("Gateway cancels abandoned active sessions after the owner grace period without requiring disconnect", async () => {
+test("Gateway cancels active sessions after the disconnected owner grace period", async () => {
   let clock = Date.now();
   const makeClient = (_provider, options) =>
     new AcpClient({ provider: "mock", command: process.execPath, args: [capabilityAgent], permissionPolicy: "auto_approve" }, options);
@@ -941,6 +941,7 @@ test("Gateway cancels abandoned active sessions after the owner grace period wit
     const opened = await service.call("session_open", { provider: "claude", cwd: process.cwd(), permissionPolicy: "auto_approve" }, { rootId: "main-a" });
     const task = await service.call("task_prompt", { sessionId: opened.sessionId, prompt: "long-terminal" }, { rootId: "main-a" });
     await waitForTerminalCount(service, opened.sessionId, 1);
+    service.detachRoot("main-a");
     clock += 11;
     await service.runMaintenance();
     await waitForStatus(service, opened.sessionId, "cancelled");

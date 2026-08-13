@@ -6,6 +6,7 @@ import { ERROR_CODES, GatewayError } from "./errors.js";
 // half-applied interleaving. The bound is a module constant on purpose: it is a
 // safety valve against a runaway caller, not a tuning knob on the wire.
 export const SESSION_QUEUE_LIMIT = 32;
+export const SESSION_CRITICAL_QUEUE_RESERVE = 2;
 
 // Tracks which queue owns the current async context. Awaiting the same queue
 // from inside one of its own commands would deadlock forever, so it throws
@@ -18,17 +19,18 @@ export class SessionQueue {
     this.id = id;
     this.limit = limit;
     this.items = [];
+    this.criticalItems = [];
     this.running = null;
     this.closedError = null;
     this.drainWaiters = new Set();
   }
 
   get depth() {
-    return this.items.length + (this.running == null ? 0 : 1);
+    return this.items.length + this.criticalItems.length + (this.running == null ? 0 : 1);
   }
 
   get idle() {
-    return this.running == null && this.items.length === 0;
+    return this.running == null && this.items.length === 0 && this.criticalItems.length === 0;
   }
 
   // Awaited command: the caller gets the body's value or its original error
@@ -39,14 +41,14 @@ export class SessionQueue {
         `Session queue ${this.id} re-entered by ${kind} from inside command ${this.running}`
       );
     }
-    return this.#submit(kind, fn);
+    return this.#submit(kind, fn, false);
   }
 
   // Fire-and-forget command (turn callbacks, provider exit, orphan cancel).
   // There is no caller to reject to, and a closed queue must not turn into an
   // unhandled rejection, so the outcome is swallowed by design.
   post(kind, fn) {
-    void this.#submit(kind, fn).catch(() => {});
+    void this.#submit(kind, fn, true).catch(() => {});
   }
 
   // Rejects everything still waiting. A command queued behind a close would
@@ -54,6 +56,7 @@ export class SessionQueue {
   closeWith(error) {
     this.closedError = error;
     for (const item of this.items.splice(0)) item.reject(error);
+    for (const item of this.criticalItems.splice(0)) item.reject(error);
     this.#settleDrain();
   }
 
@@ -75,26 +78,29 @@ export class SessionQueue {
     });
   }
 
-  #submit(kind, fn) {
+  #submit(kind, fn, critical) {
     if (this.closedError) return Promise.reject(this.closedError);
     // The cap counts everything outstanding, the running command included, so
     // the bound is on work this session still owes rather than on how much of
     // it happens to be waiting at this instant.
-    if (this.depth >= this.limit) {
+    const limit = this.limit + (critical ? SESSION_CRITICAL_QUEUE_RESERVE : 0);
+    if (this.depth >= limit) {
       return Promise.reject(new GatewayError(
         ERROR_CODES.SESSION_ACTIVE,
         `Session ${this.id} has too many queued commands`
       ));
     }
     return new Promise((resolve, reject) => {
-      this.items.push({ kind, fn, resolve, reject });
+      const item = { kind, fn, resolve, reject, critical };
+      if (critical) this.criticalItems.push(item);
+      else this.items.push(item);
       if (this.running == null) void this.#pump();
     });
   }
 
   async #pump() {
-    while (this.items.length) {
-      const item = this.items.shift();
+    while (this.criticalItems.length || this.items.length) {
+      const item = this.criticalItems.shift() ?? this.items.shift();
       this.running = item.kind;
       try {
         item.resolve(await RUNNING.run(this, () => item.fn()));
