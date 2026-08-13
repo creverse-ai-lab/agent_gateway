@@ -5,7 +5,7 @@ const textAccumulators = new WeakMap();
 
 // The control lane. An event worth persisting is an event worth never dropping,
 // so one closed list decides all three of its consumers: the ring slots telemetry
-// can never evict (here), the snapshot-dirty set (gateway-service) and the
+// can never evict (here), snapshot scheduling (gateway-service) and the
 // transport's non-droppable lane (socket-flow, which imports the re-export).
 // Closed is the DoS property: a worker cannot promote its own chatter into the
 // protected lane by naming it something new.
@@ -13,14 +13,14 @@ export const DURABLE_EVENT_TYPES = new Set([
   "session_created", "session_restored", "session_restore_start", "session_restore_failed",
   "turn_start", "turn_end", "error", "permission_request", "permission_response",
   "elicitation_request", "elicitation_response", "cancel_requested", "orphan_cancel_requested",
-  "provider_disconnected", "session_closed", "model_changed", "config_changed"
+  "provider_disconnected", "session_closed", "model_changed", "config_changed", "task_status"
 ]);
 
 // The highest-volume, lowest-value events in the protocol. They keep a lane of
 // their own instead of sharing the ring: one turn of streaming would otherwise
 // evict every permission request and turn boundary the session ever recorded.
-// They stay pollable through a merged view, so a caller that asks for them by
-// type still gets them.
+// They remain available to explicitly opted-in live subscribers, but never enter
+// retrospective poll or replay storage.
 export const CHUNK_EVENT_TYPES = new Set([
   "agent_message_chunk", "agent_thought_chunk", "user_message_chunk"
 ]);
@@ -30,9 +30,6 @@ export const CHUNK_EVENT_TYPES = new Set([
 // saturations of the request path — about nine typical turns of control history,
 // where today's shared ring guarantees none at all.
 const CONTROL_EVENT_SLOTS = 256;
-// One screen of streaming context. Chunks are a live-delivery concern; the
-// retained copy exists so a caller that polls by type shortly after sees them.
-const CHUNK_EVENT_SLOTS = 64;
 // Mirrors the inspection bound: a per-turn projection is a debugging aid, and a
 // worker with thousands of live tool calls is a bug, not a workload.
 const MAX_PROJECTED_TOOL_CALLS = 64;
@@ -81,29 +78,23 @@ export class SessionStore {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       events: [],
-      // Same session-wide sequence as the ring: one counter across every lane is
-      // what keeps a cursor, a toCursor range and a merged read monotonic.
+      // Compatibility-only inspection field. Raw chunks are live telemetry and
+      // are never appended here.
       chunkEvents: [],
       turnId: null,
       stopReason: null,
       error: null,
       waiters: new Set(),
-      // Woken only by chunk pushes, and only holds waiters whose filter selects
-      // chunks: that is what makes a default long poll immune to a chunk flood.
-      chunkWaiters: new Set(),
       eventSequence: 0,
       ...rest
     };
     session.chunkEvents = Array.isArray(session.chunkEvents) ? session.chunkEvents : [];
-    session.chunkWaiters = session.chunkWaiters instanceof Set ? session.chunkWaiters : new Set();
     session.thoughtCapture = normalizeThoughtCapture(session.thoughtCapture);
     // The highest sequence number that left a lane. "cursor at or below this"
     // means at least one event the caller has not seen is gone, even when the
     // ring still starts below the cursor because control survived.
     session.eventsEvictedThrough = Number.isFinite(session.eventsEvictedThrough)
       ? session.eventsEvictedThrough : -1;
-    session.chunkEventsEvictedThrough = Number.isFinite(session.chunkEventsEvictedThrough)
-      ? session.chunkEventsEvictedThrough : -1;
     let resultWriter = null;
     const resultBuffer = new BoundedUtf8Text(this.maxTextBytes, {
       onTrim: (buffer) => {
@@ -173,6 +164,7 @@ export class SessionStore {
           state.toolCalls.clear();
           state.toolCallsDropped = 0;
           state.usageTurn = emptyUsage();
+          state.usagePrevTokens = null;
           session.resultFinalText = null;
           session.resultFinalArtifact = null;
           session.resultInspection = [];
@@ -410,25 +402,13 @@ export class SessionStore {
     events.splice(index, 1);
   }
 
-  // Chunks take the same session-wide sequence number as ring events, so a
-  // merged read stays monotonic and a toCursor range still means one thing. Only
-  // chunk-selecting waiters are notified: a default long poll is asleep through
-  // any number of these, by construction rather than by luck.
-  pushChunk(session, event) {
+  // Raw chunks are live telemetry only. The bounded message/thought
+  // accumulators retain the state used by results and diagnostics; keeping each
+  // fragment would recreate the noisy ring under another name.
+  publishChunk(session, event) {
     const stored = { i: session.eventSequence++, ts: new Date().toISOString(), turnId: session.turnId, ...event };
-    session.chunkEvents.push(stored);
-    if (session.chunkEvents.length > CHUNK_EVENT_SLOTS) {
-      const dropped = session.chunkEvents.splice(0, session.chunkEvents.length - CHUNK_EVENT_SLOTS);
-      session.chunkEventsEvictedThrough = Math.max(
-        session.chunkEventsEvictedThrough, dropped.at(-1).i
-      );
-    }
     session.updatedAt = new Date().toISOString();
-    // Iterated the same way push does: a waking waiter deletes itself from the
-    // set, which is safe mid-iteration and costs no copy on the streaming path.
-    for (const wake of session.chunkWaiters) wake();
     this.onEvent?.(session, stored);
-    this.onChange?.(session, stored);
     return stored;
   }
 
@@ -436,19 +416,7 @@ export class SessionStore {
   // lanes are already ascending by sequence, so this is a linear merge and the
   // default poll path never pays for it.
   mergedEvents(session) {
-    const chunks = session.chunkEvents ?? [];
-    if (!chunks.length) return session.events;
-    const events = session.events;
-    if (!events.length) return [...chunks];
-    const merged = [];
-    let left = 0;
-    let right = 0;
-    while (left < events.length && right < chunks.length) {
-      merged.push(events[left].i <= chunks[right].i ? events[left++] : chunks[right++]);
-    }
-    while (left < events.length) merged.push(events[left++]);
-    while (right < chunks.length) merged.push(chunks[right++]);
-    return merged;
+    return session.events;
   }
 
   // Collapses a tool call's progress to its newest state by DELETING the prior
@@ -523,17 +491,14 @@ export class SessionStore {
     }));
   }
 
-  // Waiters fire on every push; shouldWake keeps the poll asleep for events
-  // the caller would only filter out again (tool noise for a text-only poll).
-  // wakeOnChunks additionally registers in the chunk lane's set: a chunk-blind
-  // caller is never even woken by a chunk, so it does not re-scan the ring once
-  // per streamed token.
-  wait(session, waitMs, shouldWake = () => true, wakeOnChunks = false) {
+  // Waiters fire only for retained events or status changes. Raw progress is a
+  // subscription stream and never wakes a poll, even when its filter names a
+  // chunk type.
+  wait(session, waitMs, shouldWake = () => true) {
     return new Promise((done) => {
       const finish = () => {
         clearTimeout(timer);
         session.waiters.delete(wake);
-        session.chunkWaiters?.delete(wake);
         done();
       };
       const wake = () => {
@@ -541,7 +506,6 @@ export class SessionStore {
       };
       const timer = setTimeout(finish, waitMs);
       session.waiters.add(wake);
-      if (wakeOnChunks) session.chunkWaiters?.add(wake);
     });
   }
 }
@@ -644,9 +608,7 @@ export function publicSession(session) {
     error: session.error,
     createdAt: session.createdAt,
     updatedAt: session.updatedAt,
-    // Spans every lane: the number means "events this session is holding", and
-    // splitting the storage must not silently redefine what a UI is reading.
-    eventCount: session.events.length + (session.chunkEvents?.length ?? 0),
+    eventCount: session.events.length,
     resultArtifact: session.resultArtifact ?? null
   };
 }

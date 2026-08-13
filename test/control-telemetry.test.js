@@ -15,7 +15,6 @@ const mockAgent = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 // The design's constants, pinned here rather than imported: a test that reads the
 // implementation's own number cannot notice the number changing.
 const CONTROL_EVENT_SLOTS = 256;
-const CHUNK_EVENT_SLOTS = 64;
 const MAX_PROJECTED_TOOL_CALLS = 64;
 
 async function withDirectory(prefix, run) {
@@ -75,14 +74,10 @@ test("control events survive a telemetry flood that evicts everything else", asy
     assert.equal(session.events.filter((event) => event.type === "test_event").length < 300, true);
     const telemetry = session.events.filter((event) => !DURABLE_EVENT_TYPES.has(event.type));
     assert.ok(telemetry.length <= service.store.maxEvents, "telemetry keeps its own budget, no more");
-    assert.ok(session.chunkEvents.length <= CHUNK_EVENT_SLOTS, "the chunk lane is bounded");
+    assert.deepEqual(session.chunkEvents, [], "raw chunks are never retained");
     assert.ok(session.eventsEvictedThrough >= 0, "the low-water mark recorded the drops");
 
-    const merged = service.store.mergedEvents(session);
-    for (let index = 1; index < merged.length; index += 1) {
-      assert.ok(merged[index].i > merged[index - 1].i, "the merged view is strictly monotonic by sequence");
-    }
-    assert.ok(merged.length > session.events.length, "the merged view is the union of both lanes");
+    assert.equal(service.store.mergedEvents(session), session.events, "the retained view is the control/projection ring");
   } finally {
     await service.shutdown().catch(() => {});
   }
@@ -107,6 +102,34 @@ test("control is only ever evicted by newer control, past its own slot count", a
   }
 });
 
+test("task status is protected from telemetry eviction", async () => {
+  const service = new GatewayService({
+    gcIntervalMs: 0,
+    createClient: (_provider, options) =>
+      new AcpClient({ provider: "mock", command: process.execPath, args: [mockAgent], permissionPolicy: "read_only" }, options)
+  });
+  try {
+    const opened = await service.call(
+      "session_open", { provider: "claude", cwd: process.cwd(), permissionPolicy: "read_only" }, { rootId: "main-a" }
+    );
+    const task = await service.call(
+      "task_prompt", { sessionId: opened.sessionId, prompt: "narrated-result" }, { rootId: "main-a" }
+    );
+    await waitForIdle(service, opened.sessionId);
+    const session = service.requireSession(opened.sessionId);
+    for (let index = 0; index < 500; index += 1) {
+      service.store.push(session, { type: "test_event", index });
+    }
+    const statuses = session.events
+      .filter((event) => event.type === "task_status" && event.taskId === task.taskId)
+      .map((event) => event.status);
+    assert.deepEqual(statuses, ["working", "completed"]);
+    assert.equal(DURABLE_EVENT_TYPES.has("task_status"), true);
+  } finally {
+    await service.shutdown().catch(() => {});
+  }
+});
+
 // ---------------------------------------------------------------------------
 // 2. The Wake-up gate
 // ---------------------------------------------------------------------------
@@ -121,7 +144,6 @@ test("Wake-up gate: a default long poll sleeps through progress and wakes on inp
     // Structural, not incidental: a chunk-blind caller is not even registered in
     // the lane that chunk pushes notify, so 500 chunks cost it zero wakes.
     assert.equal(session.waiters.size, 1);
-    assert.equal(session.chunkWaiters.size, 0, "a default poll never joins the chunk lane");
 
     for (let index = 0; index < 500; index += 1) service.handleUpdate(session, chunk(`c${index}`));
     for (let index = 0; index < 200; index += 1) service.handleUpdate(session, toolUpdate("call-a", index));
@@ -147,10 +169,12 @@ test("Wake-up gate: a default long poll sleeps through progress and wakes on inp
   }
 });
 
-test("a chunk that arrives after its turn was sealed cannot grow the finished transcript", async () => {
+test("a chunk that arrives after its turn was sealed is live-only and cannot grow the transcript", async () => {
   const service = new GatewayService({ gcIntervalMs: 0 });
   try {
     const session = directSession(service, "late-chunk");
+    const delivered = [];
+    service.subscribe({ sessionIds: [session.id] }, { rootId: "main-a" }, (event) => delivered.push(event));
     service.handleUpdate(session, chunk("answered"));
     assert.equal(session.resultText, "answered");
     // What #finishTurn does the moment the prompt response lands. handleUpdate is
@@ -159,10 +183,8 @@ test("a chunk that arrives after its turn was sealed cannot grow the finished tr
     session.turnSeal = session.turnId;
     service.handleUpdate(session, chunk(" and then some"));
     assert.equal(session.resultText, "answered", "a handed-out result is not rewritten behind the caller");
-    assert.ok(
-      session.chunkEvents.some((event) => event.text === " and then some"),
-      "the late chunk is still recorded and still delivered; only the transcript is sealed"
-    );
+    assert.deepEqual(session.chunkEvents, [], "the late raw fragment is not retained");
+    assert.equal(delivered.some((event) => event.text === " and then some"), true, "live observers still receive it");
     // The next turn clears the seal along with the transcript, and appending works
     // again: the gate closes a finished turn, it does not close the session.
     session.turnSeal = null;
@@ -174,20 +196,19 @@ test("a chunk that arrives after its turn was sealed cannot grow the finished tr
   }
 });
 
-test("a chunk-selecting poll does join the chunk lane and is woken by one", async () => {
+test("a chunk-selecting poll still sleeps because raw progress is subscription-only", async () => {
   const service = new GatewayService({ gcIntervalMs: 0 });
   try {
     const session = directSession(service, "chunk-wake");
     const pending = service.call(
       "poll",
-      { sessionId: session.id, cursor: 0, waitMs: 5_000, eventTypes: ["agent_message_chunk"] },
+      { sessionId: session.id, cursor: 0, waitMs: 100, eventTypes: ["agent_message_chunk"] },
       { rootId: "main-a" }
     );
     await new Promise((done) => setTimeout(done, 20));
-    assert.equal(session.chunkWaiters.size, 1, "asking for chunks subscribes to chunk wakes");
-    setTimeout(() => service.handleUpdate(session, chunk("hello")), 20);
+    service.handleUpdate(session, chunk("hello"));
     const response = await pending;
-    assert.deepEqual(response.events.map((event) => event.text), ["hello"]);
+    assert.deepEqual(response.events, []);
   } finally {
     await service.shutdown().catch(() => {});
   }
@@ -251,25 +272,26 @@ test("splitting a lane is not a truncation: a caller that lost nothing is never 
   }
 });
 
-test("eventCount spans every lane", async () => {
+test("eventCount counts retained events, not ephemeral chunks", async () => {
   const service = new GatewayService({ gcIntervalMs: 0 });
   try {
     const session = directSession(service, "count");
     service.store.push(session, { type: "turn_start" });
     for (let index = 0; index < 5; index += 1) service.handleUpdate(session, chunk(`c${index}`));
     const summary = await service.call("session", { action: "get", sessionId: session.id }, { rootId: "main-a" });
-    assert.equal(summary.eventCount, session.events.length + session.chunkEvents.length);
-    assert.equal(summary.eventCount, 6);
+    assert.equal(summary.eventCount, session.events.length);
+    assert.equal(summary.eventCount, 1);
+    assert.deepEqual(session.chunkEvents, []);
   } finally {
     await service.shutdown().catch(() => {});
   }
 });
 
 // ---------------------------------------------------------------------------
-// 4. Chunk lane: pollable, live, absent from replay (P6-5)
+// 4. Raw chunks: live only, absent from poll and replay (P6-5)
 // ---------------------------------------------------------------------------
 
-test("chunks stay live and pollable but leave subscription replay", async () => {
+test("chunks stay live but leave both poll storage and subscription replay", async () => {
   const service = new GatewayService({ gcIntervalMs: 0 });
   try {
     const session = directSession(service, "replay");
@@ -301,8 +323,8 @@ test("chunks stay live and pollable but leave subscription replay", async () => 
       { sessionId: session.id, cursor: 0, eventTypes: ["agent_message_chunk", "agent_thought_chunk"] },
       { rootId: "main-a" }
     );
-    assert.deepEqual(polled.events.map((event) => event.text), ["streamed", "reasoning"]);
-    assert.equal(polled.nextCursor, session.eventSequence, "one counter across lanes keeps cursors usable");
+    assert.deepEqual(polled.events, [], "raw telemetry is not a retrospective poll surface");
+    assert.equal(polled.nextCursor, 1, "poll advances only across retained history, not ephemeral chunks");
   } finally {
     await service.shutdown().catch(() => {});
   }
@@ -509,6 +531,12 @@ test("per-turn usage resets with the transcript; the session total survives unti
     assert.equal(snapshot.turn.source, "none");
     assert.equal(snapshot.session.updates, 1);
     assert.equal(snapshot.session.usedPeak, 500);
+    service.store.recordUsage(session, { usage: { inputTokens: 150 } }, "prompt_response");
+    assert.equal(
+      service.store.usageSnapshot(session).turn.inputTokens,
+      150,
+      "the first cumulative token sample of a new turn is not diffed against the prior turn"
+    );
 
     session.status = "idle";
     session.completedAt = new Date(Date.now() - 48 * 60 * 60_000).toISOString();
@@ -528,7 +556,7 @@ test("per-turn usage resets with the transcript; the session total survives unti
   }
 });
 
-test("usage is exposed on poll only when asked for, and on get and the task envelope", async () => {
+test("usage is exposed on poll and task results only when requested, and on diagnostic get", async () => {
   const service = new GatewayService({
     createClient: (_provider, options) =>
       new AcpClient({ provider: "mock", command: process.execPath, args: [mockAgent], permissionPolicy: "read_only" }, options)
@@ -538,7 +566,7 @@ test("usage is exposed on poll only when asked for, and on get and the task enve
       "session_open", { provider: "claude", cwd: process.cwd(), permissionPolicy: "read_only" }, { rootId: "main-a" }
     );
     const task = await service.call(
-      "task_prompt", { sessionId: opened.sessionId, prompt: "narrated-result" }, { rootId: "main-a" }
+      "task_prompt", { sessionId: opened.sessionId, prompt: "narrated-result", includeUsage: true }, { rootId: "main-a" }
     );
     await waitForIdle(service, opened.sessionId);
 
@@ -564,6 +592,13 @@ test("usage is exposed on poll only when asked for, and on get and the task enve
     assert.ok(keys.includes("usage"));
     assert.ok(keys.indexOf("usage") < keys.indexOf("result"), "usage sits inside the durable preview head");
     assert.equal(envelope.usage.inputTokens, 1_200);
+
+    const plainTask = await service.call(
+      "task_prompt", { sessionId: opened.sessionId, prompt: "narrated-result" }, { rootId: "main-a" }
+    );
+    await waitForIdle(service, opened.sessionId);
+    const plainEnvelope = await service.call("task_result", { taskId: plainTask.taskId }, { rootId: "main-a" });
+    assert.equal("usage" in plainEnvelope, false, "task usage is opt-in, like poll usage");
 
     const setup = await service.call("setup", {}, { rootId: "main-a" });
     assert.equal("usage" in setup.metrics, false, "metrics are global; one Main must not read another's spend");
@@ -704,10 +739,10 @@ test("ACP_GATEWAY_THOUGHT_CAPTURE selects the gateway-wide default and rejects n
 });
 
 // ---------------------------------------------------------------------------
-// 8. config_option_update is snapshot-dirty without being control (P6-8)
+// 8. canonical config changes are control events (P6-8)
 // ---------------------------------------------------------------------------
 
-test("a worker-initiated model change schedules a snapshot without buying a ring slot", async () => {
+test("a worker-initiated model change becomes protected canonical control state", async () => {
   const service = new GatewayService({ gcIntervalMs: 0 });
   try {
     const session = directSession(service, "config-dirty");
@@ -715,22 +750,16 @@ test("a worker-initiated model change schedules a snapshot without buying a ring
     service.schedulePersist = () => { scheduled += 1; };
     service.handleUpdate(session, {
       sessionUpdate: "config_option_update",
-      options: [{ id: "model", name: "Model", currentValue: "opus" }]
+      configOptions: [{ id: "model", name: "Model", category: "model", currentValue: "opus" }]
     });
+    await waitForCondition(() => session.model === "opus");
     assert.equal(scheduled, 1, "the change that rewrites capabilities and model now reaches disk");
-    assert.equal(DURABLE_EVENT_TYPES.has("config_option_update"), false, "snapshot-dirty is not the control lane");
+    assert.equal(DURABLE_EVENT_TYPES.has("config_changed"), true);
+    const canonical = session.events.find((event) => event.type === "config_changed");
+    assert.equal(canonical.source, "worker");
 
-    scheduled = 0;
-    for (let index = 0; index < 300; index += 1) {
-      service.handleUpdate(session, {
-        sessionUpdate: "config_option_update", options: [{ id: "model", name: "Model", currentValue: `m${index}` }]
-      });
-    }
-    assert.equal(
-      session.events.filter((event) => event.type === "config_option_update").length <= service.store.maxEvents,
-      true,
-      "unsolicited worker chatter stays evictable"
-    );
+    for (let index = 0; index < 500; index += 1) service.store.push(session, { type: "test_event", index });
+    assert.equal(session.events.includes(canonical), true, "telemetry cannot evict the canonical config transition");
   } finally {
     await service.shutdown().catch(() => {});
   }
@@ -743,4 +772,12 @@ async function waitForIdle(service, sessionId, attempts = 200) {
     await new Promise((done) => setTimeout(done, 25));
   }
   throw new Error("session never left the running state");
+}
+
+async function waitForCondition(predicate, attempts = 100) {
+  for (let index = 0; index < attempts; index += 1) {
+    if (predicate()) return;
+    await new Promise((done) => setTimeout(done, 10));
+  }
+  throw new Error("condition was not reached");
 }

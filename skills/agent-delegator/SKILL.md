@@ -96,9 +96,9 @@ When no Task handle is returned, monitor the session with `agent_acp_poll`.
 3. Treat `running`, `waiting_permission`, `waiting_input`, `cancelling`, and `restoring` as active states.
 4. Handle `idle`, `error`, `cancelled`, `disconnected`, and `unavailable` as non-active outcomes. Collect the automatically included result/artifact before deciding whether to accept, restore, retry, or report failure.
 5. The default poll response carries no progress events: it waits for terminal status and then returns the final `result`, while still delivering permission and elicitation requests that Main must answer. Do not request `includeResult` during normal active polling; set it true only when cumulative partial transcript is necessary.
-6. Opt into `eventTypes`, `includeThoughts`, `includeToolEvents`, or `includeInspection` only for required review evidence. `usage_update` is intentionally not delivered or retained.
+6. Opt into `eventTypes`, `includeThoughts`, `includeToolEvents`, `includeInspection`, or `includeUsage` only for required review evidence. Raw message/thought chunks are live-subscription telemetry rather than poll history. Raw `usage_update` events are not delivered; their bounded per-turn/session aggregate is returned only when requested.
 7. Page with `maxEvents` when needed (v1.3.x defaults to 200 and caps it at 1000; trust the live schema after upgrades). It counts delivered events, while `nextCursor` also advances over filtered events; continue until the cursor reaches the intended live or `toCursor` boundary.
-8. Expect an empty `events` array with `filteredCount > 0` and an advancing cursor. The wait wakes only for a deliverable event or status change.
+8. Expect an empty `events` array with `filteredCount > 0` and an advancing cursor. The wait wakes only for retained actionable events or status changes, never for raw progress.
 9. Treat `cursorTruncated: true` as a retained-history gap. Do not reconstruct evidence that the Gateway no longer holds.
 10. Use `toCursor` for immediate retrospective range reads. Match `eventTypes` exactly, or add a trailing `*` for prefix matching: `['tool_call']` excludes updates, while `['tool_call*']` includes `tool_call_update`.
 

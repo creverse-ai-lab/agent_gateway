@@ -58,15 +58,9 @@ const CLOSED_STATUSES = new Set(["closed"]);
 // known to be out of sync with the worker, so it has to be resumed first.
 const RESTORE_REQUIRED_STATUSES = new Set(["disconnected", "unavailable"]);
 const CONTROL_SERVER_PATTERN = /(?:acp-gateway-control|acp-mcp-bridge|gateway-daemon|control-mcp)/i;
-// Defined next to the ring that enforces it; re-exported here because this is
-// where the transport's lane table and the snapshot-dirty rule read it from.
+// Defined next to the ring that enforces it; re-exported here because the
+// transport lane table reads the same closed control-event inventory.
 export { DURABLE_EVENT_TYPES } from "./sessions.js";
-// Telemetry that still changes persisted session state. config_option_update
-// rewrites capabilities and the selected model, so a worker-initiated model
-// change was being lost on restart: it never scheduled a snapshot. Being
-// snapshot-dirty is not the same as being control — this type stays droppable
-// and evictable, because unsolicited worker chatter must not buy ring slots.
-const SNAPSHOT_DIRTY_EVENT_TYPES = new Set(["config_option_update"]);
 
 export class GatewayService {
   constructor({
@@ -197,7 +191,7 @@ export class GatewayService {
       maxInlineResultBytes,
       artifactStore: this.artifactStore,
       onChange: (_session, event) => {
-        if (!event || DURABLE_EVENT_TYPES.has(event.type) || SNAPSHOT_DIRTY_EVENT_TYPES.has(event.type)) {
+        if (!event || DURABLE_EVENT_TYPES.has(event.type)) {
           this.schedulePersist();
         }
       },
@@ -970,6 +964,7 @@ export class GatewayService {
       }
       crashAfter("task_create_durable");
       session.activeTaskId = task.taskId;
+      session.activeTaskIncludeUsage = args.includeUsage === true;
       try {
         // One command covers starting the turn and recording the handle. Split
         // across two, the turn could already have finished and this bookkeeping
@@ -989,10 +984,14 @@ export class GatewayService {
           // T1: the turn id is provenance the handle should keep across a restart,
           // but no caller is holding a response for it.
           this.#appendTaskStatus(running);
+          this.#publishTaskStatus(running);
           return this.publicTask(running);
         });
       } catch (error) {
-        if (session.activeTaskId === task.taskId) session.activeTaskId = null;
+        if (session.activeTaskId === task.taskId) {
+          session.activeTaskId = null;
+          session.activeTaskIncludeUsage = false;
+        }
         this.taskStore.remove(task.taskId);
         throw error;
       }
@@ -1059,6 +1058,9 @@ export class GatewayService {
       sessionId: task.sessionId,
       turnId: task.turnId,
       status: "cancelled",
+      ...(session?.activeTaskIncludeUsage === true
+        ? { usage: this.store.usageSnapshot(session).turn }
+        : {}),
       result: {
         text: session?.resultFinalText ?? session?.resultText ?? "",
         transcriptBytes: Buffer.byteLength(session?.resultText ?? ""),
@@ -1074,7 +1076,10 @@ export class GatewayService {
     if (cancelled && cancelled.status !== "cancelled" && cancelled.status !== "failed") {
       throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `Cannot cancel task in terminal status: ${cancelled.status}`);
     }
-    if (session?.activeTaskId === task.taskId) session.activeTaskId = null;
+    if (session?.activeTaskId === task.taskId) {
+      session.activeTaskId = null;
+      session.activeTaskIncludeUsage = false;
+    }
     return this.publicTask(cancelled);
   }
 
@@ -1137,13 +1142,10 @@ export class GatewayService {
     const maxEvents = Math.min(1000, Math.max(1, requireNonNegativeNumber(args.maxEvents, "maxEvents", 200)));
     const toCursor = args.toCursor == null ? Infinity : requireNonNegativeNumber(args.toCursor, "toCursor");
     const matchesEventType = compileEventTypes(args.eventTypes);
-    // Chunks live in a lane of their own. They are merged back in on demand, and
-    // only for a caller whose filter actually selects them, so the default poll
-    // reads exactly the array it always did.
-    const wantsChunks = matchesEventType
-      ? [...CHUNK_EVENT_TYPES].some((type) => matchesEventType(type))
-      : args.includeThoughts === true;
-    const visible = () => (wantsChunks ? this.store.mergedEvents(session) : session.events);
+    // Raw chunks are available only to an explicitly opted-in live subscriber.
+    // Poll reads the retained control/projection ring and never wakes on stream
+    // fragments, even if a caller names a chunk type.
+    const visible = () => session.events;
     const firstIndex = visible()[0]?.i ?? session.eventSequence;
     const effectiveCursor = Math.max(cursor, firstIndex);
     const deliverable = (event) => {
@@ -1160,7 +1162,7 @@ export class GatewayService {
       && !visible().some(deliverable)) {
       const statusAtWait = session.status;
       await this.store.wait(session, waitMs, () =>
-        session.status !== statusAtWait || visible().some(deliverable), wantsChunks);
+        session.status !== statusAtWait || visible().some(deliverable));
     }
     // maxEvents counts deliverable events; the cursor still advances over the
     // filtered-out ones in between so sparse type reads do not return empty
@@ -1184,7 +1186,7 @@ export class GatewayService {
       ok: true,
       ...publicSession(session),
       nextCursor: window.length ? window.at(-1).i + 1 : effectiveCursor,
-      cursorTruncated: cursorTruncatedFor(session, cursor, wantsChunks),
+      cursorTruncated: cursorTruncatedFor(session, cursor),
       events,
       // The cursor advances over filtered-out events too; this says how many,
       // so an empty poll with a moving cursor is legible.
@@ -1473,13 +1475,13 @@ export class GatewayService {
     if (type === "agent_message_chunk") {
       const text = extractText(update);
       this.store.appendResultText(session, text);
-      this.store.pushChunk(session, this.capTextEvent(session, type, text));
+      this.store.publishChunk(session, this.capTextEvent(session, type, text));
       return;
     }
     if (type === "agent_thought_chunk") {
       const text = extractText(update);
       this.store.appendThoughtText(session, text);
-      this.store.pushChunk(session, this.capTextEvent(session, type, text));
+      this.store.publishChunk(session, this.capTextEvent(session, type, text));
       return;
     }
     if (SEGMENT_BOUNDARY_TYPES.has(type)) this.store.markSegmentBoundary(session, String(type));
@@ -1554,7 +1556,11 @@ export class GatewayService {
     if (type === "config_option_update") {
       session.capabilities = { ...session.capabilities, configOptions: update.configOptions ?? [] };
       session.model = sessionModelId(update.configOptions) ?? session.model;
-      this.store.push(session, { type, ...this.capStructuredField(session, type, "data", update) });
+      this.store.push(session, {
+        type: "config_changed",
+        source: "worker",
+        ...this.capStructuredField(session, type, "data", update)
+      });
       return;
     }
     const serialized = JSON.stringify(update);
@@ -1570,7 +1576,7 @@ export class GatewayService {
     // The lane split. tool_call (the start) stays in the ring uncollapsed: it is
     // a segment boundary and the only record that the call ever began. Only its
     // progress updates are projected down to the newest state per call.
-    if (CHUNK_EVENT_TYPES.has(type)) this.store.pushChunk(session, event);
+    if (CHUNK_EVENT_TYPES.has(type)) this.store.publishChunk(session, event);
     else if (type === "tool_call_update") this.store.pushToolCallUpdate(session, event, update.toolCallId);
     else this.store.push(session, event);
   }
@@ -1712,6 +1718,7 @@ export class GatewayService {
       // nothing durable to say, so it does not get a record.
       if (task.status !== before.status || task.statusMessage !== before.statusMessage) {
         this.#appendTaskStatus(task);
+        this.#publishTaskStatus(task);
       }
       return;
     }
@@ -1719,6 +1726,7 @@ export class GatewayService {
     // Keyed off the requested status, not the resulting one: a terminal report
     // that lost to an earlier terminal writer still ends this session's claim.
     session.activeTaskId = null;
+    session.activeTaskIncludeUsage = false;
   }
 
   #commitTaskTerminal(session, taskId, status, statusMessage, result) {
@@ -1756,23 +1764,30 @@ export class GatewayService {
         error: failureMessage
       };
       if (provisional) {
-        return this.taskStore.failDeferredTerminal(taskId, failureMessage, failure, { lastUpdatedAt });
+        const failed = this.taskStore.failDeferredTerminal(taskId, failureMessage, failure, { lastUpdatedAt });
+        this.#publishTaskStatus(failed);
+        return failed;
       }
-      return this.taskStore.transition(taskId, "failed", failureMessage, {
+      const failed = this.taskStore.transition(taskId, "failed", failureMessage, {
         lastUpdatedAt,
         result: failure
       });
+      this.#publishTaskStatus(failed);
+      return failed;
     }
     if (provisional) {
       this.taskStore.flushWaiters(taskId);
+      this.#publishTaskStatus(provisional);
       return provisional;
     }
     // Publish only after the WAL barrier. waitForTerminal therefore cannot
     // observe an outcome that a process restart can take back.
-    return this.taskStore.transition(taskId, status, statusMessage, {
+    const committed = this.taskStore.transition(taskId, status, statusMessage, {
       lastUpdatedAt,
       ...(result === undefined ? {} : { result })
     });
+    this.#publishTaskStatus(committed);
+    return committed;
   }
 
   // Builds the durable form of one terminal result. Oversized results go to an
@@ -1813,6 +1828,18 @@ export class GatewayService {
       statusMessage: task.statusMessage,
       lastUpdatedAt: task.lastUpdatedAt,
       turnId: task.turnId ?? null
+    });
+  }
+
+  #publishTaskStatus(task) {
+    if (!task) return;
+    const session = this.store.get(task.sessionId);
+    if (!session || CLOSED_STATUSES.has(session.status)) return;
+    this.store.push(session, {
+      type: "task_status",
+      taskId: task.taskId,
+      status: task.status,
+      statusMessage: task.statusMessage
     });
   }
 
@@ -1874,7 +1901,9 @@ export class GatewayService {
       // Before result on purpose: the durable record keeps a bounded head of this
       // envelope as its preview, and ~200 bytes of totals placed ahead of an
       // unbounded transcript are always inside it.
-      usage: this.store.usageSnapshot(session).turn,
+      ...(session.activeTaskIncludeUsage === true
+        ? { usage: this.store.usageSnapshot(session).turn }
+        : {}),
       result: {
         text: session.resultFinalText ?? session.resultText,
         transcriptBytes: Buffer.byteLength(session.resultText),
@@ -2546,30 +2575,12 @@ function shouldDeliverEvent(subscription, event) {
   return true;
 }
 
-// The oldest sequence number this session still holds anywhere. Deliberately not
-// the ring's first index: with chunks in a lane of their own, a ring starting at
-// 12 says nothing about whether 0..11 were dropped or are simply sitting in the
-// other lane, and reading the ring alone would report truncation to every caller
-// whose session merely streamed before its first control event.
-function retainedFrom(session) {
-  const oldestEvent = session.events[0]?.i;
-  const oldestChunk = session.chunkEvents?.[0]?.i;
-  if (oldestEvent == null) return oldestChunk ?? session.eventSequence;
-  if (oldestChunk == null) return oldestEvent;
-  return Math.min(oldestEvent, oldestChunk);
-}
-
 // "At least one event after your cursor is gone." Truncation is a statement about
 // storage, never about this caller's filter — what a filter withholds is already
-// counted by filteredCount. The ring can now start below a cursor and still have
-// dropped telemetry above it, because control survives eviction, so the low-water
-// mark is what makes this honest. It errs toward true and never toward false; a
-// chunk eviction only counts for a caller whose filter would have been given
-// those chunks.
-function cursorTruncatedFor(session, cursor, includeChunks = false) {
-  if (cursor < retainedFrom(session)) return true;
-  if (cursor <= (session.eventsEvictedThrough ?? -1)) return true;
-  return includeChunks && cursor <= (session.chunkEventsEvictedThrough ?? -1);
+// counted by filteredCount. Ephemeral chunk sequence numbers are intentionally
+// absent from the ring, so only an actual ring eviction advances this watermark.
+function cursorTruncatedFor(session, cursor) {
+  return cursor <= (session.eventsEvictedThrough ?? -1);
 }
 
 function publicEvent(session, event) {

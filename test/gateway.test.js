@@ -353,7 +353,7 @@ test("Gateway poll defaults to terminal results and ignores progress or usage up
       { sessionId: session.id, cursor: 0, eventTypes: ["agent_message_chunk"] },
       { rootId: "main-a" }
     );
-    assert.deepEqual(explicitMessages.events.map((event) => event.text), ["progress"]);
+    assert.deepEqual(explicitMessages.events, [], "raw chunks are live-subscription telemetry, not poll history");
 
     // A status change without any new event must still wake a filtered poll.
     const statusWatch = service.call(
@@ -447,6 +447,8 @@ test("Gateway caps chunk and permission payload copies while keeping full data r
       permissionPolicy: "ask", turnId: "turn-1"
     });
     session.status = "running";
+    const live = [];
+    service.subscribe({ sessionIds: [session.id] }, { rootId: "main-a" }, (event) => live.push(event));
     const hugeChunk = `chunk ${"c".repeat(10_000)}`;
     service.handleUpdate(session, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: hugeChunk } });
     service.handleUpdate(session, {
@@ -465,10 +467,11 @@ test("Gateway caps chunk and permission payload copies while keeping full data r
       },
       { rootId: "main-a" }
     );
-    const chunk = poll.events.find((event) => event.type === "agent_message_chunk");
+    const chunk = live.find((event) => event.type === "agent_message_chunk");
     assert.ok(Buffer.byteLength(chunk.text) <= 4000);
     assert.equal(chunk.textTruncated, true);
     const permission = poll.events.find((event) => event.type === "permission_request");
+    assert.equal(poll.events.some((event) => event.type === "agent_message_chunk"), false);
     assert.equal(permission.toolCallTruncated, true);
     assert.deepEqual(permission.toolCall, { toolCallId: "tool-big", title: "Edit file", kind: "edit" });
     assert.equal(JSON.parse(await readFile(permission.dataArtifact.path, "utf8")).rawInput.length, 10_000);
@@ -539,7 +542,7 @@ test("Gateway poll supports bounded retrospective reads by cursor range and even
       { sessionId: opened.sessionId, cursor: 0, toCursor: done.nextCursor, eventTypes: ["agent_message_chunk"] },
       { rootId: "main-a" }
     );
-    assert.ok(messages.events.some((event) => event.type === "agent_message_chunk"));
+    assert.deepEqual(messages.events, []);
     await assert.rejects(
       service.call("poll", { sessionId: opened.sessionId, eventTypes: [] }, { rootId: "main-a" }),
       /eventTypes must be/
@@ -588,7 +591,7 @@ test("Gateway poll supports bounded retrospective reads by cursor range and even
     const metrics = (await service.call("setup", {}, { rootId: "main-a" })).metrics;
     assert.ok(metrics.pollResponses > 0);
     assert.ok(metrics.pollBytes > 0);
-    assert.ok(metrics.eventsByType.agent_message_chunk >= 1);
+    assert.equal(metrics.eventsByType.agent_message_chunk, undefined, "poll metrics exclude live-only chunks");
     assert.ok(metrics.eventsByType.tool_call >= 1);
   } finally {
     await service.shutdown().catch(() => {});
