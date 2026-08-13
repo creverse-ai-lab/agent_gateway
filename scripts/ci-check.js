@@ -9,10 +9,18 @@ import { ACP_PROTOCOL_VERSION } from "../src/acp-version.js";
 import { compareSnapshots, validateMonitorConfig, validateSnapshot } from "./acp-upstream-monitor.js";
 
 const packageDocument = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+const lockDocument = JSON.parse(await readFile(new URL("../package-lock.json", import.meta.url), "utf8"));
 const monitorConfig = JSON.parse(await readFile(new URL("../config/acp-monitor.json", import.meta.url), "utf8"));
 const upstreamSnapshot = JSON.parse(await readFile(new URL("../config/acp-upstream.snapshot.json", import.meta.url), "utf8"));
 
 assert.equal(packageDocument.version, GATEWAY_VERSION, "package and Gateway versions must match");
+assert.equal(lockDocument.version, GATEWAY_VERSION, "lockfile and Gateway versions must match");
+assert.equal(lockDocument.packages[""].version, GATEWAY_VERSION, "lockfile root package version must match");
+assert.deepEqual(
+  packageDocument.exports,
+  { ".": "./gateway-client/index.js", "./client": "./gateway-client/index.js" },
+  "only the public client entrypoint may be imported as a package subpath"
+);
 // The README title is the version a user reads before installing, and the
 // installer gates on an exact match with the running gateway. Three places,
 // one number, checked here so a release cannot ship two of the three.

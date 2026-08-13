@@ -330,6 +330,22 @@ flowchart LR
 
 `package.json`, daemon과 Control MCP가 모두 `1.4.0`을 보고해야 정상입니다. `agent_acp_setup`에서는 `gatewayVersion`, `gatewayApiVersion`, `stateSchemaVersion`으로 각각 확인할 수 있습니다. MCP 호스트가 이전 tool schema를 캐시한 경우에는 `staleFrontDoor`가 표시되므로 [호스트 재연결 절차](#호스트-재연결-절차)를 수행하세요.
 
+## 불변 runtime release
+
+downstream 앱은 이동하는 branch나 `src/` private subpath 대신 `v1.4.0` Release의 `acp-gateway-runtime-darwin-arm64.tar.gz`와 `acp-gateway/client`만 소비합니다. 공개 client 계약은 `GatewayRpcClient`, `GatewayError`, `ERROR_CODES`, `GATEWAY_API_VERSION` 네 항목이며 다른 package subpath는 `exports` 경계에서 차단됩니다.
+
+릴리스 빌더는 고정된 `v1.4.0` 소스 커밋 `a1fdb353777337ca6ec481f8563d77efaea55e95`에 public client와 production dependency를 결합하고, allowlist와 파일별 digest를 담은 `runtime-manifest.json`을 생성합니다. 로컬 산출물 옆에는 SHA-256과 서명되지 않은 build record(`*.build-record.json`)가 생성됩니다. 이 파일은 attestation이 아니며, GitHub Actions 밖에서는 `origin: local`로 표시됩니다. 공식 서명은 GitHub Actions의 `actions/attest-build-provenance`이며, workflow는 게시 전에 `gh attestation verify`로 아카이브를 검증합니다. 이미 올라간 세 asset은 덮어쓰지 않습니다.
+
+```bash
+npm run release:runtime -- --source-tag v1.4.0 --output-dir dist
+npm run release:verify -- \
+  --archive dist/acp-gateway-runtime-darwin-arm64.tar.gz \
+  --sha256 dist/acp-gateway-runtime-darwin-arm64.tar.gz.sha256 \
+  --build-record dist/acp-gateway-runtime-darwin-arm64.tar.gz.build-record.json
+```
+
+builder checkout은 clean 상태여야 합니다. `v1.4.0` 태그가 pinned commit에서 이동하면 builder와 verifier가 모두 거부합니다. manifest에는 source tag/commit과 builder commit이 모두 기록되고 tar entry 순서·정규화된 mode·mtime·소유권과 gzip OS header가 고정되므로 동일한 두 commit에서는 동일한 bytes가 생성됩니다.
+
 ### 릴리스 변경 이력
 
 1. **오류 계약과 characterization 기반 확립** — 안정적인 Gateway error code와 `{code,message,details}` wire envelope를 추가하고, 1.3.2의 prompt·poll·Task·Inbox 기본 동작을 characterization test로 고정했습니다.

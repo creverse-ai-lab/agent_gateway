@@ -6,9 +6,14 @@
   "private": true,
   "files": [
     "src/",
+    "gateway-client/",
     "skills/",
     "README.md"
   ],
+  "exports": {
+    ".": "./gateway-client/index.js",
+    "./client": "./gateway-client/index.js"
+  },
   "bin": {
     "acp-gateway": "src/index.js",
     "acp-mcp-bridge": "src/index.js",
@@ -23,7 +28,10 @@
     "guide": "node src/guide.js",
     "bootstrap": "node src/bootstrap.js",
     "test": "sh -c 'export ACP_GATEWAY_DISABLE_DYNAMIC_PROVIDERS=1 ACP_GATEWAY_ARTIFACTS=\"$(mktemp -d)\"; node --test test/*.test.js; s=$?; rm -rf \"$ACP_GATEWAY_ARTIFACTS\"; exit $s'",
+    "test:persistence:stress": "node scripts/stress-persistence.js",
     "bench:payload": "node scripts/bench-payload.js",
+    "release:runtime": "node scripts/build-runtime-release.js",
+    "release:verify": "node scripts/verify-runtime-release.js",
     "smoke": "node test/live-smoke.js",
     "smoke:subagents": "node test/live-subagent-smoke.js",
     "ci": "node scripts/ci-check.js && node scripts/acp-upstream-monitor.js --validate && npm test && node scripts/bench-payload.js",
