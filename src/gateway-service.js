@@ -984,11 +984,13 @@ export class GatewayService {
         stopReason: "cancelled"
       }
     };
-    const cancelled = this.#storeCall(() => this.taskStore.cancel(args.taskId, {
-      ownerRootId,
-      statusMessage: "Task cancelled by Main",
-      result
-    }));
+    const cancelled = this.#commitTaskTerminal(session, task.taskId, "cancelled", "Task cancelled by Main", result);
+    if (!cancelled) {
+      throw new GatewayError(ERROR_CODES.UNKNOWN_TASK, `Unknown taskId: ${task.taskId}`);
+    }
+    if (cancelled && cancelled.status !== "cancelled" && cancelled.status !== "failed") {
+      throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `Cannot cancel task in terminal status: ${cancelled.status}`);
+    }
     if (session?.activeTaskId === task.taskId) session.activeTaskId = null;
     return this.publicTask(cancelled);
   }
@@ -1552,36 +1554,64 @@ export class GatewayService {
       }
       return;
     }
+    this.#commitTaskTerminal(session, taskId, status, statusMessage, result);
     // Keyed off the requested status, not the resulting one: a terminal report
     // that lost to an earlier terminal writer still ends this session's claim.
     session.activeTaskId = null;
-    // First terminal writer already committed, including its durable record.
-    // Re-spilling and re-appending here would only add a duplicate.
-    if (TERMINAL_TASK_STATUSES.has(before.status)) return;
+  }
+
+  #commitTaskTerminal(session, taskId, status, statusMessage, result) {
+    const before = this.taskStore.find(taskId);
+    if (!before || TERMINAL_TASK_STATUSES.has(before.status)) return before;
+    const lastUpdatedAt = new Date(this.now()).toISOString();
     const durable = result === undefined ? null : this.#durableResultRecord(session, taskId, result);
-    const task = this.taskStore.transition(taskId, status, statusMessage, {
-      ...(result === undefined ? {} : { result }),
-      // The outcome exists, but nobody may consume it until it can survive a
-      // crash: a blocking reader that took it before the barrier could see a
-      // result the restarted gateway reports as failed.
-      deferWaiters: true
-    });
+    let provisional = null;
+    if (this.stateStore?.mode === "snapshot") {
+      provisional = this.taskStore.transition(taskId, status, statusMessage, {
+        lastUpdatedAt,
+        ...(result === undefined ? {} : { result }),
+        deferWaiters: true
+      });
+    }
     try {
       this.stateStore?.appendDurable(WAL_TYPES.TASK_RESULT_COMMITTED, taskId, {
-        status: task.status,
-        statusMessage: task.statusMessage,
-        lastUpdatedAt: task.lastUpdatedAt,
+        status,
+        statusMessage,
+        lastUpdatedAt,
         ...(durable ?? { result: null })
       });
       if (this.stateStore) this.persistError = null;
     } catch (error) {
-      // Accepted skew, in the safe direction: memory says completed, a restart
-      // will say failed. The gateway never claims a success no durable record
-      // backs. The waiters still have to be released or the caller hangs.
       this.persistError = error?.message ?? String(error);
-    } finally {
-      this.taskStore.flushWaiters(taskId);
+      // Never publish a success that failed its durability barrier. The created
+      // record remains recoverable and restart will also make it failed; live
+      // waiters receive this explicit failure instead of an unsafe result.
+      const failureMessage = `Task result persistence failed: ${this.persistError}`;
+      const failure = {
+        ok: false,
+        sessionId: session?.id ?? before.sessionId,
+        turnId: before.turnId,
+        status: "failed",
+        error: failureMessage
+      };
+      if (provisional) {
+        return this.taskStore.failDeferredTerminal(taskId, failureMessage, failure, { lastUpdatedAt });
+      }
+      return this.taskStore.transition(taskId, "failed", failureMessage, {
+        lastUpdatedAt,
+        result: failure
+      });
     }
+    if (provisional) {
+      this.taskStore.flushWaiters(taskId);
+      return provisional;
+    }
+    // Publish only after the WAL barrier. waitForTerminal therefore cannot
+    // observe an outcome that a process restart can take back.
+    return this.taskStore.transition(taskId, status, statusMessage, {
+      lastUpdatedAt,
+      ...(result === undefined ? {} : { result })
+    });
   }
 
   // Builds the durable form of one terminal result. Oversized results go to an

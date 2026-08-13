@@ -725,6 +725,23 @@ test("deferWaiters holds the terminal fan-out until flushWaiters releases it", a
   assert.equal(store.get(task.taskId).lastUpdatedAt, iso(10), "deferral changes delivery, never the record");
 });
 
+test("failDeferredTerminal replaces only a provisional terminal result", async () => {
+  const { store } = makeStore();
+  const task = store.create({ sessionId: "session-1", ownerRootId: "rootA" });
+  const waiting = store.waitForTerminal(task.taskId, { ownerRootId: "rootA", timeoutMs: 1_000 });
+  store.transition(task.taskId, "completed", "end_turn", {
+    result: { ok: true },
+    deferWaiters: true
+  });
+  const failed = store.failDeferredTerminal(task.taskId, "barrier failed", { ok: false });
+  assert.equal(failed.status, "failed");
+  assert.deepEqual((await waiting).result, { ok: false });
+  assert.throws(
+    () => store.failDeferredTerminal(task.taskId, "again", { ok: false }),
+    assertCode("INVALID_ARGUMENT")
+  );
+});
+
 test("flushWaiters is a no-op unless a deferred commit is outstanding", async () => {
   const { store } = makeStore();
   const task = store.create({ sessionId: "session-1", ownerRootId: "rootA" });

@@ -107,15 +107,17 @@ export function preflightStateVersion(statePath, runtimeVersion = STATE_SCHEMA_V
     return { ok: true, snapshotVersion: null, runtimeVersion };
   }
   const snapshotVersion = Number(header?.version);
-  if (!Number.isFinite(snapshotVersion) || snapshotVersion <= runtimeVersion) {
-    return { ok: true, snapshotVersion: Number.isFinite(snapshotVersion) ? snapshotVersion : null, runtimeVersion };
+  if (snapshotVersion === runtimeVersion) {
+    return { ok: true, snapshotVersion, runtimeVersion };
   }
   return {
     ok: false,
-    snapshotVersion,
+    snapshotVersion: Number.isFinite(snapshotVersion) ? snapshotVersion : null,
     runtimeVersion,
-    error: `Gateway state at ${paths.snapshot} is schema v${snapshotVersion}, but this checkout writes v${runtimeVersion}. `
-      + "Install a newer Gateway, or move the state directory aside to start fresh."
+    error: Number.isFinite(snapshotVersion)
+      ? `Gateway state at ${paths.snapshot} is schema v${snapshotVersion}, but this checkout reads v${runtimeVersion}. `
+        + "Install a matching Gateway, or move the state directory aside to start fresh."
+      : `Gateway state at ${paths.snapshot} has no valid schema version. Move it aside or recover it before updating.`
   };
 }
 
@@ -215,7 +217,7 @@ export class StateStore {
     // so it cannot preserve our marker: state.json without a writerVersion but
     // newer than the snapshot means an older gateway ran and the user has been
     // working in state we do not have. Its file wins; ours goes aside.
-    if (snapshot && legacy && !legacy.marked && legacy.mtimeMs > snapshot.mtimeMs) {
+    if (snapshot && legacy && !legacy.marked && legacy.mtimeMs >= snapshot.mtimeMs) {
       this.#quarantine(this.paths.snapshot, "downgraded", recovery);
       this.#quarantine(this.paths.wal, "downgraded", recovery);
       unlinkSafe(this.paths.snapshot);
@@ -293,13 +295,19 @@ export class StateStore {
       return fail(`header is not JSON: ${error?.message}`);
     }
     const version = Number(header?.version);
-    if (version > STATE_SCHEMA_VERSION) {
-      // Never a recoverable condition: a newer writer may have persisted fields
-      // whose meaning we would silently drop on the next write.
+    if (version !== STATE_SCHEMA_VERSION) {
+      // Never guess at either direction: an older snapshot needs an explicit
+      // migrator just as much as a newer one needs a newer reader.
       throw new GatewayError(
         ERROR_CODES.STATE_VERSION_UNSUPPORTED,
         `Gateway state snapshot is schema v${version} but this Gateway reads v${STATE_SCHEMA_VERSION}; upgrade the Gateway or move ${this.paths.snapshot} aside`
       );
+    }
+    if (!Number.isInteger(header?.walSeq) || header.walSeq < 0
+      || !Number.isInteger(header?.epoch) || header.epoch < 0
+      || !Number.isInteger(header?.bodyBytes) || header.bodyBytes < 0
+      || typeof header?.bodySha256 !== "string" || !/^[0-9a-f]{64}$/u.test(header.bodySha256)) {
+      return fail("header is missing required integrity fields");
     }
     let body = raw.subarray(split + 1);
     if (body.at(-1) === 0x0a) body = body.subarray(0, body.length - 1);
@@ -329,7 +337,15 @@ export class StateStore {
       throw error;
     }
     const mtimeMs = statSync(this.paths.state).mtimeMs;
-    const document = JSON.parse(raw); // a present-but-unparseable file still halts
+    let document;
+    try {
+      document = JSON.parse(raw);
+    } catch (error) {
+      throw new GatewayError(
+        ERROR_CODES.STATE_SNAPSHOT_CORRUPT,
+        `Legacy Gateway state ${this.paths.state} is not valid JSON: ${error?.message}`
+      );
+    }
     return { document, mtimeMs, marked: typeof document?.writerVersion === "string" };
   }
 
@@ -353,7 +369,7 @@ export class StateStore {
       const record = complete ? decodeRecord(line) : null;
       const isLast = !complete || end + 1 >= raw.length;
       if (!record) {
-        if (final && isLast) {
+        if (final && isLast && !complete) {
           // Silently discarded and counted: the tail of an un-fsynced write.
           recovery.droppedTail += 1;
           break;
@@ -389,10 +405,19 @@ export class StateStore {
         this.#seq = Math.max(this.#seq, record.seq);
         continue;
       }
-      if (this.#seq && record.seq > this.#seq + 1) {
-        recovery.alerts.push({ code: "STATE_WAL_GAP", message: `seq gap ${this.#seq} -> ${record.seq} in ${path}` });
+      if (record.seq <= this.#seq) {
+        recovery.skipped += 1;
+        continue;
       }
-      this.#seq = Math.max(this.#seq, record.seq);
+      if (this.#seq !== 0 && record.seq !== this.#seq + 1) {
+        const quarantined = this.#quarantine(path, "gap", recovery);
+        throw new GatewayError(
+          ERROR_CODES.STATE_WAL_CORRUPT,
+          `Gateway write-ahead log ${path} has a sequence gap ${this.#seq} -> ${record.seq}. `
+          + `A copy is at ${quarantined}; refusing to replay incomplete durable state.`
+        );
+      }
+      this.#seq = record.seq;
       if (this.#apply(state, record)) recovery.replayed += 1;
       else recovery.unknownTypes += 1;
     }

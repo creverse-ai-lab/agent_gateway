@@ -10,7 +10,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { AcpClient } from "../src/acp-client.js";
 import { GatewayService } from "../src/gateway-service.js";
-import { decodeRecord, statePaths } from "../src/state-store.js";
+import { decodeRecord, encodeRecord, statePaths, WAL_TYPES } from "../src/state-store.js";
 
 const mockAgent = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 const MAIN = { rootId: "main-a" };
@@ -33,12 +33,14 @@ function openSession(service, permissionPolicy = "read_only") {
 }
 
 async function waitForIdle(service, sessionId) {
+  let last = null;
   for (let attempt = 0; attempt < 40; attempt += 1) {
     const poll = await service.call("poll", { sessionId, cursor: 0, waitMs: 100 }, MAIN);
+    last = poll;
     if (poll.status === "idle") return poll;
     if (["error", "unavailable"].includes(poll.status)) throw new Error(poll.error);
   }
-  throw new Error("session never became idle");
+  throw new Error(`session never became idle (last status: ${last?.status})`);
 }
 
 // One completed task, taken all the way through the durable commit path.
@@ -164,6 +166,61 @@ test("a completed task and its result survive a restart until its TTL", async ()
       assert.equal(status.mode, "wal");
       assert.equal(status.lastRecovery.replayed, 0);
       assert.equal(status.lastRecovery.source, "snapshot");
+    } finally {
+      await second.shutdown();
+    }
+  });
+});
+
+test("a failed result barrier never exposes success and restart agrees on failure", async () => {
+  await withDirectory("state-result-barrier", async (directory) => {
+    const first = makeService(directory, { permissionPolicy: "ask" });
+    let taskId;
+    const durable = first.stateStore?.appendDurable;
+    try {
+      await first.init();
+      const opened = await openSession(first, "ask");
+      const task = await first.call("task_prompt", { sessionId: opened.sessionId, prompt: "go" }, MAIN);
+      taskId = task.taskId;
+      for (let attempt = 0; attempt < 40 && first.requireSession(opened.sessionId).status !== "waiting_permission"; attempt += 1) {
+        await new Promise((done) => setTimeout(done, 25));
+      }
+      assert.equal(first.requireSession(opened.sessionId).status, "waiting_permission");
+      const pending = (await first.call("inbox", { action: "list", status: "pending" }, MAIN)).items
+        .find((item) => item.sessionId === opened.sessionId);
+      assert.ok(pending);
+      const original = first.stateStore.appendDurable.bind(first.stateStore);
+      first.stateStore.appendDurable = (type, ...args) => {
+        if (type === WAL_TYPES.TASK_RESULT_COMMITTED) throw new Error("injected result fsync failure");
+        return original(type, ...args);
+      };
+      const resultWaiting = first.call("task_result", { taskId, waitMs: 30_000 }, MAIN);
+      await first.call("permission", {
+        sessionId: opened.sessionId,
+        requestId: pending.requestId,
+        optionId: "allow-once"
+      }, MAIN);
+      for (let attempt = 0; attempt < 80 && first.requireSession(opened.sessionId).status !== "idle"; attempt += 1) {
+        await new Promise((done) => setTimeout(done, 25));
+      }
+      assert.equal(first.requireSession(opened.sessionId).status, "idle");
+      const result = await resultWaiting;
+      assert.equal(result.ok, false);
+      assert.equal(result.status, "failed");
+      assert.match(result.error, /injected result fsync failure/);
+      assert.equal((await first.call("task_get", { taskId }, MAIN)).status, "failed");
+      first.stateStore.appendDurable = original;
+      await first.flushPersist();
+    } finally {
+      if (first.stateStore && durable) first.stateStore.appendDurable = durable.bind(first.stateStore);
+      await first.shutdown().catch(() => {});
+    }
+
+    const second = makeService(directory);
+    try {
+      await second.init();
+      assert.equal((await second.call("task_get", { taskId }, MAIN)).status, "failed");
+      assert.equal((await second.call("task_result", { taskId }, MAIN)).ok, false);
     } finally {
       await second.shutdown();
     }
@@ -406,6 +463,45 @@ test("an unmarked state.json newer than the snapshot re-migrates and raises DOWN
   });
 });
 
+test("an unmarked state.json with the same mtime as the snapshot is treated as a downgrade", async () => {
+  await withDirectory("state-downgrade-equal", async (directory) => {
+    const statePath = join(directory, "state.json");
+    const paths = statePaths(statePath);
+    const first = makeService(directory);
+    try {
+      await first.init();
+      await openSession(first);
+      await first.flushPersist();
+    } finally {
+      await first.shutdown();
+    }
+    const before = JSON.parse(await readFile(statePath, "utf8"));
+    await writeFile(statePath, `${JSON.stringify({
+      version: 4,
+      sessions: [{ ...before.sessions[0], id: "acp-equal-mtime", title: "written by v4" }],
+      tasks: [],
+      inbox: []
+    })}\n`, { mode: 0o600 });
+    const same = new Date(1_900_000_000_000);
+    await utimes(paths.snapshot, same, same);
+    await utimes(statePath, same, same);
+
+    const second = makeService(directory);
+    try {
+      await second.init();
+      const setup = await second.call("setup", {}, MAIN);
+      assert.equal(setup.persistence.lastRecovery.source, "downgrade-remigrated");
+      assert.ok(setup.alerts.some((alert) => alert.code === "DOWNGRADE_DETECTED"));
+      assert.deepEqual(
+        (await second.call("session", { action: "list" }, MAIN)).sessions.map((session) => session.sessionId),
+        ["acp-equal-mtime"]
+      );
+    } finally {
+      await second.shutdown();
+    }
+  });
+});
+
 test("a torn WAL tail starts silently; damage inside the log halts with a quarantine copy", async () => {
   await withDirectory("state-tail", async (directory) => {
     const statePath = join(directory, "state.json");
@@ -463,6 +559,35 @@ test("a torn WAL tail starts silently; damage inside the log halts with a quaran
   });
 });
 
+test("a newline-terminated bad CRC and a sequence gap both halt WAL replay", async () => {
+  for (const fault of ["bad-crc", "sequence-gap"]) {
+    await withDirectory(`state-${fault}`, async (directory) => {
+      const statePath = join(directory, "state.json");
+      const paths = statePaths(statePath);
+      const service = makeService(directory);
+      try {
+        await service.init();
+        await runTask(service);
+      } finally {
+        await keepLogAcrossShutdown(service, paths);
+      }
+      const intact = await readFile(paths.wal, "utf8");
+      const records = await readWal(paths);
+      const lastSeq = records.at(-1).seq;
+      const appended = fault === "bad-crc"
+        ? `${JSON.stringify({ v: 1, seq: lastSeq + 1, type: "wal.opened", key: "bad", payload: {}, crc32: "00000000" })}\n`
+        : encodeRecord({ v: 1, seq: lastSeq + 2, type: "wal.opened", key: "gap", payload: {} });
+      await writeFile(paths.wal, `${intact}${appended}`, { mode: 0o600 });
+      const halting = makeService(directory);
+      await assert.rejects(halting.init(), (error) => {
+        assert.equal(error.code, "STATE_WAL_CORRUPT");
+        assert.match(error.message, fault === "bad-crc" ? /damaged/ : /sequence gap/);
+        return true;
+      });
+    });
+  }
+});
+
 test("a corrupt snapshot halts instead of starting empty, and snapshot-drop falls back to v4", async () => {
   await withDirectory("state-snapshot-corrupt", async (directory) => {
     const statePath = join(directory, "state.json");
@@ -503,13 +628,13 @@ test("a corrupt snapshot halts instead of starting empty, and snapshot-drop fall
   });
 });
 
-test("a snapshot from a newer schema halts rather than being rewritten", async () => {
-  await withDirectory("state-future", async (directory) => {
+for (const version of [6, 4, undefined]) test(`a schema ${version ?? "missing"} snapshot halts rather than being rewritten`, async () => {
+  await withDirectory(`state-version-${version ?? "missing"}`, async (directory) => {
     const statePath = join(directory, "state.json");
     const paths = statePaths(statePath);
     const body = JSON.stringify({ sessions: [], tasks: [], inbox: [] });
     await writeFile(paths.snapshot, `${JSON.stringify({
-      version: 6,
+      ...(version === undefined ? {} : { version }),
       bodyBytes: Buffer.byteLength(body),
       bodySha256: createHash("sha256").update(body).digest("hex"),
       walSeq: 0,
@@ -525,8 +650,20 @@ test("a snapshot from a newer schema halts rather than being rewritten", async (
     const { preflightStateVersion } = await import("../src/state-store.js");
     const preflight = preflightStateVersion(statePath);
     assert.equal(preflight.ok, false);
-    assert.equal(preflight.snapshotVersion, 6);
-    assert.match(preflight.error, /schema v6/);
+    assert.equal(preflight.snapshotVersion, version ?? null);
+    assert.match(preflight.error, version === undefined ? /no valid schema version/ : new RegExp(`schema v${version}`));
+  });
+});
+
+test("malformed legacy state fails with a stable corruption code", async () => {
+  await withDirectory("state-legacy-corrupt", async (directory) => {
+    await writeFile(join(directory, "state.json"), "{not-json\n", { mode: 0o600 });
+    const service = makeService(directory);
+    await assert.rejects(service.init(), (error) => {
+      assert.equal(error.code, "STATE_SNAPSHOT_CORRUPT");
+      assert.match(error.message, /Legacy Gateway state/);
+      return true;
+    });
   });
 });
 
