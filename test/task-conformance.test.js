@@ -12,7 +12,6 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import {
   CallToolResultSchema,
-  CreateTaskResultSchema,
   RELATED_TASK_META_KEY
 } from "@modelcontextprotocol/sdk/types.js";
 import { AcpClient } from "../src/acp-client.js";
@@ -234,12 +233,18 @@ test("conformance: a deferred terminal commit is not observable through a waiter
     await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(settled, [], "the waiter must still be parked");
 
-    // Non-blocking reads are deliberately not gated; they are retryable polls.
+    // Status reads remain non-blocking, while tasks/result must stay parked on
+    // the durability barrier even though the in-memory status is terminal.
     assert.equal((await service.call("task_get", { taskId: task.taskId }, MAIN)).status, "completed");
-    assert.equal((await service.call("task_result", { taskId: task.taskId }, MAIN)).result.text, "deferred");
+    const resultWaiting = service.call("task_result", { taskId: task.taskId, waitMs: 30_000 }, MAIN);
+    let resultSettled = false;
+    void resultWaiting.finally(() => { resultSettled = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(resultSettled, false);
 
-    assert.equal(service.taskStore.flushWaiters(task.taskId), 1);
+    assert.equal(service.taskStore.flushWaiters(task.taskId), 2);
     assert.equal((await waiting).status, "completed");
+    assert.equal((await resultWaiting).result.text, "deferred");
     assert.deepEqual(settled, ["completed"]);
 
     // The real turn end arrives later and loses to the recorded commit.
@@ -412,7 +417,7 @@ test("conformance: a budget rejection reaches Main as a structured error over th
   }
 });
 
-test("conformance: the MCP front door tags task responses with related-task metadata", async () => {
+test("conformance: MCP tasks block for results, enforce cancel semantics, and use metadata only where allowed", async () => {
   const directory = await mkdtemp(join(tmpdir(), "acp-task-frontdoor-"));
   let daemon = null;
   let rpcClient = null;
@@ -426,7 +431,7 @@ test("conformance: the MCP front door tags task responses with related-task meta
       JSON.stringify({
         version: 1,
         providers: {
-          mock: { command: process.execPath, args: [mockAgent], permissionPolicy: "read_only" }
+          mock: { command: process.execPath, args: [mockAgent], permissionPolicy: "ask" }
         }
       })
     );
@@ -453,47 +458,65 @@ test("conformance: the MCP front door tags task responses with related-task meta
 
     const opened = await mcpClient.callTool({
       name: "agent_acp_session_open",
-      arguments: { provider: "mock", cwd: directory, permissionPolicy: "read_only" }
+      arguments: { provider: "mock", cwd: directory, permissionPolicy: "ask" }
     });
     const sessionId = opened.structuredContent?.sessionId;
     assert.match(String(sessionId), /^acp-/);
 
-    // Task-mode tools/call: the reply is a CreateTaskResult, and the SDK schema
-    // is what validates the _meta shape here.
-    const created = await mcpClient.request({
-      method: "tools/call",
-      params: {
-        name: "agent_acp_prompt",
-        arguments: { sessionId, prompt: "narrated-result" },
-        task: { ttl: 600_000 }
-      }
-    }, CreateTaskResultSchema);
-    const taskId = created.task.taskId;
+    assert.equal(mcpClient.getServerCapabilities()?.tasks?.requests, undefined,
+      "prompt acknowledgement is not advertised as a Task result");
+
+    const created = await rpcClient.call("task_prompt", { sessionId, prompt: "go", ttl: 600_000 });
+    const taskId = created.taskId;
     assert.match(taskId, /^task-/);
-    assert.deepEqual(created._meta?.[RELATED_TASK_META_KEY], { taskId });
 
-    const finished = await waitForTaskTerminal(mcpClient, taskId);
-    assert.equal(finished.status, "completed");
-    assert.deepEqual(finished._meta?.[RELATED_TASK_META_KEY], { taskId });
-
-    const payload = await mcpClient.experimental.tasks.getTaskResult(taskId, CallToolResultSchema);
+    const payloadPromise = mcpClient.experimental.tasks.getTaskResult(taskId, CallToolResultSchema);
+    const blocked = await waitForTaskStatus(mcpClient, taskId, "input_required");
+    assert.equal(blocked._meta?.[RELATED_TASK_META_KEY], undefined,
+      "tasks/get SHALL NOT carry related-task metadata");
+    const inbox = await rpcClient.call("inbox", { action: "list", status: "pending" });
+    const request = inbox.items.find((item) => item.sessionId === sessionId);
+    await rpcClient.call("permission", { sessionId, requestId: request.requestId, optionId: "allow-once" });
+    const payload = await payloadPromise;
     assert.equal(payload.isError, false);
-    assert.equal(payload.structuredContent?.result?.text, "FINAL ANSWER");
+    assert.equal(payload.structuredContent?.result?.text, "DONE");
     assert.deepEqual(payload._meta?.[RELATED_TASK_META_KEY], { taskId });
 
-    const cancelled = await mcpClient.experimental.tasks.cancelTask(taskId);
-    assert.equal(cancelled.status, "completed", "cancelling a terminal handle is a no-op");
-    assert.deepEqual(cancelled._meta?.[RELATED_TASK_META_KEY], { taskId });
+    await assert.rejects(mcpClient.experimental.tasks.cancelTask(taskId), /terminal status: completed/);
 
-    // A second handle, so tasks/list has something to page over.
-    const second = await mcpClient.request({
-      method: "tools/call",
-      params: { name: "agent_acp_prompt", arguments: { sessionId, prompt: "narrated-result" }, task: {} }
-    }, CreateTaskResultSchema);
-    await waitForTaskTerminal(mcpClient, second.task.taskId);
+    const second = await rpcClient.call("task_prompt", { sessionId, prompt: "go" });
+    await waitForTaskStatus(mcpClient, second.taskId, "input_required");
+
+    // Aborting a socket request must also release the daemon-side TaskStore
+    // waiter. Fill the entire per-task budget, abort every request, then prove
+    // the full budget can be acquired again before cancellation resolves it.
+    const abortedControllers = Array.from({ length: 16 }, () => new AbortController());
+    const abortedWaits = abortedControllers.map((controller) => rpcClient.call(
+      "task_result",
+      { taskId: second.taskId, waitMs: 30_000 },
+      35_000,
+      { signal: controller.signal }
+    ));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    for (const controller of abortedControllers) controller.abort();
+    const abortedResults = await Promise.allSettled(abortedWaits);
+    assert.equal(abortedResults.every((entry) => entry.status === "rejected" && entry.reason?.code === "WAIT_ABORTED"), true);
+
+    const replacementWaits = Array.from({ length: 16 }, () => rpcClient.call(
+      "task_result", { taskId: second.taskId, waitMs: 30_000 }, 35_000
+    ));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const cancelled = await mcpClient.experimental.tasks.cancelTask(second.taskId);
+    assert.equal(cancelled.status, "cancelled");
+    assert.equal(cancelled._meta?.[RELATED_TASK_META_KEY], undefined);
+    const replacementResults = await Promise.all(replacementWaits);
+    assert.equal(replacementResults.every((result) => result.status === "cancelled"), true);
+    const cancelledPayload = await mcpClient.experimental.tasks.getTaskResult(second.taskId, CallToolResultSchema);
+    assert.equal(cancelledPayload.structuredContent?.status, "cancelled");
+    assert.deepEqual(cancelledPayload._meta?.[RELATED_TASK_META_KEY], { taskId: second.taskId });
 
     const listed = await mcpClient.experimental.tasks.listTasks();
-    assert.deepEqual(listed.tasks.map((task) => task.taskId), [taskId, second.task.taskId]);
+    assert.deepEqual(listed.tasks.map((task) => task.taskId), [taskId, second.taskId]);
     assert.equal(listed.nextCursor, undefined, "a page that fits omits nextCursor entirely");
 
     // tasks/list carries no page size, so mint a cursor on the socket and prove
@@ -501,7 +524,7 @@ test("conformance: the MCP front door tags task responses with related-task meta
     const firstPage = await rpcClient.call("task_list", { limit: 1 });
     assert.deepEqual(firstPage.tasks.map((task) => task.taskId), [taskId]);
     const resumed = await mcpClient.experimental.tasks.listTasks(firstPage.nextCursor);
-    assert.deepEqual(resumed.tasks.map((task) => task.taskId), [second.task.taskId]);
+    assert.deepEqual(resumed.tasks.map((task) => task.taskId), [second.taskId]);
     assert.equal(resumed.nextCursor, undefined);
   } finally {
     await mcpClient?.close().catch(() => {});
@@ -518,6 +541,15 @@ async function waitForTaskTerminal(mcpClient, taskId) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   throw new Error(`task ${taskId} never reached a terminal status`);
+}
+
+async function waitForTaskStatus(mcpClient, taskId, status) {
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const task = await mcpClient.experimental.tasks.getTask(taskId);
+    if (task.status === status) return task;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`task ${taskId} never reached status ${status}`);
 }
 
 function seedSession(timestamp) {

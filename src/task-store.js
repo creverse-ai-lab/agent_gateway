@@ -395,6 +395,19 @@ export class TaskStore {
     return snapshot(record);
   }
 
+  cancel(taskId, options = {}) {
+    const record = this.#requireRecord(taskId, options?.ownerRootId);
+    if (TERMINAL_TASK_STATUSES.has(record.status)) {
+      throw taskError("INVALID_ARGUMENT", `Cannot cancel task in terminal status: ${record.status}`);
+    }
+    return this.transition(
+      taskId,
+      "cancelled",
+      options?.statusMessage ?? "Task cancelled",
+      { ownerRootId: options?.ownerRootId, result: options?.result }
+    );
+  }
+
   expireSweep() {
     if (this.#sweeping) return 0;
     this.#sweeping = true;

@@ -25,7 +25,9 @@ const server = new Server(
     capabilities: {
       tools: {},
       // Tasks are opt-in: legacy MCP clients keep using prompt + poll.
-      tasks: { list: {}, cancel: {}, requests: { tools: { call: {} } } }
+      // No current tool has task semantics yet: agent_acp_prompt returns a start
+      // acknowledgement, so advertising it as a Task would change its result.
+      tasks: { list: {}, cancel: {} }
     }
   }
 );
@@ -49,10 +51,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const method = methods[request.params.name];
     if (!method) throw new Error(`Unknown tool: ${request.params.name}`);
     const task = taskOptions(request.params);
-    if (task && request.params.name === "agent_acp_prompt") {
-      const created = await rpc.call("task_prompt", { ...(request.params.arguments ?? {}), ...task });
-      return { task: created, ...relatedTask(created.taskId) };
-    }
     if (task) throw new Error(`Tool ${request.params.name} does not support task execution`);
     const args = request.params.arguments ?? {};
     const timeoutMs = method === "poll"
@@ -71,7 +69,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 server.setRequestHandler(GetTaskRequestSchema, async (request) => {
   const record = await rpc.call("task_get", { taskId: request.params.taskId });
-  return { ...record, ...relatedTask(record.taskId) };
+  return record;
 });
 
 server.setRequestHandler(ListTasksRequestSchema, async (request) => {
@@ -90,14 +88,19 @@ server.setRequestHandler(ListTasksRequestSchema, async (request) => {
   };
 });
 
-server.setRequestHandler(GetTaskPayloadRequestSchema, async (request) => {
-  const result = await rpc.call("task_result", { taskId: request.params.taskId });
+server.setRequestHandler(GetTaskPayloadRequestSchema, async (request, extra) => {
+  const result = await rpc.call(
+    "task_result",
+    { taskId: request.params.taskId, waitMs: 120_000 },
+    125_000,
+    { signal: extra.signal }
+  );
   return toolResult(result, result.ok === false, relatedTask(request.params.taskId));
 });
 
 server.setRequestHandler(CancelTaskRequestSchema, async (request) => {
   const record = await rpc.call("task_cancel", { taskId: request.params.taskId });
-  return { ...record, ...relatedTask(record.taskId) };
+  return record;
 });
 
 process.once("SIGTERM", () => rpc.close());
@@ -197,7 +200,7 @@ function controlTools() {
     },
     {
       name: "agent_acp_prompt",
-      description: "Start a prompt in an owned worker session. Supports MCP Task execution when the client opts in.",
+      description: "Start a prompt in an owned worker session and immediately return its session/turn acknowledgement.",
       inputSchema: {
         type: "object",
         properties: {
@@ -206,8 +209,7 @@ function controlTools() {
           prompt: { oneOf: [{ type: "string" }, { type: "array", items: { type: "object" } }] }
         },
         required: ["sessionId", "prompt"]
-      },
-      execution: { taskSupport: "optional" }
+      }
     },
     {
       name: "agent_acp_poll",

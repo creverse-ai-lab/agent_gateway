@@ -883,24 +883,46 @@ export class GatewayService {
 
   async taskResult(args, context) {
     const ownerRootId = requireRoot(context);
-    return this.#storeCall(() => {
-      const task = this.taskStore.get(args.taskId, { ownerRootId });
-      // The store hands back the stored payload as-is, possibly null, so it never
-      // invents an envelope. The legacy fallback is the caller's, and it stays
-      // here: a future agent_acp_run reuses this method, not a second copy.
-      return this.taskStore.result(args.taskId, { ownerRootId })
-        ?? { ok: false, error: task.statusMessage ?? "Task completed without a result" };
-    });
+    const task = await this.#storeCallAsync(() => this.taskStore.waitForTerminal(args.taskId, {
+      ownerRootId,
+      timeoutMs: args.waitMs ?? 120_000,
+      signal: context?.signal
+    }));
+    // The store hands back the stored payload as-is, possibly null, so it never
+    // invents an envelope. The legacy fallback is the caller's, and it stays
+    // here: agent_acp_run reuses this method, not a second copy.
+    return this.#storeCall(() => this.taskStore.result(args.taskId, { ownerRootId }))
+      ?? { ok: false, error: task.statusMessage ?? "Task completed without a result" };
   }
 
   async taskCancel(args, context) {
     const ownerRootId = requireRoot(context);
     const task = this.#storeCall(() => this.taskStore.get(args.taskId, { ownerRootId }));
-    if (TERMINAL_TASK_STATUSES.has(task.status)) return this.publicTask(task);
+    if (TERMINAL_TASK_STATUSES.has(task.status)) {
+      throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `Cannot cancel task in terminal status: ${task.status}`);
+    }
     await this.sessionCancel({ sessionId: task.sessionId }, context);
-    // The real terminal state lands when the ACP turn actually ends; until then
-    // the handle only records that cancellation was asked for.
-    return this.publicTask(this.#storeCall(() => this.taskStore.markCancelling(args.taskId, { ownerRootId })));
+    const session = this.store.get(task.sessionId);
+    const result = {
+      ok: true,
+      sessionId: task.sessionId,
+      turnId: task.turnId,
+      status: "cancelled",
+      result: {
+        text: session?.resultFinalText ?? session?.resultText ?? "",
+        transcriptBytes: Buffer.byteLength(session?.resultText ?? ""),
+        artifact: session?.resultArtifact ?? null,
+        ...(session?.resultFinalArtifact ? { textArtifact: session.resultFinalArtifact } : {}),
+        stopReason: "cancelled"
+      }
+    };
+    const cancelled = this.#storeCall(() => this.taskStore.cancel(args.taskId, {
+      ownerRootId,
+      statusMessage: "Task cancelled by Main",
+      result
+    }));
+    if (session?.activeTaskId === task.taskId) session.activeTaskId = null;
+    return this.publicTask(cancelled);
   }
 
   // TaskStore is dependency-free and raises plain Errors tagged with a code.
@@ -909,6 +931,18 @@ export class GatewayService {
   #storeCall(operation) {
     try {
       return operation();
+    } catch (error) {
+      if (error instanceof GatewayError) throw error;
+      const code = typeof error?.code === "string" && ERROR_CODES[error.code]
+        ? ERROR_CODES[error.code]
+        : ERROR_CODES.GATEWAY_ERROR;
+      throw new GatewayError(code, error?.message ?? String(error));
+    }
+  }
+
+  async #storeCallAsync(operation) {
+    try {
+      return await operation();
     } catch (error) {
       if (error instanceof GatewayError) throw error;
       const code = typeof error?.code === "string" && ERROR_CODES[error.code]

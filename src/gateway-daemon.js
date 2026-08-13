@@ -33,6 +33,7 @@ const server = createServer((socket) => {
   clients.add(socket);
   socket.once("close", () => clients.delete(socket));
   const subscriptions = new Set();
+  const requestAborts = new Map();
   let boundRootId = null;
   const sender = createSocketSender(socket, {
     unsubscribe: (subscriptionId) => service.unsubscribe(subscriptionId, { rootId: boundRootId }),
@@ -70,6 +71,14 @@ const server = createServer((socket) => {
           setImmediate(() => void shutdown().finally(() => process.exit(0)));
           return;
         }
+        if (request.method === "request_cancel") {
+          const requestId = request.args?.requestId;
+          if (typeof requestId !== "string" || !requestId) {
+            throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "requestId is required");
+          }
+          requestAborts.get(requestId)?.abort();
+          return;
+        }
         if (request.method === "subscribe") {
           const result = service.subscribe(request.args, { rootId: request.rootId }, (event) => {
             sendEvent(result.subscriptionId, event);
@@ -84,8 +93,16 @@ const server = createServer((socket) => {
           send({ id: request.id, ok: true, result });
           return;
         }
-        const result = isGuide ? await service.guide() : await service.call(request.method, request.args, { rootId: request.rootId });
-        send({ id: request.id, ok: true, result });
+        const controller = new AbortController();
+        requestAborts.set(request.id, controller);
+        try {
+          const result = isGuide
+            ? await service.guide()
+            : await service.call(request.method, request.args, { rootId: request.rootId, signal: controller.signal });
+          send({ id: request.id, ok: true, result });
+        } finally {
+          requestAborts.delete(request.id);
+        }
       } catch (error) {
         // error stays byte-identical for existing callers; errorCode is additive
         // so a Main can branch on a stable code instead of message text.
@@ -100,6 +117,8 @@ const server = createServer((socket) => {
     }
   });
   socket.once("close", () => {
+    for (const controller of requestAborts.values()) controller.abort();
+    requestAborts.clear();
     service.removeSubscriptions(subscriptions);
     if (boundRootId) service.detachRoot(boundRootId);
   });

@@ -24,9 +24,11 @@ export class GatewayRpcClient {
     this.maxFrameBytes = gatewayLifecycleConfig().maxFrameBytes;
   }
 
-  async call(method, args = {}, timeoutMs = 30_000) {
+  async call(method, args = {}, timeoutMs = 30_000, options = {}) {
+    if (options?.signal?.aborted) throw waitAbortedError(method);
     await this.connect();
-    return this.#requestConnected(method, args, timeoutMs);
+    if (options?.signal?.aborted) throw waitAbortedError(method);
+    return this.#requestConnected(method, args, timeoutMs, options);
   }
 
   async subscribe(args = {}, onEvent, timeoutMs = 30_000) {
@@ -117,24 +119,43 @@ export class GatewayRpcClient {
     });
   }
 
-  #requestConnected(method, args, timeoutMs) {
+  #requestConnected(method, args, timeoutMs, options = {}) {
     if (!this.socket || this.socket.destroyed) throw new Error("Gateway socket is not connected");
     const id = randomUUID();
+    const signal = options?.signal;
     return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        callback(value);
+      };
+      const cancelRemote = () => {
+        if (!this.socket || this.socket.destroyed) return;
+        this.socket.write(`${JSON.stringify({
+          method: "request_cancel",
+          args: { requestId: id },
+          token: this.token,
+          rootId: this.rootId
+        })}\n`);
+      };
+      const onAbort = () => {
+        this.pending.delete(id);
+        cancelRemote();
+        finish(reject, waitAbortedError(method));
+      };
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`Gateway request timeout: ${method}`));
+        cancelRemote();
+        finish(reject, new Error(`Gateway request timeout: ${method}`));
       }, timeoutMs);
       this.pending.set(id, {
-        resolve: (value) => {
-          clearTimeout(timer);
-          resolve(value);
-        },
-        reject: (error) => {
-          clearTimeout(timer);
-          reject(error);
-        }
+        resolve: (value) => finish(resolve, value),
+        reject: (error) => finish(reject, error)
       });
+      signal?.addEventListener("abort", onAbort, { once: true });
       this.socket.write(`${JSON.stringify({ id, method, args, token: this.token, rootId: this.rootId })}\n`);
     });
   }
@@ -283,4 +304,10 @@ export class GatewayRpcClient {
     for (const pending of this.pending.values()) pending.reject(new Error("Gateway client closed"));
     this.pending.clear();
   }
+}
+
+function waitAbortedError(method) {
+  const error = new Error(`Gateway request aborted: ${method}`);
+  error.code = "WAIT_ABORTED";
+  return error;
 }

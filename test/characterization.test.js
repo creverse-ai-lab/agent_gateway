@@ -296,7 +296,7 @@ test("characterization: task TTL expires from createdAt, and touching lastUpdate
   }
 });
 
-test("characterization: task_result rejects a working task and task_list has no paging fields", async () => {
+test("conformance: task_result waits for terminal state and task_list keeps the legacy unpaged shape", async () => {
   const service = new GatewayService({ gcIntervalMs: 0 });
   try {
     const createdAt = new Date().toISOString();
@@ -314,9 +314,9 @@ test("characterization: task_result rejects a working task and task_list has no 
       result: null
     });
 
-    await assert.rejects(service.call("task_result", { taskId: "task-fabricated" }, MAIN), (error) => {
-      assert.match(error.message, /is not complete/);
-      assert.equal(error.code, "TASK_NOT_COMPLETE");
+    await assert.rejects(service.call("task_result", { taskId: "task-fabricated", waitMs: 10 }, MAIN), (error) => {
+      assert.match(error.message, /Timed out/);
+      assert.equal(error.code, "WAIT_TIMEOUT");
       return true;
     });
 

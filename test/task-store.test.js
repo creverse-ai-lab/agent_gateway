@@ -499,6 +499,32 @@ test("markCancelling annotates active tasks without transitioning them", () => {
   assert.equal(noop.lastUpdatedAt, iso(40));
 });
 
+test("cancel commits one terminal result and rejects terminal cancellation", async () => {
+  const { store, clock } = makeStore();
+  const task = store.create({ sessionId: "session-1", ownerRootId: "rootA" });
+  const waiting = store.waitForTerminal(task.taskId, { ownerRootId: "rootA", timeoutMs: 1_000 });
+
+  clock.t = 25;
+  const cancelled = store.cancel(task.taskId, {
+    ownerRootId: "rootA",
+    statusMessage: "cancelled by Main",
+    result: { ok: true, status: "cancelled" }
+  });
+  assert.equal(cancelled.status, "cancelled");
+  assert.deepEqual(store.result(task.taskId), { ok: true, status: "cancelled" });
+  assert.equal((await waiting).status, "cancelled");
+
+  // A late worker completion cannot overwrite cancellation: terminal-first-wins.
+  store.transition(task.taskId, "completed", "late", { result: { ok: true, status: "completed" } });
+  assert.equal(store.get(task.taskId).status, "cancelled");
+  assert.deepEqual(store.result(task.taskId), { ok: true, status: "cancelled" });
+  assert.throws(() => store.cancel(task.taskId), (error) => {
+    assert.equal(error.code, "INVALID_ARGUMENT");
+    assert.match(error.message, /terminal status: cancelled/);
+    return true;
+  });
+});
+
 test("result throws TASK_NOT_COMPLETE while active and returns the stored payload once terminal", () => {
   const { store } = makeStore();
   const task = store.create({ sessionId: "session-1", ownerRootId: "rootA" });
