@@ -32,14 +32,21 @@ const server = new Server(
   }
 );
 
+// The daemon's version, learned from whatever setup or session response ran
+// last. The tool array is frozen at module load and this process cannot
+// relist it, so a version skew means the schema in the host's cache may
+// describe a gateway that is no longer running.
+let daemonVersion = null;
+
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const methods = {
     agent_acp_setup: "setup",
     agent_acp_session_open: "session_open",
     agent_acp_session_restore: "session_restore",
     agent_acp_config: "config",
     agent_acp_prompt: "prompt",
+    agent_acp_run: "run",
     agent_acp_poll: "poll",
     agent_acp_permission: "permission",
     agent_acp_answer: "answer",
@@ -51,14 +58,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const method = methods[request.params.name];
     if (!method) throw new Error(`Unknown tool: ${request.params.name}`);
     const task = taskOptions(request.params);
+    if (task && method === "run") {
+      const created = await rpc.call(
+        "task_run",
+        { ...(request.params.arguments ?? {}), ...task }
+      );
+      return { task: created, ...relatedTask(created.taskId) };
+    }
     if (task) throw new Error(`Tool ${request.params.name} does not support task execution`);
     const args = request.params.arguments ?? {};
+    if (method === "run") return await runTool(args, extra);
     const timeoutMs = method === "poll"
       ? Math.max(30_000, Number(args.waitMs ?? 0) + 5_000)
       : method === "setup" && args.refreshAgentUpdates === true
         ? 120_000
         : 30_000;
-    return toolResult(await rpc.call(method, args, timeoutMs));
+    return toolResult(withFrontDoorNotice(method, await rpc.call(method, args, timeoutMs)));
   } catch (error) {
     return toolResult({
       ok: false,
@@ -107,6 +122,88 @@ process.once("SIGTERM", () => rpc.close());
 process.once("SIGINT", () => rpc.close());
 await server.connect(new StdioServerTransport());
 
+// agent_acp_run, in two rpc calls on purpose. The first one only admits the work
+// and returns the handle; the second one waits. Nothing else can report a taskId
+// before a timeout can happen, and a timeout on a single fused call would leave
+// the caller holding no handle for work that is definitely running.
+const RUN_DEFAULT_WAIT_MS = 55_000;
+const RUN_MAX_WAIT_MS = 600_000;
+
+async function runTool(args, extra) {
+  const requested = Number(args.waitMs ?? RUN_DEFAULT_WAIT_MS);
+  const waitMs = Math.min(RUN_MAX_WAIT_MS, Number.isFinite(requested) ? Math.max(0, requested) : RUN_DEFAULT_WAIT_MS);
+  let taskId = typeof args.taskId === "string" ? args.taskId : null;
+  if (!taskId) {
+    const admitted = await rpc.call("run", { ...args, waitMs: 0 }, 30_000);
+    taskId = typeof admitted.taskId === "string" ? admitted.taskId : null;
+    await announceTask(extra, taskId);
+    if (!taskId || waitMs === 0) return toolResult(admitted, admitted.ok === false, relatedTask(taskId));
+  }
+  // The rpc budget follows the poll precedent: the caller's wait plus the slack
+  // the gateway needs to answer it.
+  const envelope = await raceAbort(
+    rpc.call("run", { taskId, waitMs }, Math.max(30_000, waitMs + 5_000)),
+    extra?.signal,
+    taskId
+  );
+  return toolResult(envelope, envelope.ok === false, relatedTask(taskId));
+}
+
+// An abort abandons the WAIT, never the turn. The worker keeps working and the
+// handle stays collectable, because "I stopped waiting" and "stop the work" are
+// different instructions and only agent_acp_cancel means the second one.
+function raceAbort(pending, signal, taskId) {
+  if (!signal) return pending;
+  return Promise.race([
+    pending,
+    new Promise((resolve) => {
+      const abandon = () => resolve({
+        ok: true,
+        status: "working",
+        incomplete: "wait_abandoned",
+        taskId,
+        next: { attach: { tool: "agent_acp_run", arguments: { taskId } } }
+      });
+      if (signal.aborted) abandon();
+      else signal.addEventListener("abort", abandon, { once: true });
+    })
+  ]);
+}
+
+// The handle, delivered before the wait can fail. A host whose transport times
+// out mid-run still has the id it needs to attach again — the only mitigation
+// available for a timeout we do not own.
+async function announceTask(extra, taskId) {
+  const progressToken = extra?._meta?.progressToken;
+  if (progressToken == null || !taskId || typeof extra?.sendNotification !== "function") return;
+  try {
+    await extra.sendNotification({
+      method: "notifications/progress",
+      params: { progressToken, progress: 0, message: `agent_acp_run accepted; taskId=${taskId}` }
+    });
+  } catch {
+    // Progress is best effort by definition; the wait is what matters.
+  }
+}
+
+// Version skew is invisible from inside a session: a daemon restart swaps only
+// the socket (the rpc client reconnects transparently), the tool array here was
+// frozen at module load, and the host caches it. This notice is the one channel
+// that reaches the model when its cached schema no longer matches the gateway.
+function withFrontDoorNotice(method, result) {
+  if (method !== "setup" && method !== "session_open" && method !== "session_restore") return result;
+  if (typeof result?.gatewayVersion === "string") daemonVersion = result.gatewayVersion;
+  if (!daemonVersion || daemonVersion === GATEWAY_VERSION || !result || typeof result !== "object") return result;
+  return {
+    ...result,
+    staleFrontDoor: {
+      frontDoorVersion: GATEWAY_VERSION,
+      gatewayVersion: daemonVersion,
+      action: "reconnect the agent-acp MCP server"
+    }
+  };
+}
+
 // One place builds a tool envelope. `extra` carries result-level additions such
 // as _meta, so the task and non-task paths cannot drift apart.
 function toolResult(data, isError = false, extra = {}) {
@@ -142,7 +239,8 @@ function controlTools() {
         type: "object",
         properties: {
           provider: { type: "string", minLength: 1 },
-          refreshAgentUpdates: { type: "boolean", description: "Wait for a fresh ACP registry and Gateway main-version check, applying enabled automatic adapter updates." }
+          refreshAgentUpdates: { type: "boolean", description: "Wait for a fresh ACP registry and Gateway main-version check, applying enabled automatic adapter updates." },
+          mode: { type: "string", enum: ["full", "summary"], description: "summary returns versions, response profiles, persistence health, alerts, providers and liveSessions only - roughly a fifth of full. Use full when choosing or installing a provider; the limits a session needs are already on the session_open response." }
         }
       }
     },
@@ -208,10 +306,36 @@ function controlTools() {
         properties: {
           sessionId: { type: "string" },
           model: { type: "string", minLength: 1, description: "Optional model for this and following turns. Process-scoped providers require a new session to change it." },
-          prompt: { oneOf: [{ type: "string" }, { type: "array", items: { type: "object" } }] }
+          prompt: { oneOf: [{ type: "string" }, { type: "array", items: { type: "object" } }] },
+          resultBudgetBytes: { type: "integer", minimum: 0, description: "Task mode only: cap the delivered result.text of this turn's terminal envelope. Over the cap the envelope carries a bounded head plus totalBytes, omittedBytes and a textArtifact pointer." },
+          resultDelivery: { type: "string", enum: ["inline", "artifact"], description: "Task mode only: artifact delivers an empty text plus a textArtifact pointer regardless of size." },
+          responseProfile: { type: "string", enum: ["current", "compact", "diagnostic"], description: "Task mode only: shape of this task's terminal result object." },
+          includeUsage: { type: "boolean", description: "Task mode only: include result.usageSummary in the terminal envelope." }
         },
         required: ["sessionId", "prompt"]
       }
+    },
+    {
+      name: "agent_acp_run",
+      description: "Run a prompt in an owned worker session and wait for its outcome, or attach to an already running one with taskId. Always creates a durable Task handle, so the direct return and the MCP Task result are the same object. A wait that runs out is not an error: it returns status working with the taskId to attach to. Never resend the prompt after a failure that is not a validation error - always retry with {taskId}.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          sessionId: { type: "string", description: "Start mode. Mutually exclusive with taskId." },
+          prompt: { oneOf: [{ type: "string" }, { type: "array", items: { type: "object" } }], description: "Start mode. Mutually exclusive with taskId." },
+          taskId: { type: "string", description: "Attach mode: keep waiting on a run that has already started. Carries no prompt, so a retry cannot start the work twice." },
+          model: { type: "string", minLength: 1, description: "Optional model for this and following turns. Process-scoped providers require a new session to change it." },
+          waitMs: { type: "integer", minimum: 0, maximum: 600000, description: "How long to wait for a terminal outcome. Defaults to 55000, below the usual 60s host tool timeout. On the first run of a session prefer 25000, then raise it once a turn has completed normally." },
+          resultBudgetBytes: { type: "integer", minimum: 0, description: "Cap the delivered result.text. Over the cap the result carries a bounded head plus totalBytes, omittedBytes and a textArtifact pointer." },
+          resultDelivery: { type: "string", enum: ["inline", "artifact"], description: "artifact delivers an empty text plus a textArtifact pointer regardless of size." },
+          responseProfile: { type: "string", enum: ["current", "compact", "diagnostic"], description: "Shape of the result object inside the terminal envelope." },
+          includeUsage: { type: "boolean", description: "Include result.usageSummary in the terminal envelope." },
+          idempotencyKey: { type: "string", description: "Retry-safe start. A repeat with the same key on the same session attaches to the existing run instead of prompting the worker again; the last eight keys per session are remembered." },
+          ttl: { type: "integer", minimum: 0, description: "Milliseconds the Task handle stays collectable, measured from creation." },
+          pollInterval: { type: "integer", minimum: 0, description: "Milliseconds the client should wait between status checks." }
+        }
+      },
+      execution: { taskSupport: "optional" }
     },
     {
       name: "agent_acp_poll",
@@ -229,7 +353,10 @@ function controlTools() {
           includeResult: { type: "boolean", description: "Include the result object. Defaults to true only after the turn has finished; pass true to include it while the turn is still active. After the turn ends result.text carries only the final message segment; the full narrated transcript stays readable via agent_acp_session get." },
           includeInspection: { type: "boolean", description: "Include closed narration segments (each preview capped to 4KB of UTF-8; full text via each segment's artifact pointer; inspectionDropped counts evicted segments) inside the result object. Defaults to false." },
           includeUsage: { type: "boolean", description: "Include result.usageSummary: the {turn, session} token, context and cost totals the worker reported. Defaults to false; requires the result object (see includeResult)." },
-          maxEvents: { type: "integer", minimum: 1, maximum: 1000 }
+          maxEvents: { type: "integer", minimum: 1, maximum: 1000 },
+          responseProfile: { type: "string", enum: ["current", "compact", "diagnostic"], description: "current (default) is the frozen full response. compact drops the session envelope and every zero-valued paging field, keeping ok, sessionId, turnId, status, nextCursor, events and the terminal result. diagnostic adds queue depth, pending request counts and illegal-transition counters. Per call, never sticky; check setup or session_open responseProfiles before sending one." },
+          resultBudgetBytes: { type: "integer", minimum: 0, description: "Cap the delivered result.text for this call. Over the cap the result carries a bounded head plus totalBytes, omittedBytes and a textArtifact pointer. totalBytes is the size of the answer; transcriptBytes is the size of the whole narration." },
+          resultDelivery: { type: "string", enum: ["inline", "artifact"], description: "artifact delivers an empty text plus a textArtifact pointer regardless of size." }
         },
         required: ["sessionId"]
       }
@@ -292,7 +419,12 @@ function controlTools() {
         properties: {
           action: { type: "string", enum: ["list", "get"] },
           inboxId: { type: "string" },
-          status: { type: "string", enum: ["pending", "answered", "interrupted"] }
+          status: { type: "string", enum: ["pending", "answered", "interrupted"] },
+          sessionId: { type: "string", description: "List only rows belonging to one session." },
+          type: { type: "string", enum: ["permission_request", "worker_question"], description: "List only one kind of request." },
+          detail: { type: "string", enum: ["full", "summary"], description: "summary drops options, message and requestedSchema and reduces toolCall to its id, title and kind. Use get for the full row before answering." },
+          limit: { type: "integer", minimum: 1, maximum: 100, description: "Page size. Passing limit or cursor switches the response to paged mode, which adds nextCursor (null on the last page). Without either, the response is the unpaged 1.3.x list." },
+          cursor: { type: "string", description: "Opaque keyset cursor from a previous page's nextCursor." }
         },
         required: ["action"]
       }

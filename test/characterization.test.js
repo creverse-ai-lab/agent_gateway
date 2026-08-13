@@ -33,9 +33,14 @@ const TERMINAL_POLL_KEYS = sorted([...ACTIVE_POLL_KEYS, "result"]);
 // undefined-valued thought field, and textArtifact appears only when the
 // final answer was spilled to disk.
 const WIRE_RESULT_KEYS = sorted(["text", "transcriptBytes", "artifact", "stopReason"]);
+// GOLDEN DIFF (1.4.0 PR 7, H1): responseProfiles joins setup. It is the only
+// way a Main can learn that compact/diagnostic exist: an old gateway ignores an
+// unknown argument silently, so probing by sending one cannot detect support.
+// Everything else in full setup is frozen; mode:"summary" is a separate, opt-in
+// response and never changes this one.
 const SETUP_KEYS = sorted([
-  "ok", "gatewayVersion", "gatewayApiVersion", "stateSchemaVersion", "persistence", "lifecycle",
-  "resourceLimits", "metrics", "agentUpdates", "gatewayUpdate", "alerts", "detected", "providers"
+  "ok", "gatewayVersion", "gatewayApiVersion", "stateSchemaVersion", "responseProfiles", "persistence",
+  "lifecycle", "resourceLimits", "metrics", "agentUpdates", "gatewayUpdate", "alerts", "detected", "providers"
 ]);
 // GOLDEN DIFF (1.4.0 PR 4): taskRetentionMs joins lifecycle. A task's bytes now
 // have their own retention, separate from its session's, because a completed
@@ -77,9 +82,13 @@ const INBOX_TRUNCATED_ITEM_KEYS = sorted([
   ...INBOX_ITEM_KEYS, "toolCallTruncated", "toolCallBytes", "toolCallArtifact"
 ]);
 // publicTask() fields.
+// GOLDEN DIFF (1.4.0 PR 7, H6): origin says which tool minted the handle,
+// "prompt" or "run". A declared +5.2% on task_get, and the only way tasks/list
+// stays legible once two tools create handles; a recovered pre-1.4.0 record
+// reads back as "prompt", which is what it necessarily was.
 const TASK_KEYS = sorted([
   "taskId", "sessionId", "turnId", "status", "ttl", "pollInterval", "createdAt", "lastUpdatedAt",
-  "statusMessage"
+  "statusMessage", "origin"
 ]);
 
 test("characterization: prompt ack is exactly the accepted-turn envelope", async () => {
@@ -171,6 +180,7 @@ test("characterization: setup reports gateway, API and state schema versions wit
     assert.equal(setup.ok, true);
     assert.equal(setup.gatewayVersion, GATEWAY_VERSION);
     assert.equal(setup.gatewayApiVersion, 1);
+    assert.deepEqual(setup.responseProfiles, ["current", "compact", "diagnostic"]);
     // GOLDEN DIFF (1.4.0 PR 4): the persisted schema is v5 (snapshot + WAL). The
     // v4 state.json is still written alongside it as downgrade insurance, which is
     // why every other assertion about that file is unchanged.

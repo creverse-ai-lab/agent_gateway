@@ -7,6 +7,11 @@ import { ArtifactStore, defaultArtifactRoot } from "./artifacts.js";
 import { utf8ByteHead } from "./bounded-utf8.js";
 import { ERROR_CODES, GatewayError } from "./errors.js";
 import { currentModelId, detectProviders, providerConfig } from "./providers.js";
+import {
+  capPendingOptions, compareInboxDesc, decodeInboxCursor, encodeInboxCursor, isAfterInboxCursor,
+  projectInboxItem, projectPoll, projectResult, PROFILES, relevantAlerts, requireInboxDetail,
+  requireProfile, requireResultBudget, requireResultDelivery
+} from "./response-profile.js";
 import { SessionQueue } from "./session-queue.js";
 import {
   CHUNK_EVENT_TYPES, DURABLE_EVENT_TYPES, normalizeThoughtCapture, publicSession, SessionStore
@@ -133,6 +138,13 @@ export class GatewayService {
     // Alerts raised by recovery (downgrade detected, WAL truncated) ride the
     // setup().alerts array that Main already reads.
     this.stateAlerts = [];
+    // Per-task delivery preferences (profile, budget, usage) captured at prompt
+    // time, because finishTaskForSession builds the envelope when no caller is
+    // present to state them. Deliberately NOT on the session (a later poll would
+    // inherit an unrelated past call's mode) and deliberately NOT persisted: a
+    // task that was still in flight at restart is failed, and a terminal one
+    // already has its envelope built.
+    this.taskDelivery = new Map();
     // v5 durability. Absent for the many callers that run without a state path:
     // then every append is a no-op and nothing is fail-closed.
     this.stateStore = statePath
@@ -354,12 +366,16 @@ export class GatewayService {
       session_restore: () => this.sessionRestore(args, context),
       config: () => this.sessionConfig(args, context),
       prompt: () => this.sessionPrompt(args, context),
+      run: () => this.sessionRun(args, context),
       poll: () => this.sessionPoll(args, context),
       permission: () => this.sessionPermission(args, context),
       answer: () => this.sessionAnswer(args, context),
       cancel: () => this.sessionCancel(args, context),
       session: () => this.sessionManage(args, context),
       task_prompt: () => this.taskPrompt(args, context),
+      // Task-mode agent_acp_run: same admission and same handle as task_prompt,
+      // recorded with the origin that actually minted it.
+      task_run: () => this.taskPrompt(args, context, "run"),
       task_get: () => this.taskGet(args, context),
       task_list: () => this.taskList(args, context),
       task_result: () => this.taskResult(args, context),
@@ -462,16 +478,47 @@ export class GatewayService {
     };
   }
 
-  async setup({ provider, refreshAgentUpdates = false } = {}) {
+  async setup({ provider, refreshAgentUpdates = false, mode = "full" } = {}) {
+    if (mode !== "full" && mode !== "summary") {
+      throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `Unknown setup mode: ${mode}`);
+    }
     if (refreshAgentUpdates && this.agentUpdateManager) await this.agentUpdateManager.refresh();
     const detected = await detectProviders();
     const names = provider ? [requireProvider(provider)] : [];
     const agentUpdates = this.agentUpdateManager?.snapshot() ?? null;
+    const alerts = [...(agentUpdates?.alerts ?? []), ...this.stateAlerts];
+    const liveSessions = this.store.list().filter((session) => session.client?.alive).length;
+    // The omitted blocks are the ones a delegating Main re-reads on every hop
+    // without acting on them: `detected` (install-time paths, and the only
+    // machine-dependent part of this payload), resourceLimits, lifecycle and
+    // metrics. session_open now carries the five limits that can fail a prompt,
+    // so nothing actionable is lost by not asking for the full table.
+    if (mode === "summary") {
+      return {
+        ok: true,
+        gatewayVersion: GATEWAY_VERSION,
+        gatewayApiVersion: GATEWAY_API_VERSION,
+        stateSchemaVersion: STATE_SCHEMA_VERSION,
+        responseProfiles: [...PROFILES],
+        persistence: { healthy: this.persistError == null, error: this.persistError },
+        alerts,
+        providers: detected.map((item) => ({
+          provider: item.id,
+          ok: item.agentInstalled && item.adapterInstalled,
+          started: false
+        })),
+        liveSessions
+      };
+    }
     return {
       ok: true,
       gatewayVersion: GATEWAY_VERSION,
       gatewayApiVersion: GATEWAY_API_VERSION,
       stateSchemaVersion: STATE_SCHEMA_VERSION,
+      // Declaration-first capability. A gateway without this key is an old one,
+      // and probe-by-sending cannot detect that: an unknown argument is silently
+      // ignored, so a compact request would come back full with no error.
+      responseProfiles: [...PROFILES],
       // healthy/error keep their names and meaning (AgenLynk branches on them);
       // everything else here is additive diagnostics.
       persistence: {
@@ -487,15 +534,12 @@ export class GatewayService {
           lastRecovery: null
         })
       },
-      lifecycle: {
-        ...this.lifecycle,
-        liveSessions: this.store.list().filter((session) => session.client?.alive).length
-      },
+      lifecycle: { ...this.lifecycle, liveSessions },
       resourceLimits: this.resourceLimits,
       metrics: { ...this.metrics, eventsByType: { ...this.metrics.eventsByType } },
       agentUpdates,
       gatewayUpdate: agentUpdates?.gatewaySource ?? null,
-      alerts: [...(agentUpdates?.alerts ?? []), ...this.stateAlerts],
+      alerts,
       detected,
       providers: provider ? await Promise.all(
         names.map(async (name) => {
@@ -591,7 +635,13 @@ export class GatewayService {
       existing.orphanedAt = null;
       client.onSessionUpdate(acpSessionId, (update) => this.handleUpdate(existing, update));
       this.store.push(existing, { type: "session_restored", method });
-      return { ok: true, ...publicSession(existing), capabilities: configured.response, restoredWith: method };
+      return {
+        ok: true,
+        ...publicSession(existing),
+        capabilities: configured.response,
+        restoredWith: method,
+        ...this.bindTimeFacts(existing)
+      };
     }
 
     return this.registerSession({
@@ -663,7 +713,31 @@ export class GatewayService {
       ok: true,
       ...publicSession(session),
       capabilities: fields.created ?? {},
-      restoredWith: fields.restoredWith
+      restoredWith: fields.restoredWith,
+      ...this.bindTimeFacts(session)
+    };
+  }
+
+  // What a Main must know at bind time, delivered on the call it already makes.
+  // Every field here exists to remove a setup() round trip from the hot path:
+  // the capability list it branches on, the API contract version, the alerts
+  // that are about THIS session, and the five limits that can fail a prompt
+  // (maxPromptBytes rejects in admission, so learning it afterwards is too late).
+  // Persistence health is deliberately absent: it already fails a task closed and
+  // raises an alert, and one fact on two channels is how the two drift apart.
+  bindTimeFacts(session) {
+    const alerts = [...(this.agentUpdateManager?.snapshot()?.alerts ?? []), ...this.stateAlerts];
+    return {
+      responseProfiles: [...PROFILES],
+      gatewayApiVersion: GATEWAY_API_VERSION,
+      ...relevantAlerts(alerts, session.provider),
+      limits: {
+        maxPromptBytes: this.resourceLimits.maxPromptBytes,
+        maxInlineResultBytes: this.resourceLimits.maxInlineResultBytes,
+        resultRetentionMs: this.lifecycle.resultRetentionMs,
+        sessionRetentionMs: this.lifecycle.sessionRetentionMs,
+        taskRetentionMs: this.lifecycle.taskRetentionMs
+      }
     };
   }
 
@@ -825,7 +899,128 @@ export class GatewayService {
         `prompt exceeds ${this.resourceLimits.maxPromptBytes} bytes: ${promptBytes}`
       );
     }
+    // Delivery arguments are validated in admission too, so a mistyped profile
+    // costs no turn and no reservation. They only take effect where an envelope
+    // is actually built (Task mode); a direct prompt's reader states its own.
+    requireProfile(args.responseProfile);
+    requireResultBudget(args.resultBudgetBytes);
+    requireResultDelivery(args.resultDelivery);
     return this.#reserve(session, "prompt");
+  }
+
+  // agent_acp_run. The only tool whose direct return and whose tasks/result are
+  // the same CallToolResult — because it is the only one that always has a Task,
+  // and both paths end at this.taskResult(). Structural identity, not a copy
+  // that has to be kept in step.
+  async sessionRun(args, context) {
+    const ownerRootId = requireRoot(context);
+    const attaching = args.taskId != null;
+    if (attaching && (args.prompt !== undefined || args.sessionId !== undefined)) {
+      throw new GatewayError(
+        ERROR_CODES.INVALID_ARGUMENT,
+        "agent_acp_run starts a turn with {sessionId, prompt} or attaches to one with {taskId}, never both"
+      );
+    }
+    // 55s stays under the SDK host's 60s default tool timeout, so an ordinary
+    // wait fails on OUR terms (a legible ok:true handoff) rather than as a
+    // transport timeout the gateway never gets to explain.
+    const waitMs = Math.min(600_000, requireNonNegativeNumber(args.waitMs, "waitMs", 55_000));
+    const taskId = attaching
+      ? this.#storeCall(() => this.taskStore.get(args.taskId, { ownerRootId })).taskId
+      : await this.#startRunTask(args, context);
+    if (waitMs === 0) return this.#runHandoff(taskId, context);
+    let record;
+    try {
+      // The TASK waiter, never store.wait: store.wait fires at finalizeResult,
+      // which is before the durability barrier, so a crash could take back a
+      // result this call had already handed out.
+      record = await this.taskStore.waitForTerminal(taskId, {
+        ownerRootId,
+        timeoutMs: waitMs,
+        // Returning control is the only correct answer to input_required: the
+        // request cannot be answered from inside the call that is waiting on it.
+        stopOn: ["input_required"]
+      });
+    } catch (error) {
+      if (error?.code === "WAIT_TIMEOUT") return this.#runHandoff(taskId, context, { timedOut: true });
+      return this.#storeCall(() => { throw error; });
+    }
+    if (!TERMINAL_TASK_STATUSES.has(record.status)) return this.#runHandoff(taskId, context);
+    return this.taskResult({ taskId }, context);
+  }
+
+  async #startRunTask(args, context) {
+    const session = requireOwnedSession(this.requireSession(args.sessionId), context);
+    const existing = this.#idempotentRun(session, args.idempotencyKey);
+    if (existing) return existing;
+    const created = await this.taskPrompt(args, context, "run");
+    this.#rememberRun(session, args.idempotencyKey, created.taskId);
+    return created.taskId;
+  }
+
+  // Not an error return. A timeout or a pending worker request is a handoff: the
+  // work is still running and the handle is still good, so the model is told what
+  // to call next. Reporting isError here would make it retry the whole call —
+  // which is exactly how one prompt becomes two.
+  #runHandoff(taskId, context, { timedOut = false } = {}) {
+    const ownerRootId = requireRoot(context);
+    const task = this.#storeCall(() => this.taskStore.get(taskId, { ownerRootId }));
+    if (TERMINAL_TASK_STATUSES.has(task.status)) return this.taskResult({ taskId }, context);
+    if (task.status === "input_required") {
+      const pending = this.#pendingInboxRecord(task.sessionId);
+      return {
+        ok: true,
+        status: "input_required",
+        taskId,
+        sessionId: task.sessionId,
+        ...(pending ? { pending } : {}),
+        next: {
+          answerWith: pending?.type === "worker_question" ? "agent_acp_answer" : "agent_acp_permission",
+          thenAttach: { tool: "agent_acp_run", arguments: { taskId } }
+        }
+      };
+    }
+    return {
+      ok: true,
+      status: "working",
+      ...(timedOut ? { incomplete: "wait_budget_exceeded" } : {}),
+      taskId,
+      sessionId: task.sessionId,
+      next: {
+        attach: { tool: "agent_acp_run", arguments: { taskId } },
+        poll: { tool: "agent_acp_poll", arguments: { sessionId: task.sessionId, waitMs: 30_000 } }
+      }
+    };
+  }
+
+  // The newest obligation on this session, as the compact inbox record PR 5
+  // already defines. Options are capped here and nowhere else: this is the only
+  // response that carries them without a cursor to page with.
+  #pendingInboxRecord(sessionId) {
+    const rows = [...this.inbox.values()]
+      .filter((item) => item.sessionId === sessionId && item.status === "pending")
+      .sort(compareInboxDesc);
+    return rows.length ? capPendingOptions(publicInboxItem(rows[0])) : null;
+  }
+
+  // PR 2's admission covers "retried while running". It cannot cover the window
+  // this tool opens: a wait times out, the turn then finishes, the session goes
+  // idle, and a retry is admitted — prompting the worker a second time. The key
+  // is the only layer that covers that window. Per session, last eight, never
+  // persisted (a restart fails the task, so there is nothing to be idempotent
+  // about afterwards).
+  #idempotentRun(session, key) {
+    if (typeof key !== "string" || !key.trim()) return null;
+    const taskId = session._runKeys?.get(key);
+    return taskId && this.taskStore.find(taskId) ? taskId : null;
+  }
+
+  #rememberRun(session, key, taskId) {
+    if (typeof key !== "string" || !key.trim()) return;
+    session._runKeys ??= new Map();
+    session._runKeys.delete(key);
+    session._runKeys.set(key, taskId);
+    while (session._runKeys.size > 8) session._runKeys.delete(session._runKeys.keys().next().value);
   }
 
   async sessionPrompt(args, context) {
@@ -930,7 +1125,9 @@ export class GatewayService {
     this.finishTaskForSession(session);
   }
 
-  async taskPrompt(args, context) {
+  // `origin` is a parameter, not an argument: a wire caller must not be able to
+  // claim a handle came from agent_acp_run when it came from a prompt.
+  async taskPrompt(args, context, origin = "prompt") {
     const session = this.#admitTurn(args, context);
     // Everything past admission is inside the finally: a budget rejection must
     // release the reservation, or one refused task would leave the session
@@ -944,8 +1141,10 @@ export class GatewayService {
         sessionId: session.id,
         ownerRootId: requireRoot(context),
         ttl: args.ttl,
-        pollInterval: args.pollInterval
+        pollInterval: args.pollInterval,
+        origin
       }));
+      this.#rememberDelivery(task.taskId, args);
       // The barrier is BEFORE the ACP turn starts. After it, a crash can only
       // lose work that has a durable handle; before it, only work that was never
       // started. The other order manufactures the opposite phantom: real worker
@@ -1038,11 +1237,34 @@ export class GatewayService {
       timeoutMs: args.waitMs ?? 120_000,
       signal: context?.signal
     }));
-    // The store hands back the stored payload as-is, possibly null, so it never
-    // invents an envelope. The legacy fallback is the caller's, and it stays
-    // here: agent_acp_run reuses this method, not a second copy.
-    return this.#storeCall(() => this.taskStore.result(args.taskId, { ownerRootId }))
-      ?? { ok: false, error: task.statusMessage ?? "Task completed without a result" };
+    return this.#storeCall(() => {
+      // The store hands back the stored payload as-is, possibly null, so it never
+      // invents an envelope. The legacy fallback is the caller's, and it stays
+      // here: agent_acp_run reuses this method, not a second copy.
+      const stored = this.taskStore.result(args.taskId, { ownerRootId });
+      if (stored == null) {
+        return { ok: false, taskId: task.taskId, error: task.statusMessage ?? "Task completed without a result" };
+      }
+      // Every envelope names its own handle. Envelopes built by this gateway
+      // already carry it; this covers the ones recovered from an older snapshot
+      // and the degraded previews recovery rebuilds from a WAL head.
+      if (typeof stored !== "object" || Array.isArray(stored) || Object.hasOwn(stored, "taskId")) return stored;
+      return { taskId: task.taskId, ...stored };
+    });
+  }
+
+  // Delivery preferences travel with the handle, not with the session: the
+  // envelope is built by a turn callback with no caller present, so the only
+  // moment to state them is when the work is submitted. An ordinary task stores
+  // nothing at all.
+  #rememberDelivery(taskId, args) {
+    const profile = requireProfile(args.responseProfile);
+    const budget = requireResultBudget(args.resultBudgetBytes);
+    const delivery = requireResultDelivery(args.resultDelivery);
+    const includeUsage = args.includeUsage === true;
+    const includeThoughts = args.includeThoughts === true;
+    if (profile === "current" && budget == null && delivery === "inline" && !includeUsage && !includeThoughts) return;
+    this.taskDelivery.set(taskId, { profile, budget, delivery, includeUsage, includeThoughts });
   }
 
   async taskCancel(args, context) {
@@ -1115,12 +1337,32 @@ export class GatewayService {
     const action = args.action ?? "list";
     if (action === "list") {
       const status = args.status;
+      const detail = requireInboxDetail(args.detail);
+      // Paged only when the caller actually asked to page. An argument-free list
+      // keeps the 1.3.2 contract exactly — {ok, items}, and no nextCursor key at
+      // all — because AgenLynk's monitor reads it unpaged.
+      const paged = args.cursor != null || args.limit != null;
+      const cursor = args.cursor == null ? null : decodeInboxCursor(args.cursor);
+      const limit = args.limit == null
+        ? 50
+        : Math.min(100, Math.max(1, requireNonNegativeNumber(args.limit, "limit")));
+      const matching = [...this.inbox.values()]
+        .filter((item) => item.ownerRootId === rootId
+          && (!status || item.status === status)
+          && (args.sessionId == null || item.sessionId === args.sessionId)
+          && (args.type == null || item.type === args.type))
+        .sort(compareInboxDesc);
+      if (!paged) {
+        return { ok: true, items: matching.map((item) => projectInboxItem(publicInboxItem(item), detail)) };
+      }
+      const after = matching.filter((item) => isAfterInboxCursor(item, cursor));
+      const page = after.slice(0, limit);
       return {
         ok: true,
-        items: [...this.inbox.values()]
-          .filter((item) => item.ownerRootId === rootId && (!status || item.status === status))
-          .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
-          .map(publicInboxItem)
+        items: page.map((item) => projectInboxItem(publicInboxItem(item), detail)),
+        // null, not absent, on the last page: one shape for every page means a
+        // caller's loop condition never has to distinguish the two.
+        nextCursor: after.length > limit ? encodeInboxCursor(page[page.length - 1]) : null
       };
     }
     if (action === "get") {
@@ -1137,6 +1379,11 @@ export class GatewayService {
 
   async sessionPoll(args, context) {
     const session = requireOwnedSession(this.requireSession(args.sessionId), context);
+    // Validated before the wait, not after it: a caller that mistyped a profile
+    // must not spend its whole waitMs discovering that.
+    const profile = requireProfile(args.responseProfile);
+    const budget = requireResultBudget(args.resultBudgetBytes);
+    const delivery = requireResultDelivery(args.resultDelivery);
     const cursor = requireNonNegativeNumber(args.cursor, "cursor", 0);
     const waitMs = Math.min(120_000, requireNonNegativeNumber(args.waitMs, "waitMs", 0));
     const maxEvents = Math.min(1000, Math.max(1, requireNonNegativeNumber(args.maxEvents, "maxEvents", 200)));
@@ -1182,6 +1429,7 @@ export class GatewayService {
     // turn multiplies the caller's context cost, so it is opt-in until the turn ends.
     const active = ACTIVE_STATUSES.has(session.status);
     const includeResult = args.includeResult === true || (args.includeResult !== false && !active);
+    const diagnostic = profile === "diagnostic";
     const response = {
       ok: true,
       ...publicSession(session),
@@ -1192,28 +1440,51 @@ export class GatewayService {
       // so an empty poll with a moving cursor is legible.
       filteredCount: window.length - events.length,
       ...(!includeResult ? {} : {
-        result: {
-          // After the turn ends, text carries only the final message segment;
-          // the full narrated transcript stays readable via session get.
-          text: active ? session.resultText : session.resultFinalText ?? session.resultText,
-          transcriptBytes: Buffer.byteLength(session.resultText),
-          artifact: session.resultArtifact ?? null,
-          ...(session.resultFinalArtifact ? { textArtifact: session.resultFinalArtifact } : {}),
-          thought: args.includeThoughts === true ? session.thoughtText : undefined,
-          stopReason: session.stopReason,
-          ...(args.includeInspection === true ? (() => {
-            const snapshot = this.store.inspectionSnapshot(session);
-            return { inspection: snapshot.segments, inspectionDropped: snapshot.dropped };
-          })() : {}),
-          // Opt-in: the frozen result shape has four keys and no consumer of a
-          // token count today, so this is a field a caller asks for, never one
-          // every poll pays for.
-          ...(args.includeUsage === true ? { usageSummary: this.store.usageSnapshot(session) } : {})
-        }
+        // After the turn ends, text carries only the final message segment; the
+        // full narrated transcript stays readable via session get. Opt-ins stay
+        // opt-in — diagnostic is the profile that asks for all of them at once.
+        result: this.projectSessionResult(session, {
+          profile,
+          active,
+          includeThoughts: args.includeThoughts === true,
+          includeInspection: args.includeInspection === true || diagnostic,
+          includeUsage: args.includeUsage === true || diagnostic,
+          budget,
+          delivery
+        })
       })
     };
-    this.recordPollMetrics(response);
-    return response;
+    const projected = projectPoll(profile, response, diagnostic ? this.#pollDiagnostics(session) : null);
+    // Measured on what actually goes out, so the compact saving shows up in the
+    // gateway's own metrics rather than only in the benchmark.
+    this.recordPollMetrics(projected);
+    return projected;
+  }
+
+  // The one call site shape used by poll AND by all three terminal envelopes.
+  // Everything the projection needs that lives outside the session record — the
+  // usage accumulator, the inspection ring, the artifact spill — is bound here.
+  projectSessionResult(session, options = {}) {
+    return projectResult(session, {
+      ...options,
+      inspection: options.includeInspection ? this.store.inspectionSnapshot(session) : null,
+      usageSummary: options.includeUsage ? this.store.usageSnapshot(session) : null,
+      spill: (text) => this.store.spillText(session.id, "result-final", text)
+    });
+  }
+
+  // Session-scoped on purpose: a poll asks about one session, and the global
+  // counter would report other sessions' problems into this one's response.
+  #pollDiagnostics(session) {
+    const pending = session.client?.pendingSessionInput?.(session.acpSessionId)
+      ?? { permissions: 0, elicitations: 0 };
+    return {
+      // PR 2's deferred question, answered without touching the status
+      // vocabulary: "admitted but not yet running" is a queue fact, not a status.
+      queue: { depth: session._queue?.depth ?? 0, reserved: session._reserved ?? null },
+      illegalTransitions: session._illegalTransitions ?? 0,
+      pending: { permissions: pending.permissions, elicitations: pending.elicitations }
+    };
   }
 
   recordPollMetrics(response) {
@@ -1391,19 +1662,12 @@ export class GatewayService {
       // arrive.
       session.completedAt = new Date(this.now()).toISOString();
       this.store.finalizeResult(session);
-      this.updateTaskForSession(session, "cancelled", "Session closed before the turn completed", {
-        ok: true,
-        sessionId: session.id,
-        turnId: session.turnId,
-        status: "cancelled",
-        result: {
-          text: session.resultFinalText ?? session.resultText,
-          transcriptBytes: Buffer.byteLength(session.resultText),
-          artifact: session.resultArtifact ?? null,
-          ...(session.resultFinalArtifact ? { textArtifact: session.resultFinalArtifact } : {}),
-          stopReason: "cancelled"
-        }
-      });
+      this.updateTaskForSession(
+        session,
+        "cancelled",
+        "Session closed before the turn completed",
+        this.taskTerminalEnvelope(session, { ok: true, status: "cancelled", stopReason: "cancelled" })
+      );
     }
     this.interruptSessionInbox(session, "Main closed the worker session");
     const client = session.client;
@@ -1701,7 +1965,10 @@ export class GatewayService {
       pollInterval: task.pollInterval,
       createdAt: task.createdAt,
       lastUpdatedAt: task.lastUpdatedAt,
-      statusMessage: task.statusMessage
+      statusMessage: task.statusMessage,
+      // Which tool minted this handle. A recovered pre-1.4.0 record has no
+      // origin and was necessarily a prompt.
+      origin: task.origin ?? "prompt"
     };
   }
 
@@ -1848,6 +2115,7 @@ export class GatewayService {
     // Without a durable removal, a TTL or retention delete comes back on the next
     // replay: the create record is still in the log, and nothing contradicts it.
     if (change?.type === "removed" && change.taskId) {
+      this.taskDelivery.delete(change.taskId);
       this.stateStore?.forgetTask(change.taskId);
       this.stateStore?.append(WAL_TYPES.TASK_REMOVED, change.taskId, {});
     }
@@ -1893,26 +2161,45 @@ export class GatewayService {
     if (!session.activeTaskId) return;
     const status = session.status === "cancelled" ? "cancelled" : session.status === "idle" ? "completed" : "failed";
     const message = session.error ?? session.stopReason ?? status;
-    this.updateTaskForSession(session, status, message, {
+    this.updateTaskForSession(session, status, message, this.taskTerminalEnvelope(session, {
       ok: status === "completed" || status === "cancelled",
+      status: session.status,
+      error: session.error
+    }));
+  }
+
+  // One terminal envelope, three producers (turn end, close, orphan cancel).
+  // They were three hand-rolled copies that had already drifted: only this one
+  // carried usage, and none of them could honour a caller's result budget. The
+  // envelope a Task hands back is the same object on every path now, which is
+  // also what makes agent_acp_run and tasks/result byte-identical for free.
+  taskTerminalEnvelope(session, { ok, status, stopReason, error = null } = {}) {
+    const taskId = session.activeTaskId ?? null;
+    const delivery = (taskId ? this.taskDelivery.get(taskId) : null) ?? {};
+    const diagnostic = delivery.profile === "diagnostic";
+    return {
+      ok,
       sessionId: session.id,
       turnId: session.turnId,
-      status: session.status,
+      ...(taskId ? { taskId } : {}),
+      status,
       // Before result on purpose: the durable record keeps a bounded head of this
       // envelope as its preview, and ~200 bytes of totals placed ahead of an
       // unbounded transcript are always inside it.
-      ...(session.activeTaskIncludeUsage === true
+      ...(delivery.includeUsage === true || diagnostic
         ? { usage: this.store.usageSnapshot(session).turn }
         : {}),
-      result: {
-        text: session.resultFinalText ?? session.resultText,
-        transcriptBytes: Buffer.byteLength(session.resultText),
-        artifact: session.resultArtifact ?? null,
-        ...(session.resultFinalArtifact ? { textArtifact: session.resultFinalArtifact } : {}),
-        stopReason: session.stopReason
-      },
-      ...(session.error ? { error: session.error } : {})
-    });
+      result: this.projectSessionResult(session, {
+        profile: delivery.profile ?? "current",
+        ...(stopReason === undefined ? {} : { stopReason }),
+        includeThoughts: delivery.includeThoughts === true,
+        includeInspection: diagnostic,
+        includeUsage: delivery.includeUsage === true || diagnostic,
+        budget: delivery.budget ?? null,
+        delivery: delivery.delivery ?? "inline"
+      }),
+      ...(error ? { error } : {})
+    };
   }
 
   // A count bound on inbox history, per root and resolved only. A pending row is
@@ -2161,6 +2448,9 @@ export class GatewayService {
     for (const session of this.store.list()) {
       if (session.resultArtifact?.path) keepPaths.add(session.resultArtifact.path);
       if (session.resultFinalArtifact?.path) keepPaths.add(session.resultFinalArtifact.path);
+      // The spill-once memo behind a budgeted read: same lifetime as the result
+      // it is a pointer to, so it ages out with the session rather than under it.
+      if (session.resultBudgetArtifact?.path) keepPaths.add(session.resultBudgetArtifact.path);
       for (const segment of session.resultInspection ?? []) {
         if (segment.artifact?.path) keepPaths.add(segment.artifact.path);
       }
@@ -2294,19 +2584,12 @@ export class GatewayService {
     // Snapshot through the result model, not the raw transcript: the task
     // result must honor the final-segment split and the inline cap.
     this.store.finalizeResult(session);
-    this.updateTaskForSession(session, "cancelled", "Cancelled after Main disconnect", {
-      ok: true,
-      sessionId: session.id,
-      turnId: session.turnId,
-      status: "cancelled",
-      result: {
-        text: session.resultFinalText ?? session.resultText,
-        transcriptBytes: Buffer.byteLength(session.resultText),
-        artifact: session.resultArtifact ?? null,
-        ...(session.resultFinalArtifact ? { textArtifact: session.resultFinalArtifact } : {}),
-        stopReason: "cancelled"
-      }
-    });
+    this.updateTaskForSession(
+      session,
+      "cancelled",
+      "Cancelled after Main disconnect",
+      this.taskTerminalEnvelope(session, { ok: true, status: "cancelled", stopReason: "cancelled" })
+    );
     this.store.push(session, { type: "turn_end", stopReason: "cancelled" });
     return true;
   }

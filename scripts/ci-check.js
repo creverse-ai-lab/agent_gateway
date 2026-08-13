@@ -13,6 +13,15 @@ const monitorConfig = JSON.parse(await readFile(new URL("../config/acp-monitor.j
 const upstreamSnapshot = JSON.parse(await readFile(new URL("../config/acp-upstream.snapshot.json", import.meta.url), "utf8"));
 
 assert.equal(packageDocument.version, GATEWAY_VERSION, "package and Gateway versions must match");
+// The README title is the version a user reads before installing, and the
+// installer gates on an exact match with the running gateway. Three places,
+// one number, checked here so a release cannot ship two of the three.
+const readme = await readFile(new URL("../README.md", import.meta.url), "utf8");
+assert.equal(
+  readme.split("\n", 1)[0],
+  `# ACP Gateway v${GATEWAY_VERSION}`,
+  "README title and Gateway versions must match"
+);
 validateMonitorConfig(monitorConfig);
 validateSnapshot(upstreamSnapshot, monitorConfig);
 assert.deepEqual(

@@ -83,6 +83,20 @@ function normalizeStatusFilter(status) {
   return new Set(wanted);
 }
 
+// Terminal states are never listed: they always stop a wait, so accepting one
+// here would only make the option look like it could turn that off.
+function normalizeStopOn(stopOn) {
+  if (stopOn == null) return null;
+  const wanted = Array.isArray(stopOn) ? stopOn : [stopOn];
+  if (wanted.length === 0) return null;
+  for (const value of wanted) {
+    if (!ACTIVE_TASK_STATUSES.has(value)) {
+      throw taskError("INVALID_ARGUMENT", `Unsupported stopOn status: ${String(value)}`);
+    }
+  }
+  return new Set(wanted);
+}
+
 export class TaskStore {
   #now;
   #defaultTtlMs;
@@ -160,10 +174,16 @@ export class TaskStore {
       turnId = null,
       ttl,
       pollInterval,
+      // Which tool minted the handle. Persisted rather than derived, because
+      // after a restart there is nothing left to derive it from.
+      origin = "prompt",
       statusMessage = DEFAULT_STATUS_MESSAGE
     } = options ?? {};
     requireNonEmptyString(sessionId, "sessionId");
     requireNonEmptyString(ownerRootId, "ownerRootId");
+    if (origin !== "prompt" && origin !== "run") {
+      throw taskError("INVALID_ARGUMENT", `origin must be one of: prompt, run`);
+    }
     if (turnId != null && typeof turnId !== "string") throw taskError("INVALID_ARGUMENT", "turnId must be a string or null");
     if (typeof statusMessage !== "string") throw taskError("INVALID_ARGUMENT", "statusMessage must be a string");
     const normalizedTtl = this.#normalizeTtl(ttl, true);
@@ -202,6 +222,7 @@ export class TaskStore {
       createdAt: iso,
       lastUpdatedAt: iso,
       statusMessage,
+      origin,
       result: null
     };
     this.#tasks.set(record.taskId, record);
@@ -251,6 +272,10 @@ export class TaskStore {
       // deliberately NOT gated: they are retryable polls, not consumption.
       if (options?.deferWaiters === true) this.#deferredTerminal.add(record.taskId);
       else this.#resolveWaiters(record);
+    } else {
+      // A waiter may declare non-terminal states it also stops on. Only those
+      // waiters wake; every other one keeps waiting for a real terminal.
+      this.#resolveStopOnWaiters(record);
     }
     return snapshot(record);
   }
@@ -324,14 +349,19 @@ export class TaskStore {
   }
 
   async waitForTerminal(taskId, options = {}) {
-    const { ownerRootId, timeoutMs = 120_000, signal } = options ?? {};
+    const { ownerRootId, timeoutMs = 120_000, signal, stopOn = null } = options ?? {};
     const record = this.#requireRecord(taskId, ownerRootId);
+    // Non-terminal states this waiter also stops on. input_required is the one
+    // that matters: a caller blocked on the turn is structurally unable to answer
+    // the request that is blocking it, so it has to get control back.
+    const stopSet = normalizeStopOn(stopOn);
     // A deferred terminal record is not releasable yet: its committer has not
     // finished making the outcome durable, so even a waiter that arrives after
     // the commit queues until flushWaiters().
     if (TERMINAL_TASK_STATUSES.has(record.status) && !this.#deferredTerminal.has(record.taskId)) {
       return snapshot(record);
     }
+    if (stopSet?.has(record.status)) return snapshot(record);
     if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
       throw taskError("INVALID_ARGUMENT", "timeoutMs must be a finite number greater than 0");
     }
@@ -351,7 +381,7 @@ export class TaskStore {
 
     const taskIdKey = record.taskId;
     return await new Promise((resolve, reject) => {
-      const waiter = { taskId: taskIdKey, resolve, reject, timer: null, signal, onAbort: null };
+      const waiter = { taskId: taskIdKey, resolve, reject, timer: null, signal, onAbort: null, stopOn: stopSet };
       let set = this.#waiters.get(taskIdKey);
       if (!set) {
         set = new Set();
@@ -565,6 +595,9 @@ export class TaskStore {
       createdAt,
       lastUpdatedAt: typeof raw.lastUpdatedAt === "string" ? raw.lastUpdatedAt : createdAt,
       statusMessage: typeof raw.statusMessage === "string" ? raw.statusMessage : "",
+      // A snapshot written before this field existed described a prompt: run did
+      // not exist to write one.
+      origin: raw.origin === "run" ? "run" : "prompt",
       result: raw.result ?? null
     };
   }
@@ -593,6 +626,16 @@ export class TaskStore {
     const set = this.#waiters.get(record.taskId);
     if (!set) return;
     for (const waiter of [...set]) {
+      this.#settleWaiter(waiter);
+      waiter.resolve(snapshot(record));
+    }
+  }
+
+  #resolveStopOnWaiters(record) {
+    const set = this.#waiters.get(record.taskId);
+    if (!set) return;
+    for (const waiter of [...set]) {
+      if (!waiter.stopOn?.has(record.status)) continue;
       this.#settleWaiter(waiter);
       waiter.resolve(snapshot(record));
     }

@@ -1,4 +1,4 @@
-# ACP Gateway v1.3.2
+# ACP Gateway v1.4.0
 
 혹시 여러 AI 에이전트를 쓰고 계신가요?
 
@@ -80,6 +80,22 @@ acp-gateway-bootstrap --update-skill
 ```
 
 `--update-skill`은 installer 상태에 기록된 모든 `agent-delegator` 복사본을 대상으로 하며, Gateway 소스 pull, adapter·MCP 변경, daemon 재시작은 수행하지 않습니다. 설치 시 기록한 SHA-256 tree digest와 현재 설치본이 일치할 때만 교체하므로 사용자가 수정한 skill은 `customized` 경고와 함께 보존됩니다. v1.3.0 이하에서 설치해 digest가 없는 복사본도 내용이 현재 기본본과 같더라도 `legacy-unverified`로 보존합니다. 내용을 검토한 뒤 기본본으로 덮어쓰려는 경우에만 `--update-skill --force`를 사용하세요. 최신 Gateway 소스를 먼저 받을 때는 `acp-gateway-bootstrap --update`가 성공한 다음 별도 명령으로 실행합니다.
+
+### 호스트 재연결 절차
+
+Gateway를 새 버전으로 올린 뒤에는 **호스트(Claude/Codex/Grok/Auggie) 세션을 반드시 다시 연결해야** 새 tool과 인자가 보입니다. MCP 호스트는 서버가 처음 응답한 tool 목록을 세션 동안 캐시하고, daemon 재시작은 소켓만 교체하기 때문에(RPC가 투명하게 재접속) 낡은 스키마는 아무 오류 없이 그대로 남습니다. 서버 version을 올려도 캐시는 깨지지 않습니다.
+
+순서대로 실행하세요.
+
+```bash
+acp-gateway-bootstrap --update          # 1. Gateway 소스·adapter·daemon 갱신
+acp-gateway-bootstrap --update-skill    # 2. skill 갱신 (수정본이면 --force)
+```
+
+3. **호스트 재연결** — Claude Code는 `/mcp reconnect` 또는 새 세션, Codex·Grok·Auggie는 새 세션을 시작합니다.
+4. **검증** — tool 목록에 `agent_acp_run`이 있고, `agent_acp_setup` 응답에 `staleFrontDoor`가 없으면 정상입니다.
+
+`staleFrontDoor`는 프론트 도어(호스트에 등록된 MCP 프로세스)의 버전과 실행 중인 daemon 버전이 다를 때 `agent_acp_setup`·`agent_acp_session_open` 응답에 붙는 알림으로, `frontDoorVersion`·`gatewayVersion`·필요한 조치를 담고 있습니다. 이 알림이 보이면 3번을 수행하세요.
 
 주요 installer 옵션:
 
@@ -296,6 +312,18 @@ flowchart LR
 4. **ACP 작업 전달** — prompt, 파일 작업, tool event와 중간 결과가 ACP를 통해 오갑니다.
 5. **권한·질문 처리** — Worker의 permission 요청이나 질문은 Gateway Inbox를 거쳐 오케스트레이터에게 전달되고, 그 응답이 다시 Worker로 돌아갑니다.
 6. **결과 회수·재사용** — 오케스트레이터는 MCP Task 또는 poll로 상태와 결과를 받고, 필요하면 같은 세션을 다시 호출하거나 복구합니다.
+
+## v1.4.0 변경 사항
+
+**Durable · Bounded · Quiet** — 재시작 후에도 정확하고, 모든 자원이 제한되며, Main을 불필요하게 깨우지 않는 Gateway. 기존 호출은 인자를 하나도 바꾸지 않으면 **응답이 바이트 단위로 동일**합니다. 아래 기능은 전부 opt-in입니다.
+
+- **`agent_acp_run` 신설** — prompt를 보내고 결과까지 기다리는 단일 도구입니다. 직접 반환값과 MCP Task 결과가 **같은 객체**라서 처리할 shape가 하나뿐입니다. 대기 시간이 끝나면 오류가 아니라 `{status:"working", taskId}`를 돌려주므로, 실패 시에는 prompt를 다시 보내지 말고 `{taskId}`로만 재시도하면 됩니다(중복 실행이 구조적으로 불가능). permission이 필요하면 `{status:"input_required", pending}`으로 제어권을 즉시 돌려줍니다. `idempotencyKey`로 재시도 안전성을 한 겹 더 확보할 수 있습니다.
+- **응답 프로파일** — `agent_acp_poll`에 `responseProfile: "compact"`를 주면 세션 봉투를 제거하고 `events`·최종 `result`만 남겨 **약 3분의 1 크기**로 줄어듭니다(빈 poll 483 → 152 bytes, permission poll 814 → 483 bytes). `"diagnostic"`은 큐 깊이·대기 요청 수 등 진단 정보를 더합니다. 인자를 생략하면 기존 응답 그대로입니다.
+- **`setup mode:"summary"`** — 버전·프로파일·persistence·alert·provider 목록만 담은 요약(363 bytes, 전체의 약 19%)입니다. 세션마다 필요한 값은 `agent_acp_session_open` 응답이 직접 실어 보내므로(`responseProfiles`, `limits`, `relevantAlerts`) 위임할 때마다 setup을 다시 부를 필요가 없습니다.
+- **결과 예산** — `resultBudgetBytes`·`resultDelivery`로 돌려받을 결과 크기를 호출마다 제한할 수 있습니다. 초과분은 잘린 본문과 함께 `totalBytes`·`omittedBytes`·`textArtifact` 포인터로 전달되며, 같은 답변에 대한 spill은 한 번만 일어납니다.
+- **Inbox 필터·페이징** — `sessionId`, `type`, `limit`, `cursor`, `detail:"summary"`를 지원합니다. 인자 없는 호출은 기존과 완전히 동일한 전체 목록입니다.
+- **내구성·경계·정숙성(PR 1~6)** — state v5 snapshot + WAL과 crash-safe 복구, MCP Task 의미론(TTL은 생성 시점 기준), 세션별 mailbox와 명시적 상태 전이, 모든 전송 구간의 프레임·큐·타임아웃 예산, control/telemetry 레인 분리와 usage 집계가 포함됩니다.
+- **호스트 재연결 감지** — 프론트 도어와 daemon 버전이 어긋나면 `staleFrontDoor`로 알립니다. 위의 [호스트 재연결 절차](#호스트-재연결-절차)를 따르세요.
 
 ## v1.3.2 변경 사항
 
