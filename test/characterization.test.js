@@ -245,7 +245,15 @@ test("characterization: a completed task stays in memory and is never persisted"
   }
 });
 
-test("characterization: task TTL expires from lastUpdatedAt, not createdAt", async () => {
+// GOLDEN DIFF (1.4.0 PR 3, checklist section 2 / PR 3 and section 6 rule 3).
+// 1.3.2 keyed task expiry off lastUpdatedAt, so every status touch bought the
+// handle another full TTL and a chatty task could outlive its declared lifetime
+// indefinitely. TaskStore anchors expiry to createdAt, which is the MCP contract
+// (SDK spec: ttl is "requested duration in milliseconds to retain task from
+// creation"). This test previously asserted the lastUpdatedAt behaviour; it now
+// pins the createdAt behaviour, and it is the only characterization case PR 3
+// rewrites.
+test("characterization: task TTL expires from createdAt, and touching lastUpdatedAt cannot extend it", async () => {
   const epoch = Date.parse("2026-01-01T00:00:00.000Z");
   let clock = epoch;
   const service = new GatewayService({
@@ -265,16 +273,19 @@ test("characterization: task TTL expires from lastUpdatedAt, not createdAt", asy
     assert.equal(record.status, "completed");
     assert.equal(record.createdAt, "2026-01-01T00:00:00.000Z");
 
-    // A later status touch moves lastUpdatedAt forward; TTL follows that field.
+    // The touch that used to buy another 60s. It moves lastUpdatedAt and nothing
+    // else: createdAt is the immutable expiry anchor.
     record.lastUpdatedAt = new Date(epoch + 50_000).toISOString();
-    clock = epoch + 70_000;
+    clock = epoch + 59_999;
     assert.equal(
       (await service.call("task_get", { taskId: task.taskId }, MAIN)).status,
       "completed",
-      "past createdAt+ttl but not lastUpdatedAt+ttl: still readable"
+      "readable right up to createdAt+ttl"
     );
+    assert.equal(service.tasks.get(task.taskId).lastUpdatedAt, new Date(epoch + 50_000).toISOString());
 
-    clock = epoch + 120_000;
+    // 1.3.2 kept this handle until lastUpdatedAt+ttl (epoch+110s).
+    clock = epoch + 60_000;
     await assert.rejects(service.call("task_get", { taskId: task.taskId }, MAIN), (error) => {
       assert.match(error.message, /^Unknown taskId: /);
       assert.equal(error.code, "UNKNOWN_TASK");
@@ -285,7 +296,7 @@ test("characterization: task TTL expires from lastUpdatedAt, not createdAt", asy
   }
 });
 
-test("characterization: task_result rejects a working task and task_list has no paging fields", async () => {
+test("conformance: task_result waits for terminal state and task_list keeps the legacy unpaged shape", async () => {
   const service = new GatewayService({ gcIntervalMs: 0 });
   try {
     const createdAt = new Date().toISOString();
@@ -303,9 +314,9 @@ test("characterization: task_result rejects a working task and task_list has no 
       result: null
     });
 
-    await assert.rejects(service.call("task_result", { taskId: "task-fabricated" }, MAIN), (error) => {
-      assert.match(error.message, /is not complete/);
-      assert.equal(error.code, "TASK_NOT_COMPLETE");
+    await assert.rejects(service.call("task_result", { taskId: "task-fabricated", waitMs: 10 }, MAIN), (error) => {
+      assert.match(error.message, /Timed out/);
+      assert.equal(error.code, "WAIT_TIMEOUT");
       return true;
     });
 

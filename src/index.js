@@ -8,7 +8,8 @@ import {
   GetTaskPayloadRequestSchema,
   GetTaskRequestSchema,
   ListTasksRequestSchema,
-  ListToolsRequestSchema
+  ListToolsRequestSchema,
+  RELATED_TASK_META_KEY
 } from "@modelcontextprotocol/sdk/types.js";
 import { controlToken, rootId } from "./config.js";
 import { errorEnvelope } from "./errors.js";
@@ -24,7 +25,9 @@ const server = new Server(
     capabilities: {
       tools: {},
       // Tasks are opt-in: legacy MCP clients keep using prompt + poll.
-      tasks: { list: {}, cancel: {}, requests: { tools: { call: {} } } }
+      // No current tool has task semantics yet: agent_acp_prompt returns a start
+      // acknowledgement, so advertising it as a Task would change its result.
+      tasks: { list: {}, cancel: {} }
     }
   }
 );
@@ -48,9 +51,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const method = methods[request.params.name];
     if (!method) throw new Error(`Unknown tool: ${request.params.name}`);
     const task = taskOptions(request.params);
-    if (task && request.params.name === "agent_acp_prompt") {
-      return { task: await rpc.call("task_prompt", { ...(request.params.arguments ?? {}), ...task }) };
-    }
     if (task) throw new Error(`Tool ${request.params.name} does not support task execution`);
     const args = request.params.arguments ?? {};
     const timeoutMs = method === "poll"
@@ -68,32 +68,62 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 server.setRequestHandler(GetTaskRequestSchema, async (request) => {
-  return rpc.call("task_get", { taskId: request.params.taskId });
+  const record = await rpc.call("task_get", { taskId: request.params.taskId });
+  return record;
 });
 
-server.setRequestHandler(ListTasksRequestSchema, async () => {
-  return rpc.call("task_list");
+server.setRequestHandler(ListTasksRequestSchema, async (request) => {
+  // tasks/list carries only a cursor (no page size), so the front door picks the
+  // page size itself: without a limit the gateway answers unpaged, which is the
+  // contract the direct socket callers depend on but an unbounded reply here.
+  // 200 is the store's maximum page, so a host with fewer handles sees exactly
+  // what it saw before.
+  const cursor = request.params?.cursor;
+  const listed = await rpc.call("task_list", { limit: 200, ...(cursor == null ? {} : { cursor }) });
+  // ListTasksResultSchema types nextCursor as an optional string, so the last
+  // page omits the key rather than sending the gateway's null.
+  return {
+    tasks: listed.tasks,
+    ...(typeof listed.nextCursor === "string" ? { nextCursor: listed.nextCursor } : {})
+  };
 });
 
-server.setRequestHandler(GetTaskPayloadRequestSchema, async (request) => {
-  const result = await rpc.call("task_result", { taskId: request.params.taskId });
-  return toolResult(result, result.ok === false);
+server.setRequestHandler(GetTaskPayloadRequestSchema, async (request, extra) => {
+  const result = await rpc.call(
+    "task_result",
+    { taskId: request.params.taskId, waitMs: 120_000 },
+    125_000,
+    { signal: extra.signal }
+  );
+  return toolResult(result, result.ok === false, relatedTask(request.params.taskId));
 });
 
 server.setRequestHandler(CancelTaskRequestSchema, async (request) => {
-  return rpc.call("task_cancel", { taskId: request.params.taskId });
+  const record = await rpc.call("task_cancel", { taskId: request.params.taskId });
+  return record;
 });
 
 process.once("SIGTERM", () => rpc.close());
 process.once("SIGINT", () => rpc.close());
 await server.connect(new StdioServerTransport());
 
-function toolResult(data, isError = false) {
+// One place builds a tool envelope. `extra` carries result-level additions such
+// as _meta, so the task and non-task paths cannot drift apart.
+function toolResult(data, isError = false, extra = {}) {
   return {
     content: [{ type: "text", text: JSON.stringify(data) }],
     structuredContent: data,
-    isError
+    isError,
+    ...extra
   };
+}
+
+// The task association a client uses to tie a response back to a handle. Shape
+// and key come from the SDK: RELATED_TASK_META_KEY
+// ("io.modelcontextprotocol/related-task") carrying RelatedTaskMetadataSchema
+// ({taskId}) inside _meta.
+function relatedTask(taskId) {
+  return typeof taskId === "string" && taskId ? { _meta: { [RELATED_TASK_META_KEY]: { taskId } } } : {};
 }
 
 function taskOptions(params) {
@@ -170,7 +200,7 @@ function controlTools() {
     },
     {
       name: "agent_acp_prompt",
-      description: "Start a prompt in an owned worker session. Supports MCP Task execution when the client opts in.",
+      description: "Start a prompt in an owned worker session and immediately return its session/turn acknowledgement.",
       inputSchema: {
         type: "object",
         properties: {
@@ -179,8 +209,7 @@ function controlTools() {
           prompt: { oneOf: [{ type: "string" }, { type: "array", items: { type: "object" } }] }
         },
         required: ["sessionId", "prompt"]
-      },
-      execution: { taskSupport: "optional" }
+      }
     },
     {
       name: "agent_acp_poll",

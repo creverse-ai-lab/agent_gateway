@@ -14,6 +14,15 @@ export const ERROR_CODES = Object.freeze({
   SESSION_CLOSED: "SESSION_CLOSED",
   SESSION_NOT_WAITING: "SESSION_NOT_WAITING",
   TASK_NOT_COMPLETE: "TASK_NOT_COMPLETE",
+  // Raised by TaskStore budgets and waits. The store itself stays
+  // dependency-free and tags plain Errors with these same strings; the gateway
+  // re-raises them as GatewayError so the wire envelope carries the code.
+  TASK_LIMIT_EXCEEDED: "TASK_LIMIT_EXCEEDED",
+  TASK_WAITER_LIMIT: "TASK_WAITER_LIMIT",
+  TASK_TTL_EXPIRED: "TASK_TTL_EXPIRED",
+  TASK_STORE_CLOSED: "TASK_STORE_CLOSED",
+  WAIT_TIMEOUT: "WAIT_TIMEOUT",
+  WAIT_ABORTED: "WAIT_ABORTED",
   SUBSCRIPTION_NOT_OWNED: "SUBSCRIPTION_NOT_OWNED",
   CONTROL_ACCESS_DENIED: "CONTROL_ACCESS_DENIED",
   ROOT_REQUIRED: "ROOT_REQUIRED",
