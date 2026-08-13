@@ -1,0 +1,77 @@
+name: Release runtime
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: Immutable Gateway source tag
+        required: true
+        default: v1.4.0
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build-release:
+    runs-on: macos-14
+    timeout-minutes: 20
+    env:
+      SOURCE_TAG: ${{ inputs.source_tag }}
+      ASSET: acp-gateway-runtime-darwin-arm64.tar.gz
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.18.0
+          cache: npm
+      - run: npm ci
+      - name: Refuse existing immutable assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$SOURCE_TAG" >/dev/null 2>&1; then
+            existing="$(gh release view "$SOURCE_TAG" --json assets --jq '.assets[].name')"
+            for name in "$ASSET" "$ASSET.sha256" "$ASSET.build-record.json"; do
+              if printf '%s\n' "$existing" | grep -Fxq "$name"; then
+                echo "Refusing to overwrite immutable release asset $name on $SOURCE_TAG" >&2
+                exit 1
+              fi
+            done
+          fi
+      - run: npm run ci
+      - name: CPU-saturated persistence/crash round
+        env:
+          ACP_GATEWAY_STRESS_ROUNDS: "1"
+        run: npm run test:persistence:stress
+      - name: Build twice and verify reproducibility
+        run: |
+          node scripts/build-runtime-release.js --source-tag "$SOURCE_TAG" --output-dir dist/one
+          node scripts/build-runtime-release.js --source-tag "$SOURCE_TAG" --output-dir dist/two
+          cmp "dist/one/$ASSET" "dist/two/$ASSET"
+          node scripts/verify-runtime-release.js \
+            --archive "dist/one/$ASSET" \
+            --sha256 "dist/one/$ASSET.sha256" \
+            --build-record "dist/one/$ASSET.build-record.json"
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/one/acp-gateway-runtime-darwin-arm64.tar.gz
+      - name: Verify GitHub build provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh attestation verify "dist/one/$ASSET" --repo "${{ github.repository }}"
+      - name: Publish immutable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$SOURCE_TAG" >/dev/null 2>&1; then
+            gh release create "$SOURCE_TAG" --verify-tag --title "ACP Gateway ${SOURCE_TAG#v}"
+          fi
+          gh release upload "$SOURCE_TAG" \
+            "dist/one/$ASSET" \
+            "dist/one/$ASSET.sha256" \
+            "dist/one/$ASSET.build-record.json"
