@@ -388,7 +388,7 @@ test("conformance: task_result waits for terminal state and task_list keeps the 
   }
 });
 
-test("characterization: structured errors retain optional details", () => {
+test("characterization: structured errors retain details and drop foreign codes", () => {
   const details = { method: "nope", retryable: false };
   assert.deepEqual(
     errorEnvelope(new GatewayError(ERROR_CODES.UNKNOWN_METHOD, "Unknown gateway method: nope", details)),
