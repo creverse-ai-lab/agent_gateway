@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { ERROR_CODES } from "../src/errors.js";
 import {
-  LANE_HIGH, LANE_LOW, LANE_NORMAL, LANE_SHARE, NdjsonChannel
+  LANE_BUDGET_FRACTION, LANE_HIGH, LANE_LOW, LANE_NORMAL, NdjsonChannel
 } from "../src/ndjson-channel.js";
 
 // A deterministic Writable stand-in. `credits` is how many more frames the OS
@@ -10,11 +10,13 @@ import {
 // property of the test instead of the platform: real sockets auto-tune their
 // buffers, so byte-level assertions against them are flaky on macOS.
 class MockStream {
-  constructor({ credits = Infinity } = {}) {
+  constructor({ credits = Infinity, writableLength = 0 } = {}) {
     this.credits = credits;
     this.frames = [];
     this.destroyed = false;
+    this.writableLength = writableLength;
     this.drainHandlers = new Set();
+    this.handlers = new Map();
   }
 
   write(frame) {
@@ -31,11 +33,15 @@ class MockStream {
 
   on(event, handler) {
     if (event === "drain") this.drainHandlers.add(handler);
+    const handlers = this.handlers.get(event) ?? new Set();
+    handlers.add(handler);
+    this.handlers.set(event, handlers);
     return this;
   }
 
   off(event, handler) {
     if (event === "drain") this.drainHandlers.delete(handler);
+    this.handlers.get(event)?.delete(handler);
     return this;
   }
 
@@ -51,14 +57,15 @@ class MockStream {
 
 const isCode = (code) => (error) => error?.code === code;
 
-test("lane shares derive from one queue budget and reserve HIGH", () => {
+test("overlapping lane ceilings derive from one global queue budget and reserve HIGH", () => {
   const channel = new NdjsonChannel(new MockStream(), { maxQueueBytes: 4_000_000 });
   const lanes = channel.snapshot().lanes;
-  assert.equal(lanes.high.budget, 500_000);
-  assert.equal(lanes.normal.budget, 1_500_000);
+  assert.equal(lanes.high.budget, 4_000_000);
+  assert.equal(lanes.normal.budget, 3_500_000);
   assert.equal(lanes.low.budget, 2_000_000);
-  assert.equal(lanes.high.budget + lanes.normal.budget + lanes.low.budget, 4_000_000);
-  assert.equal(LANE_SHARE[LANE_HIGH] + LANE_SHARE[LANE_NORMAL] + LANE_SHARE[LANE_LOW], 1);
+  assert.equal(LANE_BUDGET_FRACTION[LANE_HIGH], 1);
+  assert.equal(LANE_BUDGET_FRACTION[LANE_NORMAL], 7 / 8);
+  assert.equal(LANE_BUDGET_FRACTION[LANE_LOW], 1 / 2);
 });
 
 test("without backpressure lanes are unobservable and delivery stays FIFO", () => {
@@ -152,7 +159,7 @@ test("a frame over the cap is refused before it can consume a lane budget", () =
   assert.equal(channel.write(LANE_HIGH, { tag: "small" }), true);
 });
 
-test("an empty lane admits one frame far over its derived budget", () => {
+test("no empty lane can bypass the aggregate queue budget", () => {
   const stream = new MockStream({ credits: 0 });
   const channel = new NdjsonChannel(stream, {
     maxQueueBytes: 4_000,
@@ -160,16 +167,30 @@ test("an empty lane admits one frame far over its derived budget", () => {
     writeTimeoutMs: 0
   });
   channel.write(LANE_NORMAL, { tag: "inline" });
-  // The HIGH share of 4000 bytes is 500. A 2MB terminal answer still goes on:
-  // maxFrameBytes bounds a frame, the lane budget bounds a backlog.
-  assert.equal(channel.write(LANE_HIGH, { tag: "huge", pad: "x".repeat(2_000_000) }), true);
-  const lanes = channel.snapshot().lanes;
-  assert.ok(lanes.high.bytes > lanes.high.budget);
-  // The exemption is for one frame, not for the lane.
   assert.throws(
-    () => channel.write(LANE_HIGH, { tag: "second", pad: "y".repeat(2_000_000) }),
+    () => channel.write(LANE_HIGH, { tag: "huge", pad: "x".repeat(2_000_000) }),
     isCode(ERROR_CODES.TRANSPORT_CONGESTED)
   );
+  assert.equal(channel.snapshot().queuedBytes, 0);
+});
+
+test("OS-side and channel-side backlog share one aggregate ceiling", () => {
+  const stream = new MockStream({ credits: 0, writableLength: 200 });
+  const fatals = [];
+  const channel = new NdjsonChannel(stream, {
+    maxQueueBytes: 400,
+    maxFrameBytes: 1_000,
+    writeTimeoutMs: 0,
+    onFatal: (error) => fatals.push(error)
+  });
+  channel.write(LANE_HIGH, { tag: "inline" });
+  channel.write(LANE_LOW, { tag: "queued" });
+  assert.ok(stream.writableLength + channel.queuedBytes <= 400);
+  assert.throws(
+    () => channel.write(LANE_HIGH, { tag: "overflow", pad: "x".repeat(250) }),
+    isCode(ERROR_CODES.TRANSPORT_CONGESTED)
+  );
+  assert.equal(fatals.length, 1);
 });
 
 test("LOW sheds frames at its budget, reports every drop, and spares HIGH", () => {
@@ -270,7 +291,7 @@ test("a reserved lane refuses to grow past its budget through coalescing", () =>
     onFatal: (error) => fatals.push(error)
   });
   channel.write(LANE_NORMAL, { tag: "inline" });
-  channel.write(LANE_NORMAL, { tag: "ballast", pad: "b".repeat(2_500) });
+  channel.write(LANE_NORMAL, { tag: "ballast", pad: "b".repeat(6_500) });
   channel.write(LANE_NORMAL, { tag: "marker", range: 1 }, { coalesceKey: "gap-1" });
   assert.throws(
     () => channel.write(LANE_NORMAL, { tag: "marker", pad: "x".repeat(4_000) }, { coalesceKey: "gap-1" }),
@@ -279,19 +300,30 @@ test("a reserved lane refuses to grow past its budget through coalescing", () =>
   assert.equal(fatals.length, 1);
 });
 
-test("the single-frame exemption survives coalescing", () => {
+test("coalescing cannot turn one queued frame into an aggregate-budget bypass", () => {
   const stream = new MockStream({ credits: 0 });
   const channel = new NdjsonChannel(stream, { maxQueueBytes: 4_000, writeTimeoutMs: 0 });
   channel.write(LANE_NORMAL, { tag: "inline" });
   channel.write(LANE_LOW, { tag: "only", version: 1 }, { coalesceKey: "tool-1" });
-  // The lane holds exactly the frame being replaced, so replacing it still leaves
-  // one frame in the lane: the load-bearing invariant is about the count, not the
-  // path that got there.
   assert.equal(
     channel.write(LANE_LOW, { tag: "only", version: 2, pad: "x".repeat(100_000) }, { coalesceKey: "tool-1" }),
-    true
+    false
   );
-  assert.equal(channel.pending(LANE_LOW, "tool-1").version, 2);
+  assert.equal(channel.pending(LANE_LOW, "tool-1").version, 1);
+});
+
+test("stream errors and closes fail a blocked channel exactly once", () => {
+  const stream = new MockStream({ credits: 0 });
+  const fatals = [];
+  const channel = new NdjsonChannel(stream, { writeTimeoutMs: 0, onFatal: (error) => fatals.push(error) });
+  channel.write(LANE_HIGH, { tag: "blocked" });
+  const errorHandler = stream.handlers?.get("error")?.values().next().value;
+  const closeHandler = stream.handlers?.get("close")?.values().next().value;
+  errorHandler(new Error("EPIPE"));
+  closeHandler();
+  assert.equal(fatals.length, 1);
+  assert.match(fatals[0].message, /EPIPE/);
+  assert.throws(() => channel.write(LANE_HIGH, { tag: "after" }), isCode(ERROR_CODES.TRANSPORT_CLOSED));
 });
 
 test("the write deadline is armed only while blocked and restarts on progress", async (t) => {

@@ -994,6 +994,7 @@ test("a worker that cannot be told about a cancel is still sealed and finalized"
     session.client.cancelSession = () => {
       throw new Error("Transport normal lane exceeded 1500000 queued bytes");
     };
+    service.detachRoot("main-a");
     clock += 11;
     await service.runMaintenance();
     await waitForStatus(service, opened.sessionId, "cancelled");

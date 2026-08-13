@@ -58,7 +58,8 @@ const RESOURCE_LIMIT_KEYS = sorted([
   "maxEvents", "maxTextBytes", "maxInlineResultBytes", "maxArtifactBytes", "maxArtifactTotalBytes",
   "maxTerminalsPerSession", "maxPendingRequestsPerSession", "maxFrameBytes",
   "maxQueueBytes", "writeTimeoutMs", "maxPromptBytes", "maxFileReadBytes",
-  "maxTerminalOutputBytes", "maxSessionsPerRoot", "maxInboxHistoryPerRoot"
+  "maxTerminalOutputBytes", "maxSessionsPerRoot", "maxInboxHistoryPerRoot",
+  "maxInboxItemBytes", "maxPendingInboxBytesPerSession", "maxPendingInboxBytesPerRoot"
 ]);
 const METRICS_KEYS = sorted([
   "startedAt", "pollResponses", "pollBytes", "eventBytes", "resultBytes", "eventsByType"
@@ -67,7 +68,7 @@ const METRICS_KEYS = sorted([
 // under the payload cap that record is byte-identical to 1.3.2's.
 const INBOX_ITEM_KEYS = sorted([
   "inboxId", "sessionId", "turnId", "type", "status", "createdAt", "resolvedAt", "resolution",
-  "requestId", "toolCall", "options", "mode", "message", "requestedSchema", "toolCallId"
+  "requestId", "toolCall", "options", "mode", "message", "requestedSchema", "toolCallId", "payloadBytes"
 ]);
 // GOLDEN DIFF (1.4.0 PR 5, G4): a row whose tool call exceeded the 4000-byte
 // payload cap gains these three, and only then. The truncation is now visible
@@ -228,6 +229,7 @@ test("characterization: inbox list returns the same full payload as inbox get", 
       options: [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }]
     });
 
+    await waitForInboxCount(service, 2);
     const listed = await service.call("inbox", { action: "list" }, MAIN);
     assert.deepEqual(sorted(Object.keys(listed)), sorted(["ok", "items"]));
     assert.equal(listed.items.length, 2);
@@ -474,4 +476,13 @@ async function waitForIdle(service, sessionId) {
     if (["error", "unavailable"].includes(poll.status)) throw new Error(poll.error);
   }
   throw new Error("Gateway session did not become idle");
+}
+
+async function waitForInboxCount(service, expected) {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const inbox = await service.call("inbox", { action: "list", status: "pending" }, MAIN);
+    if (inbox.items.length === expected) return inbox.items;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`Gateway inbox did not reach ${expected} pending items`);
 }

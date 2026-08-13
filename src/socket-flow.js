@@ -99,9 +99,10 @@ export function createSocketSender(socket, {
   // socket, so writableLength was the whole answer; now the channel stops feeding
   // the socket at its high-water mark and holds the rest, so the socket alone
   // would never reach a megabyte again and the gates below would be unreachable.
-  // A max, never a sum — summing counts the same backpressure twice and halves
-  // the real budget.
-  const backlog = () => Math.max(socket.writableLength, channel.queuedBytes);
+  // These are disjoint buffers: writableLength is already handed to Node/the OS,
+  // queuedBytes is still owned by the channel. The connection budget covers the
+  // sum so neither layer can hide backlog in the other.
+  const backlog = () => socket.writableLength + channel.queuedBytes;
 
   const send = (message) => {
     if (socket.destroyed) throw new Error("Gateway socket closed");

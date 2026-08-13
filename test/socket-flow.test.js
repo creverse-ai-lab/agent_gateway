@@ -81,8 +81,8 @@ test("slow subscription is removed while the control connection remains usable",
   assert.equal(socket.messages()[1].id, "control");
 });
 
-// Preserved from 1.3.2, with the knob renamed: the OS-side gate stays a separate
-// check from the channel's own queue accounting, never a sum of the two.
+// Preserved from 1.3.2, with the knob renamed: OS-side backlog alone can still
+// exhaust the aggregate connection budget.
 test("hard connection backpressure destroys the whole socket", () => {
   const socket = mockSocket({ writableLength: 401 });
   const sender = createSocketSender(socket, {
@@ -97,7 +97,7 @@ test("hard connection backpressure destroys the whole socket", () => {
 
 test("an opted-in subscriber that falls behind is shed, not killed", () => {
   const removed = [];
-  const socket = mockSocket({ writableLength: 2_000_000, credits: 0 });
+  const socket = mockSocket({ writableLength: 0, credits: 0 });
   const sender = createSocketSender(socket, {
     subscriptions: new Map([["sub-1", { acceptsGaps: true }]]),
     unsubscribe: (id) => removed.push(id),
@@ -212,7 +212,7 @@ test("a subscriber that never opted in is never coalesced", () => {
 // 16KB high-water mark, so a megabytes-deep backlog now sits in the channel and
 // the OS-side number never moves. Whichever buffer holds it, four megabytes behind
 // is four megabytes behind.
-test("a backlog held by the channel trips the connection gate, not just the socket buffer", () => {
+test("the channel never admits a backlog beyond the connection budget", () => {
   const socket = mockSocket({ credits: 0 });
   const sender = createSocketSender(socket, {
     subscriptions: new Map([["sub-1", { acceptsGaps: true }]]),
@@ -223,14 +223,11 @@ test("a backlog held by the channel trips the connection gate, not just the sock
     writeTimeoutMs: 0
   });
   sender.sendEvent("sub-1", chunk(0, "inline"));
-  // One frame far over the whole connection budget: an empty lane always admits
-  // it, so this is the case where the channel really is holding more than the
-  // connection is allowed to be behind.
-  sender.sendEvent("sub-1", chunk(1, "y".repeat(2_000)));
+  assert.equal(sender.sendEvent("sub-1", chunk(1, "y".repeat(2_000))), false);
   assert.equal(socket.writableLength, 0, "the OS-side buffer never sees it");
-  assert.ok(sender.channel.queuedBytes > 400);
-  assert.throws(() => sender.send({ id: "control" }), /connection buffer exceeded/);
-  assert.equal(socket.destroyed, true);
+  assert.ok(sender.channel.queuedBytes <= 400);
+  assert.equal(sender.send({ id: "control" }), undefined);
+  assert.equal(socket.destroyed, false);
 });
 
 // Reworked for the overtaking fix: durable events used to be queued here purely

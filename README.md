@@ -223,12 +223,15 @@ Task 생성과 결과 확정은 응답을 반환하기 전에 WAL에 append + fs
 | `ACP_GATEWAY_FSYNC` | `normal` | `off`는 테스트·임시 볼륨 전용 |
 | `ACP_GATEWAY_STATE_RECOVERY` | (없음) | `truncate`: 손상 직전까지 WAL replay 후 시작 / `snapshot-drop`: snapshot 폐기 후 `state.json`에서 복구 / `cold`: 빈 상태로 시작 |
 | `ACP_GATEWAY_TASK_RETENTION_MS` | `24h` | Task 레코드와 결과 artifact의 디스크 생존 기간(세션 보존과 독립) |
-| `ACP_GATEWAY_MAX_QUEUE_BYTES` | `4000000` | control 연결당 쓰기 큐 예산. lane 예산(HIGH 1/8·NORMAL 3/8·LOW 1/2)은 이 값에서 파생 |
+| `ACP_GATEWAY_MAX_QUEUE_BYTES` | `4000000` | control 연결당 OS+channel 합산 쓰기 예산. HIGH는 전체, NORMAL은 7/8, LOW는 1/2까지 사용 |
 | `ACP_GATEWAY_WRITE_TIMEOUT_MS` | `10000` | 이 시간 동안 OS가 한 바이트도 받지 않으면 해당 연결·프로바이더를 종료 |
 | `ACP_GATEWAY_MAX_PROMPT_BYTES` | `1000000` | 초과 prompt는 턴을 만들기 전에 `PROMPT_TOO_LARGE`로 거부 |
 | `ACP_GATEWAY_MAX_FILE_READ_BYTES` | `500000` | worker의 `fs/read_text_file` 응답 바이트 상한(거부 대신 절단) |
 | `ACP_GATEWAY_MAX_TERMINAL_OUTPUT_BYTES` | `10000000` | terminal 출력 버퍼 상한(기존 하드코딩 값과 동일) |
 | `ACP_GATEWAY_MAX_SESSIONS_PER_ROOT` | `64` | Main당 동시 세션 상한. 초과 시 `SESSION_LIMIT_EXCEEDED` |
+| `ACP_GATEWAY_MAX_INBOX_ITEM_BYTES` | `65536` | worker permission/elicitation 한 건의 보관 바이트 상한 |
+| `ACP_GATEWAY_MAX_PENDING_INBOX_BYTES_PER_SESSION` | `524288` | 세션당 pending inbox 합산 바이트 상한 |
+| `ACP_GATEWAY_MAX_PENDING_INBOX_BYTES_PER_ROOT` | `4194304` | Main당 pending inbox 합산 바이트 상한 |
 | `ACP_GATEWAY_MAX_INBOX_HISTORY_PER_ROOT` | `1000` | Main당 보관하는 처리 완료 inbox 건수(pending은 제거 대상 아님) |
 
 persistence가 불건강해지면 **새 Task 생성만** `PERSISTENCE_UNHEALTHY`로 거부합니다(핸들 = 내구성 약속). `session_open`과 직접 `prompt`는 계속 동작하며, 다음 성공한 write에서 건강 상태가 회복됩니다. `setup().persistence`에 `mode`, `walSeq`, `walBytes`, `snapshotEpoch`, `fsyncCount`, `lastRecovery`가 함께 보고됩니다.

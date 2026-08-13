@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { AcpClient } from "../src/acp-client.js";
+import { ArtifactStore } from "../src/artifacts.js";
 import { readInto, readTextHead, readTextLines, trimIncompleteUtf8 } from "../src/bounded-utf8.js";
 import { ERROR_CODES } from "../src/errors.js";
 import { GatewayService } from "../src/gateway-service.js";
@@ -202,6 +203,9 @@ test("setup reports every budget as a flat number", async () => {
     assert.equal(limits.maxTerminalOutputBytes, 10_000_000);
     assert.equal(limits.maxSessionsPerRoot, 64);
     assert.equal(limits.maxInboxHistoryPerRoot, 1_000);
+    assert.equal(limits.maxInboxItemBytes, 64 * 1024);
+    assert.equal(limits.maxPendingInboxBytesPerSession, 512 * 1024);
+    assert.equal(limits.maxPendingInboxBytesPerRoot, 4 * 1024 * 1024);
   } finally {
     await service.shutdown().catch(() => {});
   }
@@ -297,6 +301,9 @@ test("resolved inbox history is evicted oldest first while pending rows are unto
         });
         session.status = "running";
       }
+      for (let attempt = 0; attempt < 40 && service.inbox.size < 6; attempt += 1) {
+        await new Promise((done) => setTimeout(done, 5));
+      }
       const rows = [...service.inbox.values()];
       assert.equal(rows.length, 6);
       // Five answered at increasing times, one left as an obligation.
@@ -316,6 +323,122 @@ test("resolved inbox history is evicted oldest first while pending rows are unto
     } finally {
       await service.shutdown().catch(() => {});
     }
+  });
+});
+
+test("permission options are compacted and pending inbox bytes are bounded per session and root", async () => {
+  await withDirectory("inbox-bytes", async (directory) => {
+    const rejected = [];
+    const service = new GatewayService({
+      gcIntervalMs: 0,
+      maxInboxItemBytes: 4_000,
+      maxPendingInboxBytesPerSession: 5_000,
+      maxPendingInboxBytesPerRoot: 7_500,
+      artifactRoot: join(directory, "artifacts")
+    });
+    try {
+      const makeSession = (id) => {
+        const session = service.store.create({
+          provider: "mock", acpSessionId: id, cwd: "/", ownerRootId: "main-a",
+          permissionPolicy: "ask", turnId: "turn-1",
+          client: {
+            respondPermission(requestId) { rejected.push(requestId); },
+            pendingSessionInput() { return { permissions: 0, elicitations: 0 }; }
+          }
+        });
+        session.status = "running";
+        return session;
+      };
+      const options = Array.from({ length: 30 }, (_, index) => ({
+        optionId: `option-${index}`,
+        name: `Choice ${index} ${"n".repeat(80)}`,
+        kind: index === 0 ? "allow_once" : "reject_once"
+      }));
+      const first = makeSession("inbox-bytes-1");
+      service.handleUpdate(first, {
+        sessionUpdate: "permission_request", requestId: 1,
+        toolCall: { toolCallId: "tool-1", title: "Edit", kind: "edit" }, options
+      });
+      for (let attempt = 0; attempt < 40 && service.inbox.size < 1; attempt += 1) {
+        await new Promise((done) => setTimeout(done, 5));
+      }
+      const row = [...service.inbox.values()][0];
+      assert.equal(row.optionsTruncated, true);
+      assert.ok(row.options.length <= 16);
+      assert.ok(row.payloadBytes <= 4_000);
+      assert.equal(typeof row.optionsArtifact.path, "string");
+
+      // A second row on the same session crosses its byte allowance and is
+      // rejected back to the worker instead of being retained.
+      first.status = "running";
+      service.handleUpdate(first, {
+        sessionUpdate: "permission_request", requestId: 2,
+        toolCall: { toolCallId: "tool-2", title: "Edit", kind: "edit" }, options
+      });
+      for (let attempt = 0; attempt < 40 && rejected.length < 1; attempt += 1) {
+        await new Promise((done) => setTimeout(done, 5));
+      }
+      assert.deepEqual(rejected, [2]);
+      assert.equal(service.inbox.size, 1);
+
+      // Another session shares the root allowance; it can never push the sum
+      // over the configured root ceiling.
+      const second = makeSession("inbox-bytes-2");
+      service.handleUpdate(second, {
+        sessionUpdate: "permission_request", requestId: 3,
+        toolCall: { toolCallId: "tool-3", title: "Edit", kind: "edit" }, options
+      });
+      for (let attempt = 0; attempt < 40 && service.inbox.size < 2 && rejected.length < 2; attempt += 1) {
+        await new Promise((done) => setTimeout(done, 5));
+      }
+      const third = makeSession("inbox-bytes-3");
+      service.handleUpdate(third, {
+        sessionUpdate: "permission_request", requestId: 4,
+        toolCall: { toolCallId: "tool-4", title: "Edit", kind: "edit" }, options
+      });
+      for (let attempt = 0; attempt < 40 && rejected.length < 2; attempt += 1) {
+        await new Promise((done) => setTimeout(done, 5));
+      }
+      assert.deepEqual(rejected, [2, 4]);
+      const pendingBytes = [...service.inbox.values()]
+        .filter((item) => item.status === "pending")
+        .reduce((total, item) => total + item.payloadBytes, 0);
+      assert.ok(pendingBytes <= 7_500);
+    } finally {
+      await service.shutdown().catch(() => {});
+    }
+  });
+});
+
+test("AcpClient rejects an oversized permission before retaining its params", async () => {
+  const client = new AcpClient(
+    { provider: "mock", command: process.execPath, args: [mockAgent], permissionPolicy: "ask" },
+    { permissionPolicy: "ask", maxInboxItemBytes: 1_024 }
+  );
+  try {
+    await client.start();
+    const session = await client.sessionNew({ cwd: process.cwd(), permissionPolicy: "ask" });
+    const result = await client.sessionPrompt({ sessionId: session.sessionId, prompt: "huge-permission" });
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(client.pendingPermissions.size, 0);
+    assert.deepEqual(client.pendingSessionInput(session.sessionId), { permissions: 0, elicitations: 0 });
+  } finally {
+    await client.stop();
+  }
+});
+
+test("retention never unlinks an artifact while its writer is active", async () => {
+  await withDirectory("active-artifact", async (directory) => {
+    const store = new ArtifactStore({ root: join(directory, "artifacts") });
+    const writer = store.create("session-a", "terminal");
+    writer.append("first");
+    const path = writer.metadata().path;
+    assert.equal(store.prune(0, Date.now() + 1_000), 0);
+    writer.append("-second");
+    writer.finalize();
+    assert.equal(await readFile(path, "utf8"), "first-second");
+    assert.equal(store.prune(0, Date.now() + 1_000), 1);
+    await assert.rejects(readFile(path, "utf8"), /ENOENT/);
   });
 });
 

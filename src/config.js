@@ -42,6 +42,9 @@ export function gatewayLifecycleConfig() {
     maxArtifactTotalBytes: numberEnv("ACP_GATEWAY_MAX_ARTIFACT_TOTAL_BYTES", 512 * 1024 * 1024, 1),
     maxTerminalsPerSession: numberEnv("ACP_GATEWAY_MAX_TERMINALS_PER_SESSION", 16, 1),
     maxPendingRequestsPerSession: numberEnv("ACP_GATEWAY_MAX_PENDING_REQUESTS_PER_SESSION", 64, 1),
+    maxInboxItemBytes: numberEnv("ACP_GATEWAY_MAX_INBOX_ITEM_BYTES", 64 * 1024, 1024),
+    maxPendingInboxBytesPerSession: numberEnv("ACP_GATEWAY_MAX_PENDING_INBOX_BYTES_PER_SESSION", 512 * 1024, 1024),
+    maxPendingInboxBytesPerRoot: numberEnv("ACP_GATEWAY_MAX_PENDING_INBOX_BYTES_PER_ROOT", 4 * 1024 * 1024, 1024),
     maxFrameBytes: numberEnv("ACP_GATEWAY_MAX_FRAME_BYTES", 32 * 1024 * 1024, 1024),
     // Per-connection write budget and stall deadline for every NDJSON transport.
     // The default is today's MAX_CONNECTION_BUFFER_BYTES, split into lane shares

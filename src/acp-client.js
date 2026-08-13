@@ -48,6 +48,7 @@ export class AcpClient {
     this.artifactStore = options.artifactStore ?? null;
     this.maxTerminalsPerSession = options.maxTerminalsPerSession ?? 16;
     this.maxPendingRequestsPerSession = options.maxPendingRequestsPerSession ?? 64;
+    this.maxInboxItemBytes = options.maxInboxItemBytes ?? 64 * 1024;
     this.maxFrameBytes = options.maxFrameBytes ?? 32 * 1024 * 1024;
     this.maxFileReadBytes = options.maxFileReadBytes ?? 500_000;
     // The clamp that has always been here as a literal, now named. Same default,
@@ -414,13 +415,24 @@ export class AcpClient {
         if (decision) this.#respond(id, decision);
         else {
           this.#requirePendingInputCapacity(params.sessionId);
-          this.pendingPermissions.set(id, { rpcId: id, params });
-          this.sessionHandlers.get(params.sessionId)?.({
-            sessionUpdate: "permission_request",
-            requestId: id,
-            toolCall: params.toolCall,
-            options: params.options
-          });
+          this.#requirePendingInputBytes(params);
+          const retained = {
+            sessionId: params.sessionId,
+            toolCall: { kind: params.toolCall?.kind },
+            options: (params.options ?? []).map((option) => ({ optionId: option.optionId, kind: option.kind }))
+          };
+          this.pendingPermissions.set(id, { rpcId: id, params: retained });
+          try {
+            this.sessionHandlers.get(params.sessionId)?.({
+              sessionUpdate: "permission_request",
+              requestId: id,
+              toolCall: params.toolCall,
+              options: params.options
+            });
+          } catch (error) {
+            this.pendingPermissions.delete(id);
+            throw error;
+          }
         }
         return;
       }
@@ -428,15 +440,21 @@ export class AcpClient {
         if (!params.sessionId) throw new Error("Only session-scoped elicitation is supported");
         if (params.mode !== "form") throw new Error(`Unsupported elicitation mode: ${params.mode}`);
         this.#requirePendingInputCapacity(params.sessionId);
-        this.pendingElicitations.set(id, { rpcId: id, params });
-        this.sessionHandlers.get(params.sessionId)?.({
-          sessionUpdate: "elicitation_request",
-          requestId: id,
-          mode: params.mode,
-          message: params.message,
-          requestedSchema: params.requestedSchema,
-          toolCallId: params.toolCallId ?? null
-        });
+        this.#requirePendingInputBytes(params);
+        this.pendingElicitations.set(id, { rpcId: id, params: { sessionId: params.sessionId } });
+        try {
+          this.sessionHandlers.get(params.sessionId)?.({
+            sessionUpdate: "elicitation_request",
+            requestId: id,
+            mode: params.mode,
+            message: params.message,
+            requestedSchema: params.requestedSchema,
+            toolCallId: params.toolCallId ?? null
+          });
+        } catch (error) {
+          this.pendingElicitations.delete(id);
+          throw error;
+        }
         return;
       }
       if (method === "fs/read_text_file") {
@@ -723,6 +741,13 @@ export class AcpClient {
     const pending = this.pendingSessionInput(sessionId);
     if (pending.permissions + pending.elicitations >= this.maxPendingRequestsPerSession) {
       throw new Error(`ACP session pending request limit exceeded: ${this.maxPendingRequestsPerSession}`);
+    }
+  }
+
+  #requirePendingInputBytes(params) {
+    const bytes = Buffer.byteLength(JSON.stringify(params ?? null));
+    if (bytes > this.maxInboxItemBytes) {
+      throw new Error(`ACP pending input payload exceeds ${this.maxInboxItemBytes} bytes`);
     }
   }
 

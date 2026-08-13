@@ -75,6 +75,9 @@ export class GatewayService {
     maxArtifactTotalBytes = 512 * 1024 * 1024,
     maxTerminalsPerSession = 16,
     maxPendingRequestsPerSession = 64,
+    maxInboxItemBytes = 64 * 1024,
+    maxPendingInboxBytesPerSession = 512 * 1024,
+    maxPendingInboxBytesPerRoot = 4 * 1024 * 1024,
     maxFrameBytes = 32 * 1024 * 1024,
     // Transport, session and root budgets. Flat numbers on purpose: setup()
     // renders these straight into a Main-side table, and a nested object would
@@ -156,6 +159,9 @@ export class GatewayService {
       maxArtifactTotalBytes,
       maxTerminalsPerSession,
       maxPendingRequestsPerSession,
+      maxInboxItemBytes,
+      maxPendingInboxBytesPerSession,
+      maxPendingInboxBytesPerRoot,
       maxFrameBytes,
       maxQueueBytes,
       writeTimeoutMs,
@@ -224,7 +230,7 @@ export class GatewayService {
     // Replay has already folded the WAL into these records as plain data.
     this.taskStore.recover(loaded.tasks);
     for (const record of loaded.inbox) {
-      const item = { ...record };
+      const item = compactRecoveredInbox(record, this.resourceLimits.maxInboxItemBytes);
       // An ACP permission request is tied to the old worker process. It cannot
       // be answered after a daemon restart, but must remain visible to Main.
       if (item.status === "pending") {
@@ -1438,10 +1444,15 @@ export class GatewayService {
       // at the same artifact the delivered event does instead of keeping a second
       // full copy of the same tool call.
       const toolCall = this.#capture(session, `${type}-toolCall`, update.toolCall);
+      const options = this.#capture(session, `${type}-options`, update.options);
       // The durable record is created BEFORE the ring push that makes the request
       // pollable. Reversed (as it was through 1.3.2), a poll could hand Main a
       // requestId whose inbox row does not exist yet.
-      if (admitted) this.createPermissionInbox(session, update, toolCall);
+      const inboxItem = admitted ? this.createPermissionInbox(session, update, toolCall, options) : null;
+      if (admitted && !inboxItem) {
+        this.syncSessionInputState(session);
+        return;
+      }
       this.store.push(session, {
         type,
         requestId: update.requestId,
@@ -1449,7 +1460,9 @@ export class GatewayService {
         ...(toolCall.truncated
           ? { toolCallTruncated: true, dataArtifact: toolCall.artifact, toolCall: toolCallHead(update.toolCall) }
           : { toolCall: toolCall.value }),
-        options: update.options
+        ...(options.truncated
+          ? { optionsTruncated: true, optionsBytes: options.bytes, optionsArtifact: options.artifact, options: optionsHead(update.options) }
+          : { options: options.value })
       });
       if (!admitted) return;
       this.updateTaskForSession(session, "input_required", "Waiting for Main permission");
@@ -1469,7 +1482,13 @@ export class GatewayService {
       const messageArtifact = admitted && message !== update.message
         ? this.store.spillText(session.id, `${type}-message`, update.message)
         : null;
-      if (admitted) this.createElicitationInbox(session, update, { schema, message, messageArtifact });
+      const inboxItem = admitted
+        ? this.createElicitationInbox(session, update, { schema, message, messageArtifact })
+        : null;
+      if (admitted && !inboxItem) {
+        this.syncSessionInputState(session);
+        return;
+      }
       this.store.push(session, {
         type,
         requestId: update.requestId,
@@ -1556,6 +1575,7 @@ export class GatewayService {
       artifactStore: this.artifactStore,
       maxTerminalsPerSession: this.resourceLimits.maxTerminalsPerSession,
       maxPendingRequestsPerSession: this.resourceLimits.maxPendingRequestsPerSession,
+      maxInboxItemBytes: this.resourceLimits.maxInboxItemBytes,
       maxFrameBytes: this.resourceLimits.maxFrameBytes,
       maxFileReadBytes: this.resourceLimits.maxFileReadBytes,
       maxTerminalOutputBytes: this.resourceLimits.maxTerminalOutputBytes,
@@ -1835,7 +1855,7 @@ export class GatewayService {
     return changed;
   }
 
-  createPermissionInbox(session, update, toolCall = null) {
+  createPermissionInbox(session, update, toolCall = null, options = null) {
     const existing = [...this.inbox.values()].find((item) =>
       item.sessionId === session.id && item.turnId === session.turnId
       && item.requestId === update.requestId && item.type === "permission_request" && item.status === "pending"
@@ -1866,9 +1886,16 @@ export class GatewayService {
             toolCallArtifact: toolCall.artifact
           }
         : { toolCall: update.toolCall }),
-      // Always inline: options are what Main chooses between, and they are small.
-      options: update.options
+      ...(options?.truncated
+        ? {
+            options: optionsHead(update.options),
+            optionsTruncated: true,
+            optionsBytes: options.bytes,
+            optionsArtifact: options.artifact
+          }
+        : { options: update.options })
     };
+    if (!this.#admitInboxItem(session, item)) return null;
     this.inbox.set(inboxId, item);
     this.#appendInboxCreated(item);
     this.schedulePersist();
@@ -1915,10 +1942,45 @@ export class GatewayService {
         : { requestedSchema: update.requestedSchema }),
       toolCallId: update.toolCallId
     };
+    if (!this.#admitInboxItem(session, item)) return null;
     this.inbox.set(inboxId, item);
     this.#appendInboxCreated(item);
     this.schedulePersist();
     return item;
+  }
+
+  #admitInboxItem(session, item) {
+    setStablePayloadBytes(item);
+    const pending = [...this.inbox.values()].filter((candidate) => candidate.status === "pending");
+    const sessionBytes = pending
+      .filter((candidate) => candidate.sessionId === session.id)
+      .reduce((total, candidate) => total + inboxPayloadBytes(candidate), 0);
+    const rootBytes = pending
+      .filter((candidate) => candidate.ownerRootId === session.ownerRootId)
+      .reduce((total, candidate) => total + inboxPayloadBytes(candidate), 0);
+    const limit = item.payloadBytes > this.resourceLimits.maxInboxItemBytes
+      ? `item ${item.payloadBytes}/${this.resourceLimits.maxInboxItemBytes}`
+      : sessionBytes + item.payloadBytes > this.resourceLimits.maxPendingInboxBytesPerSession
+        ? `session ${sessionBytes + item.payloadBytes}/${this.resourceLimits.maxPendingInboxBytesPerSession}`
+        : rootBytes + item.payloadBytes > this.resourceLimits.maxPendingInboxBytesPerRoot
+          ? `root ${rootBytes + item.payloadBytes}/${this.resourceLimits.maxPendingInboxBytesPerRoot}`
+          : null;
+    if (!limit) return true;
+    try {
+      if (item.type === "permission_request") {
+        session.client?.respondPermission(item.requestId, null, session.acpSessionId);
+      } else {
+        session.client?.respondElicitation(item.requestId, { action: "cancel" }, session.acpSessionId);
+      }
+    } catch {
+      // The provider may have disconnected between admission and rejection.
+    }
+    this.store.push(session, {
+      type: "error",
+      errorCode: ERROR_CODES.INBOX_BUDGET_EXCEEDED,
+      text: `Inbox byte budget exceeded (${limit})`
+    });
+    return false;
   }
 
   resolveInbox(session, requestId, status, resolution) {
@@ -2027,6 +2089,7 @@ export class GatewayService {
     // answered yet.
     for (const item of this.inbox.values()) {
       if (item.toolCallArtifact?.path) keepPaths.add(item.toolCallArtifact.path);
+      if (item.optionsArtifact?.path) keepPaths.add(item.optionsArtifact.path);
       if (item.requestedSchemaArtifact?.path) keepPaths.add(item.requestedSchemaArtifact.path);
       if (item.messageArtifact?.path) keepPaths.add(item.messageArtifact.path);
     }
@@ -2443,11 +2506,71 @@ function toolCallHead(toolCall) {
   return { toolCallId: toolCall?.toolCallId, title: toolCall?.title, kind: toolCall?.kind };
 }
 
+function optionsHead(options) {
+  if (!Array.isArray(options)) return [];
+  return options.slice(0, 16).map((option) => ({
+    optionId: option?.optionId,
+    name: option?.name,
+    kind: option?.kind
+  }));
+}
+
+function inboxPayloadBytes(item) {
+  return Number.isFinite(item?.payloadBytes)
+    ? item.payloadBytes
+    : Buffer.byteLength(JSON.stringify(item ?? null));
+}
+
+function setStablePayloadBytes(item) {
+  let previous = -1;
+  while (item.payloadBytes !== previous) {
+    previous = item.payloadBytes;
+    item.payloadBytes = Buffer.byteLength(JSON.stringify(item));
+  }
+}
+
+function compactRecoveredInbox(record, maxBytes) {
+  const item = { ...record };
+  setStablePayloadBytes(item);
+  if (item.payloadBytes <= maxBytes) return item;
+  const compact = {
+    inboxId: item.inboxId,
+    ownerRootId: item.ownerRootId,
+    sessionId: item.sessionId,
+    turnId: item.turnId,
+    type: item.type,
+    status: item.status,
+    createdAt: item.createdAt,
+    resolvedAt: item.resolvedAt,
+    resolution: item.resolution,
+    requestId: item.requestId,
+    ...(item.toolCall ? { toolCall: toolCallHead(item.toolCall), toolCallTruncated: true } : {}),
+    ...(item.options ? { options: optionsHead(item.options), optionsTruncated: true } : {}),
+    ...(item.mode != null ? { mode: item.mode } : {}),
+    ...(item.message != null
+      ? { message: utf8ByteHead(String(item.message), EVENT_PAYLOAD_CAP_BYTES), messageTruncated: true }
+      : {}),
+    ...(item.requestedSchema != null ? { requestedSchemaTruncated: true } : {}),
+    ...(item.toolCallId != null ? { toolCallId: item.toolCallId } : {}),
+    recoveredPayloadTruncated: true
+  };
+  setStablePayloadBytes(compact);
+  if (compact.payloadBytes > maxBytes) {
+    delete compact.toolCall;
+    delete compact.options;
+    delete compact.message;
+    setStablePayloadBytes(compact);
+  }
+  return compact;
+}
+
 // Present only when something was actually truncated, so an ordinary row is
 // byte-identical to the one 1.3.2 returned. The pointer is returned as a pointer:
 // get() does not rehydrate an artifact, exactly like every other dataArtifact.
 const INBOX_PROJECTION_KEYS = [
   "toolCallTruncated", "toolCallBytes", "toolCallArtifact",
+  "optionsTruncated", "optionsBytes", "optionsArtifact", "payloadBytes",
+  "recoveredPayloadTruncated",
   "messageTruncated", "messageBytes", "messageArtifact",
   "requestedSchemaTruncated", "requestedSchemaBytes", "requestedSchemaArtifact"
 ];

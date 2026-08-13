@@ -13,13 +13,22 @@ const LANE_ORDER = [LANE_HIGH, LANE_NORMAL, LANE_LOW];
 // byte caps would let an operator make HIGH unschedulable, so the split stays a
 // property of the lane contract: HIGH is a reservation, LOW is the shock
 // absorber. Only LOW is droppable — HIGH and NORMAL are never shed.
-export const LANE_SHARE = Object.freeze({ [LANE_HIGH]: 1 / 8, [LANE_NORMAL]: 3 / 8, [LANE_LOW]: 1 / 2 });
+// Hard backlog ceilings. LOW can use half the connection, NORMAL can borrow all
+// but HIGH's 1/8 reserve, and HIGH can use the full global budget. The global
+// ceiling is checked as well, so these overlapping limits never multiply memory.
+export const LANE_BUDGET_FRACTION = Object.freeze({
+  [LANE_HIGH]: 1,
+  [LANE_NORMAL]: 7 / 8,
+  [LANE_LOW]: 1 / 2
+});
 export const DEFAULT_MAX_QUEUE_BYTES = 4_000_000;
 export const DEFAULT_WRITE_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_FRAME_BYTES = 32 * 1024 * 1024;
 
 export class NdjsonChannel {
   #drainHandler = () => this.#onDrain();
+  #errorHandler = (error) => this.#fail(error);
+  #closeHandler = () => this.#fail(new GatewayError(ERROR_CODES.TRANSPORT_CLOSED, "Transport stream closed"));
 
   constructor(stream, {
     maxQueueBytes = DEFAULT_MAX_QUEUE_BYTES,
@@ -38,7 +47,7 @@ export class NdjsonChannel {
       lane,
       frames: [],
       bytes: 0,
-      budget: Math.max(1, Math.floor(maxQueueBytes * LANE_SHARE[lane]))
+      budget: Math.max(1, Math.floor(maxQueueBytes * LANE_BUDGET_FRACTION[lane]))
     }]));
     this.queuedBytes = 0;
     this.blocked = false;
@@ -48,6 +57,8 @@ export class NdjsonChannel {
     this.timer = null;
     this.flushWaiters = [];
     stream.on("drain", this.#drainHandler);
+    stream.on("error", this.#errorHandler);
+    stream.on("close", this.#closeHandler);
   }
 
   // Returns false only for a dropped LOW frame. Everything else that cannot be
@@ -73,6 +84,7 @@ export class NdjsonChannel {
     // FIFO see exactly the order they saw before lanes existed. Reordering is
     // only ever visible under real backpressure.
     if (this.queuedBytes === 0 && !this.blocked) {
+      if (!this.#fits(state, frame.length)) return this.#rejectBudget(lane, state, frame, coalesceKey, meta);
       this.#toStream(frame);
       return true;
     }
@@ -81,27 +93,11 @@ export class NdjsonChannel {
       if (index >= 0) {
         const previous = state.frames[index];
         const delta = frame.length - previous.frame.length;
-        // Coalescing replaces a frame; it does not buy an exemption from the lane
-        // budget. Without this check an update that grows on every revision walks
-        // the lane arbitrarily far past its share while reporting itself as a
-        // saving. The single-frame exemption still applies: when the superseded
-        // frame is the only one in the lane, the lane is still admitting exactly
-        // one frame, however large.
-        if (delta > 0 && state.frames.length > 1 && state.bytes + delta > state.budget) {
-          if (lane === LANE_LOW) {
-            // The queued frame keeps its place, so the update is the one that
-            // never arrives and the one the gap has to name.
-            this.stats.dropped += 1;
-            this.stats.droppedBytes += frame.length;
-            this.onDrop?.([{ lane, bytes: frame.length, coalesceKey, meta }]);
-            return false;
-          }
-          const error = new GatewayError(
-            ERROR_CODES.TRANSPORT_CONGESTED,
-            `Transport ${lane} lane exceeded ${state.budget} queued bytes`
-          );
-          this.#fail(error);
-          throw error;
+        // The initial admission check counted the whole frame in addition to the
+        // one it replaces. Re-check the actual delta so a shrinking or bounded
+        // replacement is accepted without any exemption.
+        if (delta > 0 && !this.#fits(state, delta)) {
+          return this.#rejectBudget(lane, state, frame, coalesceKey, meta);
         }
         state.bytes += delta;
         this.queuedBytes += delta;
@@ -116,25 +112,7 @@ export class NdjsonChannel {
         return true;
       }
     }
-    // Load-bearing invariant: an empty lane always admits one frame, however
-    // large. An 8MB terminal response must not become undeliverable because the
-    // HIGH lane's derived share is 512KB. maxFrameBytes bounds a single frame,
-    // the lane budget bounds a backlog.
-    const exempt = state.frames.length === 0;
-    if (!exempt && state.bytes + frame.length > state.budget) {
-      if (lane === LANE_LOW) {
-        this.stats.dropped += 1;
-        this.stats.droppedBytes += frame.length;
-        this.onDrop?.([{ lane, bytes: frame.length, coalesceKey, meta }]);
-        return false;
-      }
-      const error = new GatewayError(
-        ERROR_CODES.TRANSPORT_CONGESTED,
-        `Transport ${lane} lane exceeded ${state.budget} queued bytes`
-      );
-      this.#fail(error);
-      throw error;
-    }
+    if (!this.#fits(state, frame.length)) return this.#rejectBudget(lane, state, frame, coalesceKey, meta);
     state.frames.push({ frame, coalesceKey, meta, message });
     state.bytes += frame.length;
     this.queuedBytes += frame.length;
@@ -231,6 +209,30 @@ export class NdjsonChannel {
     return this.stream.destroyed === true || this.stream.writable === false;
   }
 
+  #streamBytes() {
+    return Number.isFinite(this.stream.writableLength) ? Math.max(0, this.stream.writableLength) : 0;
+  }
+
+  #fits(state, addedBytes) {
+    return state.bytes + addedBytes <= state.budget
+      && this.#streamBytes() + this.queuedBytes + addedBytes <= this.maxQueueBytes;
+  }
+
+  #rejectBudget(lane, state, frame, coalesceKey, meta) {
+    if (lane === LANE_LOW) {
+      this.stats.dropped += 1;
+      this.stats.droppedBytes += frame.length;
+      this.onDrop?.([{ lane, bytes: frame.length, coalesceKey, meta }]);
+      return false;
+    }
+    const error = new GatewayError(
+      ERROR_CODES.TRANSPORT_CONGESTED,
+      `Transport ${lane} lane or aggregate backlog exceeded ${state.budget}/${this.maxQueueBytes} bytes`
+    );
+    this.#fail(error);
+    throw error;
+  }
+
   #toStream(frame) {
     this.stats.frames += 1;
     this.stats.bytes += frame.length;
@@ -300,6 +302,8 @@ export class NdjsonChannel {
   #teardown(error) {
     this.#clearTimer();
     this.stream.off("drain", this.#drainHandler);
+    this.stream.off("error", this.#errorHandler);
+    this.stream.off("close", this.#closeHandler);
     this.#discard();
     this.fatal ??= error;
     this.#rejectWaiters(error);
