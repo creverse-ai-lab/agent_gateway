@@ -5,9 +5,10 @@ import { stat } from "node:fs/promises";
 import { AcpClient, PERMISSION_POLICIES, requirePermissionPolicy } from "./acp-client.js";
 import { ArtifactStore, defaultArtifactRoot } from "./artifacts.js";
 import { utf8ByteHead } from "./bounded-utf8.js";
+import { ERROR_CODES, GatewayError } from "./errors.js";
 import { currentModelId, detectProviders, providerConfig } from "./providers.js";
 import { publicSession, SessionStore } from "./sessions.js";
-import { GATEWAY_VERSION } from "./version.js";
+import { GATEWAY_API_VERSION, GATEWAY_VERSION, STATE_SCHEMA_VERSION } from "./version.js";
 
 const ACTIVE_STATUSES = new Set(["running", "waiting_permission", "waiting_input", "cancelling", "restoring"]);
 // Only the start of new work closes a message segment. Progress updates
@@ -209,21 +210,29 @@ export class GatewayService {
       inbox: () => this.inboxManage(args, context)
     };
     const handler = handlers[method];
-    if (!handler) throw new Error(`Unknown gateway method: ${method}`);
+    if (!handler) {
+      throw new GatewayError(ERROR_CODES.UNKNOWN_METHOD, `Unknown gateway method: ${method}`, { method });
+    }
     return handler();
   }
 
   subscribe(args = {}, context = {}, emit) {
-    if (typeof emit !== "function") throw new Error("Subscription emitter is required");
+    if (typeof emit !== "function") {
+      throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "Subscription emitter is required");
+    }
     const rootId = requireRoot(context);
     const requested = args.sessionIds;
-    if (requested != null && !Array.isArray(requested)) throw new Error("sessionIds must be an array");
+    if (requested != null && !Array.isArray(requested)) {
+      throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "sessionIds must be an array");
+    }
     const sessions = requested == null
       ? this.store.list().filter((session) => session.ownerRootId === rootId)
       : requested.map((id) => requireOwnedSession(this.requireSession(id), context));
     for (const session of sessions) this.touchSessionOwner(session);
     const cursors = args.cursors ?? {};
-    if (typeof cursors !== "object" || Array.isArray(cursors)) throw new Error("cursors must be an object");
+    if (typeof cursors !== "object" || Array.isArray(cursors)) {
+      throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "cursors must be an object");
+    }
     const subscriptionId = `sub-${randomUUID()}`;
     const subscription = {
       subscriptionId,
@@ -258,7 +267,9 @@ export class GatewayService {
     requireString(subscriptionId, "subscriptionId");
     const subscription = this.subscriptions.get(subscriptionId);
     if (!subscription) return { ok: true, removed: false };
-    if (subscription.rootId !== requireRoot(context)) throw new Error("Subscription belongs to another Main");
+    if (subscription.rootId !== requireRoot(context)) {
+      throw new GatewayError(ERROR_CODES.SUBSCRIPTION_NOT_OWNED, "Subscription belongs to another Main");
+    }
     this.subscriptions.delete(subscriptionId);
     return { ok: true, removed: true };
   }
@@ -298,6 +309,8 @@ export class GatewayService {
     return {
       ok: true,
       gatewayVersion: GATEWAY_VERSION,
+      gatewayApiVersion: GATEWAY_API_VERSION,
+      stateSchemaVersion: STATE_SCHEMA_VERSION,
       persistence: { healthy: this.persistError == null, error: this.persistError },
       lifecycle: {
         ...this.lifecycle,
@@ -411,11 +424,19 @@ export class GatewayService {
   }
 
   registerSession(fields) {
-    if (!fields.acpSessionId) throw new Error("ACP session operation returned no sessionId");
+    if (!fields.acpSessionId) {
+      throw new GatewayError(ERROR_CODES.GATEWAY_ERROR, "ACP session operation returned no sessionId");
+    }
     const duplicate = this.store
       .list()
       .find((item) => item.provider === fields.provider && item.acpSessionId === fields.acpSessionId);
-    if (duplicate) throw new Error(`ACP session is already registered as ${duplicate.id}`);
+    if (duplicate) {
+      throw new GatewayError(
+        ERROR_CODES.INVALID_ARGUMENT,
+        `ACP session is already registered as ${duplicate.id}`,
+        { sessionId: duplicate.id, acpSessionId: fields.acpSessionId }
+      );
+    }
     const session = this.store.create({
       provider: fields.provider,
       client: fields.client,
@@ -467,7 +488,10 @@ export class GatewayService {
       } else {
         const modelOption = findModelOption(configOptions);
         if (!modelOption) {
-          throw new Error(`ACP agent does not advertise a model config option; requested model=${requestedModel}`);
+          throw new GatewayError(
+            ERROR_CODES.INVALID_ARGUMENT,
+            `ACP agent does not advertise a model config option; requested model=${requestedModel}`
+          );
         }
         const changed = await client.setSessionConfigOption({
           sessionId,
@@ -483,11 +507,15 @@ export class GatewayService {
 
   async sessionConfig(args, context) {
     const session = requireOwnedSession(this.requireSession(args.sessionId), context);
-    if (CLOSED_STATUSES.has(session.status)) throw new Error(`Session ${session.id} is closed`);
+    if (CLOSED_STATUSES.has(session.status)) {
+      throw new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`);
+    }
     const action = args.action ?? "list";
-    if (action !== "list" && action !== "set") throw new Error(`Unknown config action: ${action}`);
+    if (action !== "list" && action !== "set") {
+      throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `Unknown config action: ${action}`);
+    }
     if (action === "set" && (session.promptStarting || ACTIVE_STATUSES.has(session.status))) {
-      throw new Error(`Session ${session.id} is still active`);
+      throw new GatewayError(ERROR_CODES.SESSION_ACTIVE, `Session ${session.id} is still active`);
     }
     await this.ensureConnected(session, context);
     const configOptions = session.capabilities?.configOptions ?? [];
@@ -496,12 +524,19 @@ export class GatewayService {
     }
 
     requireString(args.configId, "configId");
-    if (!Object.hasOwn(args, "value")) throw new Error("value is required for config set");
+    if (!Object.hasOwn(args, "value")) {
+      throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "value is required for config set");
+    }
     const option = configOptions.find((item) => item?.id === args.configId);
-    if (!option) throw new Error(`Worker does not advertise config option: ${args.configId}`);
+    if (!option) {
+      throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `Worker does not advertise config option: ${args.configId}`);
+    }
     const value = validateSessionConfigValue(option, args.value);
     if (isModelOption(option) && session.client.config.modelScope === "process" && value !== session.model) {
-      throw new Error(`Provider ${session.provider} selects model per process; open a new session with model=${value}`);
+      throw new GatewayError(
+        ERROR_CODES.INVALID_ARGUMENT,
+        `Provider ${session.provider} selects model per process; open a new session with model=${value}`
+      );
     }
     const response = await session.client.setSessionConfigOption({
       sessionId: session.acpSessionId,
@@ -528,10 +563,14 @@ export class GatewayService {
 
   async sessionPrompt(args, context) {
     const session = requireOwnedSession(this.requireSession(args.sessionId), context);
-    if (session.promptStarting || ACTIVE_STATUSES.has(session.status)) throw new Error(`Session ${session.id} is still active`);
-    if (CLOSED_STATUSES.has(session.status)) throw new Error(`Session ${session.id} is closed`);
+    if (session.promptStarting || ACTIVE_STATUSES.has(session.status)) {
+      throw new GatewayError(ERROR_CODES.SESSION_ACTIVE, `Session ${session.id} is still active`);
+    }
+    if (CLOSED_STATUSES.has(session.status)) {
+      throw new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`);
+    }
     if (typeof args.prompt !== "string" && !Array.isArray(args.prompt)) {
-      throw new Error("prompt must be a string or ACP content array");
+      throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "prompt must be a string or ACP content array");
     }
     session.promptStarting = true;
     try {
@@ -539,7 +578,10 @@ export class GatewayService {
       const requestedModel = optionalString(args.model, "model");
       if (requestedModel && requestedModel !== session.model) {
         if (session.client.config.modelScope === "process") {
-          throw new Error(`Provider ${session.provider} selects model per process; open a new session with model=${requestedModel}`);
+          throw new GatewayError(
+            ERROR_CODES.INVALID_ARGUMENT,
+            `Provider ${session.provider} selects model per process; open a new session with model=${requestedModel}`
+          );
         }
         const configured = await this.configureSessionModel(
           session.client,
@@ -592,8 +634,12 @@ export class GatewayService {
 
   async taskPrompt(args, context) {
     const session = requireOwnedSession(this.requireSession(args.sessionId), context);
-    if (session.promptStarting || ACTIVE_STATUSES.has(session.status)) throw new Error(`Session ${session.id} is still active`);
-    if (CLOSED_STATUSES.has(session.status)) throw new Error(`Session ${session.id} is closed`);
+    if (session.promptStarting || ACTIVE_STATUSES.has(session.status)) {
+      throw new GatewayError(ERROR_CODES.SESSION_ACTIVE, `Session ${session.id} is still active`);
+    }
+    if (CLOSED_STATUSES.has(session.status)) {
+      throw new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`);
+    }
     const now = new Date(this.now()).toISOString();
     const task = {
       taskId: `task-${randomUUID()}`,
@@ -637,7 +683,10 @@ export class GatewayService {
   async taskResult(args, context) {
     const task = requireOwnedTask(this.requireTask(args.taskId), context);
     if (["working", "input_required"].includes(task.status)) {
-      throw new Error(`Task ${task.taskId} is not complete; use tasks/get and retry after its pollInterval`);
+      throw new GatewayError(
+        ERROR_CODES.TASK_NOT_COMPLETE,
+        `Task ${task.taskId} is not complete; use tasks/get and retry after its pollInterval`
+      );
     }
     return task.result ?? { ok: false, error: task.statusMessage ?? "Task completed without a result" };
   }
@@ -667,11 +716,13 @@ export class GatewayService {
     if (action === "get") {
       requireString(args.inboxId, "inboxId");
       const item = this.inbox.get(args.inboxId);
-      if (!item) throw new Error(`Unknown inboxId: ${args.inboxId}`);
-      if (item.ownerRootId !== rootId) throw new Error("Inbox item belongs to another Main");
+      if (!item) throw new GatewayError(ERROR_CODES.UNKNOWN_INBOX, `Unknown inboxId: ${args.inboxId}`);
+      if (item.ownerRootId !== rootId) {
+        throw new GatewayError(ERROR_CODES.NOT_INBOX_OWNER, "Inbox item belongs to another Main");
+      }
       return { ok: true, item: publicInboxItem(item) };
     }
-    throw new Error(`Unknown inbox action: ${action}`);
+    throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `Unknown inbox action: ${action}`);
   }
 
   async sessionPoll(args, context) {
@@ -762,7 +813,9 @@ export class GatewayService {
 
   async sessionPermission(args, context) {
     const session = requireOwnedSession(this.requireSession(args.sessionId), context);
-    if (session.status !== "waiting_permission") throw new Error("Session is not waiting for permission");
+    if (session.status !== "waiting_permission") {
+      throw new GatewayError(ERROR_CODES.SESSION_NOT_WAITING, "Session is not waiting for permission");
+    }
     await session.client.respondPermission(Number(args.requestId), args.optionId ?? null, session.acpSessionId);
     this.store.push(session, {
       type: "permission_response",
@@ -776,7 +829,9 @@ export class GatewayService {
 
   async sessionAnswer(args, context) {
     const session = requireOwnedSession(this.requireSession(args.sessionId), context);
-    if (session.status !== "waiting_input") throw new Error("Session is not waiting for input");
+    if (session.status !== "waiting_input") {
+      throw new GatewayError(ERROR_CODES.SESSION_NOT_WAITING, "Session is not waiting for input");
+    }
     const requestId = Number(args.requestId);
     const action = args.action ?? "accept";
     const response = action === "accept"
@@ -847,7 +902,7 @@ export class GatewayService {
       }
       return { ok: true, closed };
     }
-    throw new Error(`Unknown action: ${args.action}`);
+    throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `Unknown action: ${args.action}`);
   }
 
   async closeSession(session) {
@@ -1024,21 +1079,30 @@ export class GatewayService {
       const actualModel = currentModelId(client.initResult);
       if (config.expectedModel && actualModel !== config.expectedModel) {
         await client.stop();
-        throw new Error(`required model=${config.expectedModel}, actual=${actualModel || "<missing>"}`);
+        throw new GatewayError(
+          ERROR_CODES.INVALID_ARGUMENT,
+          `required model=${config.expectedModel}, actual=${actualModel || "<missing>"}`
+        );
       }
       this.clients.set(clientKey, client);
       return client;
     } catch (error) {
       if (this.clients.get(clientKey) === client) this.clients.delete(clientKey);
       await client.stop().catch(() => {});
-      throw new Error(`${provider} ACP setup failed: ${error?.message ?? error}; ${(client.stderr ?? "").slice(-1000)}`);
+      if (error instanceof GatewayError) throw error;
+      throw new GatewayError(
+        ERROR_CODES.GATEWAY_ERROR,
+        `${provider} ACP setup failed: ${error?.message ?? error}; ${(client.stderr ?? "").slice(-1000)}`
+      );
     }
   }
 
   requireSession(id) {
     requireString(id, "sessionId");
     const session = this.store.get(id);
-    if (!session) throw new Error(`Unknown sessionId: ${id}`);
+    if (!session) {
+      throw new GatewayError(ERROR_CODES.UNKNOWN_SESSION, `Unknown sessionId: ${id}`, { sessionId: id });
+    }
     return session;
   }
 
@@ -1046,7 +1110,7 @@ export class GatewayService {
     requireString(id, "taskId");
     this.pruneTasks();
     const task = this.tasks.get(id);
-    if (!task) throw new Error(`Unknown taskId: ${id}`);
+    if (!task) throw new GatewayError(ERROR_CODES.UNKNOWN_TASK, `Unknown taskId: ${id}`);
     return task;
   }
 
@@ -1371,7 +1435,7 @@ export class GatewayService {
     await writeFile(
       temporary,
       `${JSON.stringify({
-        version: 4,
+        version: STATE_SCHEMA_VERSION,
         sessions: this.store.checkpoints(),
         tasks: [...this.tasks.values()].filter((task) => ["working", "input_required"].includes(task.status)),
         inbox: [...this.inbox.values()].filter((item) => ["pending", "interrupted"].includes(item.status))
@@ -1395,12 +1459,17 @@ export class GatewayService {
 }
 
 function sanitizeWorkerMcpServers(servers) {
-  if (!Array.isArray(servers)) throw new Error("mcpServers must be an array");
+  if (!Array.isArray(servers)) {
+    throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "mcpServers must be an array");
+  }
   return servers.map((server) => {
     const serialized = JSON.stringify(server);
     const name = String(server?.name ?? server?.id ?? "");
     if (/^(?:agent-acp|agent-acp-control)$/i.test(name) || CONTROL_SERVER_PATTERN.test(serialized)) {
-      throw new Error("Control MCP/Gateway cannot be injected into a worker session");
+      throw new GatewayError(
+        ERROR_CODES.INVALID_ARGUMENT,
+        "Control MCP/Gateway cannot be injected into a worker session"
+      );
     }
     return server;
   });
@@ -1408,7 +1477,9 @@ function sanitizeWorkerMcpServers(servers) {
 
 function optionalString(value, name) {
   if (value == null) return null;
-  if (typeof value !== "string" || !value.trim()) throw new Error(`${name} must be a non-empty string`);
+  if (typeof value !== "string" || !value.trim()) {
+    throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `${name} must be a non-empty string`);
+  }
   return value.trim();
 }
 
@@ -1425,20 +1496,30 @@ function isModelOption(option) {
 
 function validateSessionConfigValue(option, value) {
   if (option.type === "boolean") {
-    if (typeof value !== "boolean") throw new Error(`Config option ${option.id} requires a boolean value`);
+    if (typeof value !== "boolean") {
+      throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `Config option ${option.id} requires a boolean value`);
+    }
     return value;
   }
   if (option.type === "select") {
-    if (typeof value !== "string" || !value) throw new Error(`Config option ${option.id} requires a string value`);
+    if (typeof value !== "string" || !value) {
+      throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `Config option ${option.id} requires a string value`);
+    }
     const values = (option.options ?? []).flatMap((item) =>
       Array.isArray(item?.options) ? item.options : [item]
     ).map((item) => item?.value).filter((item) => typeof item === "string");
     if (!values.includes(value)) {
-      throw new Error(`Invalid value for config option ${option.id}: ${value}; expected one of: ${values.join(", ")}`);
+      throw new GatewayError(
+        ERROR_CODES.INVALID_ARGUMENT,
+        `Invalid value for config option ${option.id}: ${value}; expected one of: ${values.join(", ")}`
+      );
     }
     return value;
   }
-  throw new Error(`Unsupported config option type for ${option.id}: ${option.type ?? "unknown"}`);
+  throw new GatewayError(
+    ERROR_CODES.INVALID_ARGUMENT,
+    `Unsupported config option type for ${option.id}: ${option.type ?? "unknown"}`
+  );
 }
 
 function sessionModelId(configOptions) {
@@ -1447,12 +1528,16 @@ function sessionModelId(configOptions) {
 }
 
 function requireOwnedSession(session, context) {
-  if (session.ownerRootId !== requireRoot(context)) throw new Error("Session belongs to another Main");
+  if (session.ownerRootId !== requireRoot(context)) {
+    throw new GatewayError(ERROR_CODES.NOT_SESSION_OWNER, "Session belongs to another Main");
+  }
   return session;
 }
 
 function requireOwnedTask(task, context) {
-  if (task.ownerRootId !== requireRoot(context)) throw new Error("Task belongs to another Main");
+  if (task.ownerRootId !== requireRoot(context)) {
+    throw new GatewayError(ERROR_CODES.NOT_TASK_OWNER, "Task belongs to another Main");
+  }
   return task;
 }
 
@@ -1465,12 +1550,16 @@ function restoreMethod(initResult, requested) {
   const capabilities = initResult?.agentCapabilities ?? {};
   const canResume = Boolean(capabilities.sessionCapabilities?.resume);
   const canLoad = capabilities.loadSession === true;
-  if (requested === "resume" && !canResume) throw new Error("ACP agent does not support session/resume");
-  if (requested === "load" && !canLoad) throw new Error("ACP agent does not support session/load");
+  if (requested === "resume" && !canResume) {
+    throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "ACP agent does not support session/resume");
+  }
+  if (requested === "load" && !canLoad) {
+    throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "ACP agent does not support session/load");
+  }
   if (requested === "resume" || requested === "load") return requested;
   if (canResume) return "resume";
   if (canLoad) return "load";
-  throw new Error("ACP agent does not support session restore");
+  throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "ACP agent does not support session restore");
 }
 
 function canRestoreSession(initResult) {
@@ -1520,22 +1609,28 @@ function publicInboxItem(item) {
 }
 
 function requireProvider(provider) {
-  if (typeof provider !== "string" || !provider.trim()) throw new Error("provider is required");
+  if (typeof provider !== "string" || !provider.trim()) {
+    throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "provider is required");
+  }
   providerConfig(provider);
   return provider;
 }
 
 function requireString(value, name) {
-  if (typeof value !== "string" || !value.trim()) throw new Error(`${name} is required`);
+  if (typeof value !== "string" || !value.trim()) {
+    throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `${name} is required`);
+  }
 }
 
 function requireNonNegativeNumber(value, name, fallback) {
   if (value == null) {
-    if (fallback === undefined) throw new Error(`${name} is required`);
+    if (fallback === undefined) throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `${name} is required`);
     return fallback;
   }
   const parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed < 0) throw new Error(`${name} must be a non-negative integer`);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `${name} must be a non-negative integer`);
+  }
   return parsed;
 }
 
@@ -1545,12 +1640,17 @@ function compileEventTypes(value) {
   if (value == null) return null;
   if (!Array.isArray(value) || value.length === 0
     || value.some((item) => typeof item !== "string" || !item.trim())) {
-    throw new Error("eventTypes must be a non-empty array of strings");
+    throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "eventTypes must be a non-empty array of strings");
   }
   const matchers = value.map((entry) => {
     if (!entry.endsWith("*")) return { exact: entry };
     const prefix = entry.slice(0, -1);
-    if (!prefix) throw new Error("eventTypes wildcard entries need at least one character before *");
+    if (!prefix) {
+      throw new GatewayError(
+        ERROR_CODES.INVALID_ARGUMENT,
+        "eventTypes wildcard entries need at least one character before *"
+      );
+    }
     return { prefix };
   });
   return (type) => matchers.some((matcher) =>
@@ -1571,7 +1671,9 @@ function latestTimestamp(...timestamps) {
 async function requireDirectory(path) {
   requireString(path, "cwd");
   const absolute = resolve(path);
-  if (!(await stat(absolute)).isDirectory()) throw new Error(`Not a directory: ${absolute}`);
+  if (!(await stat(absolute)).isDirectory()) {
+    throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `Not a directory: ${absolute}`);
+  }
   return absolute;
 }
 

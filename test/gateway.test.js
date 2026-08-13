@@ -609,7 +609,11 @@ test("Gateway poll returns a complete artifact for an oversized worker result", 
 test("Gateway rejects recursive Control MCP injection", () => {
   assert.throws(
     () => sanitizeWorkerMcpServers([{ name: "agent-acp", command: "acp-gateway-control" }]),
-    /cannot be injected/
+    (error) => {
+      assert.match(error.message, /cannot be injected/);
+      assert.equal(error.code, "INVALID_ARGUMENT");
+      return true;
+    }
   );
   assert.deepEqual(sanitizeWorkerMcpServers([{ name: "project-guide", command: "guide-mcp" }]), [
     { name: "project-guide", command: "guide-mcp" }
