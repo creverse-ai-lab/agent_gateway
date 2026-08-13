@@ -1,41 +1,77 @@
 #!/usr/bin/env node
 
 import { timingSafeEqual } from "node:crypto";
-import { chmod, open, readFile, unlink } from "node:fs/promises";
+import { chmod, open, readFile, unlink, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
-import { controlToken, gatewayAgentUpdateConfig, gatewayLifecycleConfig, gatewaySocketPath, gatewayStatePath } from "./config.js";
+import {
+  controlToken, gatewayAgentUpdateConfig, gatewayLifecycleConfig, gatewayObservabilityConfig,
+  gatewayPersistenceConfig, gatewaySocketPath, gatewayStatePath
+} from "./config.js";
 import { AgentUpdateManager } from "./agent-updates.js";
+import { ERROR_CODES, GatewayError, errorEnvelope } from "./errors.js";
 import { checkGatewaySource } from "./gateway-source-monitor.js";
 import { GatewayService } from "./gateway-service.js";
 import { readNdjson } from "./ndjson.js";
 import { createSocketSender } from "./socket-flow.js";
+import { statePaths } from "./state-store.js";
 import { GATEWAY_VERSION } from "./version.js";
 
+// A start that dies in init() is invisible: autostart spawns this process with
+// stdio ignored, so the only thing a Main ever sees is a socket that never
+// appears. Recovery failures leave their reason in a file the client reads.
+const STATE_RECOVERY_EXIT_CODE = 78; // EX_CONFIG: operator action required
+// Admission bound per control connection, as a module constant (the PR2
+// precedent for safety valves). The arithmetic that rules out a smaller number:
+// a 120s long poll across maxSessionsPerRoot (64) sessions is 64 legitimately
+// parked requests, so 256 is that with room to spare. A naive 64 would break the
+// intended usage instead of an abusive one.
+const MAX_INFLIGHT_REQUESTS_PER_CONNECTION = 256;
 const socketPath = gatewaySocketPath();
+const statePath = gatewayStatePath();
 const expectedToken = controlToken();
 const expectedRootId = process.env.ACP_GATEWAY_ROOT_ID || null;
 const gatewayConfig = gatewayLifecycleConfig();
 const agentUpdateManager = new AgentUpdateManager({ ...gatewayAgentUpdateConfig(), sourceChecker: checkGatewaySource });
-const service = new GatewayService({ statePath: gatewayStatePath(), agentUpdateManager, ...gatewayConfig });
+const service = new GatewayService({
+  statePath,
+  agentUpdateManager,
+  ...gatewayConfig,
+  ...gatewayObservabilityConfig(),
+  persistence: gatewayPersistenceConfig()
+});
 const clients = new Set();
 let shutdownPromise = null;
 const daemonLock = await acquireDaemonLock(socketPath);
 try {
   await service.init();
+  await unlink(statePaths(statePath).marker).catch(() => {});
   await removeStaleSocket(socketPath);
 } catch (error) {
   await releaseDaemonLock(daemonLock);
+  if (typeof error?.code === "string" && error.code.startsWith("STATE_")) {
+    await writeRecoveryMarker(error);
+    process.stderr.write(`acp-gateway-daemon: ${error.message}\n`);
+    process.exit(STATE_RECOVERY_EXIT_CODE);
+  }
   throw error;
 }
 
 const server = createServer((socket) => {
   clients.add(socket);
   socket.once("close", () => clients.delete(socket));
-  const subscriptions = new Set();
+  // A Map now, not a Set: the value carries whether that subscriber opted into
+  // gap tolerance, which is what decides between shedding and killing it.
+  const subscriptions = new Map();
+  const requestAborts = new Map();
   let boundRootId = null;
+  let inflight = 0;
   const sender = createSocketSender(socket, {
+    subscriptions,
     unsubscribe: (subscriptionId) => service.unsubscribe(subscriptionId, { rootId: boundRootId }),
-    removeSubscription: (subscriptionId) => subscriptions.delete(subscriptionId)
+    removeSubscription: (subscriptionId) => subscriptions.delete(subscriptionId),
+    maxQueueBytes: gatewayConfig.maxQueueBytes,
+    writeTimeoutMs: gatewayConfig.writeTimeoutMs,
+    maxFrameBytes: gatewayConfig.maxFrameBytes
   });
   const { send, sendEvent } = sender;
   readNdjson(socket, {
@@ -47,43 +83,105 @@ const server = createServer((socket) => {
         request = JSON.parse(line);
         const isGuide = request.method === "guide";
         if (!isGuide) {
-          if (!tokenMatches(request.token, expectedToken)) throw new Error("Control access denied");
-          if (typeof request.rootId !== "string" || !request.rootId) throw new Error("rootId is required");
-          if (expectedRootId && request.rootId !== expectedRootId) throw new Error("Control root identity mismatch");
-          if (boundRootId && request.rootId !== boundRootId) throw new Error("Socket is already bound to another Main");
+          if (!tokenMatches(request.token, expectedToken)) {
+            throw new GatewayError(ERROR_CODES.CONTROL_ACCESS_DENIED, "Control access denied");
+          }
+          if (typeof request.rootId !== "string" || !request.rootId) {
+            throw new GatewayError(ERROR_CODES.ROOT_REQUIRED, "rootId is required");
+          }
+          if (expectedRootId && request.rootId !== expectedRootId) {
+            throw new GatewayError(ERROR_CODES.ROOT_MISMATCH, "Control root identity mismatch");
+          }
+          if (boundRootId && request.rootId !== boundRootId) {
+            throw new GatewayError(ERROR_CODES.SOCKET_ALREADY_BOUND, "Socket is already bound to another Main");
+          }
           if (!boundRootId) {
             boundRootId = request.rootId;
             service.attachRoot(boundRootId);
           }
         }
-        if (request.method === "daemon_shutdown") {
-          send({ id: request.id, ok: true, result: { ok: true, pid: process.pid, version: GATEWAY_VERSION } });
-          setImmediate(() => void shutdown().finally(() => process.exit(0)));
-          return;
+        // Refused before dispatch, so an over-limit request costs the round trip
+        // and nothing else.
+        if (inflight >= MAX_INFLIGHT_REQUESTS_PER_CONNECTION) {
+          throw new GatewayError(
+            ERROR_CODES.TOO_MANY_INFLIGHT_REQUESTS,
+            `Too many in-flight Gateway requests on this connection: ${MAX_INFLIGHT_REQUESTS_PER_CONNECTION}`
+          );
         }
-        if (request.method === "subscribe") {
-          const result = service.subscribe(request.args, { rootId: request.rootId }, (event) => {
-            sendEvent(result.subscriptionId, event);
-          });
-          subscriptions.add(result.subscriptionId);
-          send({ id: request.id, ok: true, result });
-          return;
+        inflight += 1;
+        try {
+          if (request.method === "request_cancel") {
+            const requestId = request.args?.requestId;
+            if (typeof requestId !== "string" || !requestId) {
+              throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "requestId is required");
+            }
+            requestAborts.get(requestId)?.abort();
+            return;
+          }
+          if (request.method === "daemon_shutdown") {
+            send({ id: request.id, ok: true, result: { ok: true, pid: process.pid, version: GATEWAY_VERSION } });
+            setImmediate(() => void shutdown().finally(() => process.exit(0)));
+            return;
+          }
+          if (request.method === "subscribe") {
+            const result = service.subscribe(request.args, { rootId: request.rootId }, (event) => {
+              sendEvent(result.subscriptionId, event);
+            });
+            // Additive and opt-in: a client that says nothing keeps the old
+            // contract, so a vendored one cannot be handed a record it does not
+            // understand.
+            subscriptions.set(result.subscriptionId, { acceptsGaps: request.args?.acceptsGaps === true });
+            send({ id: request.id, ok: true, result });
+            return;
+          }
+          if (request.method === "unsubscribe") {
+            const result = service.unsubscribe(request.args?.subscriptionId, { rootId: request.rootId });
+            subscriptions.delete(request.args?.subscriptionId);
+            send({ id: request.id, ok: true, result });
+            return;
+          }
+          const controller = new AbortController();
+          requestAborts.set(request.id, controller);
+          try {
+            const result = isGuide
+              ? await service.guide()
+              : await service.call(request.method, request.args, { rootId: request.rootId, signal: controller.signal });
+            send({ id: request.id, ok: true, result });
+          } finally {
+            requestAborts.delete(request.id);
+          }
+        } finally {
+          inflight -= 1;
         }
-        if (request.method === "unsubscribe") {
-          const result = service.unsubscribe(request.args?.subscriptionId, { rootId: request.rootId });
-          subscriptions.delete(request.args?.subscriptionId);
-          send({ id: request.id, ok: true, result });
-          return;
-        }
-        const result = isGuide ? await service.guide() : await service.call(request.method, request.args, { rootId: request.rootId });
-        send({ id: request.id, ok: true, result });
       } catch (error) {
-        if (!socket.destroyed) send({ id: request?.id ?? null, ok: false, error: error?.message ?? String(error) });
+        // error stays byte-identical for existing callers; errorCode is additive
+        // so a Main can branch on a stable code instead of message text.
+        //
+        // Best effort, and it has to be: the send itself can throw now. A closed
+        // or congested channel refuses the write without the socket ever being
+        // destroyed, so `!socket.destroyed` is not the guard it reads as, and the
+        // throw would escape this async line handler as an unhandled rejection —
+        // taking the daemon down over a reply nobody is waiting for any more.
+        try {
+          if (!socket.destroyed) {
+            send({
+              id: request?.id ?? null,
+              ok: false,
+              ...errorEnvelope(error)
+            });
+          }
+        } catch {
+          // The connection is already gone or failing; its own close handler and
+          // the channel's onFatal own the teardown.
+        }
       }
     }
   });
   socket.once("close", () => {
-    service.removeSubscriptions(subscriptions);
+    for (const controller of requestAborts.values()) controller.abort();
+    requestAborts.clear();
+    sender.destroy();
+    service.removeSubscriptions(subscriptions.keys());
     if (boundRootId) service.detachRoot(boundRootId);
   });
 });
@@ -113,6 +211,18 @@ async function shutdown() {
 
 process.once("SIGTERM", () => void shutdown().finally(() => process.exit(0)));
 process.once("SIGINT", () => void shutdown().finally(() => process.exit(0)));
+
+async function writeRecoveryMarker(error) {
+  const marker = statePaths(statePath).marker;
+  const document = {
+    at: new Date().toISOString(),
+    pid: process.pid,
+    gatewayVersion: GATEWAY_VERSION,
+    errorCode: error.code,
+    error: error.message
+  };
+  await writeFile(marker, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 }).catch(() => {});
+}
 
 function tokenMatches(actual, expected) {
   if (typeof actual !== "string") return false;

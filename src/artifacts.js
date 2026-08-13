@@ -1,4 +1,4 @@
-import { closeSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -21,6 +21,7 @@ export class ArtifactStore {
     this.maxFileBytes = maxFileBytes;
     this.maxTotalBytes = maxTotalBytes;
     this.usedBytes = directoryBytes(root);
+    this.activePaths = new Set();
   }
 
   create(sessionId, kind) {
@@ -33,7 +34,7 @@ export class ArtifactStore {
     for (const entry of safeEntries(this.root)) {
       if (!entry.isFile() || !entry.name.startsWith(ARTIFACT_PREFIX)) continue;
       const path = join(this.root, entry.name);
-      if (keepPaths?.has(path)) continue;
+      if (keepPaths?.has(path) || this.activePaths.has(path)) continue;
       try {
         const info = statSync(path);
         if (info.mtimeMs + retentionMs > now) continue;
@@ -47,12 +48,35 @@ export class ArtifactStore {
     return removed;
   }
 
+  // Makes the directory entry itself durable. A file whose name a WAL record
+  // points at is only reachable after its parent directory is on disk.
+  syncDirectory() {
+    let fd = null;
+    try {
+      fd = openSync(this.root, "r");
+      fsyncSync(fd);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (fd != null) closeSync(fd);
+    }
+  }
+
   reserve(requested, fileBytes) {
     return Math.max(0, Math.min(
       requested,
       this.maxFileBytes - fileBytes,
       this.maxTotalBytes - this.usedBytes
     ));
+  }
+
+  markActive(path) {
+    this.activePaths.add(path);
+  }
+
+  markInactive(path) {
+    if (path) this.activePaths.delete(path);
   }
 }
 
@@ -107,10 +131,13 @@ class ArtifactWriter {
     }
   }
 
-  finalize(tail = null) {
+  // sync is for the durable path only (a WAL record that names this file): the
+  // fsync must happen before the close, and the caller must then inspect
+  // metadata().error, because append() records I/O failures instead of throwing.
+  finalize(tail = null, { sync = false } = {}) {
     if (this.complete) return;
     if (this.started && tail != null) this.append(tail);
-    this.#close();
+    this.#close({ sync });
     this.complete = true;
   }
 
@@ -131,10 +158,21 @@ class ArtifactWriter {
     const path = join(this.store.root, `${ARTIFACT_PREFIX}${this.sessionId}-${this.kind}-${randomUUID()}.txt`);
     this.fd = openSync(path, "wx", 0o600);
     this.path = path;
+    this.store.markActive(path);
   }
 
-  #close() {
+  #close({ sync = false } = {}) {
     if (this.fd == null) return;
+    // A failed fsync must still close the descriptor: the error belongs on the
+    // record, not in a leaked fd.
+    if (sync) {
+      try {
+        fsyncSync(this.fd);
+      } catch (error) {
+        this.truncated = true;
+        this.error ??= error?.message ?? String(error);
+      }
+    }
     try {
       closeSync(this.fd);
     } catch (error) {
@@ -142,6 +180,7 @@ class ArtifactWriter {
       this.error ??= error?.message ?? String(error);
     }
     this.fd = null;
+    this.store.markInactive(this.path);
   }
 }
 

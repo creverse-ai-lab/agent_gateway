@@ -1,4 +1,4 @@
-# ACP Gateway v1.3.2
+# ACP Gateway v1.4.0
 
 혹시 여러 AI 에이전트를 쓰고 계신가요?
 
@@ -81,6 +81,22 @@ acp-gateway-bootstrap --update-skill
 
 `--update-skill`은 installer 상태에 기록된 모든 `agent-delegator` 복사본을 대상으로 하며, Gateway 소스 pull, adapter·MCP 변경, daemon 재시작은 수행하지 않습니다. 설치 시 기록한 SHA-256 tree digest와 현재 설치본이 일치할 때만 교체하므로 사용자가 수정한 skill은 `customized` 경고와 함께 보존됩니다. v1.3.0 이하에서 설치해 digest가 없는 복사본도 내용이 현재 기본본과 같더라도 `legacy-unverified`로 보존합니다. 내용을 검토한 뒤 기본본으로 덮어쓰려는 경우에만 `--update-skill --force`를 사용하세요. 최신 Gateway 소스를 먼저 받을 때는 `acp-gateway-bootstrap --update`가 성공한 다음 별도 명령으로 실행합니다.
 
+### 호스트 재연결 절차
+
+Gateway를 새 버전으로 올린 뒤에는 **호스트(Claude/Codex/Grok/Auggie) 세션을 반드시 다시 연결해야** 새 tool과 인자가 보입니다. MCP 호스트는 서버가 처음 응답한 tool 목록을 세션 동안 캐시하고, daemon 재시작은 소켓만 교체하기 때문에(RPC가 투명하게 재접속) 낡은 스키마는 아무 오류 없이 그대로 남습니다. 서버 version을 올려도 캐시는 깨지지 않습니다.
+
+순서대로 실행하세요.
+
+```bash
+acp-gateway-bootstrap --update          # 1. Gateway 소스·adapter·daemon 갱신
+acp-gateway-bootstrap --update-skill    # 2. skill 갱신 (수정본이면 --force)
+```
+
+3. **호스트 재연결** — Claude Code는 `/mcp reconnect` 또는 새 세션, Codex·Grok·Auggie는 새 세션을 시작합니다.
+4. **검증** — tool 목록에 `agent_acp_run`이 있고, `agent_acp_setup` 응답에 `staleFrontDoor`가 없으면 정상입니다.
+
+`staleFrontDoor`는 프론트 도어(호스트에 등록된 MCP 프로세스)의 버전과 실행 중인 daemon 버전이 다를 때 `agent_acp_setup`·`agent_acp_session_open` 응답에 붙는 알림으로, `frontDoorVersion`·`gatewayVersion`·필요한 조치를 담고 있습니다. 이 알림이 보이면 3번을 수행하세요.
+
 주요 installer 옵션:
 
 | 옵션 | 설명 |
@@ -114,7 +130,7 @@ Control·Guide MCP 등록은 Codex, Claude, Grok, Auggie를 지원합니다. 기
 
 ### ACP 상류 버전 모니터링
 
-저장소는 ACP 공식 protocol 저장소와 registry 전체를 매일 확인합니다. Protocol release·공개 wire version, registry agent의 추가·삭제·버전·배포 정보가 바뀌면 `automation/acp-upstream-monitor` 브랜치에서 `dev` 대상 검토 PR을 생성하거나 기존 PR을 갱신합니다. npm과 GitHub Actions의 일반 버전 업데이트는 Dependabot이 별도의 `dev` 대상 PR로 관리합니다. 보안 업데이트는 GitHub 정책에 따라 기본 브랜치인 `main`을 대상으로 합니다.
+ACP 공식 protocol 저장소와 registry 확인은 maintainer가 아래 명령으로 수동 수행합니다. Protocol release·공개 wire version, registry agent의 추가·삭제·버전·배포 정보가 바뀌면 snapshot을 갱신해 검토 후 `dev`에 커밋합니다. npm과 GitHub Actions의 일반 버전 업데이트는 Dependabot이 별도의 `dev` 대상 PR로 관리합니다. 보안 업데이트는 GitHub 정책에 따라 기본 브랜치인 `main`을 대상으로 합니다.
 
 ```bash
 npm run monitor:check   # 변경이 있으면 보고서를 출력하고 종료 코드 2 반환
@@ -123,15 +139,15 @@ npm run monitor:sync-dependencies  # 저장소가 직접 포함한 ACP adapter �
 npm run update:upstream  # 위 갱신과 전체 CI를 한 번에 실행하는 수동 유지보수 경로
 ```
 
-GitHub Actions의 write/PR 권한을 사용할 수 없는 저장소에서는 maintainer가 `npm run update:upstream`을 실행하면 예약 workflow가 하던 snapshot 갱신, 관리 대상 ACP adapter pin·lockfile 동기화와 전체 CI를 로컬에서 한 번에 수행할 수 있습니다. 이 명령은 커밋이나 push를 자동으로 하지 않습니다. `git diff`로 protocol·registry 변경과 테스트 결과를 검토한 뒤 `dev`에 커밋하면 됩니다. 일반 사용자의 `acp-gateway-bootstrap --update`는 저장소 파일을 임의로 수정하지 않고 상류 변경을 보고한 뒤 runtime adapter만 안전하게 갱신합니다.
+maintainer가 `npm run update:upstream`을 실행하면 snapshot 갱신, 관리 대상 ACP adapter pin·lockfile 동기화와 전체 CI를 로컬에서 한 번에 수행할 수 있습니다. 이 명령은 커밋이나 push를 자동으로 하지 않습니다. `git diff`로 protocol·registry 변경과 테스트 결과를 검토한 뒤 `dev`에 커밋하면 됩니다. 일반 사용자의 `acp-gateway-bootstrap --update`는 저장소 파일을 임의로 수정하지 않고 상류 변경을 보고한 뒤 runtime adapter만 안전하게 갱신합니다.
 
 두 업데이트 경로는 역할이 다릅니다.
 
 - **ACP agent/adapter 버전:** daemon이 공식 registry의 고정 버전을 주기적으로 확인해 자동 갱신합니다. `acp-gateway-bootstrap --update`를 실행할 때도 즉시 registry를 새로 읽고 같은 갱신을 수행합니다.
-- **ACP protocol wire version:** 새 major를 감지해 PR에 경고하지만 자동 적용하지 않습니다. 호환성 테스트 후 `src/acp-version.js`와 monitor 설정을 함께 바꿔야 합니다.
+- **ACP protocol wire version:** 새 major를 감지해 `monitor:check` 보고서에 경고하지만 자동 적용하지 않습니다. 호환성 테스트 후 `src/acp-version.js`와 monitor 설정을 함께 바꿔야 합니다.
 - **Gateway npm 의존성:** Dependabot PR에서 lockfile과 CI 결과를 확인한 뒤 병합합니다.
 
-현재 runtime은 ACP wire version 1을 사용합니다. 공식 저장소의 `schema/v2`도 감지되지만, v2 지원으로 표시하거나 자동 전환하지 않습니다. Snapshot PR은 알림과 검토 시작점이며 자동 병합 또는 Gateway release를 수행하지 않습니다.
+현재 runtime은 ACP wire version 1을 사용합니다. 공식 저장소의 `schema/v2`도 감지되지만, v2 지원으로 표시하거나 자동 전환하지 않습니다. Snapshot 갱신은 알림과 검토 시작점이며 자동 병합 또는 Gateway release를 수행하지 않습니다.
 
 v1.1.0부터 daemon은 시작 시점과 이후 24시간마다 ACP 공식 registry를 확인합니다. 발견된 `npx`·`uvx` adapter가 새 버전이면 자동으로 설치하고 provider 정의를 갱신합니다. 이미 실행 중인 Worker process는 중단하지 않으며, 새 process나 session부터 갱신된 adapter가 적용됩니다. 직접 설치해야 하는 binary 배포는 자동 교체하지 않고 health 경고로 남깁니다.
 
@@ -149,7 +165,7 @@ acp-gateway-bootstrap --agent-auto-update on
 acp-gateway-bootstrap --agent-update-notifications on
 ```
 
-예약 실행과 Dependabot 설정은 GitHub의 기본 브랜치에 존재해야 활성화됩니다. 따라서 `dev` 검증이 끝나면 monitoring workflow 자체는 `main`에 병합하고 원격 `dev` 브랜치를 유지해야 합니다. 또한 저장소의 **Settings → Actions → General → Workflow permissions**에서 GitHub Actions의 PR 생성을 허용해야 자동 PR이 생성됩니다.
+Dependabot 설정은 GitHub의 기본 브랜치에 존재해야 활성화되며, `dev` 대상 PR을 위해 원격 `dev` 브랜치를 유지해야 합니다.
 
 ## 사용 방법
 
@@ -183,7 +199,7 @@ Gateway는 Worker가 공개하지 않은 `temperature`, `max_tokens` 같은 값�
 
 v1.3.0부터 poll 기본값이 절약형입니다. 턴이 진행 중일 때 `result`는 자동으로 생략되고(`includeResult: true`로 명시할 때만 포함), 종료 후 poll의 `result.text`에는 누적 transcript가 아니라 **최종 답변 세그먼트**(마지막 작업 경계 이후의 메시지 텍스트)만 담깁니다. 진행 narration은 `includeInspection: true`로 조회합니다. `agent_acp_session` `get`의 `includeTranscript: true`는 메모리에 남은 bounded transcript를 반환하며, overflow된 전체 transcript는 `resultArtifact`를 따라 회수합니다. `cursor`/`toCursor`/`eventTypes`로 보존된 이벤트 이력도 범위 조회할 수 있습니다. 자세한 회수 경로는 `agent-delegator` skill의 "Retrieve the correct result" 표를 따르세요.
 
-인라인 상한을 넘는 데이터는 전부 `~/.acp-gateway/artifacts`의 파일로 스필되고 응답에는 잘린 미리보기와 포인터(경로·바이트 수·완료 여부)가 실립니다 — 4KB(UTF-8)를 넘는 tool 이벤트 payload는 `dataArtifact`, 64KB를 넘는 최종 답변은 `textArtifact`, 메모리 상한(1MB)을 넘는 transcript는 `resultArtifact`. 인라인에는 상한 내 내용만 유지하므로 RAM과 오케스트레이터 컨텍스트가 결과 크기에 따라 늘어나지 않습니다. Artifact는 파일당 100MB·전체 512MB이고, 라이브 세션이 참조하는 파일은 24시간 정리에서 보존됩니다. 동시 미응답 권한·질문 요청은 세션당 64개의 안전 상한을 따르며, 큰 설명 chunk는 32MB protocol frame 상한 안에서 그대로 처리합니다.
+인라인 상한을 넘는 데이터는 전부 `~/.acp-gateway/artifacts`의 파일로 스필되고 응답에는 잘린 미리보기와 포인터(경로·바이트 수·완료 여부)가 실립니다 — 4KB(UTF-8)를 넘는 tool 이벤트 payload는 `dataArtifact`, 64KB를 넘는 최종 답변은 `textArtifact`, 메모리 상한(1MB)을 넘는 transcript는 `resultArtifact`. 인라인에는 상한 내 내용만 유지하므로 RAM과 오케스트레이터 컨텍스트가 결과 크기에 따라 늘어나지 않습니다. Artifact는 파일당 100MB·전체 512MB이고, 라이브 세션이 참조하는 파일은 24시간 정리에서 보존됩니다. 동시 미응답 권한·질문 요청은 세션당 64개의 안전 상한을 따르며, 큰 설명 chunk는 32MB protocol frame 상한 안에서 그대로 처리합니다. 전송·세션·Main 단위 예산도 `setup().resourceLimits`에 함께 실립니다 — control 연결당 쓰기 큐 4MB와 10초 무진행 상한(worker stdin 쪽 큐는 동시 요청 상한에서 파생), prompt 1MB, 파일 읽기 500KB(바이트 기준, 초과분은 `_meta["acp-gateway/read"]`로 절단을 알림), terminal 출력 10MB, Main당 세션 64개와 처리 완료 inbox 이력 1000건.
 
 ### 권한 정책
 
@@ -199,13 +215,42 @@ Control token, 오케스트레이터 식별자(Main ID)와 Gateway socket 경로
 
 ### 세션과 데이터
 
-- 기본 상태 파일: `~/.acp-gateway/state.json`
+- 상태 파일(schema v5): `~/.acp-gateway/state.snapshot.json`(전체 상태) + `~/.acp-gateway/state.wal.ndjson`(control 전이 로그)
+- `~/.acp-gateway/state.json`은 v4 형식으로 계속 기록됩니다 — 구 Gateway로 롤백해도 세션이 복구되도록 두는 다운그레이드 보험이며 1.5.0에서 제거 예정
 - idle resumable 세션은 기본 30분 후 unload
 - 결과와 이벤트는 기본 24시간 보존
-- session resume checkpoint는 기본 7일 보존
+- session resume checkpoint는 기본 7일 보존, Task 핸들의 바이트는 기본 24시간 보존(`ACP_GATEWAY_TASK_RETENTION_MS`)
 - 장시간 유지가 필요한 세션은 `pin` 사용
 - 응답 본문, thought, 전체 이벤트 이력은 상태 파일에 영구 저장하지 않음
 - 인라인 상한을 넘은 결과와 terminal 출력은 `~/.acp-gateway/artifacts`에 임시 저장 후 결과 보존 기간에 맞춰 정리
+
+#### 내구성과 복구
+
+Task 생성과 결과 확정은 응답을 반환하기 전에 WAL에 append + fsync합니다. 즉 Main이 받은 Task 핸들은 daemon이 죽어도 남아 있고, 재시작 후 미완 Task는 `failed`(재시작 메시지)로 확정됩니다. 나머지 전이(permission·질문 기록, 세션 등록/종료, 상태 변경)는 5ms group commit입니다. macOS에서 Node는 `F_FULLFSYNC`를 노출하지 않으므로 `fsync(2)`만 사용합니다 — 프로세스 비정상 종료는 완전히 보호되고, 전원 손실은 group commit 창(기본 5ms)만 노출됩니다.
+
+상태 파일이 손상되면 daemon은 **빈 상태로 조용히 시작하지 않고** 중단합니다. 이때 `~/.acp-gateway/state.recovery-required`에 이유를 기록하고 exit 78로 종료하며, Control MCP 연결 실패 메시지에 그 내용이 표면화됩니다. 복구는 명시적으로 선택합니다.
+
+| 환경 변수 | 기본값 | 설명 |
+| --- | --- | --- |
+| `ACP_GATEWAY_WAL` | `on` | `off`면 WAL 없이 critical mutation마다 snapshot을 동기 기록(동일한 내구성 약속, 더 큰 쓰기 비용) |
+| `ACP_GATEWAY_WAL_GROUP_COMMIT_MS` | `5` | 비임계 전이의 group commit 간격 |
+| `ACP_GATEWAY_WAL_ROTATE_BYTES` / `_RECORDS` / `_INTERVAL_MS` | `4MiB` / `10000` / `15m` | WAL 회전 조건 |
+| `ACP_GATEWAY_WAL_INLINE_RESULT_BYTES` | `4096` | 이 크기를 넘는 Task 결과는 artifact로 분리하고 WAL은 참조 + preview만 기록 |
+| `ACP_GATEWAY_FSYNC` | `normal` | `off`는 테스트·임시 볼륨 전용 |
+| `ACP_GATEWAY_STATE_RECOVERY` | (없음) | `truncate`: 손상 직전까지 WAL replay 후 시작 / `snapshot-drop`: snapshot 폐기 후 `state.json`에서 복구 / `cold`: 빈 상태로 시작 |
+| `ACP_GATEWAY_TASK_RETENTION_MS` | `24h` | Task 레코드와 결과 artifact의 디스크 생존 기간(세션 보존과 독립) |
+| `ACP_GATEWAY_MAX_QUEUE_BYTES` | `4000000` | control 연결당 OS+channel 합산 쓰기 예산. HIGH는 전체, NORMAL은 7/8, LOW는 1/2까지 사용 |
+| `ACP_GATEWAY_WRITE_TIMEOUT_MS` | `10000` | 이 시간 동안 OS가 한 바이트도 받지 않으면 해당 연결·프로바이더를 종료 |
+| `ACP_GATEWAY_MAX_PROMPT_BYTES` | `1000000` | 초과 prompt는 턴을 만들기 전에 `PROMPT_TOO_LARGE`로 거부 |
+| `ACP_GATEWAY_MAX_FILE_READ_BYTES` | `500000` | worker의 `fs/read_text_file` 응답 바이트 상한(거부 대신 절단) |
+| `ACP_GATEWAY_MAX_TERMINAL_OUTPUT_BYTES` | `10000000` | terminal 출력 버퍼 상한(기존 하드코딩 값과 동일) |
+| `ACP_GATEWAY_MAX_SESSIONS_PER_ROOT` | `64` | Main당 동시 세션 상한. 초과 시 `SESSION_LIMIT_EXCEEDED` |
+| `ACP_GATEWAY_MAX_INBOX_ITEM_BYTES` | `65536` | worker permission/elicitation 한 건의 보관 바이트 상한 |
+| `ACP_GATEWAY_MAX_PENDING_INBOX_BYTES_PER_SESSION` | `524288` | 세션당 pending inbox 합산 바이트 상한 |
+| `ACP_GATEWAY_MAX_PENDING_INBOX_BYTES_PER_ROOT` | `4194304` | Main당 pending inbox 합산 바이트 상한 |
+| `ACP_GATEWAY_MAX_INBOX_HISTORY_PER_ROOT` | `1000` | Main당 보관하는 처리 완료 inbox 건수(pending은 제거 대상 아님) |
+
+persistence가 불건강해지면 **새 Task 생성만** `PERSISTENCE_UNHEALTHY`로 거부합니다(핸들 = 내구성 약속). `session_open`과 직접 `prompt`는 계속 동작하며, 다음 성공한 write에서 건강 상태가 회복됩니다. `setup().persistence`에 `mode`, `walSeq`, `walBytes`, `snapshotEpoch`, `fsyncCount`, `lastRecovery`가 함께 보고됩니다.
 
 ## ACP와 MCP란?
 
@@ -268,10 +313,57 @@ flowchart LR
 5. **권한·질문 처리** — Worker의 permission 요청이나 질문은 Gateway Inbox를 거쳐 오케스트레이터에게 전달되고, 그 응답이 다시 Worker로 돌아갑니다.
 6. **결과 회수·재사용** — 오케스트레이터는 MCP Task 또는 poll로 상태와 결과를 받고, 필요하면 같은 세션을 다시 호출하거나 복구합니다.
 
+## v1.4.0 변경 사항
+
+**Durable · Bounded · Quiet** — 재시작 후에도 정확하고, 주요 자원이 명시된 상한 안에 머물며, Main을 불필요하게 깨우지 않는 안정화 릴리스입니다.
+
+### 버전 정보
+
+| 항목 | 버전·요구사항 | 의미 |
+|---|---|---|
+| ACP Gateway | `1.4.0` | daemon, Control MCP와 installer의 릴리스 버전 |
+| Gateway Control API | `1` | 공개 control method와 응답 계약. additive 변경에는 올리지 않음 |
+| State schema | `5` | `state.snapshot.json` + checksummed `state.wal.ndjson` |
+| Legacy state schema | `4` | rollback을 위해 병행 기록하며 1.5.0에서 종료 예정 |
+| Runtime | Node.js `>=22` | macOS와 Linux 지원 |
+| 호환 기준 | `1.3.2` | 인자 없는 핵심 호출의 응답 형태와 기존 method 유지 |
+
+`package.json`, daemon과 Control MCP가 모두 `1.4.0`을 보고해야 정상입니다. `agent_acp_setup`에서는 `gatewayVersion`, `gatewayApiVersion`, `stateSchemaVersion`으로 각각 확인할 수 있습니다. MCP 호스트가 이전 tool schema를 캐시한 경우에는 `staleFrontDoor`가 표시되므로 [호스트 재연결 절차](#호스트-재연결-절차)를 수행하세요.
+
+### 릴리스 변경 이력
+
+1. **오류 계약과 characterization 기반 확립** — 안정적인 Gateway error code와 `{code,message,details}` wire envelope를 추가하고, 1.3.2의 prompt·poll·Task·Inbox 기본 동작을 characterization test로 고정했습니다.
+2. **SessionActor-lite 도입** — 세션별 mailbox와 명시적 FSM guard로 prompt·cancel·close·restore·provider-exit을 직렬화했습니다. 늦은 callback과 중복 terminal 처리도 idempotent하게 만들었습니다.
+3. **TaskStore v2 전환** — Task TTL을 `createdAt` 기준으로 통일하고, terminal-first-wins, blocking result waiter, 취소 의미론, root 격리, waiter·Task 상한과 keyset pagination을 구현했습니다.
+4. **State schema v5와 crash-safe 복구** — snapshot과 checksummed WAL, fsync barrier, replay idempotency, state-directory lock, v4 migration·downgrade 감지를 추가했습니다. 손상된 내부 WAL이나 snapshot에서는 빈 상태로 시작하지 않고 안전하게 중단합니다.
+5. **Bounded transport와 자원 예산** — 모든 NDJSON 전송 구간에 frame·queue·lane·write-timeout 상한을 적용하고, prompt·파일 읽기·terminal 출력·session·Inbox·artifact에도 명시적인 예산을 추가했습니다. 대용량 파일은 전체 `readFile` 대신 bounded streaming read로 처리합니다.
+6. **Control/telemetry 분리** — permission·질문·Task 상태 같은 control event를 telemetry flood에서 보호합니다. raw message/thought chunk는 live subscription으로만 전달하고, usage는 ring 저장이나 poll wake-up 없이 turn/session 누계로 집계합니다.
+7. **Compact API와 실행 경로 단순화** — `agent_acp_run`, `current|compact|diagnostic` 응답 프로파일, setup summary, 결과 byte budget, Inbox 필터·페이징과 idempotency key를 추가했습니다.
+
+마무리 안정화에서는 close flush timer의 참조가 사라져 shutdown이 멈출 수 있던 문제, transport 종료가 worker-death로 정규화되지 않던 문제, aggregate transport·Inbox budget 우회, 구조적 오류 누락과 compact run의 복구 중 중복 실행 가능성을 수정했습니다. CI에는 session race, resource budget, transport backpressure, Task conformance, state corruption과 18개 crash cut-point 검증이 포함됩니다.
+
+### 주요 API 추가
+
+- **`agent_acp_run` 신설** — prompt를 보내고 결과까지 기다리는 단일 도구입니다. 직접 반환값과 MCP Task 결과가 **같은 객체**라서 처리할 shape가 하나뿐입니다. 대기 시간이 끝나면 오류가 아니라 `{status:"working", taskId}`를 돌려주므로, 실패 시에는 prompt를 다시 보내지 말고 `{taskId}`로만 재시도하면 됩니다(중복 실행이 구조적으로 불가능). permission이 필요하면 `{status:"input_required", pending}`으로 제어권을 즉시 돌려줍니다. `idempotencyKey`로 재시도 안전성을 한 겹 더 확보할 수 있습니다.
+- **응답 프로파일** — `agent_acp_poll`에 `responseProfile: "compact"`를 주면 세션 봉투를 제거하고 `events`·최종 `result`만 남겨 **약 3분의 1 크기**로 줄어듭니다(빈 poll 483 → 152 bytes, permission poll 814 → 483 bytes). `"diagnostic"`은 큐 깊이·대기 요청 수 등 진단 정보를 더합니다. 인자를 생략하면 기존 응답 그대로입니다.
+- **`setup mode:"summary"`** — 버전·프로파일·persistence·alert·provider 목록만 담은 요약(363 bytes, 전체의 약 19%)입니다. 세션마다 필요한 값은 `agent_acp_session_open` 응답이 직접 실어 보내므로(`responseProfiles`, `limits`, `relevantAlerts`) 위임할 때마다 setup을 다시 부를 필요가 없습니다.
+- **결과 예산** — `resultBudgetBytes`(0–65,536)·`resultDelivery`로 돌려받을 결과 크기를 호출마다 제한할 수 있습니다. 초과분은 잘린 본문과 함께 전체 답변 기준 `totalBytes`·`omittedBytes`·완전한 `textArtifact` 포인터로 전달되며, 같은 답변에 대한 spill은 한 번만 일어납니다.
+- **Inbox 필터·페이징** — `sessionId`, `type`, `limit`, `cursor`, `detail:"summary"`를 지원합니다. 인자 없는 호출은 기존과 완전히 동일한 전체 목록입니다.
+- **내구성·경계·정숙성(PR 1~6)** — state v5 snapshot + WAL과 crash-safe 복구, MCP Task 의미론(TTL은 생성 시점 기준), 세션별 mailbox와 명시적 상태 전이, 모든 전송 구간의 프레임·큐·타임아웃 예산, control/telemetry 레인 분리와 usage 집계가 포함됩니다.
+- **호스트 재연결 감지** — 프론트 도어와 daemon 버전이 어긋나면 `staleFrontDoor`로 알립니다. 위의 [호스트 재연결 절차](#호스트-재연결-절차)를 따르세요.
+
+### 호환성 참고
+
+- 인자 없는 `task_list`와 Inbox list, 기본 `current` poll 응답 형태는 1.3.2 공개 계약을 유지합니다. compact·diagnostic profile, pagination과 summary는 opt-in입니다.
+- raw message/thought chunk는 보존형 poll history가 아니라 live subscription 전용입니다. 재연결 후 과거 chunk replay가 필요한 consumer는 자체 저장 계층이 필요합니다.
+- 큰 Inbox payload는 메모리에 전문을 중복 보관하지 않고 preview와 artifact pointer를 반환합니다.
+- 새 resource budget을 넘는 요청은 무제한으로 수용하는 대신 안정적인 error code로 거부됩니다. 기존에 상한을 초과하던 workload는 setup의 `limits`를 확인해 설정을 조정해야 합니다.
+- State v5를 사용한 뒤 1.3.2로 rollback하면 병행 기록된 legacy v4 상태를 읽습니다. downgrade 감지 alert를 확인한 뒤 다시 1.4.0으로 복귀하세요.
+
 ## v1.3.2 변경 사항
 
-- **최종 결과 중심 poll** — 기본 poll은 진행 메시지·thought·tool 이벤트를 전달하지 않고, 종료 시 최종 `result`와 Main이 처리해야 하는 permission·질문만 보냅니다. 중간 증거는 `eventTypes`, `includeThoughts`, `includeToolEvents`, `includeInspection`으로 명시 요청해야 합니다.
-- **usage 이벤트 차단** — 반복되는 ACP `usage_update`는 Gateway에 저장하거나 poll을 깨우지 않습니다. provider 계측 신호가 frontdoor tool call과 컨텍스트 소비로 증폭되는 경로를 제거했습니다.
+- **최종 결과 중심 poll** — poll은 raw message/thought chunk를 보관하거나 전달하지 않고, 종료 시 최종 `result`와 Main이 처리해야 하는 permission·질문을 중심으로 응답합니다. raw chunk는 명시적으로 구독한 live observer에만 전달되며, 저장된 중간 증거는 `eventTypes`, `includeToolEvents`, `includeInspection`, 결과 thought는 `includeThoughts`로 요청합니다.
+- **usage 이벤트 집계** — 반복되는 ACP `usage_update` 원문은 event ring에 저장하거나 poll을 깨우지 않고 turn/session 누계로 합산합니다. poll의 `includeUsage`, session 상세 조회, 명시적으로 요청한 Task 결과에서만 작은 summary를 노출합니다.
 - **간결한 Worker 반환 기본** — `agent-delegator`가 상세 보고서가 필요하지 않은 요청에 결론·필수 근거·변경 경로·테스트 상태만 간결히 반환하도록 지시합니다.
 
 ## v1.3.1 변경 사항

@@ -17,6 +17,20 @@ function request(method, params) {
   return new Promise((resolve) => pending.set(id, resolve));
 }
 
+// One stdout write for a whole batch, so the gateway sees the burst as a single
+// chunk and the concurrency bound is measured, not the scheduler.
+function requestAll(calls) {
+  const promises = [];
+  let frames = "";
+  for (const [method, params] of calls) {
+    const id = nextId++;
+    frames += `${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`;
+    promises.push(new Promise((resolve) => pending.set(id, resolve)));
+  }
+  process.stdout.write(frames);
+  return Promise.all(promises);
+}
+
 rl.on("line", async (line) => {
   const message = JSON.parse(line);
   if (Object.hasOwn(message, "id") && (Object.hasOwn(message, "result") || message.error)) {
@@ -62,6 +76,40 @@ rl.on("line", async (line) => {
         id: message.id,
         result: { stopReason: first.error || second.error ? "rejected" : "end_turn" }
       });
+      return;
+    }
+    if (mode?.startsWith("read-storm:")) {
+      const shots = Number(mode.split(":")[1]);
+      const responses = await requestAll(
+        Array.from({ length: shots }, () => ["fs/read_text_file", { sessionId, path: `${cwd}/storm.txt` }])
+      );
+      const refused = responses.filter(
+        (response) => response.error?.message?.includes("concurrent client request limit")
+      ).length;
+      send({ jsonrpc: "2.0", id: message.id, result: {
+        stopReason: `served=${responses.length - refused} refused=${refused}`
+      } });
+      return;
+    }
+    if (mode?.startsWith("read-file:")) {
+      const [, name, line, limit] = mode.split(":");
+      const response = await request("fs/read_text_file", {
+        sessionId,
+        path: `${cwd}/${name}`,
+        ...(line ? { line: Number(line) } : {}),
+        ...(limit ? { limit: Number(limit) } : {})
+      });
+      const content = response.result?.content;
+      // Reports shape, never the bytes: an oversized stopReason would just be
+      // capped again on its way through the event ring.
+      send({ jsonrpc: "2.0", id: message.id, result: { stopReason: JSON.stringify({
+        error: response.error?.message ?? null,
+        bytes: content == null ? null : Buffer.byteLength(content, "utf8"),
+        head: content?.slice(0, 12) ?? null,
+        tail: content?.slice(-12) ?? null,
+        meta: response.result?._meta ?? null,
+        keys: response.result ? Object.keys(response.result).sort() : null
+      }) } });
       return;
     }
     if (mode === "terminal") {

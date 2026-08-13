@@ -3,6 +3,8 @@
 import { spawn } from "node:child_process";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { gatewayStatePath } from "./config.js";
+import { preflightStateVersion } from "./state-store.js";
 import { updateSourceCheckout } from "./source-update.js";
 import { GATEWAY_VERSION } from "./version.js";
 
@@ -24,6 +26,13 @@ try {
   } else {
     const { installerHelp, parseInstallerArgs, runInstaller } = await import("./installer.js");
     const options = parseInstallerArgs(argv);
+    // The only moment a human is watching. After the install, the daemon starts
+    // detached: a runtime that reads an older state schema than the one on disk
+    // would fail invisibly, so it is refused here instead.
+    if (!options.help) {
+      const preflight = preflightStateVersion(gatewayStatePath());
+      if (!preflight.ok) throw new Error(preflight.error);
+    }
     await chooseFrontDoor(options);
     if (options.help) {
       process.stdout.write(`${installerHelp()}\n`);

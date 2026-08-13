@@ -1,0 +1,81 @@
+// Error codes are a stable wire contract: Main-side callers branch on them
+// after the message text has already been rewritten. Never rename or reuse a
+// code, only add new ones.
+export const ERROR_CODES = Object.freeze({
+  INVALID_ARGUMENT: "INVALID_ARGUMENT",
+  UNKNOWN_METHOD: "UNKNOWN_METHOD",
+  UNKNOWN_SESSION: "UNKNOWN_SESSION",
+  UNKNOWN_TASK: "UNKNOWN_TASK",
+  UNKNOWN_INBOX: "UNKNOWN_INBOX",
+  NOT_SESSION_OWNER: "NOT_SESSION_OWNER",
+  NOT_TASK_OWNER: "NOT_TASK_OWNER",
+  NOT_INBOX_OWNER: "NOT_INBOX_OWNER",
+  SESSION_ACTIVE: "SESSION_ACTIVE",
+  SESSION_CLOSED: "SESSION_CLOSED",
+  SESSION_NOT_WAITING: "SESSION_NOT_WAITING",
+  TASK_NOT_COMPLETE: "TASK_NOT_COMPLETE",
+  // Raised by TaskStore budgets and waits. The store itself stays
+  // dependency-free and tags plain Errors with these same strings; the gateway
+  // re-raises them as GatewayError so the wire envelope carries the code.
+  TASK_LIMIT_EXCEEDED: "TASK_LIMIT_EXCEEDED",
+  TASK_WAITER_LIMIT: "TASK_WAITER_LIMIT",
+  TASK_TTL_EXPIRED: "TASK_TTL_EXPIRED",
+  TASK_STORE_CLOSED: "TASK_STORE_CLOSED",
+  WAIT_TIMEOUT: "WAIT_TIMEOUT",
+  WAIT_ABORTED: "WAIT_ABORTED",
+  SUBSCRIPTION_NOT_OWNED: "SUBSCRIPTION_NOT_OWNED",
+  CONTROL_ACCESS_DENIED: "CONTROL_ACCESS_DENIED",
+  ROOT_REQUIRED: "ROOT_REQUIRED",
+  ROOT_MISMATCH: "ROOT_MISMATCH",
+  SOCKET_ALREADY_BOUND: "SOCKET_ALREADY_BOUND",
+  // The fail-closed persistence path: a Task handle is a durability promise, so
+  // it is refused rather than issued while the state store cannot keep it.
+  PERSISTENCE_UNHEALTHY: "PERSISTENCE_UNHEALTHY",
+  // Startup-only halts. Each one means "state exists on disk that this process
+  // cannot safely interpret", and each names the opt-in that overrides it. They
+  // never appear on a request path.
+  STATE_WAL_CORRUPT: "STATE_WAL_CORRUPT",
+  STATE_SNAPSHOT_CORRUPT: "STATE_SNAPSHOT_CORRUPT",
+  STATE_VERSION_UNSUPPORTED: "STATE_VERSION_UNSUPPORTED",
+  STATE_DIR_LOCKED: "STATE_DIR_LOCKED",
+  // Bounded transport (NdjsonChannel): the write side of an NDJSON connection.
+  // A frame nobody can send, a backlog nobody is draining, or a peer that
+  // stopped taking bytes at all.
+  TRANSPORT_CLOSED: "TRANSPORT_CLOSED",
+  TRANSPORT_CONGESTED: "TRANSPORT_CONGESTED",
+  TRANSPORT_WRITE_TIMEOUT: "TRANSPORT_WRITE_TIMEOUT",
+  FRAME_TOO_LARGE: "FRAME_TOO_LARGE",
+  // Admission budgets. Each is refused before any work is dispatched, so a
+  // caller that sees one has spent nothing but the round trip.
+  TOO_MANY_INFLIGHT_REQUESTS: "TOO_MANY_INFLIGHT_REQUESTS",
+  PROMPT_TOO_LARGE: "PROMPT_TOO_LARGE",
+  SESSION_LIMIT_EXCEEDED: "SESSION_LIMIT_EXCEEDED",
+  INBOX_BUDGET_EXCEEDED: "INBOX_BUDGET_EXCEEDED",
+  // Fallback for an error that has no more specific code yet.
+  GATEWAY_ERROR: "GATEWAY_ERROR"
+});
+
+// A Gateway failure with a stable code. The message stays the human-readable
+// contract it has always been; the code is what callers should branch on.
+export class GatewayError extends Error {
+  constructor(code, message, details = undefined) {
+    super(message);
+    this.name = "GatewayError";
+    this.code = code;
+    if (details !== undefined) this.details = details;
+  }
+}
+
+export function isGatewayErrorCode(code) {
+  return typeof code === "string" && Object.hasOwn(ERROR_CODES, code);
+}
+
+// Keep the legacy wire field names. Only registry codes become errorCode —
+// Node codes like ENOENT must not look like a Gateway contract.
+export function errorEnvelope(error) {
+  return {
+    error: error?.message ?? String(error),
+    ...(isGatewayErrorCode(error?.code) ? { errorCode: error.code } : {}),
+    ...(error != null && Object.hasOwn(error, "details") ? { details: error.details } : {})
+  };
+}

@@ -1,0 +1,613 @@
+import assert from "node:assert/strict";
+import { readdirSync } from "node:fs";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { AcpClient } from "../src/acp-client.js";
+import { ArtifactStore } from "../src/artifacts.js";
+import { readInto, readTextHead, readTextLines, trimIncompleteUtf8 } from "../src/bounded-utf8.js";
+import { ERROR_CODES } from "../src/errors.js";
+import { GatewayService } from "../src/gateway-service.js";
+
+const mockAgent = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
+const capabilityAgent = fileURLToPath(new URL("./mock-capability-agent.js", import.meta.url));
+const MAIN = { rootId: "main-a" };
+
+async function withDirectory(prefix, run) {
+  const directory = await mkdtemp(join(tmpdir(), `acp-budget-${prefix}-`));
+  try {
+    return await run(directory);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+const isCode = (code) => (error) => error?.code === code;
+
+test("an incomplete UTF-8 tail is removed rather than decoded to a replacement character", () => {
+  const smile = Buffer.from("🙂", "utf8");
+  assert.equal(smile.length, 4);
+  for (let keep = 1; keep < 4; keep += 1) {
+    const cut = trimIncompleteUtf8(smile.subarray(0, keep));
+    assert.equal(cut.length, 0, `a ${keep}-byte prefix of a 4-byte character keeps nothing`);
+  }
+  assert.equal(trimIncompleteUtf8(smile).length, 4);
+  assert.equal(trimIncompleteUtf8(Buffer.from("ok", "utf8")).toString("utf8"), "ok");
+  assert.equal(trimIncompleteUtf8(Buffer.alloc(0)).length, 0);
+});
+
+test("a bounded head read cuts on a character boundary, never mid-character", async () => {
+  await withDirectory("head", async (directory) => {
+    const path = join(directory, "cjk.txt");
+    // Three bytes per character, so no cap that is not a multiple of three can be
+    // honoured without backing up.
+    await writeFile(path, "가".repeat(4_000), "utf8");
+    for (const cap of [1, 2, 3, 1_000, 1_001, 1_002, 5_000]) {
+      const read = await readTextHead(path, cap);
+      assert.equal(read.truncated, true, `cap=${cap}`);
+      assert.equal(read.text.includes("�"), false, `cap=${cap} produced a replacement character`);
+      assert.equal(read.bytes % 3, 0, `cap=${cap} cut mid-character`);
+      assert.ok(read.bytes <= cap);
+      assert.equal(read.text, "가".repeat(read.bytes / 3));
+    }
+    // A file that fits is returned whole and reports no truncation.
+    const whole = await readTextHead(path, 12_000);
+    assert.equal(whole.truncated, false);
+    assert.equal(whole.bytes, 12_000);
+    assert.equal(whole.text.length, 4_000);
+  });
+});
+
+test("the streaming line window matches split-and-join for every shape", async () => {
+  await withDirectory("window", async (directory) => {
+    const path = join(directory, "lines.txt");
+    const text = "α\nbb\n\nccc\n한글 line\nlast";
+    await writeFile(path, text, "utf8");
+    const lines = text.split("\n");
+    for (const line of [1, 2, 3, 4, 5, 6, 7, 20]) {
+      for (const limit of [0, 1, 2, 3, 100]) {
+        const expected = lines.slice(line - 1, line - 1 + limit).join("\n");
+        const read = await readTextLines(path, { line, limit });
+        assert.equal(read.text, expected, `line=${line} limit=${limit}`);
+        assert.equal(read.truncated, false);
+      }
+    }
+  });
+});
+
+test("a line window deep in a large file is read in one pass and respects the byte cap", async () => {
+  await withDirectory("window-large", async (directory) => {
+    const path = join(directory, "big-lines.txt");
+    const lines = Array.from({ length: 200_000 }, (_, index) => `line-${index}`);
+    await writeFile(path, lines.join("\n"), "utf8");
+    // Crosses many 64KB read buffers, and nothing proportional to the skipped
+    // prefix is ever allocated.
+    const read = await readTextLines(path, { line: 150_001, limit: 3 });
+    assert.equal(read.text, "line-150000\nline-150001\nline-150002");
+    assert.equal(read.truncated, false);
+    const capped = await readTextLines(path, { line: 150_001, limit: 1_000, maxBytes: 40 });
+    assert.equal(capped.truncated, true);
+    assert.equal(capped.bytes, 40);
+    assert.equal(capped.text, "line-150000\nline-150001\nline-150002\nline");
+    // A window that ends exactly at the cap is complete, not truncated.
+    const exact = await readTextLines(path, { line: 1, limit: 1, maxBytes: 6 });
+    assert.equal(exact.text, "line-0");
+    assert.equal(exact.truncated, false);
+  });
+});
+
+// The plateau claim, on a real file: no sparse tricks and no /dev/zero, because
+// both let a filesystem lie about the bytes a read has to move.
+test("reading a 64MB file costs the cap, not the file", async (t) => {
+  if (process.env.CI) {
+    t.skip("writes 64MB; skipped where the disk is shared with other jobs");
+    return;
+  }
+  await withDirectory("plateau", async (directory) => {
+    const path = join(directory, "huge.txt");
+    const megabyte = `${"x".repeat(1_000_000 - 1)}\n`;
+    const chunks = [];
+    for (let index = 0; index < 64; index += 1) chunks.push(megabyte);
+    await writeFile(path, chunks.join(""), "utf8");
+    assert.equal((await stat(path)).size, 64_000_000);
+    // First read outside the measurement: it is what warms the buffers.
+    await readTextHead(path, 500_000);
+    global.gc?.();
+    const before = process.memoryUsage();
+    let bytes = 0;
+    for (let round = 0; round < 4; round += 1) {
+      const read = await readTextHead(path, 500_000);
+      assert.equal(read.truncated, true);
+      bytes += read.bytes;
+      const window = await readTextLines(path, { line: 40, limit: 2, maxBytes: 500_000 });
+      bytes += window.bytes;
+    }
+    const after = process.memoryUsage();
+    // Proof the reads were real work: each round moved the cap twice, once as a
+    // head read and once as a window.
+    assert.equal(bytes, 4 * (500_000 + 500_000));
+    const heapDelta = after.heapUsed - before.heapUsed;
+    const externalDelta = after.external - before.external;
+    assert.ok(heapDelta < 16 * 1024 * 1024, `heap grew by ${heapDelta} bytes reading a 64MB file`);
+    assert.ok(externalDelta < 16 * 1024 * 1024, `external grew by ${externalDelta} bytes`);
+  });
+});
+
+test("an oversized file read is truncated with a _meta record, and a small one is untouched", async () => {
+  await withDirectory("read-meta", async (directory) => {
+    await writeFile(join(directory, "big.txt"), "z".repeat(2_000_000), "utf8");
+    await writeFile(join(directory, "small.txt"), "just enough", "utf8");
+    await writeFile(join(directory, "lines.txt"), Array.from({ length: 50 }, (_, i) => `row-${i}`).join("\n"), "utf8");
+    const client = new AcpClient(
+      { provider: "mock", command: process.execPath, args: [capabilityAgent], permissionPolicy: "auto_approve" },
+      { permissionPolicy: "auto_approve" }
+    );
+    try {
+      await client.start();
+      const session = await client.sessionNew({ cwd: directory, permissionPolicy: "auto_approve" });
+      const ask = async (mode) => JSON.parse(
+        (await client.sessionPrompt({ sessionId: session.sessionId, prompt: mode })).stopReason
+      );
+
+      const big = await ask("read-file:big.txt");
+      assert.equal(big.bytes, 500_000, "the cap is bytes now, not UTF-16 code units");
+      assert.deepEqual(big.keys, ["_meta", "content"]);
+      assert.deepEqual(big.meta["acp-gateway/read"], {
+        truncated: true, bytes: 500_000, fileBytes: 2_000_000, maxBytes: 500_000
+      });
+
+      // Byte-identical to every previous version: no _meta key at all.
+      const small = await ask("read-file:small.txt");
+      assert.deepEqual(small.keys, ["content"]);
+      assert.equal(small.meta, null);
+      assert.equal(small.bytes, 11);
+
+      const windowed = await ask("read-file:lines.txt:3:2");
+      assert.deepEqual(windowed.keys, ["content"]);
+      assert.equal(windowed.head, "row-2\nrow-3");
+      assert.equal(windowed.bytes, 11);
+    } finally {
+      await client.stop();
+    }
+  });
+});
+
+test("a terminal output clamp is a knob with the value it always had", async () => {
+  const client = new AcpClient(
+    { provider: "mock", command: process.execPath, args: [mockAgent], permissionPolicy: "read_only" },
+    { permissionPolicy: "read_only" }
+  );
+  assert.equal(client.maxTerminalOutputBytes, 10_000_000);
+  assert.equal(client.maxFileReadBytes, 500_000);
+  const tightened = new AcpClient(
+    { provider: "mock", command: process.execPath, args: [mockAgent], permissionPolicy: "read_only" },
+    { permissionPolicy: "read_only", maxTerminalOutputBytes: 4_096, maxFileReadBytes: 64 }
+  );
+  assert.equal(tightened.maxTerminalOutputBytes, 4_096);
+  assert.equal(tightened.maxFileReadBytes, 64);
+});
+
+test("setup reports every budget as a flat number", async () => {
+  const service = new GatewayService({ gcIntervalMs: 0 });
+  try {
+    const limits = (await service.setup()).resourceLimits;
+    for (const [key, value] of Object.entries(limits)) {
+      assert.equal(typeof value, "number", `${key} must stay a flat number`);
+    }
+    assert.equal(limits.maxQueueBytes, 4_000_000);
+    assert.equal(limits.writeTimeoutMs, 10_000);
+    assert.equal(limits.maxPromptBytes, 1_000_000);
+    assert.equal(limits.maxFileReadBytes, 500_000);
+    assert.equal(limits.maxTerminalOutputBytes, 10_000_000);
+    assert.equal(limits.maxSessionsPerRoot, 64);
+    assert.equal(limits.maxInboxHistoryPerRoot, 1_000);
+    assert.equal(limits.maxInboxItemBytes, 64 * 1024);
+    assert.equal(limits.maxPendingInboxBytesPerSession, 512 * 1024);
+    assert.equal(limits.maxPendingInboxBytesPerRoot, 4 * 1024 * 1024);
+  } finally {
+    await service.shutdown().catch(() => {});
+  }
+});
+
+test("an oversized prompt is refused in admission, before a turn exists", async () => {
+  await withDirectory("prompt", async (directory) => {
+    const service = new GatewayService({
+      gcIntervalMs: 0,
+      maxPromptBytes: 1_000,
+      artifactRoot: join(directory, "artifacts")
+    });
+    try {
+      const session = service.store.create({
+        provider: "mock", acpSessionId: "prompt-budget", cwd: "/", ownerRootId: "main-a",
+        permissionPolicy: "ask"
+      });
+      await assert.rejects(
+        service.call("prompt", { sessionId: session.id, prompt: "p".repeat(2_000) }, MAIN),
+        isCode(ERROR_CODES.PROMPT_TOO_LARGE)
+      );
+      // Nothing was reserved and no turn was minted: the refusal happened before
+      // either could exist.
+      assert.equal(session.turnId, null);
+      assert.ok(!session._reserved);
+      await assert.rejects(
+        service.call("prompt", { sessionId: session.id, prompt: [{ type: "text", text: "q".repeat(2_000) }] }, MAIN),
+        isCode(ERROR_CODES.PROMPT_TOO_LARGE)
+      );
+    } finally {
+      await service.shutdown().catch(() => {});
+    }
+  });
+});
+
+test("a root cannot hold more sessions than its budget", async () => {
+  await withDirectory("sessions", async (directory) => {
+    // The capability agent mints a new session id per session/new, which is what
+    // this test needs; the plain mock agent reuses one.
+    const makeClient = (_provider, options) => new AcpClient(
+      { provider: "mock", command: process.execPath, args: [capabilityAgent], permissionPolicy: "read_only" },
+      options
+    );
+    const service = new GatewayService({
+      gcIntervalMs: 0,
+      createClient: makeClient,
+      maxSessionsPerRoot: 2,
+      artifactRoot: join(directory, "artifacts")
+    });
+    try {
+      const open = () => service.call(
+        "session_open",
+        { provider: "claude", cwd: process.cwd(), permissionPolicy: "read_only" },
+        MAIN
+      );
+      const first = await open();
+      await open();
+      await assert.rejects(open(), isCode(ERROR_CODES.SESSION_LIMIT_EXCEEDED));
+      // Another Main has its own allowance.
+      await service.call(
+        "session_open",
+        { provider: "claude", cwd: process.cwd(), permissionPolicy: "read_only" },
+        { rootId: "main-b" }
+      );
+      // And closing one frees a slot.
+      await service.call("session", { action: "close", sessionId: first.sessionId }, MAIN);
+      assert.equal((await open()).ok, true);
+    } finally {
+      await service.shutdown().catch(() => {});
+    }
+  });
+});
+
+test("resolved inbox history is evicted oldest first while pending rows are untouchable", async () => {
+  await withDirectory("inbox-history", async (directory) => {
+    const service = new GatewayService({
+      gcIntervalMs: 0,
+      maxInboxHistoryPerRoot: 3,
+      artifactRoot: join(directory, "artifacts")
+    });
+    try {
+      const session = service.store.create({
+        provider: "mock", acpSessionId: "inbox-budget", cwd: "/", ownerRootId: "main-a",
+        permissionPolicy: "ask", turnId: "turn-1"
+      });
+      session.status = "running";
+      for (let index = 0; index < 6; index += 1) {
+        service.handleUpdate(session, {
+          sessionUpdate: "permission_request",
+          requestId: index,
+          toolCall: { toolCallId: `tool-${index}`, title: "Edit", kind: "edit" },
+          options: [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }]
+        });
+        session.status = "running";
+      }
+      for (let attempt = 0; attempt < 40 && service.inbox.size < 6; attempt += 1) {
+        await new Promise((done) => setTimeout(done, 5));
+      }
+      const rows = [...service.inbox.values()];
+      assert.equal(rows.length, 6);
+      // Five answered at increasing times, one left as an obligation.
+      rows.slice(0, 5).forEach((row, index) => {
+        row.status = "answered";
+        row.resolution = "allowed";
+        // Recent, so age-based retention has no opinion and the count bound is
+        // what does the evicting.
+        row.resolvedAt = new Date(Date.now() - (5 - index) * 1_000).toISOString();
+      });
+      await service.runMaintenance();
+      const kept = [...service.inbox.values()];
+      assert.equal(kept.length, 4, "three resolved rows plus the untouchable pending one");
+      assert.equal(kept.filter((row) => row.status === "pending").length, 1);
+      const survivors = kept.filter((row) => row.status === "answered").map((row) => row.requestId).sort();
+      assert.deepEqual(survivors, [2, 3, 4], "the oldest resolved rows go first");
+    } finally {
+      await service.shutdown().catch(() => {});
+    }
+  });
+});
+
+test("permission options are compacted and pending inbox bytes are bounded per session and root", async () => {
+  await withDirectory("inbox-bytes", async (directory) => {
+    const rejected = [];
+    const service = new GatewayService({
+      gcIntervalMs: 0,
+      maxInboxItemBytes: 4_000,
+      maxPendingInboxBytesPerSession: 5_000,
+      maxPendingInboxBytesPerRoot: 7_500,
+      artifactRoot: join(directory, "artifacts")
+    });
+    try {
+      const makeSession = (id) => {
+        const session = service.store.create({
+          provider: "mock", acpSessionId: id, cwd: "/", ownerRootId: "main-a",
+          permissionPolicy: "ask", turnId: "turn-1",
+          client: {
+            respondPermission(requestId) { rejected.push(requestId); },
+            pendingSessionInput() { return { permissions: 0, elicitations: 0 }; }
+          }
+        });
+        session.status = "running";
+        return session;
+      };
+      const options = Array.from({ length: 30 }, (_, index) => ({
+        optionId: `option-${index}`,
+        name: `Choice ${index} ${"n".repeat(80)}`,
+        kind: index === 0 ? "allow_once" : "reject_once"
+      }));
+      const first = makeSession("inbox-bytes-1");
+      service.handleUpdate(first, {
+        sessionUpdate: "permission_request", requestId: 1,
+        toolCall: { toolCallId: "tool-1", title: "Edit", kind: "edit" }, options
+      });
+      for (let attempt = 0; attempt < 40 && service.inbox.size < 1; attempt += 1) {
+        await new Promise((done) => setTimeout(done, 5));
+      }
+      const row = [...service.inbox.values()][0];
+      assert.equal(row.optionsTruncated, true);
+      assert.ok(row.options.length <= 16);
+      assert.ok(row.payloadBytes <= 4_000);
+      assert.equal(typeof row.optionsArtifact.path, "string");
+
+      // A second row on the same session crosses its byte allowance and is
+      // rejected back to the worker instead of being retained.
+      first.status = "running";
+      service.handleUpdate(first, {
+        sessionUpdate: "permission_request", requestId: 2,
+        toolCall: { toolCallId: "tool-2", title: "Edit", kind: "edit" }, options
+      });
+      for (let attempt = 0; attempt < 40 && rejected.length < 1; attempt += 1) {
+        await new Promise((done) => setTimeout(done, 5));
+      }
+      assert.deepEqual(rejected, [2]);
+      assert.equal(service.inbox.size, 1);
+
+      // Another session shares the root allowance; it can never push the sum
+      // over the configured root ceiling.
+      const second = makeSession("inbox-bytes-2");
+      service.handleUpdate(second, {
+        sessionUpdate: "permission_request", requestId: 3,
+        toolCall: { toolCallId: "tool-3", title: "Edit", kind: "edit" }, options
+      });
+      for (let attempt = 0; attempt < 40 && service.inbox.size < 2 && rejected.length < 2; attempt += 1) {
+        await new Promise((done) => setTimeout(done, 5));
+      }
+      const third = makeSession("inbox-bytes-3");
+      service.handleUpdate(third, {
+        sessionUpdate: "permission_request", requestId: 4,
+        toolCall: { toolCallId: "tool-4", title: "Edit", kind: "edit" }, options
+      });
+      for (let attempt = 0; attempt < 40 && rejected.length < 2; attempt += 1) {
+        await new Promise((done) => setTimeout(done, 5));
+      }
+      assert.deepEqual(rejected, [2, 4]);
+      const pendingBytes = [...service.inbox.values()]
+        .filter((item) => item.status === "pending")
+        .reduce((total, item) => total + item.payloadBytes, 0);
+      assert.ok(pendingBytes <= 7_500);
+    } finally {
+      await service.shutdown().catch(() => {});
+    }
+  });
+});
+
+test("AcpClient rejects an oversized permission before retaining its params", async () => {
+  const client = new AcpClient(
+    { provider: "mock", command: process.execPath, args: [mockAgent], permissionPolicy: "ask" },
+    { permissionPolicy: "ask", maxInboxItemBytes: 1_024 }
+  );
+  try {
+    await client.start();
+    const session = await client.sessionNew({ cwd: process.cwd(), permissionPolicy: "ask" });
+    const result = await client.sessionPrompt({ sessionId: session.sessionId, prompt: "huge-permission" });
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(client.pendingPermissions.size, 0);
+    assert.deepEqual(client.pendingSessionInput(session.sessionId), { permissions: 0, elicitations: 0 });
+  } finally {
+    await client.stop();
+  }
+});
+
+test("retention never unlinks an artifact while its writer is active", async () => {
+  await withDirectory("active-artifact", async (directory) => {
+    const store = new ArtifactStore({ root: join(directory, "artifacts") });
+    const writer = store.create("session-a", "terminal");
+    writer.append("first");
+    const path = writer.metadata().path;
+    assert.equal(store.prune(0, Date.now() + 1_000), 0);
+    writer.append("-second");
+    writer.finalize();
+    assert.equal(await readFile(path, "utf8"), "first-second");
+    assert.equal(store.prune(0, Date.now() + 1_000), 1);
+    await assert.rejects(readFile(path, "utf8"), /ENOENT/);
+  });
+});
+
+// The GC bug the design flags: an inbox row outlives the event it came from, so the
+// artifact behind an oversized tool call must be reachable from the row itself.
+test("an artifact a pending inbox row points at survives the retention sweep", async () => {
+  await withDirectory("inbox-gc", async (directory) => {
+    const service = new GatewayService({ gcIntervalMs: 0, artifactRoot: join(directory, "artifacts") });
+    try {
+      const session = service.store.create({
+        provider: "mock", acpSessionId: "inbox-gc", cwd: "/", ownerRootId: "main-a",
+        permissionPolicy: "ask", turnId: "turn-1"
+      });
+      session.status = "running";
+      service.handleUpdate(session, {
+        sessionUpdate: "permission_request",
+        requestId: 1,
+        toolCall: { toolCallId: "tool-big", title: "Edit", kind: "edit", rawInput: "r".repeat(10_000) },
+        options: [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }]
+      });
+      const row = [...service.inbox.values()][0];
+      assert.equal(row.status, "pending");
+      const artifactPath = row.toolCallArtifact.path;
+      assert.equal(JSON.parse(await readFile(artifactPath, "utf8")).rawInput.length, 10_000);
+      // Push the permission event out of the ring, so the artifact is reachable
+      // only through the inbox row. Streamed chunks can no longer do this: a
+      // control event is only ever evicted by newer control past its own slots,
+      // which is what this floods.
+      for (let index = 0; index < 300; index += 1) {
+        service.store.push(session, { type: "turn_end", stopReason: "end_turn" });
+      }
+      assert.equal(
+        session.events.some((event) => event.type === "permission_request"),
+        false,
+        "the event that wrote the artifact is gone from the ring"
+      );
+      // A sweep far past the retention window: without the inbox walk in keepPaths
+      // this is where the artifact disappears under an unanswered request.
+      await service.runMaintenance(Date.now() + 25 * 60 * 60_000);
+      assert.equal(JSON.parse(await readFile(artifactPath, "utf8")).rawInput.length, 10_000);
+    } finally {
+      await service.shutdown().catch(() => {});
+    }
+  });
+});
+
+test("a small elicitation row stays fully inline", async () => {
+  await withDirectory("elicitation", async (directory) => {
+    const service = new GatewayService({ gcIntervalMs: 0, artifactRoot: join(directory, "artifacts") });
+    try {
+      const session = service.store.create({
+        provider: "mock", acpSessionId: "elicit", cwd: "/", ownerRootId: "main-a",
+        permissionPolicy: "ask", turnId: "turn-1"
+      });
+      session.status = "running";
+      const requestedSchema = { type: "object", properties: { choice: { type: "string" } } };
+      service.handleUpdate(session, {
+        sessionUpdate: "elicitation_request",
+        requestId: 3,
+        mode: "form",
+        message: "Which one?",
+        requestedSchema,
+        toolCallId: "tool-1"
+      });
+      const row = (await service.call("inbox", { action: "list" }, MAIN)).items[0];
+      assert.equal(row.type, "worker_question");
+      assert.equal(row.message, "Which one?");
+      assert.deepEqual(row.requestedSchema, requestedSchema);
+      assert.equal(row.messageTruncated, undefined);
+      assert.equal(row.requestedSchemaTruncated, undefined);
+
+      // An oversized schema is the one that becomes a pointer.
+      session.status = "running";
+      service.handleUpdate(session, {
+        sessionUpdate: "elicitation_request",
+        requestId: 4,
+        mode: "form",
+        message: "m".repeat(9_000),
+        requestedSchema: { type: "object", description: "d".repeat(9_000) },
+        toolCallId: "tool-2"
+      });
+      const big = (await service.call("inbox", { action: "list" }, MAIN))
+        .items.find((item) => item.requestId === 4);
+      assert.equal(big.requestedSchemaTruncated, true);
+      assert.ok(big.requestedSchemaBytes > 9_000);
+      assert.equal(typeof big.requestedSchemaArtifact.path, "string");
+      assert.equal(big.requestedSchema, undefined);
+      assert.equal(big.messageTruncated, true);
+      assert.equal(big.messageBytes, 9_000);
+      assert.ok(Buffer.byteLength(big.message) <= 4_000);
+      // The part that was cut has to be somewhere. Recording messageBytes without
+      // a pointer told Main exactly how much of the question it was not being
+      // shown and gave it no way to read it.
+      assert.equal(typeof big.messageArtifact.path, "string");
+      assert.equal(await readFile(big.messageArtifact.path, "utf8"), "m".repeat(9_000));
+      // get() hands back the same pointer rather than rehydrating it, like every
+      // other artifact reference the inbox returns.
+      const fetched = (await service.call("inbox", { action: "get", inboxId: big.inboxId }, MAIN)).item;
+      assert.deepEqual(fetched.messageArtifact, big.messageArtifact);
+      assert.equal(fetched.message, big.message);
+      // And it outlives the event that wrote it: the row is still pending.
+      for (let index = 0; index < 260; index += 1) {
+        service.handleUpdate(session, {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: `filler-${index}` }
+        });
+      }
+      await service.runMaintenance(Date.now() + 25 * 60 * 60_000);
+      assert.equal(await readFile(big.messageArtifact.path, "utf8"), "m".repeat(9_000));
+    } finally {
+      await service.shutdown().catch(() => {});
+    }
+  });
+});
+
+// A single handle.read() is not a whole file. On a network or FUSE filesystem a
+// short read is ordinary, and treating the first one as EOF reports a cut-short
+// head as complete — silent truncation, with truncated:false on it.
+test("a head read keeps reading until the file ends, not until the first short read", async () => {
+  const source = Buffer.from("가".repeat(64), "utf8");
+  const handle = {
+    reads: 0,
+    async read(buffer, offset, length, position) {
+      this.reads += 1;
+      // Seven bytes at a time: never aligned to the 3-byte characters, so a loop
+      // that stops early also cuts one in half.
+      const bytesRead = Math.max(0, Math.min(7, length, source.length - position));
+      source.copy(buffer, offset, position, position + bytesRead);
+      return { bytesRead };
+    }
+  };
+  const buffer = Buffer.alloc(source.length + 3);
+  const bytesRead = await readInto(handle, buffer);
+  assert.equal(bytesRead, source.length);
+  assert.ok(handle.reads > 1, "the fixture really did answer short");
+  assert.equal(buffer.subarray(0, bytesRead).toString("utf8"), "가".repeat(64));
+});
+
+// Matching 1.3.2, which sliced an array with NaN bounds and got an empty window.
+// Math.floor(NaN) - 1 leaves skip = NaN, every comparison against it is false, and
+// the read starts at line 1: the caller asked for a line that does not exist and
+// was handed the top of the file instead.
+test("a non-numeric line or limit returns the empty window, not the head of the file", async () => {
+  await withDirectory("window-invalid", async (directory) => {
+    const path = join(directory, "lines.txt");
+    await writeFile(path, "one\ntwo\nthree", "utf8");
+    for (const options of [
+      { line: "abc" }, { line: NaN }, { line: Infinity }, { line: -Infinity },
+      { limit: "many" }, { limit: NaN }, { limit: 0 }
+    ]) {
+      const read = await readTextLines(path, { limit: 10, ...options });
+      assert.deepEqual(read, { text: "", bytes: 0, truncated: false }, JSON.stringify(options));
+    }
+    // Numeric strings still coerce, exactly as they always did, and so does the
+    // null the caller turns into line 1 before it ever gets here.
+    assert.equal((await readTextLines(path, { line: "2", limit: "1" })).text, "two");
+    assert.equal((await readTextLines(path, { line: null, limit: 1 })).text, "one");
+  });
+});
+
+test("a window read that cannot allocate its buffer still closes the file", async () => {
+  await withDirectory("window-alloc", async (directory) => {
+    const path = join(directory, "lines.txt");
+    await writeFile(path, "one\ntwo", "utf8");
+    // The open file descriptors of this process. The allocation used to sit
+    // between open() and the try block, so throwing there leaked the handle.
+    const openDescriptors = () => readdirSync("/dev/fd").length;
+    const before = openDescriptors();
+    await assert.rejects(readTextLines(path, { line: 1, limit: 1, chunkBytes: Number.MAX_SAFE_INTEGER }));
+    assert.equal(openDescriptors(), before, "the handle opened before the allocation is released");
+  });
+});

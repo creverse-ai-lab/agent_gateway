@@ -1,6 +1,10 @@
+import { appendFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 const rl = createInterface({ input: process.stdin });
+// Crash-matrix evidence for P4 ("a turn that was never made durable was never
+// started"). Off unless a test asks for it, so no existing behaviour changes.
+const promptLog = process.env.ACP_MOCK_PROMPT_LOG || null;
 let nextId = 100;
 const pending = new Map();
 const sessionConfigs = new Map();
@@ -104,6 +108,7 @@ rl.on("line", (line) => {
   }
   if (message.method === "session/prompt") {
     const prompt = message.params.prompt?.[0]?.text;
+    if (promptLog) appendFileSync(promptLog, `${JSON.stringify({ prompt, at: Date.now() })}\n`);
     if (prompt === "large-result") {
       send({
         jsonrpc: "2.0",
@@ -114,6 +119,31 @@ rl.on("line", (line) => {
         }
       });
       send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } });
+      return;
+    }
+    // The token breakdown does not ride session/update at all: it arrives on the
+    // prompt response itself, which the gateway consumed the stopReason of and
+    // threw the rest away.
+    if (prompt === "usage-breakdown") {
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: message.params.sessionId,
+          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "DONE" } }
+        }
+      });
+      send({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: {
+          stopReason: "end_turn",
+          usage: {
+            totalTokens: 4096, inputTokens: 3000, outputTokens: 132,
+            thoughtTokens: 64, cachedReadTokens: 900, cachedWriteTokens: 0
+          }
+        }
+      });
       return;
     }
     if (prompt === "tool-events") {
@@ -243,6 +273,8 @@ rl.on("line", (line) => {
         toolCall: { toolCallId: "tool-1", title: "Edit file", kind: "edit" },
         options: prompt === "allow-always-only"
           ? [{ optionId: "allow-always", name: "Always allow", kind: "allow_always" }]
+          : prompt === "huge-permission"
+            ? [{ optionId: "allow-once", name: "x".repeat(5_000), kind: "allow_once" }]
           : [
               { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
               { optionId: "reject-once", name: "Reject", kind: "reject_once" }
