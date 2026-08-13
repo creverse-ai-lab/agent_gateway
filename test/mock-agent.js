@@ -121,6 +121,31 @@ rl.on("line", (line) => {
       send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } });
       return;
     }
+    // The token breakdown does not ride session/update at all: it arrives on the
+    // prompt response itself, which the gateway consumed the stopReason of and
+    // threw the rest away.
+    if (prompt === "usage-breakdown") {
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: message.params.sessionId,
+          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "DONE" } }
+        }
+      });
+      send({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: {
+          stopReason: "end_turn",
+          usage: {
+            totalTokens: 4096, inputTokens: 3000, outputTokens: 132,
+            thoughtTokens: 64, cachedReadTokens: 900, cachedWriteTokens: 0
+          }
+        }
+      });
+      return;
+    }
     if (prompt === "tool-events") {
       send({
         jsonrpc: "2.0",

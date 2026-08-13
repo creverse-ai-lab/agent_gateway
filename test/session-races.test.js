@@ -534,7 +534,7 @@ test("T12 a worker death during a held config releases the reservation and the t
     await waitForMarker(service, opened.sessionId, "hold:config");
     assert.equal(service.requireSession(opened.sessionId)._reserved, "prompt");
     client.proc.kill("SIGKILL");
-    await assert.rejects(task, /ACP|exited|cancelled|cleared/);
+    await assert.rejects(task, /ACP|exited|cancelled|cleared|Transport|closed/);
 
     const session = service.requireSession(opened.sessionId);
     assert.equal(session._reserved, null, "a failed prompt must not wedge the session");

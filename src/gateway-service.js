@@ -8,7 +8,9 @@ import { utf8ByteHead } from "./bounded-utf8.js";
 import { ERROR_CODES, GatewayError } from "./errors.js";
 import { currentModelId, detectProviders, providerConfig } from "./providers.js";
 import { SessionQueue } from "./session-queue.js";
-import { publicSession, SessionStore } from "./sessions.js";
+import {
+  CHUNK_EVENT_TYPES, DURABLE_EVENT_TYPES, normalizeThoughtCapture, publicSession, SessionStore
+} from "./sessions.js";
 import { crashAfter, StateStore, WAL_TYPES } from "./state-store.js";
 import { TaskStore, TERMINAL_TASK_STATUSES } from "./task-store.js";
 import { GATEWAY_API_VERSION, GATEWAY_VERSION, LEGACY_STATE_SCHEMA_VERSION, STATE_SCHEMA_VERSION } from "./version.js";
@@ -56,14 +58,9 @@ const CLOSED_STATUSES = new Set(["closed"]);
 // known to be out of sync with the worker, so it has to be resumed first.
 const RESTORE_REQUIRED_STATUSES = new Set(["disconnected", "unavailable"]);
 const CONTROL_SERVER_PATTERN = /(?:acp-gateway-control|acp-mcp-bridge|gateway-daemon|control-mcp)/i;
-// Exported for the transport's lane table: an event worth persisting is an event
-// worth never dropping, so one list decides both.
-export const DURABLE_EVENT_TYPES = new Set([
-  "session_created", "session_restored", "session_restore_start", "session_restore_failed",
-  "turn_start", "turn_end", "error", "permission_request", "permission_response",
-  "elicitation_request", "elicitation_response", "cancel_requested", "orphan_cancel_requested",
-  "provider_disconnected", "session_closed", "model_changed", "config_changed"
-]);
+// Defined next to the ring that enforces it; re-exported here because the
+// transport lane table reads the same closed control-event inventory.
+export { DURABLE_EVENT_TYPES } from "./sessions.js";
 
 export class GatewayService {
   constructor({
@@ -102,9 +99,13 @@ export class GatewayService {
     sessionRetentionMs = 7 * 24 * 60 * 60_000,
     taskRetentionMs = 24 * 60 * 60_000,
     persistence = {},
+    // Gateway-wide default for how much worker reasoning a session retains.
+    // Per-session overrides ride session_open/session_restore.
+    thoughtCapture = "tail",
     agentUpdateManager = null,
     now = () => Date.now()
   } = {}) {
+    this.observability = { thoughtCapture: normalizeThoughtCapture(thoughtCapture) };
     this.statePath = statePath;
     this.clients = new Map();
     this.clientStarts = new Map();
@@ -190,7 +191,9 @@ export class GatewayService {
       maxInlineResultBytes,
       artifactStore: this.artifactStore,
       onChange: (_session, event) => {
-        if (!event || DURABLE_EVENT_TYPES.has(event.type)) this.schedulePersist();
+        if (!event || DURABLE_EVENT_TYPES.has(event.type)) {
+          this.schedulePersist();
+        }
       },
       onEvent: (session, event) => this.publishEvent(session, event)
     });
@@ -219,6 +222,9 @@ export class GatewayService {
         events: [],
         resultText: "",
         thoughtText: "",
+        // A checkpoint written before this field existed restores on the current
+        // gateway default rather than on a hardcoded one.
+        thoughtCapture: normalizeThoughtCapture(record.thoughtCapture, this.observability.thoughtCapture),
         // No worker survived the restart, so no session owns a live handle. The
         // task's own restart conversion below is what the caller observes.
         activeTaskId: null,
@@ -401,7 +407,11 @@ export class GatewayService {
     for (const session of sessions) {
       const cursor = requireNonNegativeNumber(cursors[session.id], `cursors.${session.id}`, 0);
       const firstIndex = session.events[0]?.i ?? session.eventSequence;
-      cursorTruncated[session.id] = cursor < firstIndex;
+      // Replay is the ring only: chunks are a live-delivery concern, and a
+      // reconnecting monitor re-reading a full stream of them is the burst that
+      // makes a slow subscriber slower. It gains the complete control history in
+      // exchange, which is the part a cold start actually needs.
+      cursorTruncated[session.id] = cursorTruncatedFor(session, cursor);
       for (const event of session.events.filter((item) => item.i >= Math.max(cursor, firstIndex))) {
         if (shouldDeliverEvent(subscription, event)) events.push(publicEvent(session, event));
       }
@@ -574,6 +584,9 @@ export class GatewayService {
       existing.permissionPolicy = permissionPolicy;
       existing.model = configured.model;
       existing.capabilities = configured.response;
+      if (args.thoughtCapture != null) {
+        existing.thoughtCapture = normalizeThoughtCapture(args.thoughtCapture, existing.thoughtCapture);
+      }
       if (args.pinned != null) existing.pinned = args.pinned === true;
       existing.orphanedAt = null;
       client.onSessionUpdate(acpSessionId, (update) => this.handleUpdate(existing, update));
@@ -633,6 +646,11 @@ export class GatewayService {
       mcpServers: sanitizeWorkerMcpServers(fields.args.mcpServers ?? []),
       additionalDirectories: fields.args.additionalDirectories ?? [],
       pinned: fields.args.pinned === true,
+      // Additive per-session override of the gateway default; an unknown value
+      // falls back rather than failing an otherwise valid open.
+      thoughtCapture: normalizeThoughtCapture(
+        fields.args.thoughtCapture, this.observability.thoughtCapture
+      ),
       lastOwnerActivityAt: new Date(this.now()).toISOString(),
       _ownerActivityPersistedAt: this.now()
     });
@@ -894,6 +912,11 @@ export class GatewayService {
       this.finishTaskForSession(session);
       return;
     }
+    // The turn's token breakdown lives here, not on usage_update: PromptResponse
+    // carries a Usage object that this callback consumed the stopReason of and
+    // silently discarded. Recorded before the terminal push so a poll that sees
+    // turn_end already sees the totals.
+    if (outcome.result?.usage) this.store.recordUsage(session, outcome.result.usage, "prompt_response");
     const stopReason = outcome.result?.stopReason;
     this.#setStatus(
       session,
@@ -941,6 +964,7 @@ export class GatewayService {
       }
       crashAfter("task_create_durable");
       session.activeTaskId = task.taskId;
+      session.activeTaskIncludeUsage = args.includeUsage === true;
       try {
         // One command covers starting the turn and recording the handle. Split
         // across two, the turn could already have finished and this bookkeeping
@@ -960,10 +984,14 @@ export class GatewayService {
           // T1: the turn id is provenance the handle should keep across a restart,
           // but no caller is holding a response for it.
           this.#appendTaskStatus(running);
+          this.#publishTaskStatus(running);
           return this.publicTask(running);
         });
       } catch (error) {
-        if (session.activeTaskId === task.taskId) session.activeTaskId = null;
+        if (session.activeTaskId === task.taskId) {
+          session.activeTaskId = null;
+          session.activeTaskIncludeUsage = false;
+        }
         this.taskStore.remove(task.taskId);
         throw error;
       }
@@ -1030,6 +1058,9 @@ export class GatewayService {
       sessionId: task.sessionId,
       turnId: task.turnId,
       status: "cancelled",
+      ...(session?.activeTaskIncludeUsage === true
+        ? { usage: this.store.usageSnapshot(session).turn }
+        : {}),
       result: {
         text: session?.resultFinalText ?? session?.resultText ?? "",
         transcriptBytes: Buffer.byteLength(session?.resultText ?? ""),
@@ -1045,7 +1076,10 @@ export class GatewayService {
     if (cancelled && cancelled.status !== "cancelled" && cancelled.status !== "failed") {
       throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `Cannot cancel task in terminal status: ${cancelled.status}`);
     }
-    if (session?.activeTaskId === task.taskId) session.activeTaskId = null;
+    if (session?.activeTaskId === task.taskId) {
+      session.activeTaskId = null;
+      session.activeTaskIncludeUsage = false;
+    }
     return this.publicTask(cancelled);
   }
 
@@ -1108,7 +1142,11 @@ export class GatewayService {
     const maxEvents = Math.min(1000, Math.max(1, requireNonNegativeNumber(args.maxEvents, "maxEvents", 200)));
     const toCursor = args.toCursor == null ? Infinity : requireNonNegativeNumber(args.toCursor, "toCursor");
     const matchesEventType = compileEventTypes(args.eventTypes);
-    const firstIndex = session.events[0]?.i ?? session.eventSequence;
+    // Raw chunks are available only to an explicitly opted-in live subscriber.
+    // Poll reads the retained control/projection ring and never wakes on stream
+    // fragments, even if a caller names a chunk type.
+    const visible = () => session.events;
+    const firstIndex = visible()[0]?.i ?? session.eventSequence;
     const effectiveCursor = Math.max(cursor, firstIndex);
     const deliverable = (event) => {
       if (event.i < effectiveCursor || event.i >= toCursor) return false;
@@ -1121,15 +1159,15 @@ export class GatewayService {
     // A bounded window is a retrospective inspection read; only open-ended
     // polls wait, and only for an event the caller would actually receive.
     if (waitMs && toCursor === Infinity && ACTIVE_STATUSES.has(session.status)
-      && !session.events.some(deliverable)) {
+      && !visible().some(deliverable)) {
       const statusAtWait = session.status;
       await this.store.wait(session, waitMs, () =>
-        session.status !== statusAtWait || session.events.some(deliverable));
+        session.status !== statusAtWait || visible().some(deliverable));
     }
     // maxEvents counts deliverable events; the cursor still advances over the
     // filtered-out ones in between so sparse type reads do not return empty
     // page after empty page.
-    const ordered = session.events.filter((event) => event.i >= effectiveCursor && event.i < toCursor);
+    const ordered = visible().filter((event) => event.i >= effectiveCursor && event.i < toCursor);
     const events = [];
     let consumed = 0;
     for (const event of ordered) {
@@ -1148,7 +1186,7 @@ export class GatewayService {
       ok: true,
       ...publicSession(session),
       nextCursor: window.length ? window.at(-1).i + 1 : effectiveCursor,
-      cursorTruncated: cursor < firstIndex,
+      cursorTruncated: cursorTruncatedFor(session, cursor),
       events,
       // The cursor advances over filtered-out events too; this says how many,
       // so an empty poll with a moving cursor is legible.
@@ -1166,7 +1204,11 @@ export class GatewayService {
           ...(args.includeInspection === true ? (() => {
             const snapshot = this.store.inspectionSnapshot(session);
             return { inspection: snapshot.segments, inspectionDropped: snapshot.dropped };
-          })() : {})
+          })() : {}),
+          // Opt-in: the frozen result shape has four keys and no consumer of a
+          // token count today, so this is a field a caller asks for, never one
+          // every poll pays for.
+          ...(args.includeUsage === true ? { usageSummary: this.store.usageSnapshot(session) } : {})
         }
       })
     };
@@ -1297,6 +1339,10 @@ export class GatewayService {
         ...(args.includeTranscript === true ? { resultText: session.resultText } : {}),
         transcriptBytes: Buffer.byteLength(session.resultText),
         finalResultText: session.resultFinalText ?? null,
+        // The unpaid-for read: get is already the detail call, and usage is two
+        // small objects. turn is this turn, session is everything since the
+        // record was created or last cleared.
+        usage: this.store.usageSnapshot(session),
         // Raw event dumps drop the unbounded data field; the capped text
         // preview and dataArtifact pointers stay.
         events: args.includeEvents ? session.events.map(({ data, ...rest }) => rest) : undefined
@@ -1420,18 +1466,22 @@ export class GatewayService {
     if (!this.store.get(session.id) || CLOSED_STATUSES.has(session.status)) return;
     // Usage is provider bookkeeping, not an actionable Main event. Some ACP
     // adapters stream it repeatedly, so retaining it would repeatedly wake
-    // long polls and turn accounting chatter into frontdoor token usage.
-    if (type === "usage_update") return;
+    // long polls and turn accounting chatter into frontdoor token usage. It is
+    // accumulated instead: still no ring event, no waiter, no publish.
+    if (type === "usage_update") {
+      this.store.recordUsage(session, update, "usage_update");
+      return;
+    }
     if (type === "agent_message_chunk") {
       const text = extractText(update);
       this.store.appendResultText(session, text);
-      this.store.push(session, this.capTextEvent(session, type, text));
+      this.store.publishChunk(session, this.capTextEvent(session, type, text));
       return;
     }
     if (type === "agent_thought_chunk") {
       const text = extractText(update);
       this.store.appendThoughtText(session, text);
-      this.store.push(session, this.capTextEvent(session, type, text));
+      this.store.publishChunk(session, this.capTextEvent(session, type, text));
       return;
     }
     if (SEGMENT_BOUNDARY_TYPES.has(type)) this.store.markSegmentBoundary(session, String(type));
@@ -1506,21 +1556,29 @@ export class GatewayService {
     if (type === "config_option_update") {
       session.capabilities = { ...session.capabilities, configOptions: update.configOptions ?? [] };
       session.model = sessionModelId(update.configOptions) ?? session.model;
-      this.store.push(session, { type, ...this.capStructuredField(session, type, "data", update) });
+      this.store.push(session, {
+        type: "config_changed",
+        source: "worker",
+        ...this.capStructuredField(session, type, "data", update)
+      });
       return;
     }
     const serialized = JSON.stringify(update);
-    if (Buffer.byteLength(serialized) <= EVENT_PAYLOAD_CAP_BYTES) {
-      this.store.push(session, { type: String(type), text: serialized, data: update });
-      return;
-    }
-    // Oversized payloads leave the delivery path but stay readable on disk.
-    this.store.push(session, {
-      type: String(type),
-      text: utf8ByteHead(serialized, EVENT_PAYLOAD_CAP_BYTES),
-      dataTruncated: true,
-      dataArtifact: this.store.spillText(session.id, `event-${type}`, serialized)
-    });
+    const event = Buffer.byteLength(serialized) <= EVENT_PAYLOAD_CAP_BYTES
+      ? { type: String(type), text: serialized, data: update }
+      // Oversized payloads leave the delivery path but stay readable on disk.
+      : {
+          type: String(type),
+          text: utf8ByteHead(serialized, EVENT_PAYLOAD_CAP_BYTES),
+          dataTruncated: true,
+          dataArtifact: this.store.spillText(session.id, `event-${type}`, serialized)
+        };
+    // The lane split. tool_call (the start) stays in the ring uncollapsed: it is
+    // a segment boundary and the only record that the call ever began. Only its
+    // progress updates are projected down to the newest state per call.
+    if (CHUNK_EVENT_TYPES.has(type)) this.store.publishChunk(session, event);
+    else if (type === "tool_call_update") this.store.pushToolCallUpdate(session, event, update.toolCallId);
+    else this.store.push(session, event);
   }
 
   // Message and thought chunks are usually tiny, but nothing stops a worker
@@ -1660,6 +1718,7 @@ export class GatewayService {
       // nothing durable to say, so it does not get a record.
       if (task.status !== before.status || task.statusMessage !== before.statusMessage) {
         this.#appendTaskStatus(task);
+        this.#publishTaskStatus(task);
       }
       return;
     }
@@ -1667,6 +1726,7 @@ export class GatewayService {
     // Keyed off the requested status, not the resulting one: a terminal report
     // that lost to an earlier terminal writer still ends this session's claim.
     session.activeTaskId = null;
+    session.activeTaskIncludeUsage = false;
   }
 
   #commitTaskTerminal(session, taskId, status, statusMessage, result) {
@@ -1704,23 +1764,30 @@ export class GatewayService {
         error: failureMessage
       };
       if (provisional) {
-        return this.taskStore.failDeferredTerminal(taskId, failureMessage, failure, { lastUpdatedAt });
+        const failed = this.taskStore.failDeferredTerminal(taskId, failureMessage, failure, { lastUpdatedAt });
+        this.#publishTaskStatus(failed);
+        return failed;
       }
-      return this.taskStore.transition(taskId, "failed", failureMessage, {
+      const failed = this.taskStore.transition(taskId, "failed", failureMessage, {
         lastUpdatedAt,
         result: failure
       });
+      this.#publishTaskStatus(failed);
+      return failed;
     }
     if (provisional) {
       this.taskStore.flushWaiters(taskId);
+      this.#publishTaskStatus(provisional);
       return provisional;
     }
     // Publish only after the WAL barrier. waitForTerminal therefore cannot
     // observe an outcome that a process restart can take back.
-    return this.taskStore.transition(taskId, status, statusMessage, {
+    const committed = this.taskStore.transition(taskId, status, statusMessage, {
       lastUpdatedAt,
       ...(result === undefined ? {} : { result })
     });
+    this.#publishTaskStatus(committed);
+    return committed;
   }
 
   // Builds the durable form of one terminal result. Oversized results go to an
@@ -1761,6 +1828,18 @@ export class GatewayService {
       statusMessage: task.statusMessage,
       lastUpdatedAt: task.lastUpdatedAt,
       turnId: task.turnId ?? null
+    });
+  }
+
+  #publishTaskStatus(task) {
+    if (!task) return;
+    const session = this.store.get(task.sessionId);
+    if (!session || CLOSED_STATUSES.has(session.status)) return;
+    this.store.push(session, {
+      type: "task_status",
+      taskId: task.taskId,
+      status: task.status,
+      statusMessage: task.statusMessage
     });
   }
 
@@ -1819,6 +1898,12 @@ export class GatewayService {
       sessionId: session.id,
       turnId: session.turnId,
       status: session.status,
+      // Before result on purpose: the durable record keeps a bounded head of this
+      // envelope as its preview, and ~200 bytes of totals placed ahead of an
+      // unbounded transcript are always inside it.
+      ...(session.activeTaskIncludeUsage === true
+        ? { usage: this.store.usageSnapshot(session).turn }
+        : {}),
       result: {
         text: session.resultFinalText ?? session.resultText,
         transcriptBytes: Buffer.byteLength(session.resultText),
@@ -2129,6 +2214,10 @@ export class GatewayService {
         session.thoughtText = "";
         session.resultArtifact = null;
         session.events = [];
+        session.chunkEvents = [];
+        // The per-turn total went with resultText; the cumulative one is transient
+        // state too, and nothing persists either of them.
+        this.store.clearSessionUsage(session);
         session.transientClearedAt = new Date(now).toISOString();
         changed = true;
       }
@@ -2484,6 +2573,14 @@ function shouldDeliverEvent(subscription, event) {
   if (!subscription.includeThoughts && event.type === "agent_thought_chunk") return false;
   if (!subscription.includeToolEvents && event.type.startsWith("tool_call")) return false;
   return true;
+}
+
+// "At least one event after your cursor is gone." Truncation is a statement about
+// storage, never about this caller's filter — what a filter withholds is already
+// counted by filteredCount. Ephemeral chunk sequence numbers are intentionally
+// absent from the ring, so only an actual ring eviction advances this watermark.
+function cursorTruncatedFor(session, cursor) {
+  return cursor <= (session.eventsEvictedThrough ?? -1);
 }
 
 function publicEvent(session, event) {

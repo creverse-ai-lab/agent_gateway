@@ -299,8 +299,8 @@ flowchart LR
 
 ## v1.3.2 변경 사항
 
-- **최종 결과 중심 poll** — 기본 poll은 진행 메시지·thought·tool 이벤트를 전달하지 않고, 종료 시 최종 `result`와 Main이 처리해야 하는 permission·질문만 보냅니다. 중간 증거는 `eventTypes`, `includeThoughts`, `includeToolEvents`, `includeInspection`으로 명시 요청해야 합니다.
-- **usage 이벤트 차단** — 반복되는 ACP `usage_update`는 Gateway에 저장하거나 poll을 깨우지 않습니다. provider 계측 신호가 frontdoor tool call과 컨텍스트 소비로 증폭되는 경로를 제거했습니다.
+- **최종 결과 중심 poll** — poll은 raw message/thought chunk를 보관하거나 전달하지 않고, 종료 시 최종 `result`와 Main이 처리해야 하는 permission·질문을 중심으로 응답합니다. raw chunk는 명시적으로 구독한 live observer에만 전달되며, 저장된 중간 증거는 `eventTypes`, `includeToolEvents`, `includeInspection`, 결과 thought는 `includeThoughts`로 요청합니다.
+- **usage 이벤트 집계** — 반복되는 ACP `usage_update` 원문은 event ring에 저장하거나 poll을 깨우지 않고 turn/session 누계로 합산합니다. poll의 `includeUsage`, session 상세 조회, 명시적으로 요청한 Task 결과에서만 작은 summary를 노출합니다.
 - **간결한 Worker 반환 기본** — `agent-delegator`가 상세 보고서가 필요하지 않은 요청에 결론·필수 근거·변경 경로·테스트 상태만 간결히 반환하도록 지시합니다.
 
 ## v1.3.1 변경 사항
