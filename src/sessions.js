@@ -167,6 +167,7 @@ export class SessionStore {
           state.usagePrevTokens = null;
           session.resultFinalText = null;
           session.resultFinalArtifact = null;
+          session.resultBudgetArtifact = null;
           session.resultInspection = [];
         }
       },

@@ -177,12 +177,17 @@ export class TaskStore {
       // Which tool minted the handle. Persisted rather than derived, because
       // after a restart there is nothing left to derive it from.
       origin = "prompt",
+      idempotencyKey = null,
       statusMessage = DEFAULT_STATUS_MESSAGE
     } = options ?? {};
     requireNonEmptyString(sessionId, "sessionId");
     requireNonEmptyString(ownerRootId, "ownerRootId");
     if (origin !== "prompt" && origin !== "run") {
       throw taskError("INVALID_ARGUMENT", `origin must be one of: prompt, run`);
+    }
+    if (idempotencyKey != null
+      && (typeof idempotencyKey !== "string" || !idempotencyKey.trim() || idempotencyKey.length > 256)) {
+      throw taskError("INVALID_ARGUMENT", "idempotencyKey must be a non-empty string of at most 256 characters");
     }
     if (turnId != null && typeof turnId !== "string") throw taskError("INVALID_ARGUMENT", "turnId must be a string or null");
     if (typeof statusMessage !== "string") throw taskError("INVALID_ARGUMENT", "statusMessage must be a string");
@@ -223,6 +228,7 @@ export class TaskStore {
       lastUpdatedAt: iso,
       statusMessage,
       origin,
+      ...(origin === "run" && idempotencyKey ? { idempotencyKey } : {}),
       result: null
     };
     this.#tasks.set(record.taskId, record);
@@ -598,6 +604,10 @@ export class TaskStore {
       // A snapshot written before this field existed described a prompt: run did
       // not exist to write one.
       origin: raw.origin === "run" ? "run" : "prompt",
+      ...(raw.origin === "run" && typeof raw.idempotencyKey === "string"
+        && raw.idempotencyKey.trim() && raw.idempotencyKey.length <= 256
+        ? { idempotencyKey: raw.idempotencyKey }
+        : {}),
       result: raw.result ?? null
     };
   }

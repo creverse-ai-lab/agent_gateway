@@ -19,7 +19,7 @@
 Three separate limits, and confusing them is the usual mistake:
 
 - `limits.maxInlineResultBytes` (from `session_open`) — how much final text the Gateway keeps in memory. Beyond it the answer is spilled and `textArtifact` appears on its own.
-- `resultBudgetBytes` (per call on poll, or stated when the work is submitted on run and task-mode prompt) — how much of it is delivered to you.
+- `resultBudgetBytes` (0–65,536 bytes, per call on poll or stated when the work is submitted on run) — how much of it is delivered to you.
 - Durability has its own internal limit; when a durable result reference is lost you receive a short preview with `resultDegraded: true`, which is why a large budget can still return a small text.
 
 The decision tree for one result:

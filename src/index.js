@@ -141,10 +141,17 @@ async function runTool(args, extra) {
   }
   // The rpc budget follows the poll precedent: the caller's wait plus the slack
   // the gateway needs to answer it.
+  const waitController = new AbortController();
   const envelope = await raceAbort(
-    rpc.call("run", { taskId, waitMs }, Math.max(30_000, waitMs + 5_000)),
+    rpc.call(
+      "run",
+      { taskId, waitMs },
+      Math.max(30_000, waitMs + 5_000),
+      { signal: waitController.signal }
+    ),
     extra?.signal,
-    taskId
+    taskId,
+    () => waitController.abort()
   );
   return toolResult(envelope, envelope.ok === false, relatedTask(taskId));
 }
@@ -152,22 +159,35 @@ async function runTool(args, extra) {
 // An abort abandons the WAIT, never the turn. The worker keeps working and the
 // handle stays collectable, because "I stopped waiting" and "stop the work" are
 // different instructions and only agent_acp_cancel means the second one.
-function raceAbort(pending, signal, taskId) {
+function raceAbort(pending, signal, taskId, abandonWait = () => {}) {
   if (!signal) return pending;
-  return Promise.race([
-    pending,
-    new Promise((resolve) => {
-      const abandon = () => resolve({
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", abandon);
+      callback(value);
+    };
+    const abandon = () => {
+      finish(resolve, {
         ok: true,
         status: "working",
         incomplete: "wait_abandoned",
         taskId,
         next: { attach: { tool: "agent_acp_run", arguments: { taskId } } }
       });
-      if (signal.aborted) abandon();
-      else signal.addEventListener("abort", abandon, { once: true });
-    })
-  ]);
+      // Resolve the user-facing handoff first, then cancel only the outstanding
+      // wait RPC. The task and worker turn are untouched.
+      queueMicrotask(abandonWait);
+    };
+    pending.then(
+      (value) => finish(resolve, value),
+      (error) => finish(reject, error)
+    );
+    if (signal.aborted) abandon();
+    else signal.addEventListener("abort", abandon, { once: true });
+  });
 }
 
 // The handle, delivered before the wait can fail. A host whose transport times
@@ -306,11 +326,7 @@ function controlTools() {
         properties: {
           sessionId: { type: "string" },
           model: { type: "string", minLength: 1, description: "Optional model for this and following turns. Process-scoped providers require a new session to change it." },
-          prompt: { oneOf: [{ type: "string" }, { type: "array", items: { type: "object" } }] },
-          resultBudgetBytes: { type: "integer", minimum: 0, description: "Task mode only: cap the delivered result.text of this turn's terminal envelope. Over the cap the envelope carries a bounded head plus totalBytes, omittedBytes and a textArtifact pointer." },
-          resultDelivery: { type: "string", enum: ["inline", "artifact"], description: "Task mode only: artifact delivers an empty text plus a textArtifact pointer regardless of size." },
-          responseProfile: { type: "string", enum: ["current", "compact", "diagnostic"], description: "Task mode only: shape of this task's terminal result object." },
-          includeUsage: { type: "boolean", description: "Task mode only: include result.usageSummary in the terminal envelope." }
+          prompt: { oneOf: [{ type: "string" }, { type: "array", items: { type: "object" } }] }
         },
         required: ["sessionId", "prompt"]
       }
@@ -326,11 +342,12 @@ function controlTools() {
           taskId: { type: "string", description: "Attach mode: keep waiting on a run that has already started. Carries no prompt, so a retry cannot start the work twice." },
           model: { type: "string", minLength: 1, description: "Optional model for this and following turns. Process-scoped providers require a new session to change it." },
           waitMs: { type: "integer", minimum: 0, maximum: 600000, description: "How long to wait for a terminal outcome. Defaults to 55000, below the usual 60s host tool timeout. On the first run of a session prefer 25000, then raise it once a turn has completed normally." },
-          resultBudgetBytes: { type: "integer", minimum: 0, description: "Cap the delivered result.text. Over the cap the result carries a bounded head plus totalBytes, omittedBytes and a textArtifact pointer." },
+          resultBudgetBytes: { type: "integer", minimum: 0, maximum: 65536, description: "Cap the delivered result.text. Over the cap the result carries a bounded head plus totalBytes, omittedBytes and a textArtifact pointer." },
           resultDelivery: { type: "string", enum: ["inline", "artifact"], description: "artifact delivers an empty text plus a textArtifact pointer regardless of size." },
           responseProfile: { type: "string", enum: ["current", "compact", "diagnostic"], description: "Shape of the result object inside the terminal envelope." },
           includeUsage: { type: "boolean", description: "Include result.usageSummary in the terminal envelope." },
-          idempotencyKey: { type: "string", description: "Retry-safe start. A repeat with the same key on the same session attaches to the existing run instead of prompting the worker again; the last eight keys per session are remembered." },
+          includeThoughts: { type: "boolean", description: "Include the bounded thought capture in the terminal result." },
+          idempotencyKey: { type: "string", minLength: 1, maxLength: 256, description: "Retry-safe start. A repeat with the same key on the same session attaches to the existing durable run instead of prompting the worker again." },
           ttl: { type: "integer", minimum: 0, description: "Milliseconds the Task handle stays collectable, measured from creation." },
           pollInterval: { type: "integer", minimum: 0, description: "Milliseconds the client should wait between status checks." }
         }
@@ -355,7 +372,7 @@ function controlTools() {
           includeUsage: { type: "boolean", description: "Include result.usageSummary: the {turn, session} token, context and cost totals the worker reported. Defaults to false; requires the result object (see includeResult)." },
           maxEvents: { type: "integer", minimum: 1, maximum: 1000 },
           responseProfile: { type: "string", enum: ["current", "compact", "diagnostic"], description: "current (default) is the frozen full response. compact drops the session envelope and every zero-valued paging field, keeping ok, sessionId, turnId, status, nextCursor, events and the terminal result. diagnostic adds queue depth, pending request counts and illegal-transition counters. Per call, never sticky; check setup or session_open responseProfiles before sending one." },
-          resultBudgetBytes: { type: "integer", minimum: 0, description: "Cap the delivered result.text for this call. Over the cap the result carries a bounded head plus totalBytes, omittedBytes and a textArtifact pointer. totalBytes is the size of the answer; transcriptBytes is the size of the whole narration." },
+          resultBudgetBytes: { type: "integer", minimum: 0, maximum: 65536, description: "Cap the delivered result.text for this call. Over the cap the result carries a bounded head plus totalBytes, omittedBytes and a textArtifact pointer. totalBytes is the size of the answer; transcriptBytes is the size of the whole narration." },
           resultDelivery: { type: "string", enum: ["inline", "artifact"], description: "artifact delivers an empty text plus a textArtifact pointer regardless of size." }
         },
         required: ["sessionId"]

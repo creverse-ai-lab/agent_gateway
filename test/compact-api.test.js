@@ -19,10 +19,10 @@ import { daemonPaths, startDaemon, writeMockProviders } from "./helpers/daemon-h
 
 const mockAgent = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 const MAIN = { rootId: "main-a" };
-// The 1.3.2 byte counts for the flows an old skill produces. Checked in at
-// test/fixtures/payload-baseline.json and repeated here so the compatibility
-// gate fails as a test rather than as a report nobody reads.
-const FROZEN_1_3_2_BYTES = { empty_active_poll: 483, active_poll_permission: 814, inbox_list_one_permission: 508 };
+// The inherited current-profile byte counts for flows an old skill produces.
+// PR 5 intentionally added bounded Inbox metadata, so the gate freezes the
+// immediate parent rather than pretending that additive field never shipped.
+const INHERITED_CURRENT_BYTES = { empty_active_poll: 483, active_poll_permission: 814, inbox_list_one_permission: 527 };
 
 test("T1: agent_acp_run and tasks/result return the same envelope, byte for byte", async () => {
   const service = new GatewayService({ createClient: mockClient("read_only"), gcIntervalMs: 0 });
@@ -159,6 +159,100 @@ test("T3: the idempotency key covers the window admission cannot", async () => {
   }
 });
 
+test("T3b: an idempotency key survives a daemon restart", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-run-idempotent-restart-"));
+  const log = join(directory, "prompts.ndjson");
+  const statePath = join(directory, "state.json");
+  process.env.ACP_MOCK_PROMPT_LOG = log;
+  let service = new GatewayService({
+    statePath,
+    createClient: mockClient("read_only"),
+    gcIntervalMs: 0,
+    artifactRoot: join(directory, "artifacts")
+  });
+  try {
+    await service.init();
+    const opened = await open(service);
+    const first = await service.call(
+      "run",
+      { sessionId: opened.sessionId, prompt: "narrated-result", waitMs: 15_000, idempotencyKey: "durable-unit" },
+      MAIN
+    );
+    await service.shutdown();
+
+    service = new GatewayService({
+      statePath,
+      createClient: mockClient("read_only"),
+      gcIntervalMs: 0,
+      artifactRoot: join(directory, "artifacts")
+    });
+    await service.init();
+    const retried = await service.call(
+      "run",
+      { sessionId: opened.sessionId, prompt: "narrated-result", waitMs: 15_000, idempotencyKey: "durable-unit" },
+      MAIN
+    );
+    assert.equal(retried.taskId, first.taskId);
+    assert.equal(await promptCount(log), 1, "restart retry attached to the durable task instead of prompting again");
+  } finally {
+    delete process.env.ACP_MOCK_PROMPT_LOG;
+    await service.shutdown().catch(() => {});
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("T3c: an expired durable key starts a new run after restart", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-run-idempotent-expiry-"));
+  const log = join(directory, "prompts.ndjson");
+  const statePath = join(directory, "state.json");
+  process.env.ACP_MOCK_PROMPT_LOG = log;
+  let clock = Date.parse("2026-01-01T00:00:00.000Z");
+  let service = new GatewayService({
+    statePath,
+    now: () => clock,
+    createClient: mockClient("read_only"),
+    gcIntervalMs: 0,
+    artifactRoot: join(directory, "artifacts")
+  });
+  try {
+    await service.init();
+    const opened = await open(service);
+    const first = await service.call(
+      "run",
+      {
+        sessionId: opened.sessionId,
+        prompt: "narrated-result",
+        waitMs: 15_000,
+        ttl: 10,
+        idempotencyKey: "expires"
+      },
+      MAIN
+    );
+    await service.shutdown();
+
+    service = new GatewayService({
+      statePath,
+      now: () => clock,
+      createClient: mockClient("read_only"),
+      gcIntervalMs: 0,
+      artifactRoot: join(directory, "artifacts")
+    });
+    await service.init();
+    clock += 11;
+    const retried = await service.call(
+      "run",
+      { sessionId: opened.sessionId, prompt: "narrated-result", waitMs: 15_000, idempotencyKey: "expires" },
+      MAIN
+    );
+    assert.notEqual(retried.taskId, first.taskId);
+    assert.equal(await promptCount(log), 2);
+  } finally {
+    delete process.env.ACP_MOCK_PROMPT_LOG;
+    await service.shutdown().catch(() => {});
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("T4: the profiles are a containment chain, not three independent shapes", async () => {
   // Frozen clock: this test compares two responses byte for byte, and
   // lastOwnerActivityAt moves between calls on a live one.
@@ -253,7 +347,7 @@ test("T4b: compact moves stopReason into the result and keeps the terminal answe
   }
 });
 
-test("T5: a caller that sends no new arguments gets 1.3.2 back, byte for byte", async () => {
+test("T5: a caller that sends no new arguments keeps the inherited current profile byte for byte", async () => {
   const directory = await mkdtemp(join(tmpdir(), "acp-frozen-bytes-"));
   const service = new GatewayService({ gcIntervalMs: 0, artifactRoot: join(directory, "artifacts") });
   try {
@@ -267,7 +361,7 @@ test("T5: a caller that sends no new arguments gets 1.3.2 back, byte for byte", 
     service.handleUpdate(session, { sessionUpdate: "tool_call", toolCallId: "tool-bench-1", title: "Read file", kind: "read" });
     assert.equal(
       bytes(await service.call("poll", { sessionId: session.id, cursor: 0 }, MAIN)),
-      FROZEN_1_3_2_BYTES.empty_active_poll
+      INHERITED_CURRENT_BYTES.empty_active_poll
     );
     service.handleUpdate(session, {
       sessionUpdate: "permission_request",
@@ -280,12 +374,12 @@ test("T5: a caller that sends no new arguments gets 1.3.2 back, byte for byte", 
     });
     assert.equal(
       bytes(await service.call("poll", { sessionId: session.id, cursor: 0 }, MAIN)),
-      FROZEN_1_3_2_BYTES.active_poll_permission
+      INHERITED_CURRENT_BYTES.active_poll_permission
     );
     // The unpaged inbox keeps {ok, items} and never grows a nextCursor.
     const listed = await service.call("inbox", { action: "list" }, MAIN);
     assert.deepEqual(Object.keys(listed), ["ok", "items"]);
-    assert.equal(bytes(listed), FROZEN_1_3_2_BYTES.inbox_list_one_permission);
+    assert.equal(bytes(listed), INHERITED_CURRENT_BYTES.inbox_list_one_permission);
     // Filtering without paging is still an unpaged response.
     assert.deepEqual(
       Object.keys(await service.call("inbox", { action: "list", status: "pending" }, MAIN)),
@@ -358,6 +452,7 @@ test("T7: inbox keyset pages survive inserts between pages", async () => {
         options: [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }]
       });
     }
+    await waitForInboxCount(service, 5);
     const first = await service.call("inbox", { action: "list", limit: 2 }, MAIN);
     assert.equal(first.items.length, 2);
     assert.equal(typeof first.nextCursor, "string");
@@ -371,6 +466,7 @@ test("T7: inbox keyset pages survive inserts between pages", async () => {
       toolCall: { toolCallId: "tool-late", title: "Edit file", kind: "edit" },
       options: [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }]
     });
+    await waitForInboxCount(service, 6);
 
     const seen = first.items.map((item) => item.inboxId);
     let cursor = first.nextCursor;
@@ -493,6 +589,49 @@ test("T8: the result budget truncates once and spills once", async () => {
   }
 });
 
+test("T8b: budgets use the complete artifact and never reuse a prior turn's spill", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-budget-authoritative-"));
+  const service = new GatewayService({
+    createClient: mockClient("read_only"),
+    gcIntervalMs: 0,
+    artifactRoot: join(directory, "artifacts"),
+    maxInlineResultBytes: 64
+  });
+  try {
+    const opened = await open(service);
+    await service.call("prompt", { sessionId: opened.sessionId, prompt: "large-result" }, MAIN);
+    await waitForIdle(service, opened.sessionId);
+    const firstSession = service.requireSession(opened.sessionId);
+    assert.ok(firstSession.resultFinalArtifact?.bytes > Buffer.byteLength(firstSession.resultFinalText));
+
+    const budgeted = await service.call(
+      "poll", { sessionId: opened.sessionId, cursor: 0, resultBudgetBytes: 128 }, MAIN
+    );
+    assert.equal(budgeted.result.totalBytes, firstSession.resultFinalArtifact.bytes);
+    assert.ok(Buffer.byteLength(budgeted.result.text) > Buffer.byteLength(firstSession.resultFinalText));
+    assert.equal(
+      budgeted.result.omittedBytes,
+      budgeted.result.totalBytes - Buffer.byteLength(budgeted.result.text)
+    );
+    const firstPath = budgeted.result.textArtifact.path;
+
+    await service.call("prompt", { sessionId: opened.sessionId, prompt: "narrated-result" }, MAIN);
+    await waitForIdle(service, opened.sessionId);
+    const second = await service.call(
+      "poll", { sessionId: opened.sessionId, cursor: 0, resultBudgetBytes: 4 }, MAIN
+    );
+    assert.notEqual(second.result.textArtifact.path, firstPath);
+    assert.equal(await readFile(second.result.textArtifact.path, "utf8"), "FINAL ANSWER");
+    await assert.rejects(
+      service.call("poll", { sessionId: opened.sessionId, resultBudgetBytes: 65_537 }, MAIN),
+      /0 to 65536/
+    );
+  } finally {
+    await service.shutdown().catch(() => {});
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("T9: setup summary and session_open carry exactly the bind-time facts", async () => {
   const service = new GatewayService({ createClient: mockClient("read_only"), gcIntervalMs: 0 });
   try {
@@ -519,6 +658,7 @@ test("T9: setup summary and session_open carry exactly the bind-time facts", asy
     });
 
     const opened = await open(service);
+    assert.equal(typeof opened.gatewayVersion, "string");
     assert.deepEqual(Object.keys(opened.limits), [
       "maxPromptBytes", "maxInlineResultBytes", "resultRetentionMs", "sessionRetentionMs", "taskRetentionMs"
     ]);
@@ -631,14 +771,25 @@ test("T11: abandoning the wait does not cancel the turn; cancel does", async () 
     // Cancelling is the instruction that does stop the turn — a different verb
     // for a different intention.
     const second = await service.call(
-      "run", { sessionId: opened.sessionId, prompt: "block", waitMs: 1 }, MAIN
+      "run", {
+        sessionId: opened.sessionId,
+        prompt: "block",
+        waitMs: 1,
+        responseProfile: "compact",
+        resultBudgetBytes: 2
+      }, MAIN
     );
     assert.equal(second.ok, true);
     assert.equal(await promptCount(log), 2);
     await waitForPending(service, opened.sessionId);
-    await service.call("cancel", { sessionId: opened.sessionId }, MAIN);
-    const cancelled = await service.call("run", { taskId: second.taskId, waitMs: 15_000 }, MAIN);
+    await service.call("task_cancel", { taskId: second.taskId }, MAIN);
+    const cancelled = await service.call("task_result", { taskId: second.taskId }, MAIN);
+    assert.equal(cancelled.taskId, second.taskId);
     assert.equal(cancelled.result.stopReason, "cancelled");
+    assert.equal(Buffer.byteLength(cancelled.result.text), 2);
+    assert.equal(cancelled.result.totalBytes, 6);
+    assert.equal(cancelled.result.omittedBytes, 4);
+    assert.equal(cancelled.result.textArtifact.complete, true);
   } finally {
     delete process.env.ACP_MOCK_PROMPT_LOG;
     await service.shutdown().catch(() => {});
@@ -671,8 +822,11 @@ test("T1b: through the real front door, the run CallToolResult IS the tasks/resu
     // list it, which is the fallback signal the skill reads.
     const tools = (await mcpClient.listTools()).tools;
     const run = tools.find((tool) => tool.name === "agent_acp_run");
+    const prompt = tools.find((tool) => tool.name === "agent_acp_prompt");
     assert.ok(run, "agent_acp_run must be in the live tool list");
     assert.deepEqual(run.execution, { taskSupport: "optional" });
+    assert.equal(prompt.execution, undefined, "the acknowledgement-only prompt tool is not task-capable");
+    assert.equal(Object.hasOwn(prompt.inputSchema.properties, "resultBudgetBytes"), false);
 
     const opened = await mcpClient.callTool({
       name: "agent_acp_session_open",
@@ -755,6 +909,15 @@ async function waitForPending(service, sessionId) {
     await new Promise((done) => setTimeout(done, 20));
   }
   throw new Error("no pending worker request arrived");
+}
+
+async function waitForInboxCount(service, expected) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const items = (await service.call("inbox", { action: "list", status: "pending" }, MAIN)).items;
+    if (items.length === expected) return items;
+    await new Promise((done) => setTimeout(done, 20));
+  }
+  throw new Error(`inbox did not reach ${expected} items`);
 }
 
 async function waitForIdle(service, sessionId) {

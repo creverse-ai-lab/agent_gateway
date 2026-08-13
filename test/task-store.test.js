@@ -76,6 +76,10 @@ test("create returns the legacy task record shape plus its origin", () => {
 
   const other = makeStore().store;
   assert.equal(other.create({ sessionId: "s", ownerRootId: "rootA", origin: "run" }).origin, "run");
+  const keyed = other.create({
+    sessionId: "s", ownerRootId: "rootA", origin: "run", idempotencyKey: "durable-key"
+  });
+  assert.equal(keyed.idempotencyKey, "durable-key");
   assert.throws(
     () => other.create({ sessionId: "s", ownerRootId: "rootA", origin: "sneaky" }),
     /origin must be one of/
@@ -88,6 +92,14 @@ test("create validates its arguments", () => {
   assert.throws(() => store.create({ sessionId: "session-1" }), assertCode("INVALID_ARGUMENT"));
   assert.throws(() => store.create({ sessionId: "session-1", ownerRootId: "  " }), assertCode("INVALID_ARGUMENT"));
   assert.throws(() => store.create({ sessionId: "session-1", ownerRootId: "rootA", turnId: 7 }), assertCode("INVALID_ARGUMENT"));
+  assert.throws(
+    () => store.create({ sessionId: "session-1", ownerRootId: "rootA", origin: "run", idempotencyKey: "" }),
+    assertCode("INVALID_ARGUMENT")
+  );
+  assert.throws(
+    () => store.create({ sessionId: "session-1", ownerRootId: "rootA", origin: "run", idempotencyKey: "x".repeat(257) }),
+    assertCode("INVALID_ARGUMENT")
+  );
 });
 
 test("ttl expiry is keyed off createdAt, never lastUpdatedAt", () => {

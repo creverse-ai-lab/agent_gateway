@@ -9,7 +9,7 @@
 // behind the poll response AND all three terminal task envelopes — which is how
 // the orphan-cancel copy stopped being able to drift away from the others.
 
-import { utf8ByteHead } from "./bounded-utf8.js";
+import { readHeadBytes, utf8ByteHead } from "./bounded-utf8.js";
 import { ERROR_CODES, GatewayError } from "./errors.js";
 
 export const PROFILES = Object.freeze(["current", "compact", "diagnostic"]);
@@ -50,8 +50,11 @@ export function requireResultDelivery(value) {
 export function requireResultBudget(value) {
   if (value == null) return null;
   const parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed < 0) {
-    throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "resultBudgetBytes must be a non-negative integer");
+  if (!Number.isInteger(parsed) || parsed < 0 || parsed > DEFAULT_RESULT_BUDGET_BYTES) {
+    throw new GatewayError(
+      ERROR_CODES.INVALID_ARGUMENT,
+      `resultBudgetBytes must be an integer from 0 to ${DEFAULT_RESULT_BUDGET_BYTES}`
+    );
   }
   return parsed;
 }
@@ -68,26 +71,47 @@ export function requireResultBudget(value) {
 // whole narration. They are different numbers and conflating them is the trap
 // this comment exists to name.
 function deliverText(session, text, { budget, delivery, spill }) {
-  const totalBytes = Buffer.byteLength(text);
+  const retainedBytes = Buffer.byteLength(text);
+  const existing = completeArtifact(session.resultFinalArtifact) ? session.resultFinalArtifact : null;
+  const totalBytes = existing?.bytes ?? retainedBytes;
   if (delivery === "artifact") {
+    const textArtifact = existing ?? ensureTextArtifact(session, text, spill);
     return {
       text: "",
       totalBytes,
       omittedBytes: totalBytes,
-      textArtifact: ensureTextArtifact(session, text, spill),
-      bounded: true
+      textArtifact,
+      bounded: true,
+      degraded: !textArtifact
     };
   }
-  if (budget == null || totalBytes <= budget) {
+  if (budget == null) {
     return { text, totalBytes, omittedBytes: 0, textArtifact: session.resultFinalArtifact ?? null, bounded: false };
   }
-  const head = utf8ByteHead(text, budget);
+  if (totalBytes <= budget) {
+    const completeText = existing && retainedBytes < totalBytes
+      ? readHeadBytes(existing.path, budget)
+      : text;
+    return {
+      text: completeText ?? text,
+      totalBytes,
+      omittedBytes: completeText == null ? totalBytes - retainedBytes : 0,
+      textArtifact: session.resultFinalArtifact ?? null,
+      bounded: completeText == null,
+      degraded: completeText == null
+    };
+  }
+  const head = existing?.path
+    ? readHeadBytes(existing.path, budget) ?? utf8ByteHead(text, budget)
+    : utf8ByteHead(text, budget);
+  const textArtifact = existing ?? ensureTextArtifact(session, text, spill);
   return {
     text: head,
     totalBytes,
     omittedBytes: totalBytes - Buffer.byteLength(head),
-    textArtifact: ensureTextArtifact(session, text, spill),
-    bounded: true
+    textArtifact,
+    bounded: true,
+    degraded: !textArtifact
   };
 }
 
@@ -101,12 +125,19 @@ function deliverText(session, text, { budget, delivery, spill }) {
 // session record in the first place. An overflow spill that already exists is
 // reused, because it is the same bytes.
 function ensureTextArtifact(session, text, spill) {
-  if (session.resultFinalArtifact) return session.resultFinalArtifact;
-  if (session.resultBudgetArtifact) return session.resultBudgetArtifact;
+  if (completeArtifact(session.resultFinalArtifact)) return session.resultFinalArtifact;
+  if (completeArtifact(session.resultBudgetArtifact)) return session.resultBudgetArtifact;
   if (typeof spill !== "function" || !text) return null;
   const artifact = spill(text);
-  if (artifact) session.resultBudgetArtifact = artifact;
-  return artifact ?? null;
+  if (completeArtifact(artifact)) session.resultBudgetArtifact = artifact;
+  return completeArtifact(artifact) ? artifact : null;
+}
+
+function completeArtifact(artifact) {
+  return artifact?.complete === true && artifact.truncated !== true && !artifact.error
+    && typeof artifact.path === "string" && Number.isFinite(artifact.bytes)
+    ? artifact
+    : null;
 }
 
 // The single result builder. Callers pass what they know; the shape is decided
@@ -141,7 +172,7 @@ export function projectResult(session, options = {}) {
       ...(artifact ? { artifact } : {}),
       ...(delivered.textArtifact ? { textArtifact: delivered.textArtifact } : {}),
       ...bounds,
-      ...(degraded ? { resultDegraded: true } : {}),
+      ...(degraded || delivered.degraded ? { resultDegraded: true } : {}),
       ...(usageSummary ? { usageSummary } : {}),
       ...(includeThoughts ? { thought: session.thoughtText } : {}),
       ...(inspection ? { inspection: inspection.segments, inspectionDropped: inspection.dropped } : {})
@@ -154,6 +185,7 @@ export function projectResult(session, options = {}) {
     artifact,
     ...(delivered.textArtifact ? { textArtifact: delivered.textArtifact } : {}),
     ...bounds,
+    ...(degraded || delivered.degraded ? { resultDegraded: true } : {}),
     ...(includeThoughts ? { thought: session.thoughtText } : {}),
     stopReason,
     ...(inspection ? { inspection: inspection.segments, inspectionDropped: inspection.dropped } : {}),

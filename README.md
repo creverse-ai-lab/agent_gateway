@@ -320,7 +320,7 @@ flowchart LR
 - **`agent_acp_run` 신설** — prompt를 보내고 결과까지 기다리는 단일 도구입니다. 직접 반환값과 MCP Task 결과가 **같은 객체**라서 처리할 shape가 하나뿐입니다. 대기 시간이 끝나면 오류가 아니라 `{status:"working", taskId}`를 돌려주므로, 실패 시에는 prompt를 다시 보내지 말고 `{taskId}`로만 재시도하면 됩니다(중복 실행이 구조적으로 불가능). permission이 필요하면 `{status:"input_required", pending}`으로 제어권을 즉시 돌려줍니다. `idempotencyKey`로 재시도 안전성을 한 겹 더 확보할 수 있습니다.
 - **응답 프로파일** — `agent_acp_poll`에 `responseProfile: "compact"`를 주면 세션 봉투를 제거하고 `events`·최종 `result`만 남겨 **약 3분의 1 크기**로 줄어듭니다(빈 poll 483 → 152 bytes, permission poll 814 → 483 bytes). `"diagnostic"`은 큐 깊이·대기 요청 수 등 진단 정보를 더합니다. 인자를 생략하면 기존 응답 그대로입니다.
 - **`setup mode:"summary"`** — 버전·프로파일·persistence·alert·provider 목록만 담은 요약(363 bytes, 전체의 약 19%)입니다. 세션마다 필요한 값은 `agent_acp_session_open` 응답이 직접 실어 보내므로(`responseProfiles`, `limits`, `relevantAlerts`) 위임할 때마다 setup을 다시 부를 필요가 없습니다.
-- **결과 예산** — `resultBudgetBytes`·`resultDelivery`로 돌려받을 결과 크기를 호출마다 제한할 수 있습니다. 초과분은 잘린 본문과 함께 `totalBytes`·`omittedBytes`·`textArtifact` 포인터로 전달되며, 같은 답변에 대한 spill은 한 번만 일어납니다.
+- **결과 예산** — `resultBudgetBytes`(0–65,536)·`resultDelivery`로 돌려받을 결과 크기를 호출마다 제한할 수 있습니다. 초과분은 잘린 본문과 함께 전체 답변 기준 `totalBytes`·`omittedBytes`·완전한 `textArtifact` 포인터로 전달되며, 같은 답변에 대한 spill은 한 번만 일어납니다.
 - **Inbox 필터·페이징** — `sessionId`, `type`, `limit`, `cursor`, `detail:"summary"`를 지원합니다. 인자 없는 호출은 기존과 완전히 동일한 전체 목록입니다.
 - **내구성·경계·정숙성(PR 1~6)** — state v5 snapshot + WAL과 crash-safe 복구, MCP Task 의미론(TTL은 생성 시점 기준), 세션별 mailbox와 명시적 상태 전이, 모든 전송 구간의 프레임·큐·타임아웃 예산, control/telemetry 레인 분리와 usage 집계가 포함됩니다.
 - **호스트 재연결 감지** — 프론트 도어와 daemon 버전이 어긋나면 `staleFrontDoor`로 알립니다. 위의 [호스트 재연결 절차](#호스트-재연결-절차)를 따르세요.

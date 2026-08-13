@@ -728,6 +728,7 @@ export class GatewayService {
   bindTimeFacts(session) {
     const alerts = [...(this.agentUpdateManager?.snapshot()?.alerts ?? []), ...this.stateAlerts];
     return {
+      gatewayVersion: GATEWAY_VERSION,
       responseProfiles: [...PROFILES],
       gatewayApiVersion: GATEWAY_API_VERSION,
       ...relevantAlerts(alerts, session.provider),
@@ -1006,13 +1007,23 @@ export class GatewayService {
   // PR 2's admission covers "retried while running". It cannot cover the window
   // this tool opens: a wait times out, the turn then finishes, the session goes
   // idle, and a retry is admitted — prompting the worker a second time. The key
-  // is the only layer that covers that window. Per session, last eight, never
-  // persisted (a restart fails the task, so there is nothing to be idempotent
-  // about afterwards).
+  // is the only layer that covers that window. The task record carries the key
+  // durably so a daemon restart cannot reopen the duplicate-run window.
   #idempotentRun(session, key) {
     if (typeof key !== "string" || !key.trim()) return null;
     const taskId = session._runKeys?.get(key);
-    return taskId && this.taskStore.find(taskId) ? taskId : null;
+    if (taskId && this.taskStore.find(taskId)) return taskId;
+    for (const candidate of [...this.taskStore.records.values()].reverse()) {
+      // `records` is the replay ingress and intentionally skips lazy expiry.
+      // Revalidate each candidate before treating its durable key as live.
+      const task = this.taskStore.find(candidate.taskId);
+      if (!task) continue;
+      if (task.sessionId === session.id && task.origin === "run" && task.idempotencyKey === key) {
+        this.#rememberRun(session, key, task.taskId);
+        return task.taskId;
+      }
+    }
+    return null;
   }
 
   #rememberRun(session, key, taskId) {
@@ -1142,7 +1153,8 @@ export class GatewayService {
         ownerRootId: requireRoot(context),
         ttl: args.ttl,
         pollInterval: args.pollInterval,
-        origin
+        origin,
+        idempotencyKey: origin === "run" ? args.idempotencyKey : null
       }));
       this.#rememberDelivery(task.taskId, args);
       // The barrier is BEFORE the ACP turn starts. After it, a crash can only
@@ -1163,7 +1175,6 @@ export class GatewayService {
       }
       crashAfter("task_create_durable");
       session.activeTaskId = task.taskId;
-      session.activeTaskIncludeUsage = args.includeUsage === true;
       try {
         // One command covers starting the turn and recording the handle. Split
         // across two, the turn could already have finished and this bookkeeping
@@ -1189,7 +1200,6 @@ export class GatewayService {
       } catch (error) {
         if (session.activeTaskId === task.taskId) {
           session.activeTaskId = null;
-          session.activeTaskIncludeUsage = false;
         }
         this.taskStore.remove(task.taskId);
         throw error;
@@ -1275,22 +1285,9 @@ export class GatewayService {
     }
     await this.sessionCancel({ sessionId: task.sessionId }, context);
     const session = this.store.get(task.sessionId);
-    const result = {
-      ok: true,
-      sessionId: task.sessionId,
-      turnId: task.turnId,
-      status: "cancelled",
-      ...(session?.activeTaskIncludeUsage === true
-        ? { usage: this.store.usageSnapshot(session).turn }
-        : {}),
-      result: {
-        text: session?.resultFinalText ?? session?.resultText ?? "",
-        transcriptBytes: Buffer.byteLength(session?.resultText ?? ""),
-        artifact: session?.resultArtifact ?? null,
-        ...(session?.resultFinalArtifact ? { textArtifact: session.resultFinalArtifact } : {}),
-        stopReason: "cancelled"
-      }
-    };
+    const result = session
+      ? this.taskTerminalEnvelope(session, { ok: true, status: "cancelled", stopReason: "cancelled" })
+      : { ok: true, taskId: task.taskId, sessionId: task.sessionId, turnId: task.turnId, status: "cancelled" };
     const cancelled = this.#commitTaskTerminal(session, task.taskId, "cancelled", "Task cancelled by Main", result);
     if (!cancelled) {
       throw new GatewayError(ERROR_CODES.UNKNOWN_TASK, `Unknown taskId: ${task.taskId}`);
@@ -1300,7 +1297,6 @@ export class GatewayService {
     }
     if (session?.activeTaskId === task.taskId) {
       session.activeTaskId = null;
-      session.activeTaskIncludeUsage = false;
     }
     return this.publicTask(cancelled);
   }
@@ -1993,7 +1989,6 @@ export class GatewayService {
     // Keyed off the requested status, not the resulting one: a terminal report
     // that lost to an earlier terminal writer still ends this session's claim.
     session.activeTaskId = null;
-    session.activeTaskIncludeUsage = false;
   }
 
   #commitTaskTerminal(session, taskId, status, statusMessage, result) {

@@ -4,7 +4,7 @@
 
 Retry with the handle, never with the prompt. `agent_acp_run {taskId}` cannot start the work twice because it carries no prompt. Re-sending `{sessionId, prompt}` after a timeout, a transport error, or a host reconnect can, because by then the first turn may have finished and left the session idle and promptable.
 
-If the work is expensive to duplicate and you have no handle yet, pass `idempotencyKey` on the first `agent_acp_run`: a repeat with the same key on the same session attaches to the existing run. The last eight keys per session are remembered, and they do not survive a Gateway restart (a restart fails the task anyway).
+If the work is expensive to duplicate and you have no handle yet, pass `idempotencyKey` on the first `agent_acp_run`: a repeat with the same key on the same session attaches to the existing durable Task, including after a Gateway restart, until that Task expires.
 
 ## Failure triage
 
