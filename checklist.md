@@ -11,10 +11,10 @@
 - **Base branch: `dev`** — `main`에서 신설(2026-08-12 사용자 확정). 모든 PR은 `dev` 대상, 릴리스 시 `dev`→`main` merge PR.
 - **기본값 동결 원칙.** 현재 기본 poll은 이미 permission/elicitation만 전달하고 active result도 생략한다(`src/gateway-service.js:21,677-745`). 이 동작을 golden으로 동결하고, `compact`·`diagnostic` **둘 다 opt-in**으로 추가한다. "기본 diagnostic 유지"는 현재 동작과 반대이므로 폐기.
 - **각 PR은 독립적으로 `npm run ci` green.** 행동 변화는 PR 1의 characterization golden diff로만 드러나야 한다.
-- **Runtime source of truth(결정 필요):** 권고 = 이 repo(`agent_gateway`)를 canonical로 하고 sibling `../AgenLynk`는 tagged runtime artifact만 소비. AgenLynk에는 이미 `GATEWAY_API_VERSION=1`(`../AgenLynk/src/gateway-api-version.js`), versioned runtime updater(`../AgenLynk/src/runtime-updater.js`)가 존재 — 계약이 갈라져 있어 통합 테스트 필수.
-- **실소비자 호환성 가드레일:**
-  - AgenLynk monitor가 `session`, 무페이지 `task_list`, full `inbox`를 직접 소비(`../AgenLynk/src/monitor.js:177-205`) — summary/pagination 기본화는 즉시 breaking.
-  - AgenLynk Claude parent-link 탐지가 structuredContent 의존(`../AgenLynk/src/local-agents/claude.js:52`) — `content`+`structuredContent` 중복 유지.
+- **Runtime source of truth:** 이 repo(`agent_gateway`)가 canonical runtime과 공개 API 계약을 소유한다. downstream consumer는 versioned runtime artifact와 공개 계약만 소비하며, consumer별 배포·통합 검증은 각 consumer 경계에서 담당한다.
+- **공개 API 호환성 가드레일:**
+  - `session`, 무페이지 `task_list`, full `inbox` 응답은 기존 공개 계약 — summary/pagination 기본화는 breaking change이므로 opt-in으로만 제공한다.
+  - `content`+`structuredContent` 중복은 기존 MCP 응답 계약이므로 유지한다.
   - `skills/agent-delegator/SKILL.md:94-112`가 cursor/terminal result/full inbox 전제 — 새 skill은 capability 확인 후 compact 요청, 구 Gateway에서 standard fallback.
   - MCP host의 tool schema cache — 새 tool/profile 배포 후 재연결 절차 필요.
 
@@ -35,7 +35,7 @@
 | C9 | stdin/socket backpressure 미처리, slow subscription 제거 후 복구 없음 | CONFIRMED(일부 완충 존재) | `src/acp-client.js:105-134,601-607`, `src/socket-rpc.js:120-139,195-201`, `src/socket-flow.js:10-32` |
 | C10 | --update가 검증 전 live checkout 변경, MCP remove-then-add, blocker 검사 없음 | CONFIRMED | `src/source-update.js:3-21`, `src/installer.js:497-518,400-438,812-845` |
 | C11 | state.json atomic rename이나 version 검증/migration/checksum/fsync 부재 | CONFIRMED | `src/gateway-service.js:1368-1382,113-160` |
-| C12 | gatewayApiVersion 이미 존재(1) | **REFUTED** — cwd에 없음. 1은 ACP wire version(`src/acp-version.js:1`). state version은 4(`src/gateway-service.js:1373-1377`). `GATEWAY_API_VERSION=1`은 AgenLynk에 있음 | `../AgenLynk/src/gateway-api-version.js:1-7` |
+| C12 | gatewayApiVersion 이미 존재(1) | **REFUTED** — 이 repo에는 없음. 1은 ACP wire version(`src/acp-version.js:1`)이고 state version은 4(`src/gateway-service.js:1373-1377`)이므로 별도 공개 API 버전이 필요함 | repository source audit |
 
 ---
 
@@ -45,7 +45,7 @@
 
 ### PR 1 — Characterization·버전·구조적 에러 (행동 변화 0)
 
-- [ ] `gatewayApiVersion` **신설** — AgenLynk의 `GATEWAY_API_VERSION=1`과 정합, ACP wire version(1)과 명확히 구분되는 단일 버전 모듈
+- [ ] `gatewayApiVersion` **신설** — ACP wire version(1), state schema version과 명확히 구분되는 단일 공개 API 버전 모듈
 - [ ] `stateSchemaVersion`(현재 4) 상수화 + setup 응답 노출(additive)
 - [ ] `src/errors.js` 안정 error code 레지스트리 + **wire envelope 전파** `{code,message,details}` — 현재 daemon/client가 message만 전달(`src/gateway-daemon.js:78-81`, `src/socket-rpc.js:203-207`)해 code가 소실됨
 - [ ] characterization golden: 현재 **실제** 기본값 기준 — 기본 poll 이벤트 필터, setup 필드셋, prompt ack shape, inbox list 전문 반환, task 지속성(terminal 미저장)/TTL(lastUpdatedAt)/list 전량/실행중 result 오류
@@ -68,7 +68,7 @@
 - [ ] TaskStore 모듈 추출: create/transition/waitForTerminal/result/listPage/cancel/expire/recover
 - [ ] TTL을 `createdAt+ttl` 기준으로 변경(MCP 계약·SDK types 일치, `node_modules/@modelcontextprotocol/sdk/.../spec.types.d.ts:1234-1289`) + **TTL 경과한 active task 처리 정의**(SDK 참조 구현이 모순되므로 conformance test가 기준)
 - [ ] `tasks/result` blocking waiter + abort/disconnect 처리 + **task별·root별 waiter cap 동시 도입**(DoS 창 방지 — PR5로 미루지 않음)
-- [ ] `tasks/list` cursor pagination — 단 기존 무인자 호출은 기존 의미 유지(AgenLynk 호환)
+- [ ] `tasks/list` cursor pagination — 단 기존 무인자 호출은 공개 API 하위 호환성을 위해 기존 의미 유지
 - [ ] `io.modelcontextprotocol/related-task` metadata
 - [ ] terminal task in-memory retention(TTL까지) — 디스크 내구성은 PR 4
 - [ ] budgets: `maxTaskTtlMs`, `maxTasksPerRoot`, `maxConcurrentTasksPerRoot`
@@ -114,7 +114,7 @@
 
 - [ ] poll `responseProfile`: **current(기본, 동결)** | compact | diagnostic — capability 협상 기반
 - [ ] compact 응답: `{ok, sessionId, turnId, status, nextCursor, events[]}` + terminal일 때만 result
-- [ ] inbox list summary + `limit/cursor/sessionId/type/status/detail` 필터 — **opt-in**(기본 현행 유지, AgenLynk 호환), full payload는 get/artifact
+- [ ] inbox list summary + `limit/cursor/sessionId/type/status/detail` 필터 — **opt-in**(기본 공개 API 계약 유지), full payload는 get/artifact
 - [ ] setup `mode=summary` + `session_open` 응답에 provider/model/relevantAlerts 포함해 정상 경로 setup 생략 (registry revision cache는 실측 후 별도 결정)
 - [ ] per-turn result budget: `resultBudgetBytes`/`resultDelivery` → `{text(preview), totalBytes, omittedBytes, textArtifact}`
 - [ ] `agent_acp_run` 신설: direct 결과와 MCP Task `tasks/result`가 **동일한 CallToolResult(동형성)**. 기존 `agent_acp_prompt`는 ack 의미 유지 — mode 인자로 반환 의미를 바꾸지 않음. prompt의 Task 지원은 deprecated 또는 ack 동형 유지
@@ -131,7 +131,7 @@
 
 | 항목 | 연기 사유 | 목표 |
 |---|---|---|
-| Transactional updater (staged runtime/rollback) | **stable launcher 선행 필요** — MCP 등록이 checkout `src/index.js`를 직접 참조(`src/installer.js:653-702`)해 pointer 교체만으로 runtime이 바뀌지 않음. AgenLynk `runtime-updater.js`와 중복 — source of truth 결정 선행. (1.4.1 연기 사용자 승인, 2026-08-12) | 1.4.1 |
+| Transactional updater (staged runtime/rollback) | **stable launcher 선행 필요** — MCP 등록이 checkout `src/index.js`를 직접 참조(`src/installer.js:653-702`)해 pointer 교체만으로 runtime이 바뀌지 않음. canonical runtime의 배포·전환 모델 확정 선행. (1.4.1 연기 사용자 승인, 2026-08-12) | 1.4.1 |
 | monolith 디렉터리 전면 재배치(core/persistence/transport/…) | stabilization release에 불필요한 대규모 churn | 1.5 |
 | provider registry revision cache·setup delta | hot-path 비용 실측 후 | 1.4.1+ |
 | updater TOCTOU/lock/rollback 테스트 | updater와 함께 이동 | 1.4.1 |
@@ -156,7 +156,7 @@ DAG scheduler / LLM routing / auto result evaluator / distributed·multi-machine
 | Recovery | 잘린 WAL·손상 snapshot에서 명시적 복구 또는 안전 중단, v4 downgrade 안전 |
 | Soak | 다중 Worker·tool-heavy workload에서 RSS와 queue plateau |
 | Protocol | MCP Task TTL/result/list/related-task conformance 통과 |
-| Compat | AgenLynk monitor·기존 skill·기존 poll 기본값 golden 무변화 |
+| Compat | 공개 API 소비자·기존 skill·기존 poll 기본값 golden 무변화 |
 
 ---
 

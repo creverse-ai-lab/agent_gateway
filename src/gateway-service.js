@@ -519,7 +519,7 @@ export class GatewayService {
       // and probe-by-sending cannot detect that: an unknown argument is silently
       // ignored, so a compact request would come back full with no error.
       responseProfiles: [...PROFILES],
-      // healthy/error keep their names and meaning (AgenLynk branches on them);
+      // healthy/error keep their names and meaning for public API compatibility;
       // everything else here is additive diagnostics.
       persistence: {
         healthy: this.persistError == null,
@@ -1226,8 +1226,8 @@ export class GatewayService {
       }));
       return { tasks: page.tasks.map((task) => this.publicTask(task)), nextCursor: page.nextCursor };
     }
-    // No arguments keeps the 1.3.2 contract exactly: the full array for this
-    // root, and no nextCursor key at all (AgenLynk's monitor reads it unpaged).
+    // No arguments keeps the 1.3.2 public contract exactly: the full array for
+    // this root, and no nextCursor key at all.
     // Draining the keyset pages leaves ONE ordering and filtering implementation
     // instead of a second full-scan path that could disagree with the paged one.
     const tasks = [];
@@ -1335,8 +1335,8 @@ export class GatewayService {
       const status = args.status;
       const detail = requireInboxDetail(args.detail);
       // Paged only when the caller actually asked to page. An argument-free list
-      // keeps the 1.3.2 contract exactly — {ok, items}, and no nextCursor key at
-      // all — because AgenLynk's monitor reads it unpaged.
+      // keeps the 1.3.2 public contract exactly — {ok, items}, and no nextCursor
+      // key at all.
       const paged = args.cursor != null || args.limit != null;
       const cursor = args.cursor == null ? null : decodeInboxCursor(args.cursor);
       const limit = args.limit == null

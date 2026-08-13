@@ -274,8 +274,8 @@ test("conformance: task_list is unpaged without arguments and keyset paged with 
     ]);
     seedTasks(service, [{ taskId: "task-other", createdAt: 1_500, ownerRootId: "main-b" }]);
 
-    // AgenLynk's monitor calls this with no arguments: the full array, no paging
-    // key, and nothing from another Main.
+    // The argument-free public contract returns the full array, no paging key,
+    // and nothing from another Main.
     const unpaged = await service.call("task_list", {}, MAIN);
     assert.deepEqual(Object.keys(unpaged), ["tasks"]);
     assert.deepEqual(unpaged.tasks.map((task) => task.taskId), ids);

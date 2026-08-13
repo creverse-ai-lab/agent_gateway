@@ -315,7 +315,34 @@ flowchart LR
 
 ## v1.4.0 변경 사항
 
-**Durable · Bounded · Quiet** — 재시작 후에도 정확하고, 모든 자원이 제한되며, Main을 불필요하게 깨우지 않는 Gateway. 기존 호출은 인자를 하나도 바꾸지 않으면 **응답이 바이트 단위로 동일**합니다. 아래 기능은 전부 opt-in입니다.
+**Durable · Bounded · Quiet** — 재시작 후에도 정확하고, 주요 자원이 명시된 상한 안에 머물며, Main을 불필요하게 깨우지 않는 안정화 릴리스입니다.
+
+### 버전 정보
+
+| 항목 | 버전·요구사항 | 의미 |
+|---|---|---|
+| ACP Gateway | `1.4.0` | daemon, Control MCP와 installer의 릴리스 버전 |
+| Gateway Control API | `1` | 공개 control method와 응답 계약. additive 변경에는 올리지 않음 |
+| State schema | `5` | `state.snapshot.json` + checksummed `state.wal.ndjson` |
+| Legacy state schema | `4` | rollback을 위해 병행 기록하며 1.5.0에서 종료 예정 |
+| Runtime | Node.js `>=22` | macOS와 Linux 지원 |
+| 호환 기준 | `1.3.2` | 인자 없는 핵심 호출의 응답 형태와 기존 method 유지 |
+
+`package.json`, daemon과 Control MCP가 모두 `1.4.0`을 보고해야 정상입니다. `agent_acp_setup`에서는 `gatewayVersion`, `gatewayApiVersion`, `stateSchemaVersion`으로 각각 확인할 수 있습니다. MCP 호스트가 이전 tool schema를 캐시한 경우에는 `staleFrontDoor`가 표시되므로 [호스트 재연결 절차](#호스트-재연결-절차)를 수행하세요.
+
+### 릴리스 변경 이력
+
+1. **오류 계약과 characterization 기반 확립** — 안정적인 Gateway error code와 `{code,message,details}` wire envelope를 추가하고, 1.3.2의 prompt·poll·Task·Inbox 기본 동작을 characterization test로 고정했습니다.
+2. **SessionActor-lite 도입** — 세션별 mailbox와 명시적 FSM guard로 prompt·cancel·close·restore·provider-exit을 직렬화했습니다. 늦은 callback과 중복 terminal 처리도 idempotent하게 만들었습니다.
+3. **TaskStore v2 전환** — Task TTL을 `createdAt` 기준으로 통일하고, terminal-first-wins, blocking result waiter, 취소 의미론, root 격리, waiter·Task 상한과 keyset pagination을 구현했습니다.
+4. **State schema v5와 crash-safe 복구** — snapshot과 checksummed WAL, fsync barrier, replay idempotency, state-directory lock, v4 migration·downgrade 감지를 추가했습니다. 손상된 내부 WAL이나 snapshot에서는 빈 상태로 시작하지 않고 안전하게 중단합니다.
+5. **Bounded transport와 자원 예산** — 모든 NDJSON 전송 구간에 frame·queue·lane·write-timeout 상한을 적용하고, prompt·파일 읽기·terminal 출력·session·Inbox·artifact에도 명시적인 예산을 추가했습니다. 대용량 파일은 전체 `readFile` 대신 bounded streaming read로 처리합니다.
+6. **Control/telemetry 분리** — permission·질문·Task 상태 같은 control event를 telemetry flood에서 보호합니다. raw message/thought chunk는 live subscription으로만 전달하고, usage는 ring 저장이나 poll wake-up 없이 turn/session 누계로 집계합니다.
+7. **Compact API와 실행 경로 단순화** — `agent_acp_run`, `current|compact|diagnostic` 응답 프로파일, setup summary, 결과 byte budget, Inbox 필터·페이징과 idempotency key를 추가했습니다.
+
+마무리 안정화에서는 close flush timer의 참조가 사라져 shutdown이 멈출 수 있던 문제, transport 종료가 worker-death로 정규화되지 않던 문제, aggregate transport·Inbox budget 우회, 구조적 오류 누락과 compact run의 복구 중 중복 실행 가능성을 수정했습니다. CI에는 session race, resource budget, transport backpressure, Task conformance, state corruption과 18개 crash cut-point 검증이 포함됩니다.
+
+### 주요 API 추가
 
 - **`agent_acp_run` 신설** — prompt를 보내고 결과까지 기다리는 단일 도구입니다. 직접 반환값과 MCP Task 결과가 **같은 객체**라서 처리할 shape가 하나뿐입니다. 대기 시간이 끝나면 오류가 아니라 `{status:"working", taskId}`를 돌려주므로, 실패 시에는 prompt를 다시 보내지 말고 `{taskId}`로만 재시도하면 됩니다(중복 실행이 구조적으로 불가능). permission이 필요하면 `{status:"input_required", pending}`으로 제어권을 즉시 돌려줍니다. `idempotencyKey`로 재시도 안전성을 한 겹 더 확보할 수 있습니다.
 - **응답 프로파일** — `agent_acp_poll`에 `responseProfile: "compact"`를 주면 세션 봉투를 제거하고 `events`·최종 `result`만 남겨 **약 3분의 1 크기**로 줄어듭니다(빈 poll 483 → 152 bytes, permission poll 814 → 483 bytes). `"diagnostic"`은 큐 깊이·대기 요청 수 등 진단 정보를 더합니다. 인자를 생략하면 기존 응답 그대로입니다.
@@ -324,6 +351,14 @@ flowchart LR
 - **Inbox 필터·페이징** — `sessionId`, `type`, `limit`, `cursor`, `detail:"summary"`를 지원합니다. 인자 없는 호출은 기존과 완전히 동일한 전체 목록입니다.
 - **내구성·경계·정숙성(PR 1~6)** — state v5 snapshot + WAL과 crash-safe 복구, MCP Task 의미론(TTL은 생성 시점 기준), 세션별 mailbox와 명시적 상태 전이, 모든 전송 구간의 프레임·큐·타임아웃 예산, control/telemetry 레인 분리와 usage 집계가 포함됩니다.
 - **호스트 재연결 감지** — 프론트 도어와 daemon 버전이 어긋나면 `staleFrontDoor`로 알립니다. 위의 [호스트 재연결 절차](#호스트-재연결-절차)를 따르세요.
+
+### 호환성 참고
+
+- 인자 없는 `task_list`와 Inbox list, 기본 `current` poll 응답 형태는 1.3.2 공개 계약을 유지합니다. compact·diagnostic profile, pagination과 summary는 opt-in입니다.
+- raw message/thought chunk는 보존형 poll history가 아니라 live subscription 전용입니다. 재연결 후 과거 chunk replay가 필요한 consumer는 자체 저장 계층이 필요합니다.
+- 큰 Inbox payload는 메모리에 전문을 중복 보관하지 않고 preview와 artifact pointer를 반환합니다.
+- 새 resource budget을 넘는 요청은 무제한으로 수용하는 대신 안정적인 error code로 거부됩니다. 기존에 상한을 초과하던 workload는 setup의 `limits`를 확인해 설정을 조정해야 합니다.
+- State v5를 사용한 뒤 1.3.2로 rollback하면 병행 기록된 legacy v4 상태를 읽습니다. downgrade 감지 alert를 확인한 뒤 다시 1.4.0으로 복귀하세요.
 
 ## v1.3.2 변경 사항
 
