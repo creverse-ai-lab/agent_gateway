@@ -172,10 +172,9 @@ export class NdjsonChannel {
     if (flushMs > 0 && !this.#idle()) {
       await Promise.race([
         this.whenFlushed().catch(() => {}),
-        new Promise((resolve) => {
-          const timer = setTimeout(resolve, flushMs);
-          timer.unref?.();
-        })
+        // Keep this timer referenced: close() is awaited, and an unref'd
+        // timeout lets Node end the test run while the flush is still pending.
+        new Promise((resolve) => setTimeout(resolve, flushMs))
       ]);
     }
     this.#teardown(new GatewayError(ERROR_CODES.TRANSPORT_CLOSED, "Transport is closed"));
