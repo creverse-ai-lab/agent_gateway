@@ -26,9 +26,11 @@ const OTHER = { rootId: "main-b" };
 // Seeded fixtures are dated from process start so their TTL has not elapsed
 // against the real clock the un-mocked services in this file use.
 const SEED_EPOCH = Date.now();
+// GOLDEN DIFF (1.4.0 PR 7, H6): origin joins publicTask, so tasks/list stays
+// legible now that agent_acp_run mints handles too.
 const TASK_KEYS = [
   "taskId", "sessionId", "turnId", "status", "ttl", "pollInterval", "createdAt", "lastUpdatedAt",
-  "statusMessage"
+  "statusMessage", "origin"
 ].sort();
 
 test("conformance: TTL is measured from createdAt and status touches cannot extend it", async () => {

@@ -42,7 +42,11 @@ test("exported terminal statuses match the gateway wire contract", () => {
   assert.deepEqual([...TERMINAL_TASK_STATUSES].sort(), ["cancelled", "completed", "failed"]);
 });
 
-test("create returns the legacy task record shape", () => {
+// GOLDEN DIFF (1.4.0 PR 7, H6): the record grows `origin`. It is stored rather
+// than derived because after a restart there is nothing left to derive it from,
+// and it defaults to "prompt" both for a caller that omits it and for a snapshot
+// written before the field existed.
+test("create returns the legacy task record shape plus its origin", () => {
   const { store } = makeStore();
   const task = store.create({ sessionId: "session-1", ownerRootId: "rootA", turnId: "turn-1" });
   assert.deepEqual(Object.keys(task), [
@@ -56,8 +60,10 @@ test("create returns the legacy task record shape", () => {
     "createdAt",
     "lastUpdatedAt",
     "statusMessage",
+    "origin",
     "result"
   ]);
+  assert.equal(task.origin, "prompt");
   assert.match(task.taskId, /^task-[0-9a-f-]{36}$/);
   assert.equal(task.status, "working");
   assert.equal(task.statusMessage, "Prompt accepted");
@@ -67,6 +73,17 @@ test("create returns the legacy task record shape", () => {
   assert.equal(task.lastUpdatedAt, iso(0));
   assert.equal(task.result, null);
   assert.equal(store.size, 1);
+
+  const other = makeStore().store;
+  assert.equal(other.create({ sessionId: "s", ownerRootId: "rootA", origin: "run" }).origin, "run");
+  const keyed = other.create({
+    sessionId: "s", ownerRootId: "rootA", origin: "run", idempotencyKey: "durable-key"
+  });
+  assert.equal(keyed.idempotencyKey, "durable-key");
+  assert.throws(
+    () => other.create({ sessionId: "s", ownerRootId: "rootA", origin: "sneaky" }),
+    /origin must be one of/
+  );
 });
 
 test("create validates its arguments", () => {
@@ -75,6 +92,14 @@ test("create validates its arguments", () => {
   assert.throws(() => store.create({ sessionId: "session-1" }), assertCode("INVALID_ARGUMENT"));
   assert.throws(() => store.create({ sessionId: "session-1", ownerRootId: "  " }), assertCode("INVALID_ARGUMENT"));
   assert.throws(() => store.create({ sessionId: "session-1", ownerRootId: "rootA", turnId: 7 }), assertCode("INVALID_ARGUMENT"));
+  assert.throws(
+    () => store.create({ sessionId: "session-1", ownerRootId: "rootA", origin: "run", idempotencyKey: "" }),
+    assertCode("INVALID_ARGUMENT")
+  );
+  assert.throws(
+    () => store.create({ sessionId: "session-1", ownerRootId: "rootA", origin: "run", idempotencyKey: "x".repeat(257) }),
+    assertCode("INVALID_ARGUMENT")
+  );
 });
 
 test("ttl expiry is keyed off createdAt, never lastUpdatedAt", () => {

@@ -32,13 +32,33 @@ export const FLOW_NAMES = Object.freeze([
   "idle_poll_result",
   "setup_no_provider",
   "inbox_list_one_permission",
-  "task_get"
+  "task_get",
+  // 1.4.0 PR 7. The first six keep taking zero arguments so their numbers stay
+  // comparable across releases; these five are what the new arguments cost or
+  // save on exactly the same fixtures.
+  "compact_poll",
+  "compact_poll_permission",
+  "setup_summary",
+  "run_terminal",
+  "inbox_summary_spilled"
 ]);
 
 const NOTES = Object.freeze([
   "Sizes are Buffer.byteLength(JSON.stringify(response)) for one call.",
-  "setup_no_provider depends on locally detected providers and home path length."
+  "setup_no_provider depends on locally detected providers and home path length.",
+  "setup_summary is machine-independent: the detected-provider block is what makes setup_no_provider vary.",
+  "run_terminal is the full CallToolResult (content + structuredContent + isError), so it measures the duplication cost the 1.5.0 discussion needs."
 ]);
+
+// The front door sends content and structuredContent for the same object. This
+// is that envelope, measured rather than argued about.
+function toolResultBytes(data) {
+  return payloadBytes({
+    content: [{ type: "text", text: JSON.stringify(data) }],
+    structuredContent: data,
+    isError: data.ok === false
+  });
+}
 
 export async function measurePayloads() {
   const artifactRoot = await mkdtemp(join(tmpdir(), "acp-bench-artifacts-"));
@@ -70,6 +90,9 @@ export async function measurePayloads() {
       measured.empty_active_poll = payloadBytes(
         await fabricated.call("poll", { sessionId: session.id, cursor: 0 }, MAIN)
       );
+      measured.compact_poll = payloadBytes(
+        await fabricated.call("poll", { sessionId: session.id, cursor: 0, responseProfile: "compact" }, MAIN)
+      );
       fabricated.handleUpdate(session, {
         sessionUpdate: "permission_request",
         requestId: 1,
@@ -82,8 +105,28 @@ export async function measurePayloads() {
       measured.active_poll_permission = payloadBytes(
         await fabricated.call("poll", { sessionId: session.id, cursor: 0 }, MAIN)
       );
+      measured.compact_poll_permission = payloadBytes(
+        await fabricated.call("poll", { sessionId: session.id, cursor: 0, responseProfile: "compact" }, MAIN)
+      );
       measured.inbox_list_one_permission = payloadBytes(
         await fabricated.call("inbox", { action: "list" }, MAIN)
+      );
+      // A row whose tool call overflowed the payload cap: 1.3.2 inlined the whole
+      // thing, PR 5 replaced it with a pointer, and summary drops the fields a
+      // list view never reads.
+      //
+      // The clock has to move first. Inbox order is (createdAt DESC, inboxId
+      // DESC), and the tiebreaker is a random UUID: with a frozen clock the two
+      // rows tie and the "newest" one alternates between runs.
+      clock += 1_000;
+      fabricated.handleUpdate(session, {
+        sessionUpdate: "permission_request",
+        requestId: 2,
+        toolCall: { toolCallId: "tool-bench-3", title: "Edit file", kind: "edit", rawInput: "r".repeat(10_000) },
+        options: [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }]
+      });
+      measured.inbox_summary_spilled = payloadBytes(
+        await fabricated.call("inbox", { action: "list", limit: 1, detail: "summary" }, MAIN)
       );
     } finally {
       await fabricated.shutdown().catch(() => {});
@@ -115,6 +158,10 @@ export async function measurePayloads() {
         await live.call("poll", { sessionId: opened.sessionId, cursor: 0 }, MAIN)
       );
       measured.task_get = payloadBytes(await live.call("task_get", { taskId: task.taskId }, MAIN));
+      // One whole delegated turn as the model actually receives it.
+      measured.run_terminal = toolResultBytes(
+        await live.call("run", { sessionId: opened.sessionId, prompt: "narrated-result", waitMs: 15_000 }, MAIN)
+      );
     } finally {
       await live.shutdown().catch(() => {});
     }
@@ -123,6 +170,7 @@ export async function measurePayloads() {
     const fresh = new GatewayService({ gcIntervalMs: 0, artifactRoot, now });
     try {
       measured.setup_no_provider = payloadBytes(await fresh.call("setup", {}, MAIN));
+      measured.setup_summary = payloadBytes(await fresh.call("setup", { mode: "summary" }, MAIN));
     } finally {
       await fresh.shutdown().catch(() => {});
     }
