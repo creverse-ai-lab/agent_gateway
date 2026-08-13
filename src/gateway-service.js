@@ -424,11 +424,19 @@ export class GatewayService {
   }
 
   registerSession(fields) {
-    if (!fields.acpSessionId) throw new Error("ACP session operation returned no sessionId");
+    if (!fields.acpSessionId) {
+      throw new GatewayError(ERROR_CODES.GATEWAY_ERROR, "ACP session operation returned no sessionId");
+    }
     const duplicate = this.store
       .list()
       .find((item) => item.provider === fields.provider && item.acpSessionId === fields.acpSessionId);
-    if (duplicate) throw new Error(`ACP session is already registered as ${duplicate.id}`);
+    if (duplicate) {
+      throw new GatewayError(
+        ERROR_CODES.INVALID_ARGUMENT,
+        `ACP session is already registered as ${duplicate.id}`,
+        { sessionId: duplicate.id, acpSessionId: fields.acpSessionId }
+      );
+    }
     const session = this.store.create({
       provider: fields.provider,
       client: fields.client,
@@ -480,7 +488,10 @@ export class GatewayService {
       } else {
         const modelOption = findModelOption(configOptions);
         if (!modelOption) {
-          throw new Error(`ACP agent does not advertise a model config option; requested model=${requestedModel}`);
+          throw new GatewayError(
+            ERROR_CODES.INVALID_ARGUMENT,
+            `ACP agent does not advertise a model config option; requested model=${requestedModel}`
+          );
         }
         const changed = await client.setSessionConfigOption({
           sessionId,
@@ -522,7 +533,10 @@ export class GatewayService {
     }
     const value = validateSessionConfigValue(option, args.value);
     if (isModelOption(option) && session.client.config.modelScope === "process" && value !== session.model) {
-      throw new Error(`Provider ${session.provider} selects model per process; open a new session with model=${value}`);
+      throw new GatewayError(
+        ERROR_CODES.INVALID_ARGUMENT,
+        `Provider ${session.provider} selects model per process; open a new session with model=${value}`
+      );
     }
     const response = await session.client.setSessionConfigOption({
       sessionId: session.acpSessionId,
@@ -564,7 +578,10 @@ export class GatewayService {
       const requestedModel = optionalString(args.model, "model");
       if (requestedModel && requestedModel !== session.model) {
         if (session.client.config.modelScope === "process") {
-          throw new Error(`Provider ${session.provider} selects model per process; open a new session with model=${requestedModel}`);
+          throw new GatewayError(
+            ERROR_CODES.INVALID_ARGUMENT,
+            `Provider ${session.provider} selects model per process; open a new session with model=${requestedModel}`
+          );
         }
         const configured = await this.configureSessionModel(
           session.client,
@@ -1062,14 +1079,21 @@ export class GatewayService {
       const actualModel = currentModelId(client.initResult);
       if (config.expectedModel && actualModel !== config.expectedModel) {
         await client.stop();
-        throw new Error(`required model=${config.expectedModel}, actual=${actualModel || "<missing>"}`);
+        throw new GatewayError(
+          ERROR_CODES.INVALID_ARGUMENT,
+          `required model=${config.expectedModel}, actual=${actualModel || "<missing>"}`
+        );
       }
       this.clients.set(clientKey, client);
       return client;
     } catch (error) {
       if (this.clients.get(clientKey) === client) this.clients.delete(clientKey);
       await client.stop().catch(() => {});
-      throw new Error(`${provider} ACP setup failed: ${error?.message ?? error}; ${(client.stderr ?? "").slice(-1000)}`);
+      if (error instanceof GatewayError) throw error;
+      throw new GatewayError(
+        ERROR_CODES.GATEWAY_ERROR,
+        `${provider} ACP setup failed: ${error?.message ?? error}; ${(client.stderr ?? "").slice(-1000)}`
+      );
     }
   }
 
@@ -1442,7 +1466,10 @@ function sanitizeWorkerMcpServers(servers) {
     const serialized = JSON.stringify(server);
     const name = String(server?.name ?? server?.id ?? "");
     if (/^(?:agent-acp|agent-acp-control)$/i.test(name) || CONTROL_SERVER_PATTERN.test(serialized)) {
-      throw new Error("Control MCP/Gateway cannot be injected into a worker session");
+      throw new GatewayError(
+        ERROR_CODES.INVALID_ARGUMENT,
+        "Control MCP/Gateway cannot be injected into a worker session"
+      );
     }
     return server;
   });
@@ -1523,12 +1550,16 @@ function restoreMethod(initResult, requested) {
   const capabilities = initResult?.agentCapabilities ?? {};
   const canResume = Boolean(capabilities.sessionCapabilities?.resume);
   const canLoad = capabilities.loadSession === true;
-  if (requested === "resume" && !canResume) throw new Error("ACP agent does not support session/resume");
-  if (requested === "load" && !canLoad) throw new Error("ACP agent does not support session/load");
+  if (requested === "resume" && !canResume) {
+    throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "ACP agent does not support session/resume");
+  }
+  if (requested === "load" && !canLoad) {
+    throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "ACP agent does not support session/load");
+  }
   if (requested === "resume" || requested === "load") return requested;
   if (canResume) return "resume";
   if (canLoad) return "load";
-  throw new Error("ACP agent does not support session restore");
+  throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "ACP agent does not support session restore");
 }
 
 function canRestoreSession(initResult) {

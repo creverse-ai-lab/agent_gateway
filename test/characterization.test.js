@@ -330,6 +330,9 @@ test("characterization: structured errors retain optional details", () => {
     }
   );
   assert.deepEqual(errorEnvelope(new Error("plain failure")), { error: "plain failure" });
+  const nodeish = new Error("no such file or directory");
+  nodeish.code = "ENOENT";
+  assert.deepEqual(errorEnvelope(nodeish), { error: "no such file or directory" });
 });
 
 test("characterization: the socket error envelope carries a stable error code and details", async () => {
@@ -351,6 +354,19 @@ test("characterization: the socket error envelope carries a stable error code an
       assert.deepEqual(error.details, { method: "nope" });
       return true;
     });
+
+    await assert.rejects(
+      main.call("session_open", {
+        provider: "claude",
+        cwd: "/definitely-missing-acp-gateway-dir",
+        permissionPolicy: "read_only"
+      }),
+      (error) => {
+        assert.match(error.message, /ENOENT|no such file|Not a directory/i);
+        assert.equal(error.code, undefined, "Node codes must not become wire errorCode");
+        return true;
+      }
+    );
 
     wrong = new GatewayRpcClient({
       socketPath: daemon.socketPath,

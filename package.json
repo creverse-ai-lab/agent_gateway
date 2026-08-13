@@ -26,7 +26,7 @@
     "bench:payload": "node scripts/bench-payload.js",
     "smoke": "node test/live-smoke.js",
     "smoke:subagents": "node test/live-subagent-smoke.js",
-    "ci": "node scripts/ci-check.js && node scripts/acp-upstream-monitor.js --validate && npm test",
+    "ci": "node scripts/ci-check.js && node scripts/acp-upstream-monitor.js --validate && npm test && node scripts/bench-payload.js",
     "monitor:check": "node scripts/acp-upstream-monitor.js",
     "monitor:update": "node scripts/acp-upstream-monitor.js --update",
     "monitor:sync-dependencies": "node scripts/sync-acp-dependencies.js",

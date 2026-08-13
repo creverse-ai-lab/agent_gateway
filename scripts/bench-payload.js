@@ -194,6 +194,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   } catch (error) {
     process.stdout.write(`${JSON.stringify({ error: error?.message ?? String(error) }, null, 2)}\n`);
+    process.exit(1);
   }
   process.exit(0);
 }

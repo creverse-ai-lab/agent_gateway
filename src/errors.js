@@ -36,12 +36,16 @@ export class GatewayError extends Error {
   }
 }
 
-// Keep the legacy wire field names while preserving optional structured
-// context for callers that can make use of it.
+export function isGatewayErrorCode(code) {
+  return typeof code === "string" && Object.hasOwn(ERROR_CODES, code);
+}
+
+// Keep the legacy wire field names. Only registry codes become errorCode —
+// Node codes like ENOENT must not look like a Gateway contract.
 export function errorEnvelope(error) {
   return {
     error: error?.message ?? String(error),
-    ...(typeof error?.code === "string" && error.code ? { errorCode: error.code } : {}),
+    ...(isGatewayErrorCode(error?.code) ? { errorCode: error.code } : {}),
     ...(error != null && Object.hasOwn(error, "details") ? { details: error.details } : {})
   };
 }
