@@ -57,7 +57,7 @@ jobs:
             --sha256 "dist/one/$ASSET.sha256" \
             --build-record "dist/one/$ASSET.build-record.json"
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/one/acp-gateway-runtime-darwin-arm64.tar.gz
       - name: Verify GitHub build provenance
