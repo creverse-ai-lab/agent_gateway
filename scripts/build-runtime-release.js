@@ -32,12 +32,12 @@ function run(command, args, options = {}) {
   return execFileSync(command, args, { cwd: repositoryRoot, stdio: options.capture ? "pipe" : "inherit", encoding: "utf8" });
 }
 
-const sourceTag = option("--source-tag", "v1.4.0");
+const sourceTag = option("--source-tag", "v1.5.0");
 const outputDirectory = resolve(option("--output-dir", join(repositoryRoot, "dist")));
 const allowDirty = arguments_.includes("--allow-dirty");
 const sourceCommit = run("git", ["rev-parse", `${sourceTag}^{commit}`], { capture: true }).trim();
 const builderCommit = run("git", ["rev-parse", "HEAD"], { capture: true }).trim();
-assertPinnedSourceCommit(sourceTag, sourceCommit);
+assertPinnedSourceCommit(sourceTag, sourceCommit, option("--source-commit", undefined));
 assertBuilderCommit(builderCommit);
 const dirty = run("git", ["status", "--porcelain"], { capture: true }).trim();
 if (dirty && !allowDirty) throw new Error("Refusing a release build from a dirty builder checkout; commit or pass --allow-dirty for local validation");
@@ -50,14 +50,14 @@ try {
   const sourceArchive = join(temporary, "source.tar");
   run("git", [
     "archive", "--format=tar", `--output=${sourceArchive}`, sourceCommit, "--",
-    "src", "skills", "package.json", "package-lock.json"
+    "src", "skills", "package.json", "package-lock.json", ...(sourceTag === "v1.4.0" ? [] : ["gateway-client"])
   ]);
   execFileSync("tar", ["-xf", sourceArchive, "-C", runtimeRoot], { stdio: "inherit" });
-  await cp(join(repositoryRoot, "gateway-client"), join(runtimeRoot, "gateway-client"), { recursive: true });
+  if (sourceTag === "v1.4.0") await cp(join(repositoryRoot, "gateway-client"), join(runtimeRoot, "gateway-client"), { recursive: true });
 
   const packagePath = join(runtimeRoot, "package.json");
   const packageDocument = JSON.parse(await readFile(packagePath, "utf8"));
-  assert.equal(packageDocument.version, "1.4.0", "the v1.4.0 runtime builder only accepts package version 1.4.0");
+  assert.equal(`v${packageDocument.version}`, sourceTag, "source tag and package version must agree");
   packageDocument.files = ["src/", "gateway-client/", "skills/"];
   packageDocument.exports = { ".": "./gateway-client/index.js", "./client": "./gateway-client/index.js" };
   packageDocument.scripts = Object.fromEntries(

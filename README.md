@@ -1,4 +1,4 @@
-# ACP Gateway v1.4.0
+# ACP Gateway v1.5.0
 
 혹시 여러 AI 에이전트를 쓰고 계신가요?
 
@@ -216,7 +216,7 @@ Control token, 오케스트레이터 식별자(Main ID)와 Gateway socket 경로
 ### 세션과 데이터
 
 - 상태 파일(schema v5): `~/.acp-gateway/state.snapshot.json`(전체 상태) + `~/.acp-gateway/state.wal.ndjson`(control 전이 로그)
-- `~/.acp-gateway/state.json`은 v4 형식으로 계속 기록됩니다 — 구 Gateway로 롤백해도 세션이 복구되도록 두는 다운그레이드 보험이며 1.5.0에서 제거 예정
+- `~/.acp-gateway/state.json`은 v4 형식으로 계속 기록됩니다. 구 Gateway로 명시적으로 롤백할 수 있도록 1.5.x에서도 유지합니다.
 - idle resumable 세션은 기본 30분 후 unload
 - 결과와 이벤트는 기본 24시간 보존
 - session resume checkpoint는 기본 7일 보존, Task 핸들의 바이트는 기본 24시간 보존(`ACP_GATEWAY_TASK_RETENTION_MS`)
@@ -313,6 +313,54 @@ flowchart LR
 5. **권한·질문 처리** — Worker의 permission 요청이나 질문은 Gateway Inbox를 거쳐 오케스트레이터에게 전달되고, 그 응답이 다시 Worker로 돌아갑니다.
 6. **결과 회수·재사용** — 오케스트레이터는 MCP Task 또는 poll로 상태와 결과를 받고, 필요하면 같은 세션을 다시 호출하거나 복구합니다.
 
+## v1.5.0 변경 사항
+
+**Gateway가 엔진과 실행 정책을 소유하고, AgenLynk 등 앱과 CLI는 공개 API를 소비합니다.** 소비자가 설정 파일을 직접 쓰거나 provider 실행 차단·보존·안전 종료 정책을 별도로 구현하지 않아도 되도록 관리 계약을 추가했습니다.
+
+- **Observer 역할:** `GatewayRpcClient({access: "observer"})`는 서버가 읽기 전용 method를 집행합니다. 모니터 연결은 Main의 owner presence를 유지하지 않으며, 설정 조회 때문에 Worker를 복구하지 않습니다. 동일 Control token의 역할 제한이며 독립적인 observer credential을 제공하는 것은 아닙니다.
+- **Provider 정책:** `provider`의 `list`, `set_enabled`, `install`을 제공합니다. Off는 Gateway가 새 세션·새 restore 등록 단계에서 거부합니다(`PROVIDER_DISABLED`). 이미 등록된 세션은 계속 수행·복구할 수 있습니다. 설치는 기존 Gateway installer를 사용하고 기본적으로 dry-run입니다.
+- **엔진 설정:** `gateway_config`로 지원 옵션·활성값·저장값·revision·재시작 필요 여부를 조회하고 갱신합니다. `expectedRevision`이 낡았으면 `CONFIG_CONFLICT`로 거부합니다. `~/.acp-gateway/settings.json`이 엔진 설정의 기준이며, 해당 파일이 없으면 기존 `install.json`의 지원 설정을 읽고 최초 변경 시 migration합니다. 환경변수는 가장 우선합니다.
+- **안전 종료:** `shutdown_if_idle`과 기본 `daemon_shutdown`은 작업·Inbox·세션 생성/복구·관리 요청·background update가 남으면 `SHUTDOWN_BLOCKED`와 blockers를 반환합니다. 통과하면 새 mutation을 막고 종료합니다. 강제 종료는 명시적인 `daemon_shutdown {force:true}` 또는 OS signal입니다.
+- **정직한 replay:** live-only message/thought 유실 및 daemon 재시작 뒤 이력 단절을 subscription의 `cursorTruncated`와 새 `replay` 메타데이터로 알립니다. 실시간 연결 회복이 과거 메시지 복구를 뜻하지 않습니다. 완료 Task 결과는 `task_result`로 별도로 회수합니다.
+- **보존 미리보기:** `retention_preview`는 실제 GC와 공유하는 판정으로 세션·Task·Inbox·결과의 정리 예상 건수를 반환합니다. 진행 중 Task는 보존 기간만으로 지우지 않습니다. preview는 조회 시점의 advisory이며, 참조 보호가 적용되는 artifact의 정확한 삭제 건수를 추정하지 않습니다.
+- **오류 경로:** 취소된 `run` 대기의 waiter를 즉시 회수하고, 잘못된 cursor의 subscribe를 등록 전에 거부합니다. root당 구독 수는 64개로 제한합니다. 세션 생성 예산은 Worker 호출 전 예약합니다.
+- **실행본 식별:** full setup에 `gatewayBuildId`(실행 시점 src 파일 SHA-256), `runtimeRoot`, `instanceId`, `sourceCommit`(release manifest가 있는 경우), 적용 `configRevision`, 관리 `capabilities`를 제공합니다.
+- **의존성:** fast-uri, ip-address, hono, qs의 보안 수정 버전을 lockfile에 반영했습니다.
+
+기존 API major **1**, state schema **5**, public client 4개 export는 유지합니다. State v4 병행 기록도 1.5.x에서 계속 유지해 명시적 rollback을 지원합니다. `daemon_shutdown` 기본 거부 조건과 subscription truncation 의미의 보강은 소비자가 확인해야 하는 동작 변경입니다. 기존 AgenLynk는 새 관리 API를 호출하고 capability를 소비하도록 별도 업데이트해야 합니다. 엔진 업그레이드만으로 앱의 자체 설정 쓰기·501 endpoint가 바뀌지는 않습니다.
+
+`artifactSessionLimit`, `workerThoughtStream`, `workerSubagentTranscript`는 1.5.0 엔진 지원 설정이 아닙니다. Legacy 값은 `unsupportedLegacySettings`로 보고하며 적용된 것처럼 표시하지 않습니다. Monitor/Pet/화면 설정은 소비자 책임입니다.
+
+### 공개 관리 API와 CLI
+
+정확한 요청·응답, 소유권과 migration 절차는 [관리 API 계약](docs/management-api.md)을 참고하세요. 관리 CLI도 같은 `acp-gateway/client` RPC를 사용하며 이미 실행 중인 daemon에 연결합니다.
+
+```bash
+acp-gateway-admin setup
+acp-gateway-admin gateway_config
+acp-gateway-admin gateway_config '{"action":"set","expectedRevision":0,"values":{"idleUnloadMs":1800000}}'
+acp-gateway-admin provider '{"action":"set_enabled","provider":"claude","enabled":false}'
+acp-gateway-admin provider '{"action":"install","registryId":"claude-acp","dryRun":true}'
+acp-gateway-admin retention_preview '{"values":{"sessionRetentionMs":86400000}}'
+acp-gateway-admin shutdown_if_idle
+```
+
+`expectedRevision`은 예시의 0을 복사하지 말고 직전 조회값을 사용하세요. 설정은 안전 종료 후 새 daemon 시작에 적용됩니다. 재시작·runtime 교체를 수행하는 소비자는 자동 재연결 client를 먼저 닫고, 선택한 runtime으로 새 daemon을 시작한 뒤 setup의 실행본 식별과 적용값을 확인해야 합니다.
+
+### 1.5.0 runtime 빌드
+
+1.5.0 builder는 tag와 별도로 검토한 전체 source SHA를 요구합니다. tag가 해당 SHA와 다르면 빌드와 검증을 거부하며, 새 runtime의 엔진과 public client는 모두 같은 source commit에서 추출합니다. 기존 1.4.0 태그의 고정 SHA 검증은 유지합니다.
+
+```bash
+npm run release:runtime -- --source-tag v1.5.0 --source-commit FULL_REVIEWED_SOURCE_SHA --output-dir dist
+npm run release:verify -- --source-commit FULL_REVIEWED_SOURCE_SHA \
+  --archive dist/acp-gateway-runtime-darwin-arm64.tar.gz \
+  --sha256 dist/acp-gateway-runtime-darwin-arm64.tar.gz.sha256 \
+  --build-record dist/acp-gateway-runtime-darwin-arm64.tar.gz.build-record.json
+```
+
+위 명령은 로컬 산출물을 생성·검증합니다. GitHub Release 업로드와 attestation은 별도의 `Release runtime` workflow로 수행하며 기존 asset은 덮어쓰지 않습니다. 소비자는 게시된 새 asset의 checksum과 source SHA로 자신의 lock을 갱신해야 합니다.
+
 ## v1.4.0 변경 사항
 
 **Durable · Bounded · Quiet** — 재시작 후에도 정확하고, 주요 자원이 명시된 상한 안에 머물며, Main을 불필요하게 깨우지 않는 안정화 릴리스입니다.
@@ -324,15 +372,15 @@ flowchart LR
 | ACP Gateway | `1.4.0` | daemon, Control MCP와 installer의 릴리스 버전 |
 | Gateway Control API | `1` | 공개 control method와 응답 계약. additive 변경에는 올리지 않음 |
 | State schema | `5` | `state.snapshot.json` + checksummed `state.wal.ndjson` |
-| Legacy state schema | `4` | rollback을 위해 병행 기록하며 1.5.0에서 종료 예정 |
+| Legacy state schema | `4` | rollback을 위해 병행 기록하며 1.5.x에서도 rollback 호환을 위해 유지 |
 | Runtime | Node.js `>=22` | macOS와 Linux 지원 |
 | 호환 기준 | `1.3.2` | 인자 없는 핵심 호출의 응답 형태와 기존 method 유지 |
 
 `package.json`, daemon과 Control MCP가 모두 `1.4.0`을 보고해야 정상입니다. `agent_acp_setup`에서는 `gatewayVersion`, `gatewayApiVersion`, `stateSchemaVersion`으로 각각 확인할 수 있습니다. MCP 호스트가 이전 tool schema를 캐시한 경우에는 `staleFrontDoor`가 표시되므로 [호스트 재연결 절차](#호스트-재연결-절차)를 수행하세요.
 
-## 불변 runtime release
+## 1.4.0 불변 runtime release 기록
 
-downstream 앱은 이동하는 branch나 `src/` private subpath 대신 `v1.4.0` Release의 `acp-gateway-runtime-darwin-arm64.tar.gz`와 `acp-gateway/client`만 소비합니다. 공개 client 계약은 `GatewayRpcClient`, `GatewayError`, `ERROR_CODES`, `GATEWAY_API_VERSION` 네 항목이며 다른 package subpath는 `exports` 경계에서 차단됩니다.
+1.4.0 downstream 앱은 이동하는 branch나 `src/` private subpath 대신 `v1.4.0` Release의 `acp-gateway-runtime-darwin-arm64.tar.gz`와 `acp-gateway/client`만 소비합니다. 공개 client 계약은 `GatewayRpcClient`, `GatewayError`, `ERROR_CODES`, `GATEWAY_API_VERSION` 네 항목이며 다른 package subpath는 `exports` 경계에서 차단됩니다.
 
 릴리스 빌더는 고정된 `v1.4.0` 소스 커밋 `a1fdb353777337ca6ec481f8563d77efaea55e95`에 public client와 production dependency를 결합하고, allowlist와 파일별 digest를 담은 `runtime-manifest.json`을 생성합니다. 로컬 산출물 옆에는 SHA-256과 서명되지 않은 build record(`*.build-record.json`)가 생성됩니다. 이 파일은 attestation이 아니며, GitHub Actions 밖에서는 `origin: local`로 표시됩니다. 공식 서명은 GitHub Actions의 `actions/attest-build-provenance`이며, workflow는 게시 전에 `gh attestation verify`로 아카이브를 검증합니다. 이미 올라간 세 asset은 덮어쓰지 않습니다.
 

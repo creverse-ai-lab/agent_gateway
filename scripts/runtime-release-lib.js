@@ -37,14 +37,15 @@ function comparePath(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-export function pinnedSourceCommit(tag) {
-  const commit = PINNED_SOURCE_COMMITS[tag];
+export function pinnedSourceCommit(tag, expectedCommit) {
+  const commit = PINNED_SOURCE_COMMITS[tag] ?? (tag === "v1.5.0" && GIT_COMMIT_PATTERN.test(expectedCommit ?? "") ? expectedCommit : null);
   if (!commit) throw new Error(`No pinned source commit for tag ${tag}`);
   return commit;
 }
 
-export function assertPinnedSourceCommit(tag, commit) {
-  const expected = pinnedSourceCommit(tag);
+export function assertPinnedSourceCommit(tag, commit, expectedCommit) {
+  const expected = pinnedSourceCommit(tag, expectedCommit);
+  if (expectedCommit != null && expectedCommit !== expected) throw new Error("Explicit source commit differs from the historical pin");
   if (commit !== expected) {
     throw new Error(`Tag ${tag} resolved to ${commit}, expected pinned commit ${expected}; refusing a moved tag`);
   }
@@ -85,7 +86,7 @@ export function createUnsignedBuildRecord({
   };
 }
 
-export function assertUnsignedBuildRecord(record, { artifact, digest } = {}) {
+export function assertUnsignedBuildRecord(record, { artifact, digest, expectedSourceCommit } = {}) {
   if (record?.kind !== "unsigned-build-record") {
     throw new Error("release metadata must identify itself as an unsigned build record, not a signed attestation");
   }
@@ -99,7 +100,7 @@ export function assertUnsignedBuildRecord(record, { artifact, digest } = {}) {
   if (digest != null && record.digest?.sha256 !== digest) {
     throw new Error("build record digest does not match");
   }
-  assertPinnedSourceCommit(record.sourceTag, record.sourceCommit);
+  assertPinnedSourceCommit(record.sourceTag, record.sourceCommit, expectedSourceCommit);
   assertBuilderCommit(record.builderCommit);
   if (typeof record.builderDirty !== "boolean") throw new Error("unsigned build record builderDirty must be a boolean");
   if (record.platform !== "darwin" || record.arch !== "arm64") {
@@ -107,10 +108,10 @@ export function assertUnsignedBuildRecord(record, { artifact, digest } = {}) {
   }
 }
 
-export function assertRuntimeManifestMetadata(manifest, { artifactName } = {}) {
+export function assertRuntimeManifestMetadata(manifest, { artifactName, expectedSourceCommit } = {}) {
   if (manifest?.schemaVersion !== 1) throw new Error("runtime-manifest.json schemaVersion must be 1");
   if (manifest.package !== "acp-gateway") throw new Error("runtime-manifest.json package must be acp-gateway");
-  if (manifest.version !== "1.4.0") throw new Error("runtime-manifest.json version must be 1.4.0");
+  if (!["1.4.0", "1.5.0"].includes(manifest.version)) throw new Error("runtime-manifest.json version must be 1.4.0 or 1.5.0");
   if (manifest.apiMajor !== 1) throw new Error("runtime-manifest.json apiMajor must be 1");
   if (manifest.platform !== "darwin" || manifest.arch !== "arm64") {
     throw new Error("runtime-manifest.json platform/arch must be darwin/arm64");
@@ -134,8 +135,8 @@ export function assertRuntimeManifestMetadata(manifest, { artifactName } = {}) {
   if (manifest.source?.repository !== "https://github.com/creverse-ai-lab/agent_gateway.git") {
     throw new Error("runtime-manifest.json source.repository is incorrect");
   }
-  if (manifest.source?.tag !== "v1.4.0") throw new Error("runtime-manifest.json source.tag must be v1.4.0");
-  assertPinnedSourceCommit(manifest.source.tag, manifest.source.commit);
+  if (manifest.source?.tag !== `v${manifest.version}`) throw new Error("runtime-manifest.json source.tag must match its version");
+  assertPinnedSourceCommit(manifest.source.tag, manifest.source.commit, expectedSourceCommit);
   assertBuilderCommit(manifest.builder?.commit);
   if (typeof manifest.builder?.dirty !== "boolean") throw new Error("runtime-manifest.json builder.dirty must be a boolean");
   if (!Array.isArray(manifest.files)) throw new Error("runtime-manifest.json files must be an array");

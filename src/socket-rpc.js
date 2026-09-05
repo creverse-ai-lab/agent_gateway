@@ -1,3 +1,4 @@
+import { requireAccess } from "./access.js";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -41,9 +42,11 @@ export class GatewayRpcClient {
     token = null,
     rootId = null,
     autoStart = true,
+    access = "control",
     // Only used to find the recovery marker a halted daemon left behind.
     statePath = gatewayStatePath()
   } = {}) {
+    this.access = requireAccess(access);
     this.socketPath = socketPath;
     this.statePath = statePath;
     this.token = token;
@@ -197,7 +200,7 @@ export class GatewayRpcClient {
             method: "request_cancel",
             args: { requestId: id },
             token: this.token,
-            rootId: this.rootId
+            rootId: this.rootId, access: this.access
           });
         } catch {
           // The original wait is already being rejected. Channel fatal handling
@@ -214,7 +217,7 @@ export class GatewayRpcClient {
       // will ever arrive for.
       this.channel.write(
         HIGH_LANE_METHODS.has(method) ? LANE_HIGH : LANE_NORMAL,
-        { id, method, args, token: this.token, rootId: this.rootId }
+        { id, method, args, token: this.token, rootId: this.rootId, access: this.access }
       );
       const timer = setTimeout(() => {
         this.pending.delete(id);

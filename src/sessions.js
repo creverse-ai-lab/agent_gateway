@@ -408,6 +408,8 @@ export class SessionStore {
   // fragment would recreate the noisy ring under another name.
   publishChunk(session, event) {
     const stored = { i: session.eventSequence++, ts: new Date().toISOString(), turnId: session.turnId, ...event };
+    if (event.type === "agent_thought_chunk") session.lastThoughtSequence = stored.i;
+    else session.lastMessageSequence = stored.i;
     session.updatedAt = new Date().toISOString();
     this.onEvent?.(session, stored);
     return stored;
@@ -484,6 +486,9 @@ export class SessionStore {
       lastOwnerActivityAt: session.lastOwnerActivityAt ?? session.updatedAt,
       transientClearedAt: session.transientClearedAt ?? null,
       eventSequence: session.eventSequence,
+      lastMessageSequence: session.lastMessageSequence ?? -1,
+      lastThoughtSequence: session.lastThoughtSequence ?? -1,
+      eventsEvictedThrough: session.eventsEvictedThrough ?? -1,
       turnId: session.turnId ?? null,
       stopReason: session.stopReason ?? null,
       // Additive: a capture policy chosen per session must survive a restart, or

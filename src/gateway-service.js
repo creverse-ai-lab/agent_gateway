@@ -6,7 +6,7 @@ import { AcpClient, PERMISSION_POLICIES, requirePermissionPolicy } from "./acp-c
 import { ArtifactStore, defaultArtifactRoot } from "./artifacts.js";
 import { utf8ByteHead } from "./bounded-utf8.js";
 import { ERROR_CODES, GatewayError } from "./errors.js";
-import { currentModelId, detectProviders, providerConfig } from "./providers.js";
+import { assertProviderEnabled, currentModelId, detectProviders, providerConfig, setProviderEnabled } from "./providers.js";
 import {
   capPendingOptions, compareInboxDesc, decodeInboxCursor, encodeInboxCursor, isAfterInboxCursor,
   projectInboxItem, projectPoll, projectResult, PROFILES, relevantAlerts, requireInboxDetail,
@@ -19,6 +19,10 @@ import {
 import { crashAfter, StateStore, WAL_TYPES } from "./state-store.js";
 import { TaskStore, TERMINAL_TASK_STATUSES } from "./task-store.js";
 import { GATEWAY_API_VERSION, GATEWAY_VERSION, LEGACY_STATE_SCHEMA_VERSION, STATE_SCHEMA_VERSION } from "./version.js";
+
+import { authorizeCall, isReadOnlyCall } from "./access.js";
+import { MANAGEMENT_CAPABILITIES, RUNTIME_IDENTITY } from "./runtime-identity.js";
+import { validateSetting } from "./settings.js";
 
 const ACTIVE_STATUSES = new Set(["running", "waiting_permission", "waiting_input", "cancelling", "restoring"]);
 // The only legal status moves. Every assignment goes through #setStatus, so a
@@ -70,6 +74,7 @@ export { DURABLE_EVENT_TYPES } from "./sessions.js";
 export class GatewayService {
   constructor({
     statePath,
+    settings = null,
     maxEvents = 200,
     maxTextBytes = 1_000_000,
     maxInlineResultBytes = 64 * 1024,
@@ -110,6 +115,10 @@ export class GatewayService {
     agentUpdateManager = null,
     now = () => Date.now()
   } = {}) {
+    this.settings = settings;
+    this.draining = false;
+    this.inflightMutations = 0;
+    this.pendingSessions = new Map();
     this.observability = { thoughtCapture: normalizeThoughtCapture(thoughtCapture) };
     this.statePath = statePath;
     this.clients = new Map();
@@ -232,6 +241,7 @@ export class GatewayService {
         client: null,
         waiters: new Set(),
         events: [],
+        eventsEvictedThrough: Math.max(record.eventsEvictedThrough ?? -1, (record.eventSequence ?? 0) - 1),
         resultText: "",
         thoughtText: "",
         // A checkpoint written before this field existed restores on the current
@@ -359,9 +369,18 @@ export class GatewayService {
   }
 
   async call(method, args = {}, context = {}) {
-    this.touchOwnerActivity(args, context);
+    if (!args || typeof args !== "object" || Array.isArray(args)) {
+      throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "Gateway arguments must be an object");
+    }
+    authorizeCall(method, args, context);
+    const mutating = !isReadOnlyCall(method, args);
+    if (this.draining && mutating) throw new GatewayError(ERROR_CODES.GATEWAY_DRAINING, "Gateway is draining");
+    if (context.access !== "observer") this.touchOwnerActivity(args, context);
     const handlers = {
       setup: () => this.setup(args),
+      gateway_config: () => this.gatewayConfig(args),
+      provider: () => this.providerManage(args),
+      retention_preview: () => this.retentionPreview(args, context),
       session_open: () => this.sessionOpen(args, context),
       session_restore: () => this.sessionRestore(args, context),
       config: () => this.sessionConfig(args, context),
@@ -382,18 +401,77 @@ export class GatewayService {
       task_cancel: () => this.taskCancel(args, context),
       inbox: () => this.inboxManage(args, context)
     };
-    const handler = handlers[method];
+    const handler = Object.hasOwn(handlers, method) ? handlers[method] : null;
     if (!handler) {
       throw new GatewayError(ERROR_CODES.UNKNOWN_METHOD, `Unknown gateway method: ${method}`, { method });
     }
-    return handler();
+    if (mutating) this.inflightMutations += 1;
+    try { return await handler(); }
+    finally { if (mutating) this.inflightMutations -= 1; }
+  }
+
+  gatewayConfig(args = {}) {
+    if (!this.settings) throw new GatewayError(ERROR_CODES.CONFIG_INVALID, "Settings are unavailable for an embedded service without an explicit settings store");
+    const action = args.action ?? "get";
+    if (action === "get") return this.settings.snapshot();
+    if (action === "set") return this.settings.update(args);
+    if (action === "reset") return this.settings.update({ expectedRevision: args.expectedRevision, resetIds: args.ids ?? [] });
+    throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `Unknown gateway_config action: ${action}`);
+  }
+
+  async providerManage(args = {}) {
+    const action = args.action ?? "list";
+    if (action === "list") return { ok: true, providers: await detectProviders() };
+    if (action === "set_enabled") return setProviderEnabled(args.provider, args.enabled);
+    if (action === "install") {
+      if (typeof args.registryId !== "string" || !/^[a-z0-9][a-z0-9._-]*$/.test(args.registryId)
+        || (args.dryRun != null && typeof args.dryRun !== "boolean")) throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "registryId and boolean dryRun required");
+      const { parseInstallerArgs, runInstaller } = await import("./installer.js");
+      const options = parseInstallerArgs(["--install-adapters", "--registry-agent", args.registryId, "--skip-health-check"]);
+      options.registryAgentsOnly = true;
+      options.dryRun = args.dryRun !== false;
+      return runInstaller(options);
+    }
+    throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `Unknown provider action: ${action}`);
+  }
+
+  shutdownBlockers() {
+    return {
+      activeSessions: this.store.list().filter(s => ACTIVE_STATUSES.has(s.status) || s._reserved || s._queue?.depth).length,
+      activeTasks: [...this.taskStore.records.values()].filter(t => !TERMINAL_TASK_STATUSES.has(t.status)).length,
+      pendingInbox: [...this.inbox.values()].filter(i => i.status === "pending").length,
+      inflightMutations: this.inflightMutations,
+      pendingSessions: [...this.pendingSessions.values()].reduce((total, count) => total + count, 0),
+      providerStarts: this.clientStarts.size,
+      maintenance: this.maintenanceRunning ? 1 : 0,
+      agentUpdate: this.agentUpdateManager?.running ? 1 : 0
+    };
+  }
+
+  prepareShutdown({ force = false } = {}) {
+    if (typeof force !== "boolean") throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "force must be boolean");
+    if (this.draining) throw new GatewayError(ERROR_CODES.GATEWAY_DRAINING, "Gateway is already draining");
+    this.draining = true;
+    const blockers = this.shutdownBlockers();
+    if (!force && Object.values(blockers).some(Boolean)) {
+      this.draining = false;
+      throw new GatewayError(ERROR_CODES.SHUTDOWN_BLOCKED, "Gateway has active work", { blockers });
+    }
+    return { ok: true, draining: true, blockers };
   }
 
   subscribe(args = {}, context = {}, emit) {
+    if (!args || typeof args !== "object" || Array.isArray(args)) {
+      throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "Subscription arguments must be an object");
+    }
     if (typeof emit !== "function") {
       throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "Subscription emitter is required");
     }
+    authorizeCall("subscribe", args, context);
     const rootId = requireRoot(context);
+    if ([...this.subscriptions.values()].filter(s => s.rootId === rootId).length >= 64) {
+      throw new GatewayError(ERROR_CODES.SUBSCRIPTION_LIMIT_EXCEEDED, "At most 64 subscriptions per root");
+    }
     const requested = args.sessionIds;
     if (requested != null && !Array.isArray(requested)) {
       throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "sessionIds must be an array");
@@ -401,7 +479,7 @@ export class GatewayService {
     const sessions = requested == null
       ? this.store.list().filter((session) => session.ownerRootId === rootId)
       : requested.map((id) => requireOwnedSession(this.requireSession(id), context));
-    for (const session of sessions) this.touchSessionOwner(session);
+    if (context.access !== "observer") for (const session of sessions) this.touchSessionOwner(session);
     const cursors = args.cursors ?? {};
     if (typeof cursors !== "object" || Array.isArray(cursors)) {
       throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "cursors must be an object");
@@ -417,9 +495,9 @@ export class GatewayService {
       includeToolEvents: args.includeToolEvents === true,
       emit
     };
-    this.subscriptions.set(subscriptionId, subscription);
     const events = [];
     const cursorTruncated = {};
+    const replay = {};
     for (const session of sessions) {
       const cursor = requireNonNegativeNumber(cursors[session.id], `cursors.${session.id}`, 0);
       const firstIndex = session.events[0]?.i ?? session.eventSequence;
@@ -427,15 +505,20 @@ export class GatewayService {
       // reconnecting monitor re-reading a full stream of them is the burst that
       // makes a slow subscriber slower. It gains the complete control history in
       // exchange, which is the part a cold start actually needs.
-      cursorTruncated[session.id] = cursorTruncatedFor(session, cursor);
+      const missingLive = cursor <= Math.max(session.lastMessageSequence ?? -1, args.includeThoughts === true ? session.lastThoughtSequence ?? -1 : -1);
+      const missingRetained = cursorTruncatedFor(session, cursor);
+      cursorTruncated[session.id] = missingRetained || missingLive;
+      replay[session.id] = { complete: !cursorTruncated[session.id], retainedTruncated: missingRetained, liveOnlyMissing: missingLive, fromCursor: cursor, nextCursor: session.eventSequence };
       for (const event of session.events.filter((item) => item.i >= Math.max(cursor, firstIndex))) {
         if (shouldDeliverEvent(subscription, event)) events.push(publicEvent(session, event));
       }
     }
+    this.subscriptions.set(subscriptionId, subscription);
     return {
       subscriptionId,
       sessions: sessions.map(publicSession),
       events,
+      replay,
       cursorTruncated
     };
   }
@@ -534,6 +617,9 @@ export class GatewayService {
           lastRecovery: null
         })
       },
+      ...RUNTIME_IDENTITY,
+      capabilities: MANAGEMENT_CAPABILITIES,
+      configRevision: this.settings?.activeRevision ?? null,
       lifecycle: { ...this.lifecycle, liveSessions },
       resourceLimits: this.resourceLimits,
       metrics: { ...this.metrics, eventsByType: { ...this.metrics.eventsByType } },
@@ -566,8 +652,28 @@ export class GatewayService {
     };
   }
 
+  async withSessionAdmission(provider, context, operation) {
+    if (this.draining) throw new GatewayError(ERROR_CODES.GATEWAY_DRAINING, "Gateway is draining");
+    const root = requireRoot(context);
+    assertProviderEnabled(provider);
+    const pending = this.pendingSessions.get(root) ?? 0;
+    const live = this.store.list().filter(s => s.ownerRootId === root && !CLOSED_STATUSES.has(s.status)).length;
+    if (live + pending >= this.resourceLimits.maxSessionsPerRoot) throw new GatewayError(ERROR_CODES.SESSION_LIMIT_EXCEEDED, "Session admission budget exceeded");
+    this.pendingSessions.set(root, pending + 1);
+    try { return await operation(); }
+    finally {
+      const remaining = this.pendingSessions.get(root) - 1;
+      if (remaining) this.pendingSessions.set(root, remaining); else this.pendingSessions.delete(root);
+    }
+  }
+
   async sessionOpen(args, context) {
+    return this.withSessionAdmission(requireProvider(args.provider), context, () => this.openSession(args, context));
+  }
+
+  async openSession(args, context) {
     const provider = requireProvider(args.provider);
+    assertProviderEnabled(provider);
     const cwd = await requireDirectory(args.cwd);
     const requestedModel = optionalString(args.model, "model");
     const client = await this.getClient(provider, requestedModel);
@@ -579,22 +685,33 @@ export class GatewayService {
       additionalDirectories: args.additionalDirectories ?? [],
       permissionPolicy
     });
-    const configured = await this.configureSessionModel(client, created, requestedModel);
-    return this.registerSession({
-      args,
-      provider,
-      cwd,
-      client,
-      acpSessionId: created.sessionId,
-      created: configured.response,
-      model: configured.model,
-      permissionPolicy,
-      ownerRootId: requireRoot(context)
-    });
+    try {
+      const configured = await this.configureSessionModel(client, created, requestedModel);
+      return this.registerSession({
+        args,
+        provider,
+        cwd,
+        client,
+        acpSessionId: created.sessionId,
+        created: configured.response,
+        model: configured.model,
+        permissionPolicy,
+        ownerRootId: requireRoot(context)
+      });
+    } catch (error) {
+      await this.discardUnregisteredSession(client, created.sessionId);
+      throw error;
+    }
   }
 
   async sessionRestore(args, context, existing = null) {
+    if (existing) return this.restoreSession(args, context, existing);
+    return this.withSessionAdmission(requireProvider(args.provider), context, () => this.restoreSession(args, context));
+  }
+
+  async restoreSession(args, context, existing = null) {
     const provider = requireProvider(args.provider ?? existing?.provider);
+    if (!existing) assertProviderEnabled(provider);
     const cwd = await requireDirectory(args.cwd ?? existing?.cwd);
     const acpSessionId = args.acpSessionId ?? existing?.acpSessionId;
     requireString(acpSessionId, "acpSessionId");
@@ -612,53 +729,68 @@ export class GatewayService {
       additionalDirectories: args.additionalDirectories ?? existing?.additionalDirectories ?? [],
       permissionPolicy
     });
-    const configured = await this.configureSessionModel(client, restored, requestedModel, acpSessionId);
+    try {
+      const configured = await this.configureSessionModel(client, restored, requestedModel, acpSessionId);
 
-    if (existing) {
-      // The record can disappear while the ACP resume is in flight (close,
-      // retention). Re-attaching here would revive a session Main was told is
-      // gone, and leave a live ACP session nobody owns.
-      if (!this.store.get(existing.id) || CLOSED_STATUSES.has(existing.status)) {
-        client.clearSession(acpSessionId);
-        throw new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${existing.id} is closed`);
+      if (existing) {
+        // The record can disappear while the ACP resume is in flight (close,
+        // retention). Re-attaching here would revive a session Main was told is
+        // gone, and leave a live ACP session nobody owns.
+        if (!this.store.get(existing.id) || CLOSED_STATUSES.has(existing.status)) {
+          client.clearSession(acpSessionId);
+          throw new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${existing.id} is closed`);
+        }
+        existing.client = client;
+        this.#setStatus(existing, "idle", "session_restored");
+        existing.error = null;
+        existing.permissionPolicy = permissionPolicy;
+        existing.model = configured.model;
+        existing.capabilities = configured.response;
+        if (args.thoughtCapture != null) {
+          existing.thoughtCapture = normalizeThoughtCapture(args.thoughtCapture, existing.thoughtCapture);
+        }
+        if (args.pinned != null) existing.pinned = args.pinned === true;
+        existing.orphanedAt = null;
+        client.onSessionUpdate(acpSessionId, (update) => this.handleUpdate(existing, update));
+        this.store.push(existing, { type: "session_restored", method });
+        return {
+          ok: true,
+          ...publicSession(existing),
+          capabilities: configured.response,
+          restoredWith: method,
+          ...this.bindTimeFacts(existing)
+        };
       }
-      existing.client = client;
-      this.#setStatus(existing, "idle", "session_restored");
-      existing.error = null;
-      existing.permissionPolicy = permissionPolicy;
-      existing.model = configured.model;
-      existing.capabilities = configured.response;
-      if (args.thoughtCapture != null) {
-        existing.thoughtCapture = normalizeThoughtCapture(args.thoughtCapture, existing.thoughtCapture);
-      }
-      if (args.pinned != null) existing.pinned = args.pinned === true;
-      existing.orphanedAt = null;
-      client.onSessionUpdate(acpSessionId, (update) => this.handleUpdate(existing, update));
-      this.store.push(existing, { type: "session_restored", method });
-      return {
-        ok: true,
-        ...publicSession(existing),
-        capabilities: configured.response,
+
+      return this.registerSession({
+        args,
+        provider,
+        cwd,
+        client,
+        acpSessionId,
+        created: configured.response,
+        model: configured.model,
         restoredWith: method,
-        ...this.bindTimeFacts(existing)
-      };
+        permissionPolicy,
+        ownerRootId: requireRoot(context)
+      });
+    } catch (error) {
+      await this.discardUnregisteredSession(client, acpSessionId);
+      throw error;
     }
+  }
 
-    return this.registerSession({
-      args,
-      provider,
-      cwd,
-      client,
-      acpSessionId,
-      created: configured.response,
-      model: configured.model,
-      restoredWith: method,
-      permissionPolicy,
-      ownerRootId: requireRoot(context)
-    });
+  async discardUnregisteredSession(client, sessionId) {
+    if (this.store.list().some(s => s.client === client && s.acpSessionId === sessionId)) return;
+    try {
+      if (client.alive && client.initResult?.agentCapabilities?.sessionCapabilities?.close) {
+        await client.request("session/close", { sessionId }, 5_000);
+      }
+    } catch {} finally { client.clearSession(sessionId); }
   }
 
   registerSession(fields) {
+    assertProviderEnabled(fields.provider);
     if (!fields.acpSessionId) {
       throw new GatewayError(ERROR_CODES.GATEWAY_ERROR, "ACP session operation returned no sessionId");
     }
@@ -831,7 +963,7 @@ export class GatewayService {
     if (CLOSED_STATUSES.has(session.status) || !this.store.get(session.id)) {
       throw new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`);
     }
-    await this.ensureConnected(session, context);
+    if (!(context.access === "observer" && action === "list")) await this.ensureConnected(session, context);
     const configOptions = session.capabilities?.configOptions ?? [];
     if (action === "list") {
       return { ok: true, sessionId: session.id, configOptions };
@@ -938,6 +1070,7 @@ export class GatewayService {
       record = await this.taskStore.waitForTerminal(taskId, {
         ownerRootId,
         timeoutMs: waitMs,
+        signal: context?.signal,
         // Returning control is the only correct answer to input_required: the
         // request cannot be answered from inside the call that is waiting on it.
         stopOn: ["input_required"]
@@ -2411,11 +2544,59 @@ export class GatewayService {
   }
 
   runMaintenance(now = this.now()) {
+    if (this.draining) return Promise.resolve({ ok: true, skipped: "draining" });
     if (this.maintenanceRunning) return this.maintenanceRunning;
     this.maintenanceRunning = this.#runMaintenance(now).finally(() => {
       this.maintenanceRunning = null;
     });
     return this.maintenanceRunning;
+  }
+
+  taskRetentionEligible(task, policy, now) {
+    return TERMINAL_TASK_STATUSES.has(task.status)
+      && !this.store.get(task.sessionId)?.pinned
+      && isExpired(task.createdAt, policy.taskRetentionMs, now);
+  }
+
+  inboxRetentionEligible(item, policy, now) {
+    return item.status !== "pending" && !this.store.get(item.sessionId)?.pinned
+      && isExpired(item.resolvedAt ?? item.createdAt, policy.inboxRetentionMs, now);
+  }
+
+  sessionRetentionEligible(session, policy, now) {
+    return !session.pinned && !ACTIVE_STATUSES.has(session.status) && this.#sessionQuiet(session)
+      && !session._reserved && !session._queue?.depth
+      && isExpired(session.completedAt ?? session.updatedAt, policy.sessionRetentionMs, now);
+  }
+
+  retentionPreview(args = {}, context = {}) {
+    const allowed = new Set(["sessionRetentionMs", "taskRetentionMs", "inboxRetentionMs", "resultRetentionMs"]);
+    const values = args.values ?? Object.fromEntries(Object.entries(args).filter(([key]) => allowed.has(key)));
+    if (!values || typeof values !== "object" || Array.isArray(values)
+      || Object.keys(args).some(key => key !== "values" && !allowed.has(key))) throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "Unsupported retention preview arguments");
+    for (const [key, value] of Object.entries(values)) {
+      if (!allowed.has(key)) throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `Unsupported retention setting: ${key}`);
+      validateSetting(key, value);
+    }
+    const policy = { ...this.lifecycle, ...values };
+    const now = this.now();
+    const root = requireRoot(context);
+    const sessions = this.store.list().filter(s => s.ownerRootId === root);
+    const tasks = [...this.taskStore.records.values()].filter(t => t.ownerRootId === root);
+    const inbox = [...this.inbox.values()].filter(i => i.ownerRootId === root);
+    return {
+      ok: true, advisory: true, scope: "root", calculatedAt: new Date(now).toISOString(),
+      configRevision: this.settings?.snapshot().revision ?? null, values: policy,
+      counts: {
+        sessions: sessions.filter(s => this.sessionRetentionEligible(s, policy, now)).length,
+        tasks: tasks.filter(t => this.taskRetentionEligible(t, policy, now)).length,
+        inbox: inbox.filter(i => this.inboxRetentionEligible(i, policy, now)).length,
+        results: sessions.filter(s => !s.pinned && !ACTIVE_STATUSES.has(s.status) && !s.transientClearedAt && s.completedAt && isExpired(s.completedAt, policy.resultRetentionMs, now)).length
+      },
+      // Artifact bytes are shared across roots and retained through references.
+      // Do not manufacture a deletion count from age alone.
+      artifacts: { exact: false, reason: "reference-protected; evaluated by GC after result/session retention" }
+    };
   }
 
   async #runMaintenance(now) {
@@ -2425,7 +2606,7 @@ export class GatewayService {
     // Byte retention, separate from the handle's ttl: a record that opted out of
     // expiry (ttl=null, legacy) would otherwise sit in the snapshot forever.
     for (const task of [...this.taskStore.records.values()]) {
-      if (!isExpired(task.createdAt, this.lifecycle.taskRetentionMs, now)) continue;
+      if (!this.taskRetentionEligible(task, this.lifecycle, now)) continue;
       this.taskStore.remove(task.taskId);
       changed = true;
     }
@@ -2467,7 +2648,7 @@ export class GatewayService {
 
     for (const [id, item] of this.inbox) {
       if (item.status === "pending") continue;
-      if (isExpired(item.resolvedAt ?? item.createdAt, this.lifecycle.inboxRetentionMs, now)) {
+      if (this.inboxRetentionEligible(item, this.lifecycle, now)) {
         this.inbox.delete(id);
         this.stateStore?.append(WAL_TYPES.INBOX_REMOVED, id, {});
         changed = true;
@@ -2513,9 +2694,7 @@ export class GatewayService {
         changed = await this.unloadSession(session) || changed;
       }
 
-      const recordSince = session.completedAt ?? session.updatedAt;
-      if (!session.pinned && !ACTIVE_STATUSES.has(session.status) && this.#sessionQuiet(session)
-        && isExpired(recordSince, this.lifecycle.sessionRetentionMs, now)) {
+      if (this.sessionRetentionEligible(session, this.lifecycle, now)) {
         // Whatever is queued for this session was written against a record that
         // is about to stop existing.
         session._queue?.closeWith(
@@ -2712,6 +2891,7 @@ export class GatewayService {
 
   async shutdown() {
     this.stopped = true;
+    this.draining = true;
     await this.agentUpdateManager?.stop();
     if (this.gcTimer) clearInterval(this.gcTimer);
     this.gcTimer = null;

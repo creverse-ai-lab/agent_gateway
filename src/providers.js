@@ -3,6 +3,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { access } from "node:fs/promises";
 import { constants, readFileSync } from "node:fs";
+import { ERROR_CODES, GatewayError } from "./errors.js";
+import { readJsonFile, updateJsonFile } from "./atomic-json.js";
 import { defaultProviderRegistryPath } from "./acp-registry.js";
 
 const GROK_BIN = process.env.GROK_BIN || join(homedir(), ".grok/bin/grok");
@@ -109,6 +111,7 @@ export async function detectProviders() {
   const builtins = await Promise.all(
     Object.values(PROVIDER_MANIFESTS).map(async (manifest) => ({
       ...manifest,
+      enabled: isProviderEnabled(manifest.id),
       agentInstalled: await executableExists(manifest.agentCommand),
       adapterInstalled:
         manifest.adapter === "built-in" || manifest.id === "claude"
@@ -118,6 +121,7 @@ export async function detectProviders() {
   );
   const dynamic = await Promise.all(Object.values(configuredProviders()).map(async (definition) => ({
     id: definition.id,
+    enabled: isProviderEnabled(definition.id),
     displayName: definition.displayName ?? definition.id,
     agentCommand: definition.command,
     adapter: definition.registryId ?? "registry",
@@ -198,4 +202,30 @@ function optionalModel(value) {
   if (value == null) return null;
   if (typeof value !== "string" || !value.trim()) throw new Error("model must be a non-empty string");
   return value.trim();
+}
+
+export function isProviderEnabled(provider) {
+  if (process.env.ACP_GATEWAY_DISABLE_DYNAMIC_PROVIDERS === "1" && !process.env.ACP_GATEWAY_PROVIDERS) return true;
+  const document = readJsonFile(defaultProviderRegistryPath(), { version: 1, providers: {}, disabled: [] });
+  if (document.version !== 1 || (document.disabled != null && (!Array.isArray(document.disabled) || document.disabled.some(id => typeof id !== "string")))) {
+    throw new GatewayError(ERROR_CODES.CONFIG_INVALID, "Invalid provider policy document");
+  }
+  return !(document.disabled ?? []).includes(provider);
+}
+
+export function assertProviderEnabled(provider) {
+  if (!isProviderEnabled(provider)) throw new GatewayError(ERROR_CODES.PROVIDER_DISABLED, `Provider ${provider} is disabled`, { provider });
+}
+
+export function setProviderEnabled(provider, enabled) {
+  if (typeof provider !== "string" || !/^[a-z0-9][a-z0-9._-]*$/.test(provider) || typeof enabled !== "boolean") {
+    throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "provider and boolean enabled are required");
+  }
+  updateJsonFile(defaultProviderRegistryPath(), { version: 1, providers: {}, disabled: [] }, document => {
+    if (document.version !== 1 || (document.disabled != null && (!Array.isArray(document.disabled) || document.disabled.some(id => typeof id !== "string")))) throw new GatewayError(ERROR_CODES.CONFIG_INVALID, "Invalid provider policy document");
+    const disabled = new Set(document.disabled ?? []);
+    if (enabled) disabled.delete(provider); else disabled.add(provider);
+    return { ...document, disabled: [...disabled].sort() };
+  });
+  return { ok: true, provider, enabled };
 }

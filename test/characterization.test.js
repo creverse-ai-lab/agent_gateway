@@ -40,7 +40,8 @@ const WIRE_RESULT_KEYS = sorted(["text", "transcriptBytes", "artifact", "stopRea
 // response and never changes this one.
 const SETUP_KEYS = sorted([
   "ok", "gatewayVersion", "gatewayApiVersion", "stateSchemaVersion", "responseProfiles", "persistence",
-  "lifecycle", "resourceLimits", "metrics", "agentUpdates", "gatewayUpdate", "alerts", "detected", "providers"
+  "lifecycle", "resourceLimits", "metrics", "agentUpdates", "gatewayUpdate", "alerts", "detected", "providers",
+  "runtimeRoot", "gatewayBuildId", "sourceCommit", "instanceId", "capabilities", "configRevision"
 ]);
 // GOLDEN DIFF (1.4.0 PR 4): taskRetentionMs joins lifecycle. A task's bytes now
 // have their own retention, separate from its session's, because a completed

@@ -56,6 +56,8 @@ export async function startDaemon({
     stdio: ["ignore", "ignore", "pipe"],
     env: {
       ...process.env,
+      ACP_GATEWAY_AGENT_AUTO_UPDATE: "0",
+      ACP_GATEWAY_AGENT_UPDATE_NOTIFICATIONS: "0",
       ACP_GATEWAY_SOCKET: socketPath,
       ACP_GATEWAY_STATE: statePath,
       ACP_GATEWAY_CONTROL_TOKEN: token,

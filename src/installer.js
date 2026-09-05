@@ -17,6 +17,7 @@ import {
 } from "./acp-registry.js";
 import { GatewayRpcClient } from "./socket-rpc.js";
 import { gatewaySocketPath } from "./config.js";
+import { GatewaySettings, settingsPaths } from "./settings.js";
 import { GATEWAY_VERSION } from "./version.js";
 
 const CONTROL_NAME = "agent-acp";
@@ -395,6 +396,14 @@ export async function runInstaller(options, dependencies = {}) {
   if (state && !options.dryRun && (options.installControl || options.installGuide || options.installSkill || configuresAgentUpdates)) {
     state.updatedAt = new Date().toISOString();
     await writeInstallState(statePath, state);
+  }
+
+  if (configuresAgentUpdates && !options.dryRun) {
+    const settings = new GatewaySettings({ ...settingsPaths({ ...process.env, ACP_GATEWAY_INSTALL_STATE: statePath }) });
+    settings.update({ expectedRevision: settings.snapshot().revision, values: {
+      ...(options.agentAutoUpdate == null ? {} : { agentAutoUpdate: options.agentAutoUpdate }),
+      ...(options.agentUpdateNotifications == null ? {} : { agentUpdateNotifications: options.agentUpdateNotifications })
+    } });
   }
 
   let restart = { requested: options.restartDaemon, performed: false, wasRunning: false };

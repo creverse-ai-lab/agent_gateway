@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { authorizeCall, requireAccess } from "./access.js";
+import { GatewaySettings } from "./settings.js";
 import { timingSafeEqual } from "node:crypto";
 import { chmod, open, readFile, unlink, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
@@ -30,14 +32,16 @@ const socketPath = gatewaySocketPath();
 const statePath = gatewayStatePath();
 const expectedToken = controlToken();
 const expectedRootId = process.env.ACP_GATEWAY_ROOT_ID || null;
-const gatewayConfig = gatewayLifecycleConfig();
-const agentUpdateManager = new AgentUpdateManager({ ...gatewayAgentUpdateConfig(), sourceChecker: checkGatewaySource });
+const settings = new GatewaySettings();
+const gatewayConfig = gatewayLifecycleConfig(settings.activeValues);
+const agentUpdateManager = new AgentUpdateManager({ ...gatewayAgentUpdateConfig(settings.activeValues), sourceChecker: checkGatewaySource });
 const service = new GatewayService({
   statePath,
+  settings,
   agentUpdateManager,
   ...gatewayConfig,
-  ...gatewayObservabilityConfig(),
-  persistence: gatewayPersistenceConfig()
+  ...gatewayObservabilityConfig(settings.activeValues),
+  persistence: gatewayPersistenceConfig(settings.activeValues)
 });
 const clients = new Set();
 let shutdownPromise = null;
@@ -64,6 +68,7 @@ const server = createServer((socket) => {
   const subscriptions = new Map();
   const requestAborts = new Map();
   let boundRootId = null;
+  let boundAccess = null;
   let inflight = 0;
   const sender = createSocketSender(socket, {
     subscriptions,
@@ -82,6 +87,7 @@ const server = createServer((socket) => {
       try {
         request = JSON.parse(line);
         const isGuide = request.method === "guide";
+        const access = requireAccess(request.access);
         if (!isGuide) {
           if (!tokenMatches(request.token, expectedToken)) {
             throw new GatewayError(ERROR_CODES.CONTROL_ACCESS_DENIED, "Control access denied");
@@ -95,14 +101,17 @@ const server = createServer((socket) => {
           if (boundRootId && request.rootId !== boundRootId) {
             throw new GatewayError(ERROR_CODES.SOCKET_ALREADY_BOUND, "Socket is already bound to another Main");
           }
+          if (boundAccess && boundAccess !== access) throw new GatewayError(ERROR_CODES.SOCKET_ALREADY_BOUND, "Socket access role cannot change");
+          authorizeCall(request.method, request.args ?? {}, { access });
           if (!boundRootId) {
             boundRootId = request.rootId;
-            service.attachRoot(boundRootId);
+            boundAccess = access;
+            if (access === "control") service.attachRoot(boundRootId);
           }
         }
         // Refused before dispatch, so an over-limit request costs the round trip
         // and nothing else.
-        if (inflight >= MAX_INFLIGHT_REQUESTS_PER_CONNECTION) {
+        if (inflight >= MAX_INFLIGHT_REQUESTS_PER_CONNECTION && request.method !== "request_cancel") {
           throw new GatewayError(
             ERROR_CODES.TOO_MANY_INFLIGHT_REQUESTS,
             `Too many in-flight Gateway requests on this connection: ${MAX_INFLIGHT_REQUESTS_PER_CONNECTION}`
@@ -118,13 +127,14 @@ const server = createServer((socket) => {
             requestAborts.get(requestId)?.abort();
             return;
           }
-          if (request.method === "daemon_shutdown") {
-            send({ id: request.id, ok: true, result: { ok: true, pid: process.pid, version: GATEWAY_VERSION } });
+          if (["daemon_shutdown", "shutdown_if_idle"].includes(request.method)) {
+            service.prepareShutdown({ force: request.method === "daemon_shutdown" && request.args?.force === true });
             setImmediate(() => void shutdown().finally(() => process.exit(0)));
+            send({ id: request.id, ok: true, result: { ok: true, pid: process.pid, version: GATEWAY_VERSION } });
             return;
           }
           if (request.method === "subscribe") {
-            const result = service.subscribe(request.args, { rootId: request.rootId }, (event) => {
+            const result = service.subscribe(request.args, { rootId: request.rootId, access }, (event) => {
               sendEvent(result.subscriptionId, event);
             });
             // Additive and opt-in: a client that says nothing keeps the old
@@ -145,7 +155,7 @@ const server = createServer((socket) => {
           try {
             const result = isGuide
               ? await service.guide()
-              : await service.call(request.method, request.args, { rootId: request.rootId, signal: controller.signal });
+              : await service.call(request.method, request.args, { rootId: request.rootId, access, signal: controller.signal });
             send({ id: request.id, ok: true, result });
           } finally {
             requestAborts.delete(request.id);
@@ -182,7 +192,7 @@ const server = createServer((socket) => {
     requestAborts.clear();
     sender.destroy();
     service.removeSubscriptions(subscriptions.keys());
-    if (boundRootId) service.detachRoot(boundRootId);
+    if (boundRootId && boundAccess === "control") service.detachRoot(boundRootId);
   });
 });
 

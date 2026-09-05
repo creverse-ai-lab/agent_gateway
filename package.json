@@ -1,6 +1,6 @@
 {
   "name": "acp-gateway",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Persistent local ACP gateway with Main-only control and worker-safe guidance.",
   "type": "module",
   "private": true,
@@ -20,7 +20,8 @@
     "acp-gateway-control": "src/index.js",
     "acp-gateway-guide": "src/guide.js",
     "acp-gateway-daemon": "src/gateway-daemon.js",
-    "acp-gateway-bootstrap": "src/bootstrap.js"
+    "acp-gateway-bootstrap": "src/bootstrap.js",
+    "acp-gateway-admin": "src/admin.js"
   },
   "scripts": {
     "start": "node src/index.js",

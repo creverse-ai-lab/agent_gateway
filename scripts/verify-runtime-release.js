@@ -27,6 +27,8 @@ if (arguments_.includes("--provenance")) {
   throw new Error("local release metadata is an unsigned build record; pass --build-record, not --provenance");
 }
 
+const sourceIndex = arguments_.indexOf("--source-commit");
+const expectedSourceCommit = sourceIndex < 0 ? undefined : arguments_[sourceIndex + 1];
 const archivePath = option("--archive");
 const checksumPath = option("--sha256");
 const buildRecordPath = option("--build-record");
@@ -35,14 +37,14 @@ assert.match(expectedChecksum, /^[a-f0-9]{64}$/);
 assert.equal(await sha256File(archivePath), expectedChecksum, "archive SHA-256 does not match");
 
 const buildRecord = await readJson(buildRecordPath);
-assertUnsignedBuildRecord(buildRecord, { artifact: basename(archivePath), digest: expectedChecksum });
+assertUnsignedBuildRecord(buildRecord, { artifact: basename(archivePath), digest: expectedChecksum, expectedSourceCommit });
 
 const temporary = await mkdtemp(join(tmpdir(), "acp-gateway-verify-"));
 try {
   execFileSync("tar", ["-xzf", archivePath, "-C", temporary], { stdio: "inherit" });
   const runtimeRoot = join(temporary, RUNTIME_ROOT_NAME);
   const manifest = await readJson(join(runtimeRoot, "runtime-manifest.json"));
-  assertRuntimeManifestMetadata(manifest, { artifactName: basename(archivePath) });
+  assertRuntimeManifestMetadata(manifest, { artifactName: basename(archivePath), expectedSourceCommit });
   assert.equal(buildRecord.sourceTag, manifest.source.tag, "build record source tag differs from manifest");
   assert.equal(buildRecord.sourceCommit, manifest.source.commit, "build record source commit differs from manifest");
   assert.equal(buildRecord.builderCommit, manifest.builder.commit, "build record builder commit differs from manifest");

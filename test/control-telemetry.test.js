@@ -245,7 +245,7 @@ test("cursorTruncated reports evicted telemetry even when the ring still starts 
   }
 });
 
-test("splitting a lane is not a truncation: a caller that lost nothing is never warned", async () => {
+test("poll ignores live-only gaps while subscriptions declare incomplete history", async () => {
   const service = new GatewayService({ gcIntervalMs: 0 });
   try {
     const session = directSession(service, "no-false-truncation");
@@ -266,7 +266,7 @@ test("splitting a lane is not a truncation: a caller that lost nothing is never 
     const replay = service.subscribe(
       { sessionIds: [session.id], cursors: { [session.id]: 0 } }, { rootId: "main-a" }, () => {}
     );
-    assert.equal(replay.cursorTruncated[session.id], false);
+    assert.equal(replay.cursorTruncated[session.id], true);
   } finally {
     await service.shutdown().catch(() => {});
   }

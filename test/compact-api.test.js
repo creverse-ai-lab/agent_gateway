@@ -753,6 +753,7 @@ test("T11: abandoning the wait does not cancel the turn; cancel does", async () 
     assert.equal(handoff.ok, true, "a wait running out is never an error");
     assert.ok(["working", "input_required"].includes(handoff.status));
     assert.equal(typeof handoff.taskId, "string");
+    await waitForPending(service, opened.sessionId);
     assert.equal(await promptCount(log), 1);
 
     // The worker is untouched: answering the request it is still waiting on
@@ -780,6 +781,7 @@ test("T11: abandoning the wait does not cancel the turn; cancel does", async () 
       }, MAIN
     );
     assert.equal(second.ok, true);
+    await waitForPending(service, opened.sessionId);
     assert.equal(await promptCount(log), 2);
     await waitForPending(service, opened.sessionId);
     await service.call("task_cancel", { taskId: second.taskId }, MAIN);

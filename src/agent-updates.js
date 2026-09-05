@@ -45,7 +45,7 @@ export class AgentUpdateManager {
   }
 
   start() {
-    if (this.timer) return;
+    if (this.timer || (!this.enabled && !this.notifications)) return;
     void this.refresh();
     this.timer = setInterval(() => void this.refresh(), this.intervalMs);
     this.timer.unref?.();

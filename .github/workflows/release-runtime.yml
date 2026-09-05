@@ -6,7 +6,10 @@ on:
       source_tag:
         description: Immutable Gateway source tag
         required: true
-        default: v1.4.0
+        default: v1.5.0
+      source_commit:
+        description: Reviewed full source SHA (must match source_tag)
+        required: true
 
 permissions:
   contents: write
@@ -19,6 +22,7 @@ jobs:
     timeout-minutes: 20
     env:
       SOURCE_TAG: ${{ inputs.source_tag }}
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
       ASSET: acp-gateway-runtime-darwin-arm64.tar.gz
     steps:
       - uses: actions/checkout@v7
@@ -49,10 +53,11 @@ jobs:
         run: npm run test:persistence:stress
       - name: Build twice and verify reproducibility
         run: |
-          node scripts/build-runtime-release.js --source-tag "$SOURCE_TAG" --output-dir dist/one
-          node scripts/build-runtime-release.js --source-tag "$SOURCE_TAG" --output-dir dist/two
+          node scripts/build-runtime-release.js --source-tag "$SOURCE_TAG" --source-commit "$SOURCE_COMMIT" --output-dir dist/one
+          node scripts/build-runtime-release.js --source-tag "$SOURCE_TAG" --source-commit "$SOURCE_COMMIT" --output-dir dist/two
           cmp "dist/one/$ASSET" "dist/two/$ASSET"
           node scripts/verify-runtime-release.js \
+            --source-commit "$SOURCE_COMMIT" \
             --archive "dist/one/$ASSET" \
             --sha256 "dist/one/$ASSET.sha256" \
             --build-record "dist/one/$ASSET.build-record.json"

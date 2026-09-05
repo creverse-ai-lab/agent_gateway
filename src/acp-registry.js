@@ -1,4 +1,5 @@
 import { access, chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { updateJsonFile } from "./atomic-json.js";
 import { constants } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
@@ -186,18 +187,12 @@ function providerEnvironment(match) {
 }
 
 export async function mergeProviderDefinitions(path, definitions) {
-  let document = { version: 1, providers: {} };
-  try {
-    document = JSON.parse(await readFile(path, "utf8"));
-    if (document?.version !== 1 || !document.providers || typeof document.providers !== "object") {
-      throw new Error("unsupported provider registry format");
-    }
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw new Error(`Cannot read provider registry ${path}: ${error.message}`);
-  }
-  for (const definition of definitions) document.providers[definition.id] = definition;
-  await writeJson(path, document);
-  return document;
+  return updateJsonFile(path, { version: 1, providers: {} }, document => {
+    if (document.version !== 1 || !document.providers || typeof document.providers !== "object") throw new Error("Invalid provider registry");
+    const providers = { ...document.providers };
+    for (const definition of definitions) providers[definition.id] = definition;
+    return { ...document, version: 1, providers };
+  });
 }
 
 export async function installedGlobalNpmPackages(run) {
