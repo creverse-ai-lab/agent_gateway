@@ -32,7 +32,7 @@ function run(command, args, options = {}) {
   return execFileSync(command, args, { cwd: repositoryRoot, stdio: options.capture ? "pipe" : "inherit", encoding: "utf8" });
 }
 
-const sourceTag = option("--source-tag", "v1.5.0");
+const sourceTag = option("--source-tag", "v1.5.1");
 const outputDirectory = resolve(option("--output-dir", join(repositoryRoot, "dist")));
 const allowDirty = arguments_.includes("--allow-dirty");
 const sourceCommit = run("git", ["rev-parse", `${sourceTag}^{commit}`], { capture: true }).trim();
