@@ -55,13 +55,57 @@ Consumer-owned npm/uv invocations or copies of provider resolver policy are unne
 
 `shutdown_if_idle {}` rejects with `SHUTDOWN_BLOCKED`, `details.blockers` when active sessions, tasks, unanswered inbox records, pending session admissions, in-flight mutations, provider starts, maintenance or agent updates exist. A successful admission atomically closes mutation admission before acknowledging shutdown. Further mutations fail with `GATEWAY_DRAINING`. A blocked attempt restores admission.
 
-`daemon_shutdown {}` now uses the same safe default. `daemon_shutdown {force:true}` is an explicit destructive override for trusted control clients. OS SIGTERM/SIGINT remain unconditional shutdown. Force can interrupt workers; it does not claim their external side effects were rolled back.
+`daemon_shutdown {}` now uses the same safe default. Since 1.5.2 the public client never autostarts a daemon for `daemon_shutdown` or `shutdown_if_idle`; with nothing listening it returns `{ok:true, alreadyStopped:true}`. `daemon_shutdown {force:true}` is an explicit destructive override for trusted control clients. OS SIGTERM/SIGINT remain unconditional shutdown. Force can interrupt workers; it does not claim their external side effects were rolled back.
 
 Consumer restart sequence: close automatic subscription clients; request safe shutdown; wait for old process/socket/lock to exit; select/start the intended runtime; reconnect and verify build identity and active settings. A successful shutdown is not itself a new runtime activation, and saving config does not restart either application or engine. Legacy 1.4 daemons do not enforce this new safe shutdown contract; require capability before presenting it as safe.
 
 ## Permission policy enforcement
 
 `permissionPolicy` is enforced on what reaches the Gateway over ACP: file and terminal callbacks and `session/request_permission`. A worker that edits through its own tools without asking bypasses it. For `read_only` and `ask` sessions, the engine selects the worker's advertised `mode` value `read-only` on open and on every restore. When a provider is known to still edit inside its session roots without a request (Codex), `session_open`/restore put a `{level:"warning", code:"permission_policy_partial", provider}` alert first in `relevantAlerts`. Consumers must show it and must not present such a session as edit-proof. The alert is additive; its absence does not certify complete enforcement for other providers.
+
+Since 1.5.2, automatic decisions also depend on paths:
+- The engine compares every path a request names (`toolCall.locations[].path`, and `file_path`/`path`/`notebook_path` in `rawInput`) with the session roots, resolving symlinks.
+- A path outside the roots is never auto-approved. `read_only` refuses it. `auto_approve` sends it to Main as a normal pending permission request.
+- Gateway-protected paths are refused under every policy, including `ask`, and are never shown to a human. They are `~/.acp-gateway`, the install/settings/state directories, and the control socket. `fs/read_text_file`/`fs/write_text_file` refuse them even inside a root.
+- When several offered options share the chosen kind, a refusal prefers the one that lets the worker continue (for example Codex `decline` over `cancel`).
+
+Commands are checked as well:
+- A permission request's `rawInput.command` and a `terminal/create` command line are refused under every policy when they name a protected path. That covers the literal path and its `~`, `$HOME`, `${HOME}` and quoted spellings, plus any path-looking word that resolves physically into one, such as `link/../.acp-gateway`.
+- Other commands keep the policy's normal treatment. `auto_approve` trusts commands inside the roots, because a shell command's file access cannot be verified from its text.
+
+Claude sessions receive `_meta.claudeCode.options.disallowedTools` on `session/new` and on every restore. `read_only` adds `Bash`, `Edit`, `Write`, `MultiEdit` and `NotebookEdit`, and every policy adds path rules for the protected paths.
+
+The Grok process is started with its cwd in a Gateway-owned directory (`ACP_GATEWAY_GROK_SANDBOX_DIR`, default `~/.cache/acp-gateway/grok-sandbox`) holding `.grok/sandbox.toml`, and with `GROK_SANDBOX=acp-gateway`:
+- The profile extends Grok's `workspace` profile and denies every protected path to the whole process, through Seatbelt on macOS and Landlock on Linux.
+- It covers Grok's in-process tools such as grep, which never reach ACP.
+- Edits and terminals go through ACP and are unaffected.
+
+`permission_policy_partial` carries `scope`, the list of things the engine cannot enforce for that provider and policy: `edit_inside_roots`, `shell_write_inside_roots`, `read_outside_roots`, `read_protected`.
+- Codex under `read_only`/`ask` has all four; under `auto_approve` it has the two read scopes.
+- Grok has `read_outside_roots`.
+- A consumer should treat any capability absent from `scope` as enforced, and anything listed as possible.
+
+## Snapshot workspaces
+
+`session_open {workspace:"snapshot"}` copies `cwd` twice, before the worker starts: a working tree and an untouched baseline, as clonefile/reflink copies where supported. The diff is baseline → tree, so later edits to the original never show up as reversed worker edits. A symlink inside the tree is re-pointed into the copy; one leaving the tree is not copied and is listed in `workspace.droppedLinks`. Protected directories are never copied, and a protected `cwd` is refused. The diff is capped at 64 MiB, beyond which it fails with `WORKSPACE_ERROR`. The copy lives under `ACP_GATEWAY_WORKSPACES`, default `~/.cache/acp-gateway/workspaces`, never under a protected path. The session's `cwd` is the copy, and the response carries `workspace:{mode,source,path}`. Direct sessions have no `workspace` key.
+
+Symlinks are copied as links, and sockets/FIFOs are skipped. The copy is limited to 1 GiB and 200,000 entries; beyond that, or when `cwd` contains the workspace root, the open fails with `WORKSPACE_ERROR`. `additionalDirectories` are not copied.
+
+`session {action:"workspace_diff", sessionId}` returns `{changed, files, patch, patchBytes, truncated, patchArtifact?}`. `patch` is a `git diff --no-index` patch from the original (a/) to the copy (b/), with tree-relative paths, applicable with `git apply` in the original. It is capped at `maxInlineResultBytes`, with the complete patch as an artifact.
+
+The engine never applies the patch. The copy is deleted on close and by session retention. It survives daemon restarts.
+
+## Idempotency and worker errors
+
+A `run` whose `idempotencyKey` already names a run on the same session attaches only when the prompt and model digest match. Otherwise it fails with `IDEMPOTENCY_CONFLICT`, and `details.taskId` holds the existing task. Changing `waitMs` or `resultBudgetBytes` on a retry is not a conflict. Runs recorded before 1.5.2 carry no digest and keep the old attach behavior.
+
+A JSON-RPC error from the worker becomes `ACP_ERROR`, or `UNKNOWN_SESSION` for a `session/load|resume` of a session the worker does not know. The message keeps the historical `ACP error <code>: <message>` text, and `details.{method,acpCode,acpMessage,acpData?}` preserve the original.
+
+## Adapter generations
+
+A process is reused only while its provider definition (command, args including the adapter pin, env) is unchanged. After an adapter update, the old process keeps serving the sessions it holds, new sessions start a process of the current definition, and maintenance stops the old one when it serves nothing. Summary and full `setup` report `started` from real process liveness. `setup {provider}` adds `runningVersion` and `retiredProcesses`.
+
+When `ACP_GATEWAY_STATE` points outside `~/.acp-gateway` and `ACP_GATEWAY_PROVIDERS` is unset, provider definitions and the registry cache live next to that state file. Reads fall back to the global definitions until the first write, which copies them.
 
 ## Retention preview
 
@@ -97,4 +141,4 @@ Required invariants and validation:
 | GC cannot remove active obligations or referenced artifacts | retention/resource/persistence tests |
 | Unrecoverable event history is explicit | replay completeness tests |
 
-Release builders require a v1.5.x tag (v1.5.0 or v1.5.1) plus an independently supplied reviewed source SHA; verifiers require the same SHA. Existing v1.4.0's historical pin is retained. New archives use the public client and engine from the same source commit. Checksums and local unsigned build records are not signed provenance; the separate release workflow attests and verifies before publishing without overwriting assets.
+Release builders require a v1.5.x tag (v1.5.0 through v1.5.2) plus an independently supplied reviewed source SHA; verifiers require the same SHA. Existing v1.4.0's historical pin is retained. New archives use the public client and engine from the same source commit. Checksums and local unsigned build records are not signed provenance; the separate release workflow attests and verifies before publishing without overwriting assets.

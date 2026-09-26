@@ -283,6 +283,112 @@ ASCII와 emoji가 섞인 agent message/thought를 작은 `maxTextBytes`로 누�
 
 현재 상태: `자동화됨` — Grok·Auggie JSON 목록 검사, Control·Guide 등록 명령과 managed state 기록을 검증했다.
 
+## 9. v1.5.2 강화: 경로·보호·작업공간·운영
+
+각 시나리오는 mock 회귀 테스트(`test/hardening.test.js` 등)와 live matrix(`npm run usecases:live`) 양쪽에서 검증한다. live ID는 괄호에 적었다.
+
+### SC-28 경로 기반 자동 승인 (P02)
+
+1. `read_only`·`auto_approve`·`ask` 세션에서 `toolCall.locations`로 루트 안, 루트 밖, `..`, 내부 symlink, `link/..` 경로를 요청한다.
+
+기대 결과: 루트 안 read는 승인된다. 루트 밖은 `read_only`에서 거절되고 `auto_approve`에서는 Main에게 넘어간다. `link/..`는 커널처럼 symlink를 먼저 따라간 뒤 판정한다.
+
+현재 상태: `자동화됨` — mock 3건과 live P02. Codex는 known-limit다.
+
+### SC-29 Gateway 보호 경로 (P03, P08)
+
+1. 루트 안과 밖에 있는 보호 경로(`~/.acp-gateway`, state 디렉터리, socket)를 permission 요청, 셸 명령 문자열(`~`, `$HOME`, `${HOME}` 표기 포함), `terminal/create`, `fs/read_text_file`로 요청한다.
+
+기대 결과: 모든 정책에서 거절되고 `ask`에서도 사람에게 묻지 않는다. `.acp-gateway-old`처럼 더 긴 이름과 단순한 이름 언급은 오탐하지 않는다.
+
+현재 상태: `자동화됨` — mock 3건과 live P03·P08. Codex는 known-limit다.
+
+### SC-30 Claude 세션 규칙 (P01, P04)
+
+1. Claude `read_only` 세션에 파일 편집과 셸 명령을 요청한다.
+2. daemon 재시작 뒤 restore된 세션에서도 같은 요청을 반복한다.
+
+기대 결과: `_meta.claudeCode.options.disallowedTools`가 `session/new`와 매 `session/resume`에 전달되고, 편집과 셸 쓰기가 일어나지 않는다.
+
+현재 상태: `자동화됨`.
+
+### SC-31 자동 거절 옵션 선택
+
+1. 같은 `reject_once` 종류로 "계속"(decline)과 "중단"(cancel) 옵션을 함께 제시한다.
+
+기대 결과: 자동 거절은 decline을 고른다. cancel만 있으면 cancel을 고른다.
+
+현재 상태: `자동화됨` — v1.5.2 Codex 리뷰 턴이 셸 거절 하나로 통째로 취소된 실사용 결함에서 나왔다.
+
+### SC-32 Snapshot workspace (W01)
+
+1. `workspace:"snapshot"`으로 연 세션에서 워커가 파일을 수정한다.
+2. `workspace_diff`로 변경을 받는다.
+3. daemon을 재시작한다.
+4. 세션을 close한다.
+
+기대 결과: 원본은 변하지 않고, diff는 트리 상대 경로의 적용 가능한 패치다. 재시작 뒤에도 사본이 유지되고 close 시 삭제된다. 보호 디렉터리는 스냅샷 대상이 될 수 없고 사본에서도 빠진다.
+
+현재 상태: `자동화됨`.
+
+### SC-33 idempotencyKey 충돌 (R03)
+
+1. 같은 키로 같은 prompt, 대기 옵션만 바꾼 prompt, 다른 prompt를 보낸다.
+2. daemon을 재시작한 뒤 다시 보낸다.
+
+기대 결과: 앞의 둘은 같은 taskId로 attach되고, 다른 prompt는 `IDEMPOTENCY_CONFLICT`(details.taskId)로 거절된다. 재시작 뒤에도 같다.
+
+현재 상태: `자동화됨`.
+
+### SC-34 ACP 오류 코드 (E01)
+
+1. 워커가 JSON-RPC 오류를 반환하게 한다.
+
+기대 결과: `ACP_ERROR`로 전달된다. restore 대상 세션이 없음을 뜻하는 오류만 `UNKNOWN_SESSION`이며, cwd·모델·경로 오류는 `ACP_ERROR`로 남는다. 원본 오류는 details에 보존된다.
+
+현재 상태: `자동화됨`.
+
+### SC-35 Adapter 세대 교체와 health (S01)
+
+1. 세션을 연 뒤 provider 정의(버전 pin)를 바꾸고 새 세션을 연다.
+
+기대 결과: 새 세션은 새 프로세스를 쓰고, 기존 세션은 구 프로세스에서 계속 동작한다. 구 프로세스는 세션이 닫힌 뒤 GC가 정리한다. `started`, `runningVersion`, `retiredProcesses`가 실제 상태와 일치한다.
+
+현재 상태: `자동화됨`.
+
+### SC-36 격리 state의 provider 파일
+
+1. 기본 위치 밖의 `ACP_GATEWAY_STATE`로 provider를 enable/disable한다.
+
+기대 결과: 전역 파일은 변하지 않고 격리 사본이 생긴다. 파일이 없을 때는 전역 정의를 읽는다. `..`나 symlink로 표기한 전역 디렉터리는 격리로 보지 않는다.
+
+현재 상태: `자동화됨`.
+
+### SC-37 원자적 --update
+
+1. 새 upstream commit이 있는 상태에서 update를 실행하되, 스테이징 검증 실패, 검증 중 live 트리 변경, fast-forward 후 `npm ci` 실패, 롤백 실패를 각각 주입한다.
+
+기대 결과: 검증은 임시 worktree에서만 돌고, 실패하면 live 트리를 건드리지 않는다. 설치 실패는 이전 commit으로 롤백하며, 롤백 자체가 실패하면 그 사실을 보고한다.
+
+현재 상태: `자동화됨`.
+
+### SC-38 종료 호출과 daemon 자동 기동 (E02)
+
+1. daemon이 없는 상태에서 `daemon_shutdown`·`shutdown_if_idle`을 호출한다. 동시에 autostart 호출도 보낸다.
+
+기대 결과: 종료 호출은 `alreadyStopped`를 반환하고 daemon을 띄우지 않는다. 동시 autostart 호출은 종료 호출의 실패를 물려받지 않는다.
+
+현재 상태: `자동화됨`.
+
+### SC-39 Live matrix와 daemon kill -9 복구 (F01, F02)
+
+1. 실제 Claude·Codex·Grok으로 22개 시나리오를 실행한다.
+2. 도중에 daemon을 `kill -9`한다.
+
+기대 결과: idle 세션은 모델과 맥락을 유지한 채 복구되고, 진행 중 task는 `failed: Gateway restarted…`로 표시된 뒤 세션을 재사용할 수 있다.
+
+현재 상태: `수동` — 릴리스 전 `npm run usecases:live`.
+
 ## 권장 자동화 순서
 
 1. SC-06~SC-10 terminal lifecycle과 격리
