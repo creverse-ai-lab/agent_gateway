@@ -5,6 +5,10 @@ const rl = createInterface({ input: process.stdin });
 // Crash-matrix evidence for P4 ("a turn that was never made durable was never
 // started"). Off unless a test asks for it, so no existing behaviour changes.
 const promptLog = process.env.ACP_MOCK_PROMPT_LOG || null;
+// A codex-acp style approval preset, also opt-in so the default option list stays
+// byte-identical for every existing test.
+const modeOption = process.env.ACP_MOCK_MODE_OPTION === "1";
+const MODES = ["read-only", "agent", "agent-full-access"];
 let nextId = 100;
 const pending = new Map();
 const sessionConfigs = new Map();
@@ -14,7 +18,8 @@ function configValues(sessionId) {
     sessionConfigs.set(sessionId, {
       model: "mock-default",
       thought_level: "medium",
-      auto_compact: false
+      auto_compact: false,
+      mode: "agent"
     });
   }
   return sessionConfigs.get(sessionId);
@@ -52,7 +57,15 @@ function configOptions(sessionId) {
       name: "Auto compact",
       category: "model_config",
       currentValue: values.auto_compact
-    }
+    },
+    ...(modeOption ? [{
+      type: "select",
+      id: "mode",
+      name: "Mode",
+      category: "mode",
+      currentValue: values.mode,
+      options: MODES.map((value) => ({ value, name: value }))
+    }] : [])
   ];
 }
 
@@ -93,7 +106,8 @@ rl.on("line", (line) => {
     const valid =
       (configId === "model" && ["mock-default", "mock-pro"].includes(value))
       || (configId === "thought_level" && ["low", "medium", "high"].includes(value))
-      || (configId === "auto_compact" && type === "boolean" && typeof value === "boolean");
+      || (configId === "auto_compact" && type === "boolean" && typeof value === "boolean")
+      || (modeOption && configId === "mode" && MODES.includes(value));
     if (!valid) {
       send({ jsonrpc: "2.0", id: message.id, error: { code: -32602, message: "invalid config option" } });
       return;
