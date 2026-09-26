@@ -16,6 +16,23 @@ const HIGH_LANE_METHODS = new Set([
   "cancel", "permission", "answer", "subscribe", "unsubscribe", "daemon_shutdown", "request_cancel"
 ]);
 
+// Asking a daemon to stop must never be what starts one: an autostarted daemon
+// immediately begins background adapter updates and then refuses the very
+// shutdown it was started for. With no daemon listening these answer
+// {ok:true, alreadyStopped:true} instead.
+const NO_AUTOSTART_METHODS = new Set(["daemon_shutdown", "shutdown_if_idle"]);
+
+function daemonStarting(socketPath) {
+  try {
+    const pid = Number(readFileSync(`${socketPath}.lock`, "utf8").trim());
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
 // A daemon that halted in state recovery cannot answer, and its stderr went
 // nowhere (autostart ignores stdio). The marker file is the only channel it had,
 // so a connect failure checks for one and reports the real reason instead of
@@ -71,7 +88,16 @@ export class GatewayRpcClient {
 
   async call(method, args = {}, timeoutMs = 30_000, options = {}) {
     if (options?.signal?.aborted) throw waitAbortedError(method);
-    await this.connect();
+    if (NO_AUTOSTART_METHODS.has(method)) {
+      try {
+        await this.#connectWithoutStarting();
+      } catch (error) {
+        if (["ENOENT", "ECONNREFUSED"].includes(error?.code)) return { ok: true, alreadyStopped: true };
+        throw error;
+      }
+    } else {
+      await this.connect();
+    }
     if (options?.signal?.aborted) throw waitAbortedError(method);
     return this.#requestConnected(method, args, timeoutMs, options);
   }
@@ -112,23 +138,45 @@ export class GatewayRpcClient {
     return result;
   }
 
-  async connect() {
+  // A daemon another client just spawned holds its lock before it listens. Seeing
+  // no socket in that window is not "stopped": wait for it to come up (bounded),
+  // so the shutdown reaches the daemon instead of racing past it.
+  async #connectWithoutStarting() {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.connect({ autoStart: false });
+      } catch (error) {
+        if (!["ENOENT", "ECONNREFUSED"].includes(error?.code) || attempt >= 40 || !daemonStarting(this.socketPath)) throw error;
+        await new Promise((done) => setTimeout(done, 50));
+      }
+    }
+  }
+
+  async connect({ autoStart = this.autoStart } = {}) {
     if (this.closed) throw new Error("Gateway client is closed");
     if (this.socket && !this.socket.destroyed) return;
-    if (this.connecting) return this.connecting;
+    if (this.connecting) {
+      // Joining is safe unless this caller may start a daemon and the attempt in
+      // flight may not: a shutdown's no-autostart failure must not become an
+      // ENOENT for a concurrent setup. Wait it out, then try with autostart.
+      if (!autoStart || this.connectingAutoStart) return this.connecting;
+      await this.connecting.catch(() => {});
+      return this.connect({ autoStart });
+    }
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
-    this.connecting = this.#connectAndRestore().finally(() => {
+    this.connectingAutoStart = autoStart;
+    this.connecting = this.#connectAndRestore(autoStart).finally(() => {
       this.connecting = null;
     });
     return this.connecting;
   }
 
-  async #connectAndRestore() {
+  async #connectAndRestore(autoStart = this.autoStart) {
     try {
       await this.#connectOnce();
     } catch (error) {
-      if (!this.autoStart || !["ENOENT", "ECONNREFUSED"].includes(error?.code)) throw recoveryError(error, this.statePath);
+      if (!autoStart || !["ENOENT", "ECONNREFUSED"].includes(error?.code)) throw recoveryError(error, this.statePath);
       this.#startDaemon();
       let lastError = error;
       for (let attempt = 0; attempt < 40; attempt += 1) {

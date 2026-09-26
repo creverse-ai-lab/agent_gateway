@@ -122,7 +122,9 @@ test("read_only and ask sessions select the worker read-only mode and flag parti
       "session_open", { provider: "mockcodex", cwd: process.cwd(), permissionPolicy: "auto_approve" }, context
     );
     assert.equal(await mode(service, full.sessionId), "agent");
-    assert.equal(full.relevantAlerts.some((alert) => alert.code === "permission_policy_partial"), false);
+    // Reads are never mediated for Codex, so auto_approve is warned too.
+    assert.equal(full.relevantAlerts[0].code, "permission_policy_partial");
+    assert.match(full.relevantAlerts[0].message, /read files anywhere/);
     await service.call("session", { action: "close", sessionId: full.sessionId }, context);
 
     const ask = await service.call(

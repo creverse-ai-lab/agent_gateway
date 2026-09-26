@@ -5,7 +5,7 @@ import { access } from "node:fs/promises";
 import { constants, readFileSync } from "node:fs";
 import { ERROR_CODES, GatewayError } from "./errors.js";
 import { readJsonFile, updateJsonFile } from "./atomic-json.js";
-import { defaultProviderRegistryPath } from "./acp-registry.js";
+import { providerRegistryReadPath, seedProviderRegistry } from "./acp-registry.js";
 
 const GROK_BIN = process.env.GROK_BIN || join(homedir(), ".grok/bin/grok");
 
@@ -51,7 +51,8 @@ export function providerConfig(provider, { model } = {}) {
       // checking it here fails every cold start of an adapter whose initialize
       // result names no model (Claude, Codex), and passes only while warm.
       expectedModel: modelScope === "process" ? requested : null,
-      modelScope
+      modelScope,
+      registryVersion: typeof configured.registryVersion === "string" ? configured.registryVersion : null
     };
   }
 
@@ -161,7 +162,7 @@ export function providerIds() {
 
 function configuredProviders() {
   if (process.env.ACP_GATEWAY_DISABLE_DYNAMIC_PROVIDERS === "1" && !process.env.ACP_GATEWAY_PROVIDERS) return {};
-  const path = defaultProviderRegistryPath();
+  const path = providerRegistryReadPath();
   try {
     const document = JSON.parse(readFileSync(path, "utf8"));
     if (document?.version !== 1 || !document.providers || typeof document.providers !== "object") return {};
@@ -207,19 +208,72 @@ async function executableExists(command) {
 const PARTIAL_POLICY_PROVIDERS = new Set(["codex"]);
 const PARTIAL_POLICY_REGISTRY_IDS = new Set(["codex-acp"]);
 
+// Reads are never mediated for these providers either (measured live in 1.5.2:
+// Codex read files outside its roots and inside ~/.acp-gateway under read_only),
+// so the alert applies under every policy, auto_approve included.
 export function partialPolicyEnforcement(provider, permissionPolicy) {
-  if (permissionPolicy === "auto_approve") return null;
   const registryId = configuredProviders()[provider]?.registryId;
+  if (isGrokProvider(provider)) {
+    // Grok's built-in grep/rg reads in-process. Its sandbox profile denies the
+    // Gateway-protected paths (grok-sandbox.js), but cannot express per-session
+    // roots, so other files outside the roots stay readable through it.
+    return {
+      level: "warning",
+      code: "permission_policy_partial",
+      provider,
+      scope: ["read_outside_roots"],
+      message: `permissionPolicy=${permissionPolicy} is only partially enforced for ${provider}: `
+        + "its built-in grep tool can read files outside the session roots without a permission request. "
+        + "Gateway-protected paths are denied by the Grok sandbox profile; edits, shell commands and file reads through ACP are enforced."
+    };
+  }
   if (!PARTIAL_POLICY_PROVIDERS.has(provider) && !PARTIAL_POLICY_REGISTRY_IDS.has(registryId)) return null;
+  const edits = permissionPolicy === "auto_approve"
+    ? ""
+    : "it can edit files and run shell writes inside its session roots without a permission request, and ";
   return {
     level: "warning",
     code: "permission_policy_partial",
     provider,
+    scope: permissionPolicy === "auto_approve"
+      ? ["read_outside_roots", "read_protected"]
+      : ["edit_inside_roots", "shell_write_inside_roots", "read_outside_roots", "read_protected"],
     message: `permissionPolicy=${permissionPolicy} is only partially enforced for ${provider}: `
-      + "the worker can edit files inside its session roots without a permission request. "
-      + "The strictest worker mode was applied; writes outside the roots, network and escalations still reach the Gateway. "
-      + "Use a disposable copy of the workspace when edits must be impossible."
+      + `${edits}it can read files anywhere, including Gateway-protected paths such as ~/.acp-gateway. `
+      + "Writes outside the roots, network and escalations still reach the Gateway. "
+      + "Use workspace=snapshot when edits must be impossible, and do not hand this worker untrusted input on a machine holding the Control token."
   };
+}
+
+// Claude Code enforces its own permission rules and auto-allows commands it
+// judges safe, so a read_only session could still run Bash and read any file
+// without a permission request ever reaching the Gateway. claude-agent-acp takes
+// SDK options per session through _meta.claudeCode.options; its disallowedTools
+// uses Claude Code rule syntax, where "//" starts an absolute path.
+const CLAUDE_REGISTRY_IDS = new Set(["claude-acp"]);
+const CLAUDE_MUTATING_TOOLS = ["Bash", "Edit", "Write", "MultiEdit", "NotebookEdit"];
+const CLAUDE_PATH_TOOLS = ["Read", "Edit", "Write", "MultiEdit", "NotebookEdit", "Glob", "Grep"];
+
+const GROK_REGISTRY_IDS = new Set(["grok-build"]);
+
+export function isGrokProvider(provider) {
+  return provider === "grok" || GROK_REGISTRY_IDS.has(configuredProviders()[provider]?.registryId);
+}
+
+export function isClaudeProvider(provider) {
+  return provider === "claude" || CLAUDE_REGISTRY_IDS.has(configuredProviders()[provider]?.registryId);
+}
+
+export function workerSessionMeta(provider, { permissionPolicy, protectedPaths = [] } = {}) {
+  if (!isClaudeProvider(provider)) return null;
+  const disallowedTools = [];
+  if (permissionPolicy === "read_only") disallowedTools.push(...CLAUDE_MUTATING_TOOLS);
+  for (const path of protectedPaths) {
+    const rulePath = `/${path.replace(/\/+$/, "")}/**`;
+    for (const tool of CLAUDE_PATH_TOOLS) disallowedTools.push(`${tool}(${rulePath})`);
+  }
+  if (!disallowedTools.length) return null;
+  return { claudeCode: { options: { disallowedTools } } };
 }
 
 export function currentModelId(initResult) {
@@ -234,7 +288,7 @@ function optionalModel(value) {
 
 export function isProviderEnabled(provider) {
   if (process.env.ACP_GATEWAY_DISABLE_DYNAMIC_PROVIDERS === "1" && !process.env.ACP_GATEWAY_PROVIDERS) return true;
-  const document = readJsonFile(defaultProviderRegistryPath(), { version: 1, providers: {}, disabled: [] });
+  const document = readJsonFile(providerRegistryReadPath(), { version: 1, providers: {}, disabled: [] });
   if (document.version !== 1 || (document.disabled != null && (!Array.isArray(document.disabled) || document.disabled.some(id => typeof id !== "string")))) {
     throw new GatewayError(ERROR_CODES.CONFIG_INVALID, "Invalid provider policy document");
   }
@@ -249,7 +303,7 @@ export function setProviderEnabled(provider, enabled) {
   if (typeof provider !== "string" || !/^[a-z0-9][a-z0-9._-]*$/.test(provider) || typeof enabled !== "boolean") {
     throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "provider and boolean enabled are required");
   }
-  updateJsonFile(defaultProviderRegistryPath(), { version: 1, providers: {}, disabled: [] }, document => {
+  updateJsonFile(seedProviderRegistry(), { version: 1, providers: {}, disabled: [] }, document => {
     if (document.version !== 1 || (document.disabled != null && (!Array.isArray(document.disabled) || document.disabled.some(id => typeof id !== "string")))) throw new GatewayError(ERROR_CODES.CONFIG_INVALID, "Invalid provider policy document");
     const disabled = new Set(document.disabled ?? []);
     if (enabled) disabled.delete(provider); else disabled.add(provider);

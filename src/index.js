@@ -278,7 +278,8 @@ function controlTools() {
           pinned: { type: "boolean" },
           additionalDirectories: { type: "array", items: { type: "string" } },
           mcpServers: { type: "array", items: { type: "object" } },
-          thoughtCapture: { type: "string", enum: ["none", "tail", "full"], description: "How much worker reasoning this session retains: none keeps nothing, tail keeps the last 8KB (default), full keeps up to maxTextBytes. Live delivery of thought chunks is unaffected in every mode." }
+          thoughtCapture: { type: "string", enum: ["none", "tail", "full"], description: "How much worker reasoning this session retains: none keeps nothing, tail keeps the last 8KB (default), full keeps up to maxTextBytes. Live delivery of thought chunks is unaffected in every mode." },
+          workspace: { type: "string", enum: ["direct", "snapshot"], description: "snapshot runs the worker in a private copy of cwd and never touches the original; read the changes with agent_acp_session {action: workspace_diff} and apply them yourself. Use it when edits must be impossible (e.g. a Codex reviewer). The copy is removed on close. Default direct." }
         },
         required: ["provider", "cwd"]
       }
@@ -416,11 +417,11 @@ function controlTools() {
     },
     {
       name: "agent_acp_session",
-      description: "List, inspect, close, or clean sessions owned by this Main.",
+      description: "List, inspect, close, or clean sessions owned by this Main. workspace_diff returns the patch from the original cwd to a snapshot session's copy.",
       inputSchema: {
         type: "object",
         properties: {
-          action: { type: "string", enum: ["list", "get", "close", "clean", "pin", "unpin"] },
+          action: { type: "string", enum: ["list", "get", "close", "clean", "pin", "unpin", "workspace_diff"] },
           sessionId: { type: "string" },
           includeEvents: { type: "boolean" },
           includeTranscript: { type: "boolean", description: "Include the narrated transcript (resultText) on get. Defaults to false; transcriptBytes always reports its size. The in-memory copy is bounded (maxTextBytes) - when it overflowed, resultArtifact points at the complete spill." }

@@ -25,12 +25,12 @@ const PINNED = "a1fdb353777337ca6ec481f8563d77efaea55e95";
 
 test("1.5.x requires a caller-reviewed full source SHA independently of the tag", () => {
   const source = "1".repeat(40);
-  for (const tag of ["v1.5.0", "v1.5.1"]) {
+  for (const tag of ["v1.5.0", "v1.5.1", "v1.5.2"]) {
     assert.throws(() => assertPinnedSourceCommit(tag, source), /No pinned source commit/);
     assertPinnedSourceCommit(tag, source, source);
     assert.throws(() => assertPinnedSourceCommit(tag, "2".repeat(40), source), /refusing a moved tag/);
   }
-  assert.throws(() => assertPinnedSourceCommit("v1.5.2", source, source), /No pinned source commit/);
+  assert.throws(() => assertPinnedSourceCommit("v1.5.3", source, source), /No pinned source commit/);
   assert.throws(() => assertPinnedSourceCommit("v1.4.0", PINNED, source), /historical pin/);
 });
 

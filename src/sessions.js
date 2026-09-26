@@ -493,7 +493,10 @@ export class SessionStore {
       stopReason: session.stopReason ?? null,
       // Additive: a capture policy chosen per session must survive a restart, or
       // a restored session silently reverts to the gateway default.
-      thoughtCapture: session.thoughtCapture ?? null
+      thoughtCapture: session.thoughtCapture ?? null,
+      // Additive: a snapshot session must keep pointing at its copy after a
+      // restart, and still be able to diff against the original.
+      ...(session.workspace ? { workspace: session.workspace } : {})
     }));
   }
 
@@ -615,6 +618,17 @@ export function publicSession(session) {
     createdAt: session.createdAt,
     updatedAt: session.updatedAt,
     eventCount: session.events.length,
-    resultArtifact: session.resultArtifact ?? null
+    resultArtifact: session.resultArtifact ?? null,
+    // Only present for workspace=snapshot, so the default shape is unchanged.
+    ...(session.workspace ? {
+      workspace: {
+        mode: session.workspace.mode,
+        source: session.workspace.source,
+        path: session.workspace.path,
+        // Links leaving the tree are not copied: editing through one would
+        // escape the snapshot. Listed so Main knows the copy differs there.
+        ...(session.workspace.droppedLinks ? { droppedLinks: session.workspace.droppedLinks } : {})
+      }
+    } : {})
   };
 }

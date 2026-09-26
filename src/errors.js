@@ -59,6 +59,14 @@ export const ERROR_CODES = Object.freeze({
   PROMPT_TOO_LARGE: "PROMPT_TOO_LARGE",
   SESSION_LIMIT_EXCEEDED: "SESSION_LIMIT_EXCEEDED",
   INBOX_BUDGET_EXCEEDED: "INBOX_BUDGET_EXCEEDED",
+  // A run retried with an idempotencyKey that already names different work. The
+  // existing taskId is in details, so the caller can attach to it deliberately.
+  IDEMPOTENCY_CONFLICT: "IDEMPOTENCY_CONFLICT",
+  // The worker answered a JSON-RPC request with an error. details.acpCode and
+  // details.acpMessage carry the worker's own error unchanged.
+  ACP_ERROR: "ACP_ERROR",
+  // A snapshot workspace could not be created, compared or removed.
+  WORKSPACE_ERROR: "WORKSPACE_ERROR",
   // Fallback for an error that has no more specific code yet.
   GATEWAY_ERROR: "GATEWAY_ERROR"
 });

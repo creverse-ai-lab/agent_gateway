@@ -1,9 +1,10 @@
 import { spawn } from "node:child_process";
+import { realpathSync } from "node:fs";
 import { realpath, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { BoundedUtf8Text, readTextHead, readTextLines } from "./bounded-utf8.js";
-import { ERROR_CODES } from "./errors.js";
+import { ERROR_CODES, GatewayError } from "./errors.js";
 import { readNdjson } from "./ndjson.js";
 import { LANE_HIGH, LANE_NORMAL, NdjsonChannel } from "./ndjson-channel.js";
 import { GATEWAY_VERSION } from "./version.js";
@@ -55,6 +56,8 @@ export class AcpClient {
     // so no behavior changes with it.
     this.maxTerminalOutputBytes = options.maxTerminalOutputBytes ?? 10_000_000;
     this.maxQueueBytes = options.maxQueueBytes ?? CHILD_STDIN_QUEUE_BYTES;
+    // Canonical paths no session may touch, even when a root contains them.
+    this.protectedPaths = [...(options.protectedPaths ?? [])];
     this.writeTimeoutMs = options.writeTimeoutMs;
     this.proc = null;
     this.rl = null;
@@ -84,7 +87,8 @@ export class AcpClient {
     delete childEnv.ACP_GATEWAY_SOCKET;
     this.proc = spawn(this.config.command, this.config.args, {
       stdio: ["pipe", "pipe", "pipe"],
-      env: childEnv
+      env: childEnv,
+      ...(this.config.cwd ? { cwd: this.config.cwd } : {})
     });
     this.alive = true;
     this.proc.once("error", (error) => this.#fail(error));
@@ -222,11 +226,13 @@ export class AcpClient {
     cwd,
     mcpServers = [],
     additionalDirectories = [],
-    permissionPolicy = this.permissionPolicy
+    permissionPolicy = this.permissionPolicy,
+    meta = null
   }) {
     const roots = await canonicalRoots(cwd, additionalDirectories);
     const params = { cwd: roots[0], mcpServers };
     if (additionalDirectories.length) params.additionalDirectories = roots.slice(1);
+    if (meta) params._meta = meta;
     const result = await this.request("session/new", params, 30_000);
     this.sessionRoots.set(result.sessionId, roots);
     this.sessionPolicies.set(result.sessionId, requirePermissionPolicy(permissionPolicy));
@@ -239,11 +245,13 @@ export class AcpClient {
     cwd,
     mcpServers = [],
     additionalDirectories = [],
-    permissionPolicy = this.permissionPolicy
+    permissionPolicy = this.permissionPolicy,
+    meta = null
   }) {
     const roots = await canonicalRoots(cwd, additionalDirectories);
     const params = { sessionId, cwd: roots[0], mcpServers };
     if (additionalDirectories.length) params.additionalDirectories = roots.slice(1);
+    if (meta) params._meta = meta;
     const result = await this.request(method, params, 30_000);
     this.sessionRoots.set(sessionId, roots);
     this.sessionPolicies.set(sessionId, requirePermissionPolicy(permissionPolicy));
@@ -379,7 +387,7 @@ export class AcpClient {
       if (!pending) return;
       this.pending.delete(message.id);
       if (message.error) {
-        pending.reject(new Error(`ACP error ${message.error.code ?? ""}: ${message.error.message}`));
+        pending.reject(acpRequestError(pending.method, message.error));
       } else {
         pending.resolve(message.result);
       }
@@ -511,14 +519,49 @@ export class AcpClient {
 
   #automaticPermission(params) {
     const policy = this.sessionPolicies.get(params.sessionId) ?? this.permissionPolicy;
+    const scope = this.#permissionScope(params);
+    // A protected path is refused under every policy, ask included: Main should
+    // not be one mistaken click away from handing a worker the Control token.
+    if (scope === "protected") return this.#selectPermission(params, ["reject_once", "reject_always"]);
     if (policy === "ask") return null;
-    const options = params.options ?? [];
     const readLike = READ_ONLY_TOOL_KINDS.has(params.toolCall?.kind);
-    const wantedKinds = policy === "auto_approve" || readLike
-      ? ["allow_once", "allow_always"]
-      : ["reject_once", "reject_always"];
-    const option = wantedKinds.map((kind) => options.find((item) => item.kind === kind)).find(Boolean);
+    if (scope === "outside") {
+      // Nothing outside the declared roots is ever approved automatically.
+      // read_only refuses it; auto_approve hands the decision to Main, since it
+      // was only ever authorized inside the roots.
+      return policy === "auto_approve" ? null : this.#selectPermission(params, ["reject_once", "reject_always"]);
+    }
+    return this.#selectPermission(
+      params,
+      policy === "auto_approve" || readLike ? ["allow_once", "allow_always"] : ["reject_once", "reject_always"]
+    );
+  }
+
+  #selectPermission(params, wantedKinds) {
+    const options = params.options ?? [];
+    const option = wantedKinds
+      .map((kind) => preferContinuing(options.filter((item) => item.kind === kind)))
+      .find(Boolean);
     return { outcome: option ? { outcome: "selected", optionId: option.optionId } : { outcome: "cancelled" } };
+  }
+
+  // Classifies the paths a permission request names in toolCall.locations (and a
+  // Read-style rawInput.file_path/path) against the session roots. A request
+  // that names no path keeps its old treatment: its kind decides.
+  #permissionScope(params) {
+    const roots = this.sessionRoots.get(params.sessionId) ?? [];
+    // A shell command names its files inside a string. It cannot be parsed
+    // reliably, but naming a protected path in any spelling is enough to refuse.
+    const command = commandText(params.toolCall?.rawInput);
+    if (mentionsProtectedPath(command, this.protectedPaths)
+      || commandPathsHitProtected(command, roots[0], this.protectedPaths)) return "protected";
+    let outside = false;
+    for (const requested of requestedPaths(params.toolCall)) {
+      const path = canonicalizePhysical(isAbsolute(requested) ? requested : `${roots[0] ?? ""}/${requested}`);
+      if (this.protectedPaths.some((item) => isWithin(item, path))) return "protected";
+      if (!roots.some((root) => isWithin(root, path))) outside = true;
+    }
+    return outside ? "outside" : "inside";
   }
 
   // Truncate, never refuse: the ACP contract has no way to say "too large", and a
@@ -565,6 +608,10 @@ export class AcpClient {
     const cwd = await realpath(resolve(params.cwd ?? roots[0] ?? process.cwd()));
     if (!roots.some((root) => isWithin(root, cwd))) throw new Error(`Terminal cwd is outside ACP session roots: ${cwd}`);
     if (typeof params.command !== "string" || !params.command) throw new Error("Terminal command is required");
+    const commandLine = [params.command, ...(params.args ?? [])].join(" ");
+    if (mentionsProtectedPath(commandLine, this.protectedPaths) || commandPathsHitProtected(commandLine, cwd, this.protectedPaths)) {
+      throw new Error("Terminal command names a path protected by the Gateway");
+    }
     const activeForSession = [...this.terminals.values()].filter((item) => item.sessionId === params.sessionId).length;
     if (activeForSession >= this.maxTerminalsPerSession) {
       throw new Error(`ACP session terminal limit exceeded: ${this.maxTerminalsPerSession}`);
@@ -678,6 +725,7 @@ export class AcpClient {
       path = join(await realpath(dirname(requested)), basename(requested));
     }
     if (!roots.some((root) => isWithin(root, path))) throw new Error(`Path is outside ACP session roots: ${path}`);
+    if (this.protectedPaths.some((item) => isWithin(item, path))) throw new Error(`Path is protected by the Gateway: ${path}`);
     return path;
   }
 
@@ -831,6 +879,139 @@ function terminateChild(terminal) {
     if (!terminal.exitStatus) killChild(terminal.child, "SIGKILL");
   }, 2_000);
   timer.unref();
+}
+
+// The message keeps its historical "ACP error <code>: <message>" text. What is new
+// is the stable code: a restore of a session the worker does not know is
+// UNKNOWN_SESSION, anything else the worker refused is ACP_ERROR, and the worker's
+// own code and message always travel in details for the caller to inspect.
+const RESTORE_METHODS = new Set(["session/load", "session/resume"]);
+// Only an error that is about the session itself: ACP resourceNotFound (-32002)
+// or wording that names the session. A missing cwd, model or file ("Path not
+// found.", "working directory does not exist") stays ACP_ERROR, because a caller
+// that sees UNKNOWN_SESSION may discard a session that is still resumable.
+const SESSION_NOT_FOUND_PATTERN = /\bsession(?: [\w.:-]+)?(?: was)? (?:not[\s_-]*found|does not exist)\b|\b(?:no such|unknown) session\b/i;
+
+export function acpRequestError(method, error) {
+  const acpCode = error?.code ?? null;
+  const acpMessage = String(error?.message ?? "");
+  const notFound = RESTORE_METHODS.has(method) && (acpCode === -32002 || SESSION_NOT_FOUND_PATTERN.test(acpMessage));
+  return new GatewayError(
+    notFound ? ERROR_CODES.UNKNOWN_SESSION : ERROR_CODES.ACP_ERROR,
+    `ACP error ${acpCode ?? ""}: ${acpMessage}`,
+    { method, acpCode, acpMessage, ...(error?.data === undefined ? {} : { acpData: error.data }) }
+  );
+}
+
+// Several options can share one kind. codex-acp offers two reject_once options
+// for the same request: "decline" (continue without running it) and "cancel"
+// (stop and wait for new instructions). An automatic refusal must not end the
+// whole turn, so among same-kind options one that lets the worker continue wins;
+// a stopping option is used only when it is the only refusal offered.
+const STOPPING_OPTION = /\b(cancel|abort|stop)\b|tell .* what to do differently/i;
+const CONTINUING_OPTION = /\b(decline|deny|continue|skip)\b/i;
+
+function preferContinuing(candidates) {
+  if (candidates.length <= 1) return candidates[0];
+  const describe = (item) => `${item.optionId ?? ""} ${item.name ?? ""}`;
+  return candidates.find((item) => CONTINUING_OPTION.test(describe(item)) && !STOPPING_OPTION.test(describe(item)))
+    ?? candidates.find((item) => !STOPPING_OPTION.test(describe(item)))
+    ?? candidates[0];
+}
+
+const PATH_INPUT_KEYS = ["file_path", "path", "notebook_path", "filePath"];
+
+function requestedPaths(toolCall) {
+  const paths = [];
+  for (const location of Array.isArray(toolCall?.locations) ? toolCall.locations : []) {
+    if (typeof location?.path === "string" && location.path) paths.push(location.path);
+  }
+  const input = toolCall?.rawInput;
+  if (input && typeof input === "object") {
+    for (const key of PATH_INPUT_KEYS) if (typeof input[key] === "string" && input[key]) paths.push(input[key]);
+  }
+  return paths;
+}
+
+// Resolves the path the way the kernel will: segment by segment, following each
+// existing symlink before the next ".." is applied. path.resolve() would fold
+// "root/link/../x" into "root/x" lexically, while the kernel opens
+// "<link target>/../x" — anywhere the link points. Synchronous because a
+// permission decision cannot wait on I/O; segments that do not exist yet (a new
+// file) are appended as written.
+function canonicalizePhysical(path) {
+  let current = "/";
+  let physical = true;
+  for (const segment of String(path).split("/")) {
+    if (segment === "" || segment === ".") continue;
+    if (segment === "..") {
+      current = dirname(current);
+      continue;
+    }
+    const next = join(current, segment);
+    if (physical) {
+      try {
+        current = realpathSync(next);
+        continue;
+      } catch {
+        physical = false;
+      }
+    }
+    current = next;
+  }
+  return current;
+}
+
+// Path-looking words of a command line, resolved physically against the working
+// directory: catches "cat link/../.acp-gateway/install.json" where the literal
+// never names the protected directory. Best effort, like any shell parsing; the
+// literal check above and the Grok/Claude sandbox rules are the other layers.
+function commandPathsHitProtected(text, cwd, protectedPaths) {
+  if (!text || !protectedPaths.length) return false;
+  const words = String(text).replace(/["'\\]/g, "").split(/[\s;|&()<>=]+/);
+  for (const word of words) {
+    if (!word.includes("/") || /^[a-z][a-z0-9+.-]*:\/\//i.test(word)) continue;
+    const path = canonicalizePhysical(word.startsWith("/") ? word : `${cwd ?? ""}/${word}`);
+    if (protectedPaths.some((item) => isWithin(item, path))) return true;
+  }
+  return false;
+}
+
+function commandText(input) {
+  if (!input || typeof input !== "object") return "";
+  const command = input.command ?? input.cmd;
+  if (Array.isArray(command)) return command.join(" ");
+  return typeof command === "string" ? command : "";
+}
+
+// Every spelling a shell would expand to a protected path: the canonical path,
+// its /private-less form on macOS, and ~ / $HOME / ${HOME} forms under the home
+// directory. A match must end at a path boundary so "/x/.acp-gateway-old" is not
+// mistaken for "/x/.acp-gateway".
+function mentionsProtectedPath(raw, protectedPaths) {
+  if (!raw) return false;
+  // Quotes and backslash escapes do not change which file a shell opens:
+  // "$HOME"/.acp-gateway and $HOME/.acp-gateway are the same path.
+  const text = String(raw).replace(/["'\\]/g, "");
+  const home = process.env.HOME ?? "";
+  for (const path of protectedPaths) {
+    const forms = new Set([path, path.replace(/^\/private(?=\/)/, "")]);
+    for (const form of [...forms]) {
+      if (home && (form === home || form.startsWith(`${home}/`))) {
+        const rel = form.slice(home.length);
+        for (const prefix of ["~", "$HOME", "${HOME}"]) forms.add(`${prefix}${rel}`);
+      }
+    }
+    for (const form of forms) {
+      let index = text.indexOf(form);
+      while (index !== -1) {
+        const after = text[index + form.length];
+        if (after === undefined || /[\s/'"`;:|&)]/.test(after)) return true;
+        index = text.indexOf(form, index + 1);
+      }
+    }
+  }
+  return false;
 }
 
 function isWithin(root, path) {

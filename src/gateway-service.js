@@ -7,8 +7,12 @@ import { ArtifactStore, defaultArtifactRoot } from "./artifacts.js";
 import { utf8ByteHead } from "./bounded-utf8.js";
 import { ERROR_CODES, GatewayError } from "./errors.js";
 import {
-  assertProviderEnabled, currentModelId, detectProviders, partialPolicyEnforcement, providerConfig, setProviderEnabled
+  assertProviderEnabled, currentModelId, detectProviders, isGrokProvider, partialPolicyEnforcement, providerConfig,
+  setProviderEnabled, workerSessionMeta
 } from "./providers.js";
+import { prepareGrokSandbox } from "./grok-sandbox.js";
+import { gatewayProtectedPaths } from "./config.js";
+import { createSnapshot, defaultWorkspaceRoot, removeSnapshot, snapshotDiff } from "./workspace.js";
 import {
   capPendingOptions, compareInboxDesc, decodeInboxCursor, encodeInboxCursor, isAfterInboxCursor,
   projectInboxItem, projectPoll, projectResult, PROFILES, relevantAlerts, requireInboxDetail,
@@ -115,15 +119,34 @@ export class GatewayService {
     // Per-session overrides ride session_open/session_restore.
     thoughtCapture = "tail",
     agentUpdateManager = null,
+    // Canonical paths no worker may read or write (Control token, settings,
+    // state, socket). Injectable so tests can point them at a temp directory.
+    protectedPaths = null,
+    // Where workspace=snapshot copies live. Never under a protected path.
+    workspaceRoot = defaultWorkspaceRoot(),
+    // Process-wide Grok sandbox profile (grok-sandbox.js). Off when a test
+    // injects its own client factory, unless asked for explicitly.
+    grokSandbox = createClient == null,
+    grokSandboxDir = null,
     now = () => Date.now()
   } = {}) {
+    this.workspaceRoot = workspaceRoot;
+    this.grokSandbox = grokSandbox;
+    this.grokSandboxDir = grokSandboxDir;
     this.settings = settings;
+    this.protectedPaths = protectedPaths
+      ?? gatewayProtectedPaths(statePath ? { statePath } : {});
     this.draining = false;
     this.inflightMutations = 0;
     this.pendingSessions = new Map();
     this.observability = { thoughtCapture: normalizeThoughtCapture(thoughtCapture) };
     this.statePath = statePath;
     this.clients = new Map();
+    // Processes started from an adapter definition that has since changed (an
+    // auto-update rewrote the pin). They finish serving the sessions they already
+    // hold; new sessions get a process of the current definition. gc stops each
+    // one once no session references it.
+    this.retiredClients = new Set();
     this.clientStarts = new Map();
     this.stopped = false;
     // Counts transitions the table rejected. Zero is the invariant; the strict
@@ -590,7 +613,7 @@ export class GatewayService {
         providers: detected.map((item) => ({
           provider: item.id,
           ok: item.agentInstalled && item.adapterInstalled,
-          started: false
+          started: this.#providerStarted(item.id)
         })),
         liveSessions
       };
@@ -640,7 +663,12 @@ export class GatewayService {
               protocolVersion: client.initResult?.protocolVersion,
               capabilities: client.initResult?.agentCapabilities ?? {},
               model: currentModelId(client.initResult),
-              command: client.config.command
+              command: client.config.command,
+              // Additive: which adapter pin this process runs, and how many older
+              // processes are still finishing sessions after an adapter update.
+              runningVersion: client.gatewayRegistryVersion ?? null,
+              retiredProcesses: [...this.retiredClients]
+                .filter((retired) => retired.alive && retired.gatewayProvider === name).length
             };
           } catch (error) {
             return { provider: name, ok: false, error: error?.message ?? String(error) };
@@ -649,9 +677,25 @@ export class GatewayService {
       ) : detected.map((item) => ({
         provider: item.id,
         ok: item.agentInstalled && item.adapterInstalled,
-        started: false
+        started: this.#providerStarted(item.id)
       }))
     };
+  }
+
+  // Grok gets a process-wide sandbox profile denying the protected paths; see
+  // grok-sandbox.js. Only when the gateway starts the real provider: an injected
+  // test client factory ignores the config anyway.
+  #withProviderSandbox(provider, config) {
+    if (!this.grokSandbox || !isGrokProvider(provider) || !this.protectedPaths.length) return config;
+    const overrides = prepareGrokSandbox(this.protectedPaths, this.grokSandboxDir ?? undefined);
+    return { ...config, cwd: overrides.cwd, env: { ...(config.env ?? {}), ...overrides.env } };
+  }
+
+  // Whether any live process of this provider exists, current or retired. This
+  // used to be a hard-coded false even while the provider was running.
+  #providerStarted(provider) {
+    return [...this.clients.values(), ...this.retiredClients]
+      .some((client) => client?.alive && client.gatewayProvider === provider);
   }
 
   async withSessionAdmission(provider, context, operation) {
@@ -676,16 +720,36 @@ export class GatewayService {
   async openSession(args, context) {
     const provider = requireProvider(args.provider);
     assertProviderEnabled(provider);
-    const cwd = await requireDirectory(args.cwd);
+    const requestedCwd = await requireDirectory(args.cwd);
+    const workspaceMode = args.workspace ?? "direct";
+    if (workspaceMode !== "direct" && workspaceMode !== "snapshot") {
+      throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "workspace must be direct or snapshot");
+    }
     const requestedModel = optionalString(args.model, "model");
     const client = await this.getClient(provider, requestedModel);
     const permissionPolicy = requirePermissionPolicy(args.permissionPolicy ?? "ask");
     const mcpServers = sanitizeWorkerMcpServers(args.mcpServers ?? []);
+    // The copy is made before the worker ever sees a path, so the worker's cwd is
+    // the copy from its first request onward.
+    const workspace = workspaceMode === "snapshot"
+      ? await createSnapshot(requestedCwd, this.workspaceRoot, { protectedPaths: this.protectedPaths })
+      : null;
+    const cwd = workspace?.path ?? requestedCwd;
+    try {
+      return await this.#openSessionIn({ args, context, provider, cwd, client, requestedModel, permissionPolicy, mcpServers, workspace });
+    } catch (error) {
+      if (workspace) await removeSnapshot(workspace).catch(() => {});
+      throw error;
+    }
+  }
+
+  async #openSessionIn({ args, context, provider, cwd, client, requestedModel, permissionPolicy, mcpServers, workspace }) {
     const created = await client.sessionNew({
       cwd,
       mcpServers,
       additionalDirectories: args.additionalDirectories ?? [],
-      permissionPolicy
+      permissionPolicy,
+      meta: workerSessionMeta(provider, { permissionPolicy, protectedPaths: this.protectedPaths })
     });
     try {
       const modelled = await this.configureSessionModel(client, created, requestedModel);
@@ -699,6 +763,7 @@ export class GatewayService {
         created: configured.response,
         model: configured.model,
         permissionPolicy,
+        workspace,
         ownerRootId: requireRoot(context)
       });
     } catch (error) {
@@ -730,7 +795,8 @@ export class GatewayService {
       cwd,
       mcpServers: sanitizeWorkerMcpServers(args.mcpServers ?? existing?.mcpServers ?? []),
       additionalDirectories: args.additionalDirectories ?? existing?.additionalDirectories ?? [],
-      permissionPolicy
+      permissionPolicy,
+      meta: workerSessionMeta(provider, { permissionPolicy, protectedPaths: this.protectedPaths })
     });
     try {
       const modelled = await this.configureSessionModel(client, restored, requestedModel, acpSessionId);
@@ -843,7 +909,8 @@ export class GatewayService {
         fields.args.thoughtCapture, this.observability.thoughtCapture
       ),
       lastOwnerActivityAt: new Date(this.now()).toISOString(),
-      _ownerActivityPersistedAt: this.now()
+      _ownerActivityPersistedAt: this.now(),
+      ...(fields.workspace ? { workspace: fields.workspace } : {})
     });
     fields.client.onSessionUpdate(fields.acpSessionId, (update) => this.handleUpdate(session, update));
     this.store.push(session, { type: "session_created" });
@@ -1116,7 +1183,20 @@ export class GatewayService {
   async #startRunTask(args, context) {
     const session = requireOwnedSession(this.requireSession(args.sessionId), context);
     const existing = this.#idempotentRun(session, args.idempotencyKey);
-    if (existing) return existing;
+    if (existing) {
+      // Same key, different work: attaching would hand back another prompt's
+      // result and silently drop this one. Tasks from before the digest existed
+      // carry none and keep the old attach behaviour.
+      const stored = this.taskStore.find(existing)?.requestDigest;
+      if (stored && stored !== runRequestDigest(args)) {
+        throw new GatewayError(
+          ERROR_CODES.IDEMPOTENCY_CONFLICT,
+          `idempotencyKey ${args.idempotencyKey} already names a different run on this session`,
+          { taskId: existing, sessionId: session.id }
+        );
+      }
+      return existing;
+    }
     const created = await this.taskPrompt(args, context, "run");
     this.#rememberRun(session, args.idempotencyKey, created.taskId);
     return created.taskId;
@@ -1317,7 +1397,8 @@ export class GatewayService {
         ttl: args.ttl,
         pollInterval: args.pollInterval,
         origin,
-        idempotencyKey: origin === "run" ? args.idempotencyKey : null
+        idempotencyKey: origin === "run" ? args.idempotencyKey : null,
+        requestDigest: origin === "run" && args.idempotencyKey ? runRequestDigest(args) : null
       }));
       this.#rememberDelivery(task.taskId, args);
       // The barrier is BEFORE the ACP turn starts. After it, a crash can only
@@ -1782,6 +1863,26 @@ export class GatewayService {
       await this.closeSession(session);
       return { ok: true, closed: session.id };
     }
+    if (args.action === "workspace_diff") {
+      const diff = await snapshotDiff(session.workspace);
+      const budget = this.resourceLimits.maxInlineResultBytes;
+      const bytes = Buffer.byteLength(diff.patch);
+      const truncated = bytes > budget;
+      return {
+        ok: true,
+        sessionId: session.id,
+        source: session.workspace.source,
+        workspace: session.workspace.path,
+        changed: diff.changed,
+        files: diff.files,
+        patch: truncated ? utf8ByteHead(diff.patch, budget) : diff.patch,
+        patchBytes: bytes,
+        truncated,
+        // Over the inline budget the complete patch is an artifact, so a large
+        // change set is never silently cut short.
+        ...(truncated ? { patchArtifact: this.store.spillText(session.id, "workspace-diff", diff.patch) } : {})
+      };
+    }
     if (args.action === "pin" || args.action === "unpin") {
       session.pinned = args.action === "pin";
       if (session.pinned) session.orphanedAt = null;
@@ -1847,6 +1948,8 @@ export class GatewayService {
     // Replay must not resurrect a session Main was told is gone, even when the
     // registration record is still in the log ahead of this one.
     this.stateStore?.append(WAL_TYPES.SESSION_CLOSED, session.id, {});
+    // The copy goes with the session. Main collects workspace_diff before close.
+    if (session.workspace) await removeSnapshot(session.workspace).catch(() => {});
     // Anything still queued behind this close was written for a session that
     // now does not exist; waking it up would act on the deleted record.
     queue.closeWith(new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`));
@@ -2036,13 +2139,27 @@ export class GatewayService {
 
   async getClient(provider, model = null) {
     requireProvider(provider);
-    const config = providerConfig(provider, { model });
+    // A client started after shutdown collected the client list would outlive
+    // the daemon's own stop sweep.
+    if (this.stopped) throw new GatewayError(ERROR_CODES.GATEWAY_DRAINING, "Gateway is shutting down");
+    const config = this.#withProviderSandbox(provider, providerConfig(provider, { model }));
     const clientKey = config.modelScope === "process" ? `${provider}:${config.expectedModel}` : provider;
     const existing = this.clients.get(clientKey);
-    if (existing?.alive && existing.initResult) return existing;
+    if (existing?.alive && existing.initResult) {
+      if (existing.gatewayFingerprint === clientFingerprint(config)) return existing;
+      this.clients.delete(clientKey);
+      this.retiredClients.add(existing);
+    }
     const starting = this.clientStarts.get(clientKey);
-    if (starting) return starting;
+    if (starting) {
+      // A start of an older definition is not ours to join: wait for it to land
+      // (it becomes the current client), then choose again so it is retired.
+      if (starting.fingerprint === clientFingerprint(config)) return starting;
+      await starting.catch(() => {});
+      return this.getClient(provider, model);
+    }
     const start = this.#startClient(provider, clientKey, config);
+    start.fingerprint = clientFingerprint(config);
     this.clientStarts.set(clientKey, start);
     try {
       return await start;
@@ -2061,6 +2178,7 @@ export class GatewayService {
       maxFileReadBytes: this.resourceLimits.maxFileReadBytes,
       maxTerminalOutputBytes: this.resourceLimits.maxTerminalOutputBytes,
       writeTimeoutMs: this.resourceLimits.writeTimeoutMs,
+      protectedPaths: this.protectedPaths,
       onExit: (error) => {
         const text = error?.message ?? String(error);
         // Through each session's mailbox: a close already in flight has to finish
@@ -2085,15 +2203,23 @@ export class GatewayService {
           `required model=${config.expectedModel}, actual=${actualModel || "<missing>"}`
         );
       }
+      // Recorded from the definition the gateway asked for, not client.config: an
+      // injected client factory may carry a config of its own.
+      client.gatewayFingerprint = clientFingerprint(config);
+      client.gatewayProvider = provider;
+      client.gatewayRegistryVersion = config.registryVersion ?? null;
       this.clients.set(clientKey, client);
       return client;
     } catch (error) {
       if (this.clients.get(clientKey) === client) this.clients.delete(clientKey);
       await client.stop().catch(() => {});
-      if (error instanceof GatewayError) throw error;
+      if (error instanceof GatewayError && error.code !== ERROR_CODES.ACP_ERROR) throw error;
+      // A worker that refuses initialize still gets the stderr tail: that is
+      // where adapters explain missing auth or a broken install.
       throw new GatewayError(
-        ERROR_CODES.GATEWAY_ERROR,
-        `${provider} ACP setup failed: ${error?.message ?? error}; ${(client.stderr ?? "").slice(-1000)}`
+        error?.code === ERROR_CODES.ACP_ERROR ? ERROR_CODES.ACP_ERROR : ERROR_CODES.GATEWAY_ERROR,
+        `${provider} ACP setup failed: ${error?.message ?? error}; ${(client.stderr ?? "").slice(-1000)}`,
+        error?.details
       );
     }
   }
@@ -2736,6 +2862,7 @@ export class GatewayService {
         }
         this.store.delete(session.id);
         this.stateStore?.append(WAL_TYPES.SESSION_CLOSED, session.id, {});
+        if (session.workspace) await removeSnapshot(session.workspace).catch(() => {});
         // Task handles deliberately survive their session now: a Task's lifetime
         // is its own ttl and taskRetentionMs, not its session's retention. Deleting
         // them here made a completed handle unreadable long before its TTL.
@@ -2752,6 +2879,12 @@ export class GatewayService {
       if (this.store.list().some((session) => session.client === client)) continue;
       await client.stop().catch(() => {});
       if (this.clients.get(provider) === client) this.clients.delete(provider);
+      changed = true;
+    }
+    for (const client of [...this.retiredClients]) {
+      if (client.alive && this.store.list().some((session) => session.client === client)) continue;
+      this.retiredClients.delete(client);
+      await client.stop().catch(() => {});
       changed = true;
     }
 
@@ -2850,6 +2983,7 @@ export class GatewayService {
       for (const [key, candidate] of this.clients) {
         if (candidate === client) this.clients.delete(key);
       }
+      this.retiredClients.delete(client);
     }
     return true;
   }
@@ -2936,7 +3070,8 @@ export class GatewayService {
     await Promise.allSettled(
       this.store.list().map((session) => session._queue?.drain(5_000) ?? Promise.resolve(true))
     );
-    await Promise.all([...this.clients.values()].map((client) => client.stop()));
+    await Promise.all([...this.clients.values(), ...this.retiredClients].map((client) => client.stop()));
+    this.retiredClients.clear();
     await this.flushPersist();
     // Clean shutdown always rotates, so a normal restart replays an empty log.
     // close() is the last writer: appends after it are silent no-ops, which is
@@ -2975,6 +3110,22 @@ function optionalString(value, name) {
 }
 
 const STRICT_WORKER_MODE = "read-only";
+
+// Two processes are interchangeable only if they were started from the same
+// definition. A changed command, argument (the pinned adapter version lives in
+// the npx args) or environment means a new generation.
+function clientFingerprint(config) {
+  return JSON.stringify({ command: config?.command ?? null, args: config?.args ?? [], env: config?.env ?? {}, cwd: config?.cwd ?? null });
+}
+
+// What makes two runs "the same work" for idempotency: the prompt and the model
+// that runs it. Wait and budget options only shape how the caller reads the
+// result, so a retry may change them freely.
+function runRequestDigest(args) {
+  return createHash("sha256")
+    .update(JSON.stringify({ prompt: args.prompt ?? null, model: args.model ?? null }))
+    .digest("hex");
+}
 
 function findModelOption(configOptions) {
   if (!Array.isArray(configOptions)) return null;
