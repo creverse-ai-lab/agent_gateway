@@ -1,6 +1,6 @@
 {
   "name": "acp-gateway",
-  "version": "1.5.1",
+  "version": "1.5.2",
   "description": "Persistent local ACP gateway with Main-only control and worker-safe guidance.",
   "type": "module",
   "private": true,
@@ -35,6 +35,7 @@
     "release:verify": "node scripts/verify-runtime-release.js",
     "smoke": "node test/live-smoke.js",
     "smoke:subagents": "node test/live-subagent-smoke.js",
+    "usecases:live": "node scripts/live-usecases.js",
     "ci": "node scripts/ci-check.js && node scripts/acp-upstream-monitor.js --validate && npm test && node scripts/bench-payload.js",
     "monitor:check": "node scripts/acp-upstream-monitor.js",
     "monitor:update": "node scripts/acp-upstream-monitor.js --update",

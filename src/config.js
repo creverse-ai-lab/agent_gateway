@@ -1,6 +1,7 @@
+import { realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
-import { resolveSettings, SETTING_DEFINITIONS } from "./settings.js";
+import { dirname, join, resolve } from "node:path";
+import { resolveSettings, SETTING_DEFINITIONS, settingsPaths } from "./settings.js";
 
 const uid = typeof process.getuid === "function" ? process.getuid() : "user";
 
@@ -10,6 +11,36 @@ export function gatewaySocketPath() {
 
 export function gatewayStatePath() {
   return process.env.ACP_GATEWAY_STATE || join(homedir(), ".acp-gateway", "state.json");
+}
+
+// Paths a worker must never read or write, whatever its session roots: the
+// directories holding the Control token (install.json), engine settings and
+// Gateway state, and the control socket. Stripping the token from the worker's
+// environment is not enough when the file that stores it is readable.
+export function gatewayProtectedPaths({ statePath = gatewayStatePath(), env = process.env } = {}) {
+  const { legacy, path: settingsPath } = settingsPaths(env);
+  const candidates = [
+    join(homedir(), ".acp-gateway"),
+    dirname(legacy),
+    dirname(settingsPath),
+    dirname(statePath),
+    gatewaySocketPath()
+  ];
+  // The socket usually does not exist yet, so canonicalize through its parent:
+  // on macOS the temp directory is itself a symlink into /private.
+  const canonical = candidates.map((path) => {
+    const absolute = resolve(path);
+    try {
+      return realpathSync(absolute);
+    } catch {
+      try {
+        return join(realpathSync(dirname(absolute)), absolute.slice(dirname(absolute).length + 1));
+      } catch {
+        return absolute;
+      }
+    }
+  });
+  return [...new Set(canonical)];
 }
 
 export function controlToken() {

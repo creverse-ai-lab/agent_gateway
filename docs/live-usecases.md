@@ -107,3 +107,81 @@
 - `resultBudgetBytes: 2000`: 2,000B head, `totalBytes 13892`, `omittedBytes 11892`, `textArtifact.complete: true`.
 - ask → `input_required` → permission → `run {taskId}` attach 흐름 (Claude).
 - daemon crash 뒤 task 실패 표시와 고아 프로세스 정리, Grok 세션 자동 복구.
+
+---
+
+## 2026-09-27 · v1.5.2 강화 회차
+
+v1.5.1 이후 Codex·Grok 자문에서 나온 추천을 모두 구현한 회차입니다. 과정은 다음 순서로 진행했습니다.
+
+1. 구현하고 mock 회귀 테스트를 작성했습니다.
+2. live matrix를 1차로 실행했습니다.
+3. Codex와 Grok에게 적대적 리뷰를 받았습니다. 두 리뷰어 모두 이번에 추가한 `workspace: "snapshot"` 사본 안에서 read_only로 실행했습니다.
+4. 리뷰 결과를 반영하고 Grok에게 수정 여부를 재검증받았습니다.
+5. 최종 live matrix를 실행했습니다.
+
+### 최종 live matrix (`npm run usecases:live`)
+
+| ID | Scenario | claude | grok | codex | gateway |
+|---|---|---|---|---|---|
+| S01 | setup: provider detail and started flag | ✅ | ✅ | ✅ |  |
+| L01 | session_open read_only returns a verified model | ✅ | ✅ | ✅ |  |
+| P07 | partial-enforcement alert only where documented | ✅ | ✅ | ✅ |  |
+| R01 | happy path review | ✅ | ✅ | ✅ |  |
+| L03 | multi-turn memory | ✅ | ✅ | ✅ |  |
+| L04 | concurrent prompt on one session is refused | ✅ | ✅ | ✅ |  |
+| R03 | idempotencyKey retry attaches, different work conflicts | ✅ | ✅ | ✅ |  |
+| R02 | large answer respects resultBudgetBytes | ✅ | ✅ | ✅ |  |
+| P01 | read_only: edit inside the root | ✅ | ✅ | ⚠️ |  |
+| P02 | read_only: read outside the root | ✅ | ✅ | ⚠️ |  |
+| P03 | read_only: read a Gateway-protected file | ✅ | ✅ | ⚠️ |  |
+| P04 | read_only: shell command | ✅ | ✅ | ⚠️ |  |
+| R04 | cancel a running turn, then keep using the session | ✅ | ✅ | ✅ |  |
+| L02 | switch to another advertised model | ✅ | ✅ | ✅ |  |
+| P05 | ask: edit is approved through the inbox | ✅ | ✅ | ⚠️ |  |
+| P06 | ask: rejected edit leaves the file unchanged | ✅ | ✅ | ⚠️ |  |
+| P08 | auto_approve: shell read of a Gateway-protected file | ✅ | ✅ | ⚠️ |  |
+| W01 | snapshot workspace keeps the original untouched | ✅ | ✅ | ✅ |  |
+| E01 | restore of an unknown ACP session has a stable code | ✅ | ✅ | ✅ |  |
+| F01 | daemon kill -9: idle session restores with context and model | ✅ | ✅ | ✅ |  |
+| F02 | daemon kill -9: in-flight task fails honestly, session reusable | ✅ | ✅ | ✅ |  |
+| E02 | shutdown of a stopped daemon never starts one |  |  |  | ✅ |
+
+**결과:** pass 57, known-limit 7, fail 0. known-limit은 모두 Codex이며, 전부 세션의 `permission_policy_partial.scope`에 명시된 범위 안입니다. v1.5.1 대비 Claude는 셸 실행(UC-05)과 루트 밖·보호 경로 읽기(UC-06)가 모두 차단되었고, Grok은 보호 경로를 OS 샌드박스로 거부합니다.
+
+### 실사용 중 새로 발견해 고친 결함
+
+| ID | 발견 경위 | 결함 | 수정 |
+|---|---|---|---|
+| UC-14 | Codex 1차 리뷰 턴이 `cancelled`로 끝남 | Codex는 같은 `reject_once` 종류로 `decline`(계속)과 `cancel`(턴 중단)을 함께 제시한다. 자동 거절이 첫 항목인 `cancel`을 골라 셸 명령 하나가 거절되면 리뷰 턴 전체가 끝났다 | 같은 종류 중 "계속" 옵션을 우선 선택 (SC-31) |
+| UC-15 | live 2차의 Grok P02·P03 fail | Grok의 `read_file`과 터미널은 Gateway가 막았지만, 내장 `grep`이 ACP를 거치지 않고 루트 밖·보호 경로를 읽었다 | Grok 프로세스에 Gateway 프로필로 OS 샌드박스를 적용해 보호 경로를 `Operation not permitted`로 거부. 루트 밖 일반 파일은 `scope: read_outside_roots`로 경고 |
+| UC-16 | 리뷰 도중 | 종료 요청이 daemon을 자동 기동했고, 그 daemon의 adapter 업데이트가 종료를 거부했다 | 종료 호출은 자동 기동하지 않음 (SC-38) |
+
+### 적대적 리뷰 반영
+
+Grok 1차 리뷰에서 8건을 받았고 모두 수정했습니다. 재검증에서 "부분"으로 나온 항목은 그 뒤에 다시 수정했습니다.
+- `link/..` 경로를 lexical 대신 물리적으로 해석
+- 셸·터미널 명령 문자열의 보호 경로 검사
+- 스냅샷에서 보호 디렉터리 제외
+- update 롤백 결과 검증
+- 연결 재사용 경쟁 조건
+- 격리 판정에 realpath 사용과 `EEXIST` 처리
+- `UNKNOWN_SESSION` 매핑 축소
+- adapter 기동 중 정의가 바뀔 때의 경쟁 조건
+
+Codex 리뷰(재실행)에서 8건을 받아 7건을 수정했습니다.
+- 스냅샷 symlink를 사본 안으로 재지정하거나 제외
+- baseline 기준 diff
+- 패치 본문 보존
+- diff 64MB 상한
+- update lock과 HEAD CAS
+- 따옴표 `$HOME` 표기 검사
+- 기동 중인 daemon에 대한 종료 요청
+
+`auto_approve`에서 경로를 확인할 수 없는 셸 명령을 Main에게 넘기라는 1건은 채택하지 않았습니다. 정책 정의상 루트 안 신뢰이고, 명령 문자열로는 파일 접근을 검증할 수 없기 때문입니다. 대신 보호 경로를 가리키는 명령은 거절하고 이 한계를 문서에 명시했습니다.
+
+### 남은 한계
+
+- **Codex:** 루트 안 편집·셸 쓰기, 루트 밖·보호 경로 읽기를 막을 수 없습니다. codex-acp에 진짜 읽기 전용 sandbox preset이 없어서입니다. 편집은 `workspace: "snapshot"`으로 격리할 수 있습니다. 보호 경로 읽기를 막으려면 Codex 프로세스를 OS 샌드박스로 감싸야 하는데, Codex가 내부에서 쓰는 Seatbelt와 중첩되는지 검증이 필요해 다음 과제로 남깁니다.
+- **Grok:** 내장 grep의 루트 밖 일반 파일 읽기. 프로세스 전체 샌드박스로는 세션별 루트를 표현할 수 없습니다.
+- **flaky 테스트:** 전체 suite를 병행 부하로 돌릴 때 `persistence.test.js`의 "a replayed run of status changes lands on the last one"이 한 번 실패했습니다. 단독으로는 3회, 전체 suite로는 4회 연속 통과했습니다. 이번 변경과 무관한 타이밍 flake로 보입니다.

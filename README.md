@@ -1,4 +1,4 @@
-# ACP Gateway v1.5.1
+# ACP Gateway v1.5.2
 
 혹시 여러 AI 에이전트를 쓰고 계신가요?
 
@@ -313,6 +313,47 @@ flowchart LR
 5. **권한·질문 처리** — Worker의 permission 요청이나 질문은 Gateway Inbox를 거쳐 오케스트레이터에게 전달되고, 그 응답이 다시 Worker로 돌아갑니다.
 6. **결과 회수·재사용** — 오케스트레이터는 MCP Task 또는 poll로 상태와 결과를 받고, 필요하면 같은 세션을 다시 호출하거나 복구합니다.
 
+## v1.5.2 변경 사항
+
+v1.5.1 이후 Codex·Grok 자문과 실사용 matrix에서 나온 결함을 한 번에 정리한 강화 릴리스입니다. API major **1**과 state schema **5**는 유지되며, 새 필드와 오류 코드는 모두 additive입니다.
+
+**보안·권한**
+- **경로 기반 자동 승인:** 자동 승인이 `toolCall.locations`와 `rawInput`의 경로를 세션 루트와 비교합니다(symlink 해석 포함). 루트 밖 요청은 `read_only`에서 거절되고, `auto_approve`에서는 Main에게 넘어갑니다.
+- **Gateway 보호 경로:** `~/.acp-gateway`, state·settings 디렉터리, control socket은 정책과 무관하게 거절됩니다. 워커가 `install.json`의 Control token을 읽을 수 없습니다. `ask` 세션에서도 사람에게 묻지 않고 바로 거절합니다.
+  - 셸 명령 문자열도 검사합니다. `~`·`$HOME`·따옴표 표기와 `link/..` 같은 symlink 경유 경로가 대상이며, `terminal/create` 인자도 포함됩니다.
+- **Grok 샌드박스:** Grok은 Gateway가 만든 프로필(`.grok/sandbox.toml`, `ACP_GATEWAY_GROK_SANDBOX_DIR`)로 프로세스 전체에 OS 샌드박스(Seatbelt/Landlock)를 적용해 보호 경로를 거부합니다. 내장 `grep`처럼 ACP를 거치지 않는 도구도 토큰 파일을 읽을 수 없습니다.
+- **Claude 세션 규칙:** Claude 세션에는 `_meta.claudeCode.options.disallowedTools`를 전달합니다. `read_only`는 Bash·Edit·Write를 막고, 모든 정책에서 보호 경로 읽기를 막습니다. v1.5.1까지 Claude가 권한 요청 없이 실행하던 셸 명령과 루트 밖 읽기가 이제 차단됩니다.
+- **거절 옵션 선택:** 자동 거절이 "계속 진행" 성격의 옵션(Codex의 `decline`)을 "턴 중단" 옵션(`cancel`)보다 우선 고릅니다. 예전에는 셸 명령 하나가 거절되면 Codex 턴 전체가 끝났습니다.
+
+**작업 안전성**
+- **`workspace: "snapshot"`:** `session_open`에 지정하면 워커가 cwd의 사본에서 일하고 원본은 건드리지 않습니다. 변경은 `agent_acp_session {action: "workspace_diff"}`로 패치를 받아 Main이 직접 적용합니다. Codex처럼 루트 안 편집을 막을 수 없는 provider에 편집이 절대 일어나면 안 되는 작업을 맡길 때 씁니다.
+  - **비교 기준:** 스냅샷 시점의 baseline과 비교하므로, 그 뒤에 원본에서 한 사용자 수정이 역패치로 섞이지 않습니다.
+  - **symlink:** 트리 안을 가리키는 링크는 사본 안으로 다시 연결되고, 밖을 가리키는 링크는 복사하지 않습니다(`droppedLinks`).
+  - **제외 대상:** 보호 디렉터리는 복사하지 않습니다.
+  - **diff 크기:** 64MB로 제한됩니다.
+  - **위치·수명:** 사본은 close 시 삭제되며 `ACP_GATEWAY_WORKSPACES`(기본 `~/.cache/acp-gateway/workspaces`)에 생성됩니다. APFS·reflink를 지원하는 파일시스템에서는 clone으로 복사합니다.
+- **idempotencyKey 충돌:** 같은 키로 다른 prompt·model을 보내면 `IDEMPOTENCY_CONFLICT`(details에 기존 `taskId`)를 반환합니다. 예전에는 이전 결과를 조용히 돌려줬습니다. 대기·결과 예산 옵션만 바꾼 재시도는 그대로 attach됩니다. digest는 WAL에 저장되어 재시작 뒤에도 유지됩니다.
+
+**신뢰성·운영**
+- **ACP 오류 코드:** 워커의 JSON-RPC 오류는 `ACP_ERROR`로 전달되며, restore 대상이 없으면 `UNKNOWN_SESSION`입니다. `details.acpCode`·`acpMessage`에 원본 오류가 담깁니다.
+- **adapter 세대 관리:** adapter 정의(버전 pin)가 바뀌면 기존 프로세스는 보유 세션만 마저 처리하고, 새 세션은 새 프로세스로 엽니다. 할 일이 없어진 구 프로세스는 GC가 정리합니다. `setup`의 `started`는 실제 생존 여부를 보여 주고(예전엔 항상 false), provider 상세에 `runningVersion`과 `retiredProcesses`가 추가되었습니다.
+- **격리 state의 provider 파일:** `ACP_GATEWAY_STATE`를 기본 위치 밖으로 지정하면 `providers.json`과 registry cache도 그 디렉터리를 씁니다. 파일이 없을 때는 전역 정의를 읽고, 첫 쓰기 때 전역 내용을 복사합니다. 격리 daemon의 자동 업데이트가 더 이상 전역 파일을 바꾸지 않습니다.
+- **원자적 `--update`:** 새 upstream commit을 임시 `git worktree`에서 `npm ci`와 `npm run ci`로 먼저 검증한 뒤에만 live checkout을 fast-forward합니다.
+  - **직렬화:** 동시 update는 lock으로 막습니다.
+  - **HEAD 재확인:** merge 직전에 HEAD와 clean 상태를 다시 확인합니다.
+  - **롤백:** 이후 의존성 설치가 실패하면 이전 commit으로 되돌립니다. 되돌리기는 HEAD가 이번 update의 결과이고 트리가 깨끗할 때만 수행하며, 롤백 실패는 실패로 보고합니다.
+- **종료 호출은 daemon을 띄우지 않음:** `daemon_shutdown`·`shutdown_if_idle`은 daemon이 없으면 새로 띄우지 않고 `{ok:true, alreadyStopped:true}`를 반환합니다.
+
+**테스트**
+- **mock 회귀 테스트:** `test/hardening.test.js`에 기능별 회귀 테스트 23개를 추가했고, `test/source-update.test.js`는 staging·lock·CAS·롤백 11개로 다시 작성했습니다(전체 397개).
+- **live 시나리오:** `npm run usecases:live`는 격리 daemon과 실제 Claude·Codex·Grok으로 22개 시나리오(setup, 세션, run, 권한 8종, snapshot, 오류, `kill -9` 복구)를 돌려 provider별 pass / known-limit / fail 표를 만듭니다. 구독 할당량을 쓰므로 릴리스 전 수동 게이트로 실행합니다. 결과는 [Live use cases](docs/live-usecases.md)에 누적합니다.
+
+**알려진 한계:** 세션의 `permission_policy_partial` 경고의 `scope`가 막을 수 없는 항목을 정확히 나열합니다. live matrix는 이 범위 안의 누출만 known-limit으로 인정합니다.
+- **Codex** (`edit_inside_roots`, `shell_write_inside_roots`, `read_outside_roots`, `read_protected`): codex-acp는 자기 도구로 파일을 다루며 진짜 읽기 전용 sandbox가 없습니다. 편집을 막으려면 `workspace: "snapshot"`을 쓰고, Control token이 있는 머신에서는 Codex에 신뢰할 수 없는 입력을 맡기지 마세요.
+- **Grok** (`read_outside_roots`): 내장 `grep`이 루트 밖 일반 파일을 읽을 수 있습니다. 보호 경로는 샌드박스가 거부합니다.
+- **Claude:** 경고가 없습니다. live matrix의 모든 권한 시나리오를 통과합니다.
+- **`auto_approve`:** 루트 안에서 신뢰한다는 정책입니다. 경로를 확인할 수 없는 셸 명령은 자동 승인되며, 보호 경로를 가리키는 명령만 거절됩니다.
+
 ## v1.5.1 변경 사항
 
 실제 Claude·Codex·Grok Worker로 오케스트레이션 사용 사례를 돌려 보며 찾은 결함을 고친 패치 릴리스입니다. 사용 사례와 재현 절차는 [Live use cases](docs/live-usecases.md)에 기록했습니다. API major **1**과 state schema **5**는 바뀌지 않습니다.
@@ -357,10 +398,10 @@ acp-gateway-admin shutdown_if_idle
 
 ### 1.5.x runtime 빌드
 
-1.5.x(`v1.5.0`, `v1.5.1`) builder는 tag와 별도로 검토한 전체 source SHA를 요구합니다. tag가 해당 SHA와 다르면 빌드와 검증을 거부하며, 새 runtime의 엔진과 public client는 모두 같은 source commit에서 추출합니다. 기존 1.4.0 태그의 고정 SHA 검증은 유지합니다.
+1.5.x(`v1.5.0`~`v1.5.2`) builder는 tag와 별도로 검토한 전체 source SHA를 요구합니다. tag가 해당 SHA와 다르면 빌드와 검증을 거부하며, 새 runtime의 엔진과 public client는 모두 같은 source commit에서 추출합니다. 기존 1.4.0 태그의 고정 SHA 검증은 유지합니다.
 
 ```bash
-npm run release:runtime -- --source-tag v1.5.1 --source-commit FULL_REVIEWED_SOURCE_SHA --output-dir dist
+npm run release:runtime -- --source-tag v1.5.2 --source-commit FULL_REVIEWED_SOURCE_SHA --output-dir dist
 npm run release:verify -- --source-commit FULL_REVIEWED_SOURCE_SHA \
   --archive dist/acp-gateway-runtime-darwin-arm64.tar.gz \
   --sha256 dist/acp-gateway-runtime-darwin-arm64.tar.gz.sha256 \

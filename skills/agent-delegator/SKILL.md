@@ -37,7 +37,7 @@ A response carrying `staleFrontDoor` means the cached tool schema is older than 
 
 Choose only what the task needs: `cwd` as the narrowest root holding the required material, `additionalDirectories` for necessary extra roots, `permissionPolicy` (`read_only` for review, `ask` for approval-gated mutation, `auto_approve` only when explicitly authorized inside declared roots), `title`, `pinned` only while retention must not touch the session, and `mcpServers` for Worker tools only. Set config options only while the session is idle, and only to advertised, type-valid values.
 
-`permission_policy_partial` in `relevantAlerts` means the provider applies its own edits without asking (Codex): read_only/ask then blocks writes outside the roots, network and escalations, but not edits inside the roots. When edits must be impossible, point `cwd` at a disposable copy.
+`permission_policy_partial` in `relevantAlerts` lists in `scope` what the Gateway cannot enforce for that provider: Codex cannot be stopped from editing or shell-writing inside the roots or from reading anywhere, Grok's built-in grep can read outside the roots (never Gateway files). Treat everything in `scope` as possible. When edits must be impossible, open the session with `workspace: "snapshot"`: the worker edits a private copy, and you read the changes with `agent_acp_session {action: "workspace_diff"}` and apply them yourself. Reads outside the roots and of Gateway files are refused automatically for the other providers. A retry with the same `idempotencyKey` but a different prompt fails with `IDEMPOTENCY_CONFLICT`; use a new key for new work.
 
 ## 3. Run the work
 

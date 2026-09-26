@@ -1,8 +1,8 @@
 import { access, chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { updateJsonFile } from "./atomic-json.js";
-import { constants } from "node:fs";
+import { constants, copyFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, delimiter, dirname, join } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 
 export const ACP_REGISTRY_URL = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
 const CACHE_TTL_MS = 24 * 60 * 60_000;
@@ -21,12 +21,68 @@ const KNOWN_COMMANDS = {
   "grok-build": ["grok", join(homedir(), ".grok", "bin", "grok")]
 };
 
-export function defaultRegistryCachePath() {
-  return process.env.ACP_GATEWAY_REGISTRY_CACHE || join(homedir(), ".acp-gateway", "registry.json");
+// Resolved per call, not at import, so HOME changes (tests, sandboxes) apply.
+function globalGatewayDir() {
+  return join(homedir(), ".acp-gateway");
 }
 
+// A daemon given its own ACP_GATEWAY_STATE directory keeps its provider pins and
+// registry cache there too. Before this, an isolated daemon's adapter
+// auto-update rewrote the global ~/.acp-gateway/providers.json.
+function isolatedGatewayDir() {
+  const state = process.env.ACP_GATEWAY_STATE;
+  if (!state) return null;
+  const directory = canonicalDirectory(dirname(state));
+  return directory === canonicalDirectory(globalGatewayDir()) ? null : directory;
+}
+
+// "..", symlinks and a trailing slash must not make the global directory look
+// isolated: that would route "isolated" writes straight into the global file.
+function canonicalDirectory(path) {
+  const absolute = resolve(path);
+  try {
+    return realpathSync(absolute);
+  } catch {
+    return absolute;
+  }
+}
+
+export function defaultRegistryCachePath() {
+  if (process.env.ACP_GATEWAY_REGISTRY_CACHE) return process.env.ACP_GATEWAY_REGISTRY_CACHE;
+  return join(isolatedGatewayDir() ?? globalGatewayDir(), "registry.json");
+}
+
+// Where provider definitions are written. An explicit ACP_GATEWAY_PROVIDERS
+// always wins; otherwise an isolated state directory gets its own file.
 export function defaultProviderRegistryPath() {
-  return process.env.ACP_GATEWAY_PROVIDERS || join(homedir(), ".acp-gateway", "providers.json");
+  if (process.env.ACP_GATEWAY_PROVIDERS) return process.env.ACP_GATEWAY_PROVIDERS;
+  return join(isolatedGatewayDir() ?? globalGatewayDir(), "providers.json");
+}
+
+// Where provider definitions are read. An isolated daemon that has not written
+// its own file yet still sees the providers the user installed globally.
+export function providerRegistryReadPath() {
+  const path = defaultProviderRegistryPath();
+  if (process.env.ACP_GATEWAY_PROVIDERS || existsSync(path)) return path;
+  return join(globalGatewayDir(), "providers.json");
+}
+
+// Copy-on-write: the first write to an isolated file starts from the global
+// definitions, so enabling a provider or updating one adapter does not make the
+// isolated daemon forget every other provider.
+export function seedProviderRegistry(path = defaultProviderRegistryPath()) {
+  if (process.env.ACP_GATEWAY_PROVIDERS || existsSync(path)) return path;
+  const global = join(globalGatewayDir(), "providers.json");
+  if (path !== global && existsSync(global)) {
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    try {
+      copyFileSync(global, path, constants.COPYFILE_EXCL);
+    } catch (error) {
+      // Another writer seeded it first: that copy is just as good.
+      if (error?.code !== "EEXIST") throw error;
+    }
+  }
+  return path;
 }
 
 export async function loadOfficialRegistry({
@@ -187,6 +243,7 @@ function providerEnvironment(match) {
 }
 
 export async function mergeProviderDefinitions(path, definitions) {
+  if (path === defaultProviderRegistryPath()) seedProviderRegistry(path);
   return updateJsonFile(path, { version: 1, providers: {} }, document => {
     if (document.version !== 1 || !document.providers || typeof document.providers !== "object") throw new Error("Invalid provider registry");
     const providers = { ...document.providers };

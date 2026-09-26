@@ -178,6 +178,9 @@ export class TaskStore {
       // after a restart there is nothing left to derive it from.
       origin = "prompt",
       idempotencyKey = null,
+      // Digest of the work the key was first used for, so a retry can be told
+      // apart from different work reusing the same key. Opaque to the store.
+      requestDigest = null,
       statusMessage = DEFAULT_STATUS_MESSAGE
     } = options ?? {};
     requireNonEmptyString(sessionId, "sessionId");
@@ -229,6 +232,7 @@ export class TaskStore {
       statusMessage,
       origin,
       ...(origin === "run" && idempotencyKey ? { idempotencyKey } : {}),
+      ...(origin === "run" && idempotencyKey && typeof requestDigest === "string" ? { requestDigest } : {}),
       result: null
     };
     this.#tasks.set(record.taskId, record);
@@ -607,6 +611,9 @@ export class TaskStore {
       ...(raw.origin === "run" && typeof raw.idempotencyKey === "string"
         && raw.idempotencyKey.trim() && raw.idempotencyKey.length <= 256
         ? { idempotencyKey: raw.idempotencyKey }
+        : {}),
+      ...(raw.origin === "run" && typeof raw.requestDigest === "string" && /^[0-9a-f]{64}$/.test(raw.requestDigest)
+        ? { requestDigest: raw.requestDigest }
         : {}),
       result: raw.result ?? null
     };
