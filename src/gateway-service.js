@@ -6,7 +6,9 @@ import { AcpClient, PERMISSION_POLICIES, requirePermissionPolicy } from "./acp-c
 import { ArtifactStore, defaultArtifactRoot } from "./artifacts.js";
 import { utf8ByteHead } from "./bounded-utf8.js";
 import { ERROR_CODES, GatewayError } from "./errors.js";
-import { assertProviderEnabled, currentModelId, detectProviders, providerConfig, setProviderEnabled } from "./providers.js";
+import {
+  assertProviderEnabled, currentModelId, detectProviders, partialPolicyEnforcement, providerConfig, setProviderEnabled
+} from "./providers.js";
 import {
   capPendingOptions, compareInboxDesc, decodeInboxCursor, encodeInboxCursor, isAfterInboxCursor,
   projectInboxItem, projectPoll, projectResult, PROFILES, relevantAlerts, requireInboxDetail,
@@ -686,7 +688,8 @@ export class GatewayService {
       permissionPolicy
     });
     try {
-      const configured = await this.configureSessionModel(client, created, requestedModel);
+      const modelled = await this.configureSessionModel(client, created, requestedModel);
+      const configured = { ...modelled, response: await this.configureSessionPolicy(client, modelled.response, permissionPolicy) };
       return this.registerSession({
         args,
         provider,
@@ -730,7 +733,13 @@ export class GatewayService {
       permissionPolicy
     });
     try {
-      const configured = await this.configureSessionModel(client, restored, requestedModel, acpSessionId);
+      const modelled = await this.configureSessionModel(client, restored, requestedModel, acpSessionId);
+      // A resumed worker process starts from its default mode again, so the
+      // policy mode is reapplied on every restore, not only on open.
+      const configured = {
+        ...modelled,
+        response: await this.configureSessionPolicy(client, modelled.response, permissionPolicy, acpSessionId)
+      };
 
       if (existing) {
         // The record can disappear while the ACP resume is in flight (close,
@@ -858,7 +867,13 @@ export class GatewayService {
   // Persistence health is deliberately absent: it already fails a task closed and
   // raises an alert, and one fact on two channels is how the two drift apart.
   bindTimeFacts(session) {
-    const alerts = [...(this.agentUpdateManager?.snapshot()?.alerts ?? []), ...this.stateAlerts];
+    const policyAlert = partialPolicyEnforcement(session.provider, session.permissionPolicy);
+    const alerts = [
+      // First, so the per-session alert cap can never hide it.
+      ...(policyAlert ? [policyAlert] : []),
+      ...(this.agentUpdateManager?.snapshot()?.alerts ?? []),
+      ...this.stateAlerts
+    ];
     return {
       gatewayVersion: GATEWAY_VERSION,
       responseProfiles: [...PROFILES],
@@ -932,6 +947,21 @@ export class GatewayService {
       }
     }
     return { model, response: { ...response, configOptions } };
+  }
+
+  // Some workers enforce approvals themselves and default to a preset that
+  // approves on the user's behalf (codex-acp "agent" uses auto_review), so their
+  // edits never become ACP permission requests. For read_only/ask, select the
+  // worker's own read-only preset when it advertises one. It is best effort, not
+  // a guarantee: partialPolicyEnforcement() says so at bind time.
+  async configureSessionPolicy(client, response, permissionPolicy, sessionId = response.sessionId) {
+    if (permissionPolicy === "auto_approve") return response;
+    const configOptions = response.configOptions ?? [];
+    const modeOption = configOptions.find((option) => option?.category === "mode" || option?.id === "mode");
+    if (modeOption?.type !== "select" || modeOption.currentValue === STRICT_WORKER_MODE) return response;
+    if (!(modeOption.options ?? []).some((option) => option?.value === STRICT_WORKER_MODE)) return response;
+    const changed = await client.setSessionConfigOption({ sessionId, configId: modeOption.id, value: STRICT_WORKER_MODE });
+    return { ...response, configOptions: changed.configOptions ?? configOptions };
   }
 
   async sessionConfig(args, context) {
@@ -2943,6 +2973,8 @@ function optionalString(value, name) {
   }
   return value.trim();
 }
+
+const STRICT_WORKER_MODE = "read-only";
 
 function findModelOption(configOptions) {
   if (!Array.isArray(configOptions)) return null;

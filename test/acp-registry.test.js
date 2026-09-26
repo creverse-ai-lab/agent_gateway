@@ -108,7 +108,9 @@ test("provider definitions are merged into a private dynamic registry", async ()
     try {
       const configured = providerConfig("gemini", { model: "gemini-test" });
       assert.equal(configured.command, "npx");
-      assert.equal(configured.expectedModel, "gemini-test");
+      // Session-scoped: the model is verified per session, never at process start.
+      assert.equal(configured.expectedModel, null);
+      assert.equal(configured.modelScope, "session");
     } finally {
       if (previous == null) delete process.env.ACP_GATEWAY_PROVIDERS;
       else process.env.ACP_GATEWAY_PROVIDERS = previous;

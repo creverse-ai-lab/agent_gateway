@@ -1,4 +1,4 @@
-# ACP Gateway v1.5.0
+# ACP Gateway v1.5.1
 
 혹시 여러 AI 에이전트를 쓰고 계신가요?
 
@@ -313,6 +313,14 @@ flowchart LR
 5. **권한·질문 처리** — Worker의 permission 요청이나 질문은 Gateway Inbox를 거쳐 오케스트레이터에게 전달되고, 그 응답이 다시 Worker로 돌아갑니다.
 6. **결과 회수·재사용** — 오케스트레이터는 MCP Task 또는 poll로 상태와 결과를 받고, 필요하면 같은 세션을 다시 호출하거나 복구합니다.
 
+## v1.5.1 변경 사항
+
+실제 Claude·Codex·Grok Worker로 오케스트레이션 사용 사례를 돌려 보며 찾은 결함을 고친 패치 릴리스입니다. 사용 사례와 재현 절차는 [Live use cases](docs/live-usecases.md)에 기록했습니다. API major **1**과 state schema **5**는 바뀌지 않습니다.
+
+- **재시작 뒤 Claude·Codex 세션 복구 실패 수정:** daemon 재시작, provider 종료, idle unload(기본 30분) 뒤에 Claude·Codex 세션을 다시 쓰면 `required model=…, actual=<missing>`가 나고 세션이 `unavailable`로 바뀌던 문제를 고쳤습니다. 원인은 세션마다 모델을 고르는 registry provider도 프로세스 시작 시점에 모델을 검사한 것이었습니다. 이 검사는 provider 프로세스가 이미 떠 있으면 건너뛰어졌기 때문에 실행 순서에 따라 성공과 실패가 갈렸습니다. 이제 세션 단위 provider의 모델은 세션을 연 뒤 `configOptions`로만 확인합니다. 콜드 상태의 `session_open`에서 `model`을 명시해도 거부되지 않습니다.
+- **Codex 권한 정책 완화와 명시:** Codex adapter는 자기 도구로 파일을 고치며, 기본 `agent` preset은 승인을 자체 `auto_review`로 처리합니다. 그래서 `read_only`·`ask` 세션에서도 permission 요청 없이 편집이 일어났습니다. 이제 Gateway는 `read_only`·`ask` 세션을 열 때와 복구할 때마다 Worker가 광고한 `mode` 옵션 중 `read-only`를 선택합니다. 이 설정으로 세션 루트 밖 쓰기, 네트워크, 권한 상승이 차단되거나 Gateway로 올라옵니다. codex-acp에는 진짜 읽기 전용 sandbox preset이 없어서 루트 **안** 편집은 막을 수 없습니다. 이런 세션에는 `session_open`의 `relevantAlerts` 맨 앞에 `permission_policy_partial` 경고를 붙입니다. 편집이 절대 일어나면 안 되는 작업은 버려도 되는 작업 사본을 `cwd`로 지정하세요.
+- **skill 문서 정정:** prompt 수준 `model`과 `agent_acp_config` 모델 변경은 한 턴이 아니라 이후 모든 턴에 적용됩니다. 위 버그를 피하려고 넣었던 "기본 모델을 다시 명시하면 거부될 수 있다"는 안내도 삭제했습니다. 설치된 skill은 `acp-gateway-bootstrap --update-skill`로 갱신하세요.
+
 ## v1.5.0 변경 사항
 
 **Gateway가 엔진과 실행 정책을 소유하고, AgenLynk 등 앱과 CLI는 공개 API를 소비합니다.** 소비자가 설정 파일을 직접 쓰거나 provider 실행 차단·보존·안전 종료 정책을 별도로 구현하지 않아도 되도록 관리 계약을 추가했습니다.
@@ -347,12 +355,12 @@ acp-gateway-admin shutdown_if_idle
 
 `expectedRevision`은 예시의 0을 복사하지 말고 직전 조회값을 사용하세요. 설정은 안전 종료 후 새 daemon 시작에 적용됩니다. 재시작·runtime 교체를 수행하는 소비자는 자동 재연결 client를 먼저 닫고, 선택한 runtime으로 새 daemon을 시작한 뒤 setup의 실행본 식별과 적용값을 확인해야 합니다.
 
-### 1.5.0 runtime 빌드
+### 1.5.x runtime 빌드
 
-1.5.0 builder는 tag와 별도로 검토한 전체 source SHA를 요구합니다. tag가 해당 SHA와 다르면 빌드와 검증을 거부하며, 새 runtime의 엔진과 public client는 모두 같은 source commit에서 추출합니다. 기존 1.4.0 태그의 고정 SHA 검증은 유지합니다.
+1.5.x(`v1.5.0`, `v1.5.1`) builder는 tag와 별도로 검토한 전체 source SHA를 요구합니다. tag가 해당 SHA와 다르면 빌드와 검증을 거부하며, 새 runtime의 엔진과 public client는 모두 같은 source commit에서 추출합니다. 기존 1.4.0 태그의 고정 SHA 검증은 유지합니다.
 
 ```bash
-npm run release:runtime -- --source-tag v1.5.0 --source-commit FULL_REVIEWED_SOURCE_SHA --output-dir dist
+npm run release:runtime -- --source-tag v1.5.1 --source-commit FULL_REVIEWED_SOURCE_SHA --output-dir dist
 npm run release:verify -- --source-commit FULL_REVIEWED_SOURCE_SHA \
   --archive dist/acp-gateway-runtime-darwin-arm64.tar.gz \
   --sha256 dist/acp-gateway-runtime-darwin-arm64.tar.gz.sha256 \

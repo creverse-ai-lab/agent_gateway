@@ -1,4 +1,4 @@
-# Gateway 1.5.0 management contract
+# Gateway 1.5.x management contract
 
 ACP Gateway is the engine. AgenLynk and other consumers render and invoke this contract; they must not independently implement execution, retention, provider or permission policy. API major remains 1 and state schema remains 5. New capability discovery is on **full** `setup`, leaving summary payload costs unchanged.
 
@@ -59,6 +59,10 @@ Consumer-owned npm/uv invocations or copies of provider resolver policy are unne
 
 Consumer restart sequence: close automatic subscription clients; request safe shutdown; wait for old process/socket/lock to exit; select/start the intended runtime; reconnect and verify build identity and active settings. A successful shutdown is not itself a new runtime activation, and saving config does not restart either application or engine. Legacy 1.4 daemons do not enforce this new safe shutdown contract; require capability before presenting it as safe.
 
+## Permission policy enforcement
+
+`permissionPolicy` is enforced on what reaches the Gateway over ACP: file and terminal callbacks and `session/request_permission`. A worker that edits through its own tools without asking bypasses it. For `read_only` and `ask` sessions, the engine selects the worker's advertised `mode` value `read-only` on open and on every restore. When a provider is known to still edit inside its session roots without a request (Codex), `session_open`/restore put a `{level:"warning", code:"permission_policy_partial", provider}` alert first in `relevantAlerts`. Consumers must show it and must not present such a session as edit-proof. The alert is additive; its absence does not certify complete enforcement for other providers.
+
 ## Retention preview
 
 `retention_preview {values:{sessionRetentionMs,taskRetentionMs,inboxRetentionMs,resultRetentionMs}}` accepts any subset of those keys; direct top-level names are also supported. No deletion occurs. Unsupported policies such as artifactSessionLimit are rejected.
@@ -93,4 +97,4 @@ Required invariants and validation:
 | GC cannot remove active obligations or referenced artifacts | retention/resource/persistence tests |
 | Unrecoverable event history is explicit | replay completeness tests |
 
-Release builders require v1.5.0 plus an independently supplied reviewed source SHA; verifiers require the same SHA. Existing v1.4.0's historical pin is retained. New archives use the public client and engine from the same source commit. Checksums and local unsigned build records are not signed provenance; the separate release workflow attests and verifies before publishing without overwriting assets.
+Release builders require a v1.5.x tag (v1.5.0 or v1.5.1) plus an independently supplied reviewed source SHA; verifiers require the same SHA. Existing v1.4.0's historical pin is retained. New archives use the public client and engine from the same source commit. Checksums and local unsigned build records are not signed provenance; the separate release workflow attests and verifies before publishing without overwriting assets.

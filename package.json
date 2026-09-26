@@ -1,6 +1,6 @@
 {
   "name": "acp-gateway",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "Persistent local ACP gateway with Main-only control and worker-safe guidance.",
   "type": "module",
   "private": true,

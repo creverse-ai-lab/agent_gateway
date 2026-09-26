@@ -38,14 +38,20 @@ export const PROVIDER_MANIFESTS = {
 export function providerConfig(provider, { model } = {}) {
   const configured = configuredProviders()[provider];
   if (configured) {
+    const modelScope = configured.modelScope ?? "session";
+    const requested = optionalModel(model);
     return {
       provider,
       command: configured.command,
       args: [...configured.args],
       env: { ...configured.env },
       permissionPolicy: configured.permissionPolicy ?? "ask",
-      expectedModel: optionalModel(model),
-      modelScope: configured.modelScope ?? "session"
+      // Only a process-scoped provider fixes its model at start. A session-scoped
+      // one is verified by configureSessionModel after session/new or resume;
+      // checking it here fails every cold start of an adapter whose initialize
+      // result names no model (Claude, Codex), and passes only while warm.
+      expectedModel: modelScope === "process" ? requested : null,
+      modelScope
     };
   }
 
@@ -192,6 +198,28 @@ async function executableExists(command) {
     }
   }
   return false;
+}
+
+// Providers whose own tools can change the workspace without an ACP callback,
+// so read_only/ask is enforced only for what does reach the Gateway. codex-acp
+// applies patches through its app server inside a workspace-write sandbox, and
+// none of its mode presets is a read-only sandbox (checked through 1.13.1).
+const PARTIAL_POLICY_PROVIDERS = new Set(["codex"]);
+const PARTIAL_POLICY_REGISTRY_IDS = new Set(["codex-acp"]);
+
+export function partialPolicyEnforcement(provider, permissionPolicy) {
+  if (permissionPolicy === "auto_approve") return null;
+  const registryId = configuredProviders()[provider]?.registryId;
+  if (!PARTIAL_POLICY_PROVIDERS.has(provider) && !PARTIAL_POLICY_REGISTRY_IDS.has(registryId)) return null;
+  return {
+    level: "warning",
+    code: "permission_policy_partial",
+    provider,
+    message: `permissionPolicy=${permissionPolicy} is only partially enforced for ${provider}: `
+      + "the worker can edit files inside its session roots without a permission request. "
+      + "The strictest worker mode was applied; writes outside the roots, network and escalations still reach the Gateway. "
+      + "Use a disposable copy of the workspace when edits must be impossible."
+  };
 }
 
 export function currentModelId(initResult) {

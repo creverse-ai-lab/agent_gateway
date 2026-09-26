@@ -7,6 +7,7 @@ import test from "node:test";
 import { AcpClient } from "../src/acp-client.js";
 import { GatewayService } from "../src/gateway-service.js";
 import { GatewaySettings } from "../src/settings.js";
+import { GATEWAY_VERSION } from "../src/version.js";
 import { GatewayRpcClient } from "acp-gateway/client";
 import { startDaemon, writeMockProviders } from "./helpers/daemon-harness.js";
 
@@ -218,7 +219,7 @@ test("public RPC enforces observer, persisted config, provider Off, and atomic s
     const health = await observer.call("setup");
     assert.equal(health.capabilities.safeShutdown, true);
     assert.match(health.gatewayBuildId, /^[a-f0-9]{64}$/);
-    assert.equal(health.gatewayVersion, "1.5.0");
+    assert.equal(health.gatewayVersion, GATEWAY_VERSION);
     await control.call("provider", { action: "set_enabled", provider: "mock", enabled: false });
     await assert.rejects(control.call("session_open", { provider: "mock", cwd: directory }), { code: "PROVIDER_DISABLED" });
     const closed = daemon.waitForExit();

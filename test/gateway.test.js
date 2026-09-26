@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -36,6 +36,112 @@ test("Gateway setup exposes ACP update health alerts and supports a fresh check"
   } finally {
     await service.shutdown();
     assert.equal(stopped, true);
+  }
+});
+
+// Registry providers select the model per session, so a cold process start must
+// not require the initialize result to name one: Claude and Codex adapters never
+// do. Before the fix this only passed while the process was already warm, and a
+// daemon restart turned every such session unavailable on its first resume.
+test("Session-scoped registry provider opens and resumes an explicit model from a cold process", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-gateway-cold-model-"));
+  const statePath = join(directory, "state.json");
+  const providersPath = join(directory, "providers.json");
+  await writeFile(providersPath, JSON.stringify({
+    version: 1,
+    providers: {
+      mockreg: { command: process.execPath, args: [mockAgent], env: {}, permissionPolicy: "ask", modelScope: "session" }
+    }
+  }));
+  const previous = process.env.ACP_GATEWAY_PROVIDERS;
+  process.env.ACP_GATEWAY_PROVIDERS = providersPath;
+  let service = new GatewayService({ statePath });
+  try {
+    await service.init();
+    const opened = await service.call(
+      "session_open",
+      { provider: "mockreg", cwd: process.cwd(), permissionPolicy: "read_only", model: "mock-pro" },
+      { rootId: "main-a" }
+    );
+    assert.equal(opened.model, "mock-pro");
+    await service.shutdown();
+
+    service = new GatewayService({ statePath });
+    await service.init();
+    await service.call("prompt", { sessionId: opened.sessionId, prompt: "go" }, { rootId: "main-a" });
+    await waitForIdle(service, opened.sessionId);
+    const restored = await service.call("session", { action: "get", sessionId: opened.sessionId }, { rootId: "main-a" });
+    assert.equal(restored.status, "idle");
+    assert.equal(restored.model, "mock-pro");
+  } finally {
+    await service.shutdown();
+    if (previous == null) delete process.env.ACP_GATEWAY_PROVIDERS;
+    else process.env.ACP_GATEWAY_PROVIDERS = previous;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+// codex-acp approves its own workspace edits in the default "agent" preset, so a
+// read_only/ask session must select its read-only preset (on open and again on
+// every resume, since a new worker process starts from its default) and say at
+// bind time that enforcement inside the roots is partial.
+test("read_only and ask sessions select the worker read-only mode and flag partial enforcement", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-gateway-policy-mode-"));
+  const statePath = join(directory, "state.json");
+  const providersPath = join(directory, "providers.json");
+  await writeFile(providersPath, JSON.stringify({
+    version: 1,
+    providers: {
+      mockcodex: {
+        registryId: "codex-acp",
+        command: process.execPath,
+        args: [mockAgent],
+        env: { ACP_MOCK_MODE_OPTION: "1" },
+        permissionPolicy: "ask",
+        modelScope: "session"
+      }
+    }
+  }));
+  const previous = process.env.ACP_GATEWAY_PROVIDERS;
+  process.env.ACP_GATEWAY_PROVIDERS = providersPath;
+  const context = { rootId: "main-a" };
+  const mode = async (service, sessionId) => (await service.call("config", { sessionId }, context))
+    .configOptions.find((option) => option.id === "mode").currentValue;
+  let service = new GatewayService({ statePath });
+  try {
+    await service.init();
+    const readOnly = await service.call(
+      "session_open", { provider: "mockcodex", cwd: process.cwd(), permissionPolicy: "read_only" }, context
+    );
+    assert.equal(await mode(service, readOnly.sessionId), "read-only");
+    assert.equal(readOnly.relevantAlerts[0].code, "permission_policy_partial");
+    assert.equal(readOnly.relevantAlerts[0].provider, "mockcodex");
+    await service.call("session", { action: "close", sessionId: readOnly.sessionId }, context);
+
+    const full = await service.call(
+      "session_open", { provider: "mockcodex", cwd: process.cwd(), permissionPolicy: "auto_approve" }, context
+    );
+    assert.equal(await mode(service, full.sessionId), "agent");
+    assert.equal(full.relevantAlerts.some((alert) => alert.code === "permission_policy_partial"), false);
+    await service.call("session", { action: "close", sessionId: full.sessionId }, context);
+
+    const ask = await service.call(
+      "session_open", { provider: "mockcodex", cwd: process.cwd(), permissionPolicy: "ask" }, context
+    );
+    assert.equal(await mode(service, ask.sessionId), "read-only");
+    await service.shutdown();
+
+    service = new GatewayService({ statePath });
+    await service.init();
+    // config list reconnects through a real session/resume on a fresh process.
+    assert.equal(await mode(service, ask.sessionId), "read-only");
+    const resumed = await service.call("session", { action: "get", sessionId: ask.sessionId }, context);
+    assert.equal(resumed.status, "idle");
+  } finally {
+    await service.shutdown();
+    if (previous == null) delete process.env.ACP_GATEWAY_PROVIDERS;
+    else process.env.ACP_GATEWAY_PROVIDERS = previous;
+    await rm(directory, { recursive: true, force: true });
   }
 });
 

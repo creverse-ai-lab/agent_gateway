@@ -37,8 +37,13 @@ function comparePath(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
+// 1.5.x tags carry no historical pin: the caller supplies the reviewed SHA.
+const REVIEWED_SOURCE_TAGS = new Set(["v1.5.0", "v1.5.1"]);
+const RUNTIME_VERSIONS = ["1.4.0", "1.5.0", "1.5.1"];
+
 export function pinnedSourceCommit(tag, expectedCommit) {
-  const commit = PINNED_SOURCE_COMMITS[tag] ?? (tag === "v1.5.0" && GIT_COMMIT_PATTERN.test(expectedCommit ?? "") ? expectedCommit : null);
+  const commit = PINNED_SOURCE_COMMITS[tag]
+    ?? (REVIEWED_SOURCE_TAGS.has(tag) && GIT_COMMIT_PATTERN.test(expectedCommit ?? "") ? expectedCommit : null);
   if (!commit) throw new Error(`No pinned source commit for tag ${tag}`);
   return commit;
 }
@@ -111,7 +116,9 @@ export function assertUnsignedBuildRecord(record, { artifact, digest, expectedSo
 export function assertRuntimeManifestMetadata(manifest, { artifactName, expectedSourceCommit } = {}) {
   if (manifest?.schemaVersion !== 1) throw new Error("runtime-manifest.json schemaVersion must be 1");
   if (manifest.package !== "acp-gateway") throw new Error("runtime-manifest.json package must be acp-gateway");
-  if (!["1.4.0", "1.5.0"].includes(manifest.version)) throw new Error("runtime-manifest.json version must be 1.4.0 or 1.5.0");
+  if (!RUNTIME_VERSIONS.includes(manifest.version)) {
+    throw new Error(`runtime-manifest.json version must be one of ${RUNTIME_VERSIONS.join(", ")}`);
+  }
   if (manifest.apiMajor !== 1) throw new Error("runtime-manifest.json apiMajor must be 1");
   if (manifest.platform !== "darwin" || manifest.arch !== "arm64") {
     throw new Error("runtime-manifest.json platform/arch must be darwin/arm64");

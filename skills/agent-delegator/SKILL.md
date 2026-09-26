@@ -14,7 +14,7 @@ ACP execution only: `Main -> agent_acp_* Control tools over MCP -> local Gateway
 ## Bind the routed model
 
 - Find a provider with `agent_acp_setup {mode: "summary"}`, then call setup once with that explicit provider and read its default model.
-- If setup already reports the exact target, omit `model` from `agent_acp_session_open`: a session-scoped provider without config options can reject an otherwise identical request that restates its own default. Otherwise pass the exact target when the live schema exposes `model`. Change it later with `agent_acp_config` (session-scoped) or prompt-level `model` (one turn); a process-scoped change needs a new session.
+- Pass the exact target as `model` to `agent_acp_session_open` when the live schema exposes it; omit it only when setup already reports that exact model. Setup reports `model: null` for providers that choose the model per session (Claude, Codex) — read it from session_open instead. Change it later with `agent_acp_config` or prompt-level `model`; both apply to this and all following turns, so set it back explicitly afterwards. A process-scoped change needs a new session.
 - Verify the returned `model` every time. Stop on mismatch — never fall back silently, and never treat a provider name as proof of its active model.
 - Run `grok-4.5` read-only as a red-team worker unless the user says otherwise.
 
@@ -36,6 +36,8 @@ A response carrying `staleFrontDoor` means the cached tool schema is older than 
 ## 2. Define the session boundary
 
 Choose only what the task needs: `cwd` as the narrowest root holding the required material, `additionalDirectories` for necessary extra roots, `permissionPolicy` (`read_only` for review, `ask` for approval-gated mutation, `auto_approve` only when explicitly authorized inside declared roots), `title`, `pinned` only while retention must not touch the session, and `mcpServers` for Worker tools only. Set config options only while the session is idle, and only to advertised, type-valid values.
+
+`permission_policy_partial` in `relevantAlerts` means the provider applies its own edits without asking (Codex): read_only/ask then blocks writes outside the roots, network and escalations, but not edits inside the roots. When edits must be impossible, point `cwd` at a disposable copy.
 
 ## 3. Run the work
 
