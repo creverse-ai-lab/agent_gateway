@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { authorizeCall, requireAccess } from "./access.js";
+import { normalizeCaller } from "./caller.js";
 import { GatewaySettings } from "./settings.js";
 import { timingSafeEqual } from "node:crypto";
 import { chmod, open, readFile, unlink, writeFile } from "node:fs/promises";
@@ -155,7 +156,13 @@ const server = createServer((socket) => {
           try {
             const result = isGuide
               ? await service.guide()
-              : await service.call(request.method, request.args, { rootId: request.rootId, access, signal: controller.signal });
+              : await service.call(request.method, request.args, {
+                rootId: request.rootId,
+                access,
+                signal: controller.signal,
+                // Only a Main opens and prompts; an observer's claim is not recorded.
+                ...(access === "control" ? { caller: normalizeCaller(request.caller) } : {})
+              });
             send({ id: request.id, ok: true, result });
           } finally {
             requestAborts.delete(request.id);

@@ -496,7 +496,10 @@ export class SessionStore {
       thoughtCapture: session.thoughtCapture ?? null,
       // Additive: a snapshot session must keep pointing at its copy after a
       // restart, and still be able to diff against the original.
-      ...(session.workspace ? { workspace: session.workspace } : {})
+      ...(session.workspace ? { workspace: session.workspace } : {}),
+      // Additive: who opened the session and who started its latest turn.
+      ...(session.openedBy ? { openedBy: session.openedBy } : {}),
+      ...(session.promptedBy ? { promptedBy: session.promptedBy } : {})
     }));
   }
 
@@ -619,6 +622,10 @@ export function publicSession(session) {
     updatedAt: session.updatedAt,
     eventCount: session.events.length,
     resultArtifact: session.resultArtifact ?? null,
+    // Only present when a caller identified itself (1.6.0+ control servers),
+    // so the default shape is unchanged.
+    ...(session.openedBy ? { openedBy: session.openedBy } : {}),
+    ...(session.promptedBy ? { promptedBy: session.promptedBy } : {}),
     // Only present for workspace=snapshot, so the default shape is unchanged.
     ...(session.workspace ? {
       workspace: {

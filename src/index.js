@@ -11,13 +11,14 @@ import {
   ListToolsRequestSchema,
   RELATED_TASK_META_KEY
 } from "@modelcontextprotocol/sdk/types.js";
+import { callerFromProcess } from "./caller.js";
 import { controlToken, rootId } from "./config.js";
 import { errorEnvelope } from "./errors.js";
 import { GatewayRpcClient } from "./socket-rpc.js";
 import { PERMISSION_POLICIES } from "./acp-client.js";
 import { GATEWAY_VERSION } from "./version.js";
 
-const rpc = new GatewayRpcClient({ token: controlToken(), rootId: rootId() });
+const rpc = new GatewayRpcClient({ token: controlToken(), rootId: rootId(), caller: callerFromProcess() });
 const tools = controlTools();
 const server = new Server(
   { name: "acp-gateway-control", version: GATEWAY_VERSION },

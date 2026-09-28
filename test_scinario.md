@@ -389,6 +389,16 @@ ASCII와 emoji가 섞인 agent message/thought를 작은 `maxTextBytes`로 누�
 
 현재 상태: `수동` — 릴리스 전 `npm run usecases:live`.
 
+### SC-40 호출자 기록 (1.6.0)
+
+1. Claude Main이 세션을 열고, Codex Main이 같은 세션에 prompt를 보낸다.
+2. daemon을 재시작한다.
+3. `caller`를 보내지 않는 1.6.0 이전 Control 서버와 observer로도 같은 세션을 호출한다.
+
+기대 결과: 세션의 `openedBy`는 Claude Main이고 바뀌지 않는다. `turn_start`와 세션의 `promptedBy`는 Codex Main이며, 둘 다 재시작 뒤에도 남는다. `caller` 없는 호출의 턴에는 `promptedBy`가 없고, observer의 `caller`는 기록되지 않는다.
+
+현재 상태: `자동화됨` — `test/caller.test.js`.
+
 ## 권장 자동화 순서
 
 1. SC-06~SC-10 terminal lifecycle과 격리

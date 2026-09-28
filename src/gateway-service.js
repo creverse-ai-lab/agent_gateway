@@ -764,7 +764,8 @@ export class GatewayService {
         model: configured.model,
         permissionPolicy,
         workspace,
-        ownerRootId: requireRoot(context)
+        ownerRootId: requireRoot(context),
+        openedBy: context?.caller ?? null
       });
     } catch (error) {
       await this.discardUnregisteredSession(client, created.sessionId);
@@ -847,7 +848,8 @@ export class GatewayService {
         model: configured.model,
         restoredWith: method,
         permissionPolicy,
-        ownerRootId: requireRoot(context)
+        ownerRootId: requireRoot(context),
+        openedBy: context?.caller ?? null
       });
     } catch (error) {
       await this.discardUnregisteredSession(client, acpSessionId);
@@ -910,7 +912,10 @@ export class GatewayService {
       ),
       lastOwnerActivityAt: new Date(this.now()).toISOString(),
       _ownerActivityPersistedAt: this.now(),
-      ...(fields.workspace ? { workspace: fields.workspace } : {})
+      ...(fields.workspace ? { workspace: fields.workspace } : {}),
+      // Set once, like ownerRootId: the Main that opened (or first restored)
+      // the session. A later restore by another Main does not rewrite history.
+      ...(fields.openedBy ? { openedBy: fields.openedBy } : {})
     });
     fields.client.onSessionUpdate(fields.acpSessionId, (update) => this.handleUpdate(session, update));
     this.store.push(session, { type: "session_created" });
@@ -1325,7 +1330,13 @@ export class GatewayService {
     // previous turn must not clear or skip this one.
     session.completedAt = null;
     session.transientClearedAt = null;
-    this.store.push(session, { type: "turn_start", turnId: session.turnId });
+    // The Main that started this turn: its reply is for that caller.
+    session.promptedBy = context?.caller ?? null;
+    this.store.push(session, {
+      type: "turn_start",
+      turnId: session.turnId,
+      ...(session.promptedBy ? { promptedBy: session.promptedBy } : {})
+    });
     // The token freezes which turn this callback may finalize; the ACP read
     // loop hands the outcome to the mailbox instead of applying it inline.
     const token = session.turnId;

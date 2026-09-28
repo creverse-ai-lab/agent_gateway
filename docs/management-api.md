@@ -95,6 +95,16 @@ Symlinks are copied as links, and sockets/FIFOs are skipped. The copy is limited
 
 The engine never applies the patch. The copy is deleted on close and by session retention. It survives daemon restarts.
 
+## Caller identity
+
+Since 1.6.0 a control request may carry `caller: {provider, sessionId, pid, instanceId}`. The control MCP server fills it once at startup from the agent CLI that spawned it: `provider` from the parent process name (`claude`, `codex`, `grok`, else `null`), `sessionId` from that CLI's exported id (`CLAUDE_CODE_SESSION_ID`, `GROK_SESSION_ID`, `CODEX_THREAD_ID`; Codex exports none to MCP servers, so `null`), `pid` of the parent, and a random `instanceId` per server process. Every Main on a machine shares one `rootId`; `caller` is what tells them apart.
+
+- `openedBy` is the caller of the `session_open` or first `session_restore` that registered the session. It is set once and never rewritten.
+- `promptedBy` is the caller of the latest `prompt`, `run` or `task_prompt`. The same value is on that turn's `turn_start` event, so each turn names the Main its reply is for.
+- Both appear on session responses, `session list`, and survive restarts. They are absent when the caller sent nothing (pre-1.6.0 control servers), so the old shapes are unchanged.
+- Only `control` connections are recorded. An `observer`'s `caller` is ignored. A malformed `caller` drops attribution, never the call.
+- `sessionId` can go stale when the CLI switches sessions (for example Claude `/clear`) while the MCP server keeps running; `pid` and `instanceId` stay valid.
+
 ## Idempotency and worker errors
 
 A `run` whose `idempotencyKey` already names a run on the same session attaches only when the prompt and model digest match. Otherwise it fails with `IDEMPOTENCY_CONFLICT`, and `details.taskId` holds the existing task. Changing `waitMs` or `resultBudgetBytes` on a retry is not a conflict. Runs recorded before 1.5.2 carry no digest and keep the old attach behavior.
@@ -141,4 +151,4 @@ Required invariants and validation:
 | GC cannot remove active obligations or referenced artifacts | retention/resource/persistence tests |
 | Unrecoverable event history is explicit | replay completeness tests |
 
-Release builders require a v1.5.x tag (v1.5.0 through v1.5.2) plus an independently supplied reviewed source SHA; verifiers require the same SHA. Existing v1.4.0's historical pin is retained. New archives use the public client and engine from the same source commit. Checksums and local unsigned build records are not signed provenance; the separate release workflow attests and verifies before publishing without overwriting assets.
+Release builders require a v1.5.x tag (v1.5.0 through v1.5.2) or v1.6.0 plus an independently supplied reviewed source SHA; verifiers require the same SHA. Existing v1.4.0's historical pin is retained. New archives use the public client and engine from the same source commit. Checksums and local unsigned build records are not signed provenance; the separate release workflow attests and verifies before publishing without overwriting assets.

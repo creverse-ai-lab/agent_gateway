@@ -58,6 +58,9 @@ export class GatewayRpcClient {
     socketPath = gatewaySocketPath(),
     token = null,
     rootId = null,
+    // Who this connection speaks for (see caller.js). Optional and additive:
+    // an older daemon ignores the field.
+    caller = null,
     autoStart = true,
     access = "control",
     // Only used to find the recovery marker a halted daemon left behind.
@@ -68,6 +71,7 @@ export class GatewayRpcClient {
     this.statePath = statePath;
     this.token = token;
     this.rootId = rootId;
+    this.caller = caller;
     this.autoStart = autoStart;
     this.socket = null;
     this.channel = null;
@@ -265,7 +269,7 @@ export class GatewayRpcClient {
       // will ever arrive for.
       this.channel.write(
         HIGH_LANE_METHODS.has(method) ? LANE_HIGH : LANE_NORMAL,
-        { id, method, args, token: this.token, rootId: this.rootId, access: this.access }
+        { id, method, args, token: this.token, rootId: this.rootId, access: this.access, ...(this.caller ? { caller: this.caller } : {}) }
       );
       const timer = setTimeout(() => {
         this.pending.delete(id);

@@ -1,4 +1,4 @@
-# ACP Gateway v1.5.2
+# ACP Gateway v1.6.0
 
 혹시 여러 AI 에이전트를 쓰고 계신가요?
 
@@ -313,6 +313,20 @@ flowchart LR
 5. **권한·질문 처리** — Worker의 permission 요청이나 질문은 Gateway Inbox를 거쳐 오케스트레이터에게 전달되고, 그 응답이 다시 Worker로 돌아갑니다.
 6. **결과 회수·재사용** — 오케스트레이터는 MCP Task 또는 poll로 상태와 결과를 받고, 필요하면 같은 세션을 다시 호출하거나 복구합니다.
 
+## v1.6.0 변경 사항
+
+어느 Main이 세션을 열고 턴을 시작했는지 Gateway가 직접 기록하는 릴리스입니다. 지금까지는 한 PC의 모든 Main이 같은 `rootId`를 써서 Gateway 응답만으로는 Main을 구분할 수 없었습니다. 그래서 모니터 같은 소비자가 각 Main의 transcript를 읽어 연결을 추측했습니다. API major **1**과 state schema **5**는 유지되며, 새 필드는 모두 additive입니다.
+
+- **호출자 식별(`caller`):** Control MCP 서버는 자신을 띄운 에이전트 CLI를 호출자로 보고합니다. 요청마다 `caller: {provider, sessionId, pid, instanceId}`를 함께 보냅니다.
+  - `provider`: 부모 프로세스 이름으로 정합니다(`claude` / `codex` / `grok`).
+  - `sessionId`: CLI가 내보낸 세션 id입니다(`CLAUDE_CODE_SESSION_ID`, `GROK_SESSION_ID`, `CODEX_THREAD_ID`). Codex는 MCP 서버에 thread id를 넘기지 않으므로 `null`입니다.
+  - `pid`: 부모 CLI의 pid입니다.
+  - `instanceId`: Control MCP 서버 프로세스마다 새로 만드는 값입니다. Codex처럼 세션 id가 없을 때도 같은 thread가 한 요청끼리 묶입니다.
+- **`openedBy`:** 세션을 연(또는 처음 복구한) Main입니다. 한 번 정해지면 바뀌지 않습니다. `session_open`·`session_restore` 응답, `session list`, 재시작 후 상태에 남습니다.
+- **`promptedBy`:** 턴을 시작한 Main입니다. `turn_start` 이벤트와 세션의 최신 값에 들어갑니다. 그 턴의 응답을 받을 쪽입니다. `prompt`·`run`·`task_prompt` 모두 기록합니다.
+- **호환성:** 1.6.0 이전 Control 서버는 `caller`를 보내지 않으므로 세 필드가 모두 없습니다. 기존 응답 형태는 그대로입니다. observer 연결이 보낸 `caller`는 기록하지 않습니다. 형식이 잘못된 `caller`는 호출을 막지 않고 기록만 하지 않습니다.
+- **개인정보:** 기록하는 값은 provider, 세션 id, pid, 무작위 instance id뿐입니다. 명령줄과 환경 변수는 저장하지 않습니다.
+
 ## v1.5.2 변경 사항
 
 v1.5.1 이후 Codex·Grok 자문과 실사용 matrix에서 나온 결함을 한 번에 정리한 강화 릴리스입니다. API major **1**과 state schema **5**는 유지되며, 새 필드와 오류 코드는 모두 additive입니다.
@@ -396,12 +410,12 @@ acp-gateway-admin shutdown_if_idle
 
 `expectedRevision`은 예시의 0을 복사하지 말고 직전 조회값을 사용하세요. 설정은 안전 종료 후 새 daemon 시작에 적용됩니다. 재시작·runtime 교체를 수행하는 소비자는 자동 재연결 client를 먼저 닫고, 선택한 runtime으로 새 daemon을 시작한 뒤 setup의 실행본 식별과 적용값을 확인해야 합니다.
 
-### 1.5.x runtime 빌드
+### 1.5.x·1.6.0 runtime 빌드
 
-1.5.x(`v1.5.0`~`v1.5.2`) builder는 tag와 별도로 검토한 전체 source SHA를 요구합니다. tag가 해당 SHA와 다르면 빌드와 검증을 거부하며, 새 runtime의 엔진과 public client는 모두 같은 source commit에서 추출합니다. 기존 1.4.0 태그의 고정 SHA 검증은 유지합니다.
+1.5.x(`v1.5.0`~`v1.5.2`)와 `v1.6.0` builder는 tag와 별도로 검토한 전체 source SHA를 요구합니다. tag가 해당 SHA와 다르면 빌드와 검증을 거부하며, 새 runtime의 엔진과 public client는 모두 같은 source commit에서 추출합니다. 기존 1.4.0 태그의 고정 SHA 검증은 유지합니다.
 
 ```bash
-npm run release:runtime -- --source-tag v1.5.2 --source-commit FULL_REVIEWED_SOURCE_SHA --output-dir dist
+npm run release:runtime -- --source-tag v1.6.0 --source-commit FULL_REVIEWED_SOURCE_SHA --output-dir dist
 npm run release:verify -- --source-commit FULL_REVIEWED_SOURCE_SHA \
   --archive dist/acp-gateway-runtime-darwin-arm64.tar.gz \
   --sha256 dist/acp-gateway-runtime-darwin-arm64.tar.gz.sha256 \
