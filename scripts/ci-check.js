@@ -21,15 +21,22 @@ assert.deepEqual(
   { ".": "./gateway-client/index.js", "./client": "./gateway-client/index.js" },
   "only the public client entrypoint may be imported as a package subpath"
 );
-// The README title is the version a user reads before installing, and the
-// installer gates on an exact match with the running gateway. Three places,
-// one number, checked here so a release cannot ship two of the three.
+// The installer gates on an exact match between the front door and the running
+// gateway, so a release has one version number. package.json and the lockfile
+// are checked above; the newest changelog heading is the version a user reads
+// before installing, in both languages. The README title carries no version:
+// four translated READMEs would each be one more place for it to drift, so the
+// title is pinned to the bare name instead.
 const readme = await readFile(new URL("../README.md", import.meta.url), "utf8");
-assert.equal(
-  readme.split("\n", 1)[0],
-  `# ACP Gateway v${GATEWAY_VERSION}`,
-  "README title and Gateway versions must match"
-);
+assert.equal(readme.split("\n", 1)[0], "# ACP Gateway", "README title must be the bare name; the version lives in the changelogs");
+for (const name of ["CHANGELOG.md", "CHANGELOG.ko.md"]) {
+  const changelog = await readFile(new URL(`../${name}`, import.meta.url), "utf8");
+  assert.equal(
+    /^## (v\d[^\s]*)/m.exec(changelog)?.[1],
+    `v${GATEWAY_VERSION}`,
+    `${name} newest version heading and Gateway version must match`
+  );
+}
 validateMonitorConfig(monitorConfig);
 validateSnapshot(upstreamSnapshot, monitorConfig);
 assert.deepEqual(

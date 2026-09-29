@@ -1,28 +1,35 @@
-# ACP Gateway v1.6.0
+# ACP Gateway
 
-혹시 여러 AI 에이전트를 쓰고 계신가요?
+**English** | [한국어](README.ko.md) | [日本語](README.ja.md) | [简体中文](README.zh-CN.md)
 
-Claude에게 물어봤다가, Codex로 코드를 고치고, Grok에게 다시 리뷰를 맡기느라 터미널과 대화를 계속 돌려막고 계신가요?
+**Let the coding agent you already use delegate work to Claude Code, Codex, and Grok on demand — over MCP + ACP, with persistent sessions, interactive approvals, and no predefined workflows.**
 
-“내가 이 에이전트들을 일일이 지휘하지 말고, 한 에이전트가 다른 에이전트를 알아서 활용하면 좋을 텐데…”라고 생각해 본 적이 있으신가요?
+Do you use more than one AI agent?
 
-그런 당신을 위해 준비했습니다.
+Do you ask Claude a question, have Codex fix the code, then hand the review to Grok — juggling terminals and conversations the whole time?
 
-**한 에이전트 창에서 여러 AI 전문가에게 일을 나눠 맡기는 로컬 관제실 — ACP Gateway입니다.**
+Have you ever thought, “Instead of directing each of these agents myself, I wish one agent would just put the others to work for me…”?
 
-## 개요
+That is what this is for.
 
-ACP Gateway는 사용자가 직접 대화하는 AI, 즉 **오케스트레이터**가 로컬에 설치된 여러 AI Worker를 발견하고 ACP로 실행하며, 장기 작업과 권한 요청부터 최종 결과 회수까지 관리할 수 있게 해주는 미들웨어입니다. 코드와 도구 설명에서 사용하는 `Main`은 이 오케스트레이터 역할을 뜻합니다.
+## Overview
 
-- ACP 세션과 provider 프로세스를 daemon이 계속 유지합니다.
-- MCP가 재시작되어도 Worker 세션을 복구할 수 있습니다.
-- 모델, 권한, 질문, 취소, 결과 수집을 오케스트레이터가 통제합니다.
-- Worker에는 Gateway 제어 권한을 전달하지 않습니다.
-- 로컬 단일 사용자·단일 머신 사용을 기준으로 합니다.
+ACP Gateway is middleware that lets the AI you talk to directly — the **orchestrator** — discover the AI Workers installed on your machine, run them over ACP, and manage everything from long-running tasks and permission requests to retrieving the final result. `Main`, as used in the code and tool descriptions, means this orchestrator role.
 
-Node.js 22 이상과 macOS 또는 Linux가 필요합니다.
+- Claude Code, Codex, and Grok are supported as built-in Workers; other ACP-capable AIs installed locally are discovered by matching them against the official ACP registry.
+- The daemon keeps ACP sessions and provider processes alive.
+- Worker sessions can be recovered even when MCP restarts.
+- The orchestrator controls models, permissions, questions, cancellation, and result collection.
+- Gateway control authority is never passed to Workers.
+- Designed for local, single-user, single-machine use.
 
-## 설치 방법
+## Quick start
+
+### Requirements
+
+Node.js 22 or later, and macOS or Linux.
+
+### Install
 
 ```bash
 git clone https://github.com/creverse-ai-lab/agent_gateway.git
@@ -33,20 +40,9 @@ acp-gateway-bootstrap --install-all --refresh-registry --dry-run
 acp-gateway-bootstrap --install-all --refresh-registry
 ```
 
-마지막 두 명령 중 첫 번째는 설치 계획만 확인하는 dry-run이고, 두 번째가 실제 설치입니다. `--install-all`은 ACP 공식 registry가 지정한 `npx`·`uvx` 패키지를 전역으로 설치하거나 갱신할 수 있으므로 dry-run 결과에서 대상과 버전을 먼저 확인하세요. Registry manifest는 ACP가 관리하지만 실제 package와 binary는 각 공급자의 배포처에서 내려받습니다.
+Of the last two commands, the first is a dry-run that only shows the installation plan, and the second performs the actual installation. `--install-all` can install or update, globally, the `npx` and `uvx` packages named by the official ACP registry, so check the targets and versions in the dry-run output first. The registry manifest is maintained by ACP, but the actual packages and binaries are downloaded from each vendor's distribution site. What the installation changes on your machine is listed in [What installation changes on your machine](#what-installation-changes-on-your-machine).
 
-`--install-all`은 다음 작업을 수행합니다.
-
-- PATH, 일반 CLI 경로, 전역 npm 패키지에서 설치된 AI 자동 탐지
-- ACP 공식 registry와 대조해 현재 버전의 ACP agent/adapter 설치
-- 오케스트레이터(Main) 전용 `agent-acp` Control MCP 등록
-- 읽기 전용 `agent-acp-guide` 등록
-- 발견된 AI 각각의 사용자 skill 경로에 `agent-delegator` 설치
-- daemon 실행과 인증 상태 확인
-
-이전 버전의 daemon이 남아 있으면 installer가 health 응답의 버전을 비교해 자동으로 교체한 뒤 다시 검사합니다. 따라서 `git pull`, `npm ci` 후 `--install-all --refresh-registry`를 실행하는 수동 업그레이드도 지원합니다.
-
-기본 `--install-all`은 Codex, Claude, Grok 중 어느 agent를 사용자 대화용 **프론트 도어**로 사용할지 질문합니다. 선택한 하나에만 오케스트레이터용 Control MCP를 등록하고, 발견된 agent 전체에는 읽기 전용 Guide MCP와 skill을 설치합니다. 비대화형 설치에서는 Codex가 기본값이며 다음처럼 명시할 수 있습니다.
+By default, `--install-all` asks which of Codex, Claude, or Grok you want to use as the **front door** — the agent you talk to. The Control MCP for the orchestrator is registered only with the one you choose, while the read-only Guide MCP and the skill are installed for every discovered agent. In non-interactive installs Codex is the default, and you can choose explicitly like this:
 
 ```bash
 acp-gateway-bootstrap --install-all --front-door codex
@@ -54,484 +50,160 @@ acp-gateway-bootstrap --install-all --front-door claude
 acp-gateway-bootstrap --install-all --front-door grok
 ```
 
-여러 agent를 모두 오케스트레이터 후보로 등록하려면 `--target all`을 사용할 수 있습니다. 이 옵션은 각 agent 설정에 오케스트레이터 권한이 있는 Control MCP를 넣으므로, 신뢰하는 로컬 agent에만 사용하세요.
+### First delegation
 
-나중에 설치 계획만 다시 확인하려면:
+The installer also installs the `agent-delegator` skill for every discovered AI. From your request, the skill works out the Worker, model, and permission scope, and it guides everything from creating a Gateway session and handing over the task to checking progress, handling questions and permission requests, and retrieving the result. After installation you do not need to memorize MCP tool names — just ask the orchestrator in natural language.
 
-```bash
-acp-gateway-bootstrap --install-all --dry-run
+For example, you can ask the orchestrator AI you are talking to:
+
+```text
+Have Claude Sonnet review the authentication code in this repository, read-only, and summarize the result.
+
+Have Grok 4.5 red-team the security weaknesses of the current design, and check with me on any permission requests.
 ```
 
-새 버전으로 갱신할 때는 다음 명령 하나만 실행합니다.
+Internally it works in this order:
+
+1. `agent_acp_setup` checks the providers
+2. `agent_acp_session_open` creates a Worker session
+3. If needed, `agent_acp_config` reads and sets parameters the Worker supports, such as model, mode, and reasoning level
+4. `agent_acp_prompt` hands over the task
+5. `agent_acp_poll` checks events and status
+6. If needed, `agent_acp_permission` or `agent_acp_answer` responds
+7. When done, reuse the session or close it with `agent_acp_session`
+
+The bundled `agent-delegator` is a general-purpose starting point. If you have a Worker you use often, a default model, a permission policy, a review order, or a result format, you can edit the installed skill to fit the way you work. `acp-gateway-bootstrap --update` and a plain `--update-skill` do not overwrite your edited copy. Run `--update-skill --force` explicitly only when you want to reset it to the latest bundled version in the repository.
+
+### Permission policies
+
+Choose one of the following policies when you open a session.
+
+| Policy | Use |
+|---|---|
+| `read_only` | Analysis, review, and other read-only work |
+| `ask` | Orchestrator approval is required before changing files or running commands |
+| `auto_approve` | Automatic approval within the session boundary the user has allowed |
+
+The Control token, the orchestrator identifier (Main ID), and the Gateway socket path are removed from the ACP Worker's environment. Re-injecting the Control MCP into a Worker session is also blocked.
+
+### Updating
+
+To update to a new version, run just this one command:
 
 ```bash
 acp-gateway-bootstrap --update
 ```
 
-`--update`는 `git pull --ff-only`와 `npm ci`를 실행하고, ACP protocol·공식 registry의 상류 변경을 확인한 다음 `npm run ci`로 snapshot 검증과 전체 자동 테스트를 통과해야 다음 단계로 진행합니다. 이후 내부 dry-run 계획을 출력하고 ACP registry와 adapter, MCP 등록을 갱신합니다. 마지막으로 실행 중인 Gateway daemon을 새 버전으로 다시 시작하고 실제 버전까지 확인합니다. 설치 상태, Control identity와 최초 설치에서 선택한 프론트 도어는 그대로 유지됩니다. 상류 확인이 일시적으로 실패하면 경고를 남기되 이미 받은 소스의 로컬 검증은 계속하며, 테스트 실패는 daemon을 교체하기 전에 update 전체를 중단합니다.
+After updating, reconnect your host (Claude/Codex/Grok/Auggie) session so that the new tools and arguments become visible. For details on how this works, updating the skill, and the reconnection procedure, see the [Operations guide](docs/operations.md).
 
-사용자가 수정한 `agent-delegator`를 보호하기 위해 skill은 최초 `--install-all`에서만 설치하며 `--update`에서는 건드리지 않습니다. `--install-skill`도 최초 설치용이므로 이미 installer가 관리하는 복사본을 자동으로 덮어쓰지 않습니다. 로컬 소스 변경을 보호하기 위해 Git 작업 트리가 깨끗하지 않으면 update를 중단하므로 먼저 변경 사항을 commit하거나 stash해야 합니다. 소스와 직접 연결되는 `npm link`는 최초 설치 후 다시 할 필요가 없습니다.
-
-현재 checkout에 포함된 최신 기본 skill만 별도로 반영하려면 먼저 계획을 확인한 뒤 업데이트합니다.
-
-```bash
-acp-gateway-bootstrap --update-skill --dry-run
-acp-gateway-bootstrap --update-skill
-```
-
-`--update-skill`은 installer 상태에 기록된 모든 `agent-delegator` 복사본을 대상으로 하며, Gateway 소스 pull, adapter·MCP 변경, daemon 재시작은 수행하지 않습니다. 설치 시 기록한 SHA-256 tree digest와 현재 설치본이 일치할 때만 교체하므로 사용자가 수정한 skill은 `customized` 경고와 함께 보존됩니다. v1.3.0 이하에서 설치해 digest가 없는 복사본도 내용이 현재 기본본과 같더라도 `legacy-unverified`로 보존합니다. 내용을 검토한 뒤 기본본으로 덮어쓰려는 경우에만 `--update-skill --force`를 사용하세요. 최신 Gateway 소스를 먼저 받을 때는 `acp-gateway-bootstrap --update`가 성공한 다음 별도 명령으로 실행합니다.
-
-### 호스트 재연결 절차
-
-Gateway를 새 버전으로 올린 뒤에는 **호스트(Claude/Codex/Grok/Auggie) 세션을 반드시 다시 연결해야** 새 tool과 인자가 보입니다. MCP 호스트는 서버가 처음 응답한 tool 목록을 세션 동안 캐시하고, daemon 재시작은 소켓만 교체하기 때문에(RPC가 투명하게 재접속) 낡은 스키마는 아무 오류 없이 그대로 남습니다. 서버 version을 올려도 캐시는 깨지지 않습니다.
-
-순서대로 실행하세요.
-
-```bash
-acp-gateway-bootstrap --update          # 1. Gateway 소스·adapter·daemon 갱신
-acp-gateway-bootstrap --update-skill    # 2. skill 갱신 (수정본이면 --force)
-```
-
-3. **호스트 재연결** — Claude Code는 `/mcp reconnect` 또는 새 세션, Codex·Grok·Auggie는 새 세션을 시작합니다.
-4. **검증** — tool 목록에 `agent_acp_run`이 있고, `agent_acp_setup` 응답에 `staleFrontDoor`가 없으면 정상입니다.
-
-`staleFrontDoor`는 프론트 도어(호스트에 등록된 MCP 프로세스)의 버전과 실행 중인 daemon 버전이 다를 때 `agent_acp_setup`·`agent_acp_session_open` 응답에 붙는 알림으로, `frontDoorVersion`·`gatewayVersion`·필요한 조치를 담고 있습니다. 이 알림이 보이면 3번을 수행하세요.
-
-주요 installer 옵션:
-
-| 옵션 | 설명 |
-|---|---|
-| `--version`, `-V` | 현재 설치된 ACP Gateway 버전 확인 |
-| `--update` | 소스 pull·상류 확인·전체 테스트·dry-run 후 Adapter, MCP, daemon 갱신—사용자 skill 유지 |
-| `--install-all` | Adapter, Guide, skill 전체 설치 후 프론트 도어 하나에 Control 등록 |
-| `--front-door codex\|claude\|grok` | `--install-all`의 Control MCP 대상 명시 |
-| `--install-control` | 오케스트레이터용 Control MCP만 설치 |
-| `--install-guide` | 읽기 전용 Guide MCP만 설치 |
-| `--install-skill` | 발견된 AI에 `agent-delegator` skill 최초 설치—기존 관리본은 보존 |
-| `--update-skill` | 현재 checkout의 기본본으로 변경되지 않은 installer 관리 skill만 별도 갱신 |
-| `--discover-agents` | 설치된 AI를 ACP 공식 registry와 대조 |
-| `--registry-agent ID` | 발견 여부와 무관하게 registry agent 하나를 선택 설치 |
-| `--refresh-registry` | 24시간 cache를 무시하고 공식 registry 갱신 |
-| `--offline` | 저장된 registry cache만 사용 |
-| `--target codex\|claude\|grok\|auggie\|all` | 오케스트레이터용 Control MCP 설치 대상 선택 |
-| `--dry-run` | 실제 변경 없이 계획만 출력 |
-| `--rotate-token` | Control token과 오케스트레이터 식별자(Main ID) 교체 |
-| `--force` | 관리하지 않던 항목 또는 사용자가 수정한 관리 skill을 명시적으로 교체 |
-| `--agent-auto-update on\|off` | ACP agent/adapter 자동 업데이트 설정 후 daemon 재시작 |
-| `--agent-update-notifications on\|off` | health check 업데이트 알림 설정 후 daemon 재시작 |
-
-Control token과 오케스트레이터 식별자(Main ID)는 `~/.acp-gateway/install.json`에 권한 `0600`으로 저장되며 반복 설치에서도 재사용됩니다.
-
-Skill은 Codex `~/.codex/skills`, Claude `~/.claude/skills`, Grok `~/.grok/skills`, Auggie `~/.augment/skills`에 설치합니다. 별도 경로가 알려지지 않은 registry provider는 공용 `~/.agents/skills`를 사용합니다. 같은 공용 경로를 사용하는 provider가 여러 개면 skill 파일은 한 번만 복사하고 installer 상태에는 각 provider를 모두 기록합니다.
-
-Control·Guide MCP 등록은 Codex, Claude, Grok, Auggie를 지원합니다. 기본 `--install-all`에서 Control은 사용자가 프론트 도어로 선택한 Codex·Claude·Grok 중 하나에만 등록되고, Guide와 skill은 발견된 지원 agent 전체에 설치됩니다. `--target`은 고급 수동 대상 지정 용도로 유지됩니다. Control MCP는 Gateway 전체 제어 권한이 있으므로 신뢰하는 로컬 agent에만 설치하세요.
-
-공식 registry 원본은 `https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json`이며 `~/.acp-gateway/registry.json`에 24시간 캐시합니다. 발견된 provider 실행 정의는 `~/.acp-gateway/providers.json`에 저장됩니다. `npx`·`uvx` 배포는 registry에 고정된 버전을 설치하고, binary 배포는 이미 설치된 실행 파일을 사용합니다. registry에 등록되지 않은 임의의 AI는 ACP 실행 계약을 안전하게 추론할 수 없으므로 자동 등록하지 않습니다.
-
-### ACP 상류 버전 모니터링
-
-ACP 공식 protocol 저장소와 registry 확인은 maintainer가 아래 명령으로 수동 수행합니다. Protocol release·공개 wire version, registry agent의 추가·삭제·버전·배포 정보가 바뀌면 snapshot을 갱신해 검토 후 `dev`에 커밋합니다. npm과 GitHub Actions의 일반 버전 업데이트는 Dependabot이 별도의 `dev` 대상 PR로 관리합니다. 보안 업데이트는 GitHub 정책에 따라 기본 브랜치인 `main`을 대상으로 합니다.
-
-```bash
-npm run monitor:check   # 변경이 있으면 보고서를 출력하고 종료 코드 2 반환
-npm run monitor:update  # 검토용 snapshot을 현재 상류 상태로 갱신
-npm run monitor:sync-dependencies  # 저장소가 직접 포함한 ACP adapter 버전 동기화
-npm run update:upstream  # 위 갱신과 전체 CI를 한 번에 실행하는 수동 유지보수 경로
-```
-
-maintainer가 `npm run update:upstream`을 실행하면 snapshot 갱신, 관리 대상 ACP adapter pin·lockfile 동기화와 전체 CI를 로컬에서 한 번에 수행할 수 있습니다. 이 명령은 커밋이나 push를 자동으로 하지 않습니다. `git diff`로 protocol·registry 변경과 테스트 결과를 검토한 뒤 `dev`에 커밋하면 됩니다. 일반 사용자의 `acp-gateway-bootstrap --update`는 저장소 파일을 임의로 수정하지 않고 상류 변경을 보고한 뒤 runtime adapter만 안전하게 갱신합니다.
-
-두 업데이트 경로는 역할이 다릅니다.
-
-- **ACP agent/adapter 버전:** daemon이 공식 registry의 고정 버전을 주기적으로 확인해 자동 갱신합니다. `acp-gateway-bootstrap --update`를 실행할 때도 즉시 registry를 새로 읽고 같은 갱신을 수행합니다.
-- **ACP protocol wire version:** 새 major를 감지해 `monitor:check` 보고서에 경고하지만 자동 적용하지 않습니다. 호환성 테스트 후 `src/acp-version.js`와 monitor 설정을 함께 바꿔야 합니다.
-- **Gateway npm 의존성:** Dependabot PR에서 lockfile과 CI 결과를 확인한 뒤 병합합니다.
-
-현재 runtime은 ACP wire version 1을 사용합니다. 공식 저장소의 `schema/v2`도 감지되지만, v2 지원으로 표시하거나 자동 전환하지 않습니다. Snapshot 갱신은 알림과 검토 시작점이며 자동 병합 또는 Gateway release를 수행하지 않습니다.
-
-v1.1.0부터 daemon은 시작 시점과 이후 24시간마다 ACP 공식 registry를 확인합니다. 발견된 `npx`·`uvx` adapter가 새 버전이면 자동으로 설치하고 provider 정의를 갱신합니다. 이미 실행 중인 Worker process는 중단하지 않으며, 새 process나 session부터 갱신된 adapter가 적용됩니다. 직접 설치해야 하는 binary 배포는 자동 교체하지 않고 health 경고로 남깁니다.
-
-`agent_acp_setup` health 응답의 `agentUpdates`에는 확인 시각, 적용된 버전, 남은 수동 업데이트와 오류가 포함됩니다. 알림이 켜져 있으면 같은 응답의 `alerts`에 사용자에게 보여줄 메시지가 들어갑니다. 즉 Gateway가 임의로 화면에 push하는 방식은 아니며, 오케스트레이터가 health check 결과를 받을 때 알림을 사용자에게 전달합니다. 즉시 다시 확인하려면 `refreshAgentUpdates: true`로 setup을 호출합니다.
-
-Gateway 자체 소스는 자동으로 pull하거나 설치하지 않습니다. 같은 주기에서 현재 Git 저장소의 원격 `main`에 게시된 `package.json` 버전만 확인하며, 더 높은 버전이 있으면 health의 `gatewayUpdate`와 `gateway_source_update_available` 알림으로 `acp-gateway-bootstrap --update` 실행을 안내합니다. 따라서 로컬 source, 설치 상태와 사용자 정의 skill은 사용자가 명시적으로 업데이트하기 전까지 변경되지 않습니다.
-
-자동 업데이트와 알림은 기본으로 켜집니다. 설치 후 다음처럼 각각 끄거나 다시 켤 수 있으며, 사용자 정의 skill은 변경하지 않습니다.
-
-```bash
-acp-gateway-bootstrap --agent-auto-update off
-acp-gateway-bootstrap --agent-update-notifications off
-
-acp-gateway-bootstrap --agent-auto-update on
-acp-gateway-bootstrap --agent-update-notifications on
-```
-
-Dependabot 설정은 GitHub의 기본 브랜치에 존재해야 활성화되며, `dev` 대상 PR을 위해 원격 `dev` 브랜치를 유지해야 합니다.
-
-## 사용 방법
-
-Installer는 발견된 AI에 `agent-delegator` skill을 함께 설치합니다. 이 skill은 사용자의 요청에서 Worker, 모델과 권한 범위를 파악하고, Gateway 세션 생성부터 작업 전달, 진행 확인, 질문·권한 처리와 결과 회수까지 안내합니다. 설치 후에는 MCP 도구 이름을 외울 필요 없이 오케스트레이터에게 자연어로 작업을 요청하면 됩니다.
-
-기본 제공되는 `agent-delegator`는 범용 사용을 위한 시작점입니다. 자주 사용하는 Worker, 기본 모델, 권한 정책, 리뷰 순서나 결과 형식이 있다면 설치된 skill을 사용자 작업 방식에 맞게 수정해 사용할 수 있습니다. `acp-gateway-bootstrap --update`와 일반 `--update-skill`은 사용자 수정본을 덮어쓰지 않습니다. 저장소의 최신 기본본으로 되돌리고 싶을 때만 `--update-skill --force`를 명시적으로 실행하세요.
-
-예를 들어 사용자가 대화 중인 오케스트레이터 AI에 다음처럼 요청할 수 있습니다.
-
-```text
-Claude Sonnet에게 이 저장소의 인증 코드를 읽기 전용으로 검토시키고 결과를 정리해줘.
-
-Grok 4.5에게 현재 설계의 보안 취약점을 red-team 검토시키고, permission 요청은 나에게 확인해줘.
-```
-
-내부적으로는 다음 순서로 동작합니다.
-
-1. `agent_acp_setup`으로 provider 확인
-2. `agent_acp_session_open`으로 Worker 세션 생성
-3. 필요한 경우 `agent_acp_config`로 Worker가 지원하는 모델·모드·추론 수준 등의 파라미터 조회·설정
-4. `agent_acp_prompt`로 작업 전달
-5. `agent_acp_poll`로 이벤트와 상태 확인
-6. 필요한 경우 `agent_acp_permission` 또는 `agent_acp_answer`로 응답
-7. 완료 후 세션을 재사용하거나 `agent_acp_session`으로 종료
-
-### Worker 파라미터 제어
-
-`agent_acp_config`는 Worker가 ACP `configOptions`로 직접 공개한 세션 파라미터를 조회하고 변경합니다. `action: list`로 가능한 값과 현재값을 확인한 뒤, 세션이 작업 중이 아닐 때 `action: set`, `configId`, `value`를 전달합니다. ACP wire v1 기준으로 선택형 문자열과 boolean 설정을 지원하며, `model`, `mode`, `model_config`, `thought_level` 같은 category를 그대로 보존합니다.
-
-Gateway는 Worker가 공개하지 않은 `temperature`, `max_tokens` 같은 값을 임의로 만들어 전달하지 않습니다. 따라서 지원 범위는 Claude, Codex, Grok 등 각 ACP adapter가 실제로 광고하는 옵션에 따라 달라집니다. 설정 변경은 `config_changed` 세션 이벤트로 남으므로, 추후 DAG 오케스트레이터가 노드의 작업 유형·비용·품질 정책에 따라 파라미터를 선택하고 결과와 함께 추적할 수 있습니다. process 단위로 모델을 고정하는 Worker는 기존 세션에서 모델을 바꾸지 않고 새 세션을 열어야 합니다.
-
-v1.3.0부터 poll 기본값이 절약형입니다. 턴이 진행 중일 때 `result`는 자동으로 생략되고(`includeResult: true`로 명시할 때만 포함), 종료 후 poll의 `result.text`에는 누적 transcript가 아니라 **최종 답변 세그먼트**(마지막 작업 경계 이후의 메시지 텍스트)만 담깁니다. 진행 narration은 `includeInspection: true`로 조회합니다. `agent_acp_session` `get`의 `includeTranscript: true`는 메모리에 남은 bounded transcript를 반환하며, overflow된 전체 transcript는 `resultArtifact`를 따라 회수합니다. `cursor`/`toCursor`/`eventTypes`로 보존된 이벤트 이력도 범위 조회할 수 있습니다. 자세한 회수 경로는 `agent-delegator` skill의 "Retrieve the correct result" 표를 따르세요.
-
-인라인 상한을 넘는 데이터는 전부 `~/.acp-gateway/artifacts`의 파일로 스필되고 응답에는 잘린 미리보기와 포인터(경로·바이트 수·완료 여부)가 실립니다 — 4KB(UTF-8)를 넘는 tool 이벤트 payload는 `dataArtifact`, 64KB를 넘는 최종 답변은 `textArtifact`, 메모리 상한(1MB)을 넘는 transcript는 `resultArtifact`. 인라인에는 상한 내 내용만 유지하므로 RAM과 오케스트레이터 컨텍스트가 결과 크기에 따라 늘어나지 않습니다. Artifact는 파일당 100MB·전체 512MB이고, 라이브 세션이 참조하는 파일은 24시간 정리에서 보존됩니다. 동시 미응답 권한·질문 요청은 세션당 64개의 안전 상한을 따르며, 큰 설명 chunk는 32MB protocol frame 상한 안에서 그대로 처리합니다. 전송·세션·Main 단위 예산도 `setup().resourceLimits`에 함께 실립니다 — control 연결당 쓰기 큐 4MB와 10초 무진행 상한(worker stdin 쪽 큐는 동시 요청 상한에서 파생), prompt 1MB, 파일 읽기 500KB(바이트 기준, 초과분은 `_meta["acp-gateway/read"]`로 절단을 알림), terminal 출력 10MB, Main당 세션 64개와 처리 완료 inbox 이력 1000건.
-
-### 권한 정책
-
-세션을 열 때 다음 정책 중 하나를 선택합니다.
-
-| 정책 | 용도 |
-|---|---|
-| `read_only` | 분석, 검토, 읽기 전용 작업 |
-| `ask` | 파일 변경이나 명령 실행 전에 오케스트레이터 승인 필요 |
-| `auto_approve` | 사용자가 허용한 세션 경계 안에서 자동 승인 |
-
-Control token, 오케스트레이터 식별자(Main ID)와 Gateway socket 경로는 ACP Worker 환경에서 제거됩니다. Worker 세션에 Control MCP를 다시 주입하는 것도 차단합니다.
-
-### 세션과 데이터
-
-- 상태 파일(schema v5): `~/.acp-gateway/state.snapshot.json`(전체 상태) + `~/.acp-gateway/state.wal.ndjson`(control 전이 로그)
-- `~/.acp-gateway/state.json`은 v4 형식으로 계속 기록됩니다. 구 Gateway로 명시적으로 롤백할 수 있도록 1.5.x에서도 유지합니다.
-- idle resumable 세션은 기본 30분 후 unload
-- 결과와 이벤트는 기본 24시간 보존
-- session resume checkpoint는 기본 7일 보존, Task 핸들의 바이트는 기본 24시간 보존(`ACP_GATEWAY_TASK_RETENTION_MS`)
-- 장시간 유지가 필요한 세션은 `pin` 사용
-- 응답 본문, thought, 전체 이벤트 이력은 상태 파일에 영구 저장하지 않음
-- 인라인 상한을 넘은 결과와 terminal 출력은 `~/.acp-gateway/artifacts`에 임시 저장 후 결과 보존 기간에 맞춰 정리
-
-#### 내구성과 복구
-
-Task 생성과 결과 확정은 응답을 반환하기 전에 WAL에 append + fsync합니다. 즉 Main이 받은 Task 핸들은 daemon이 죽어도 남아 있고, 재시작 후 미완 Task는 `failed`(재시작 메시지)로 확정됩니다. 나머지 전이(permission·질문 기록, 세션 등록/종료, 상태 변경)는 5ms group commit입니다. macOS에서 Node는 `F_FULLFSYNC`를 노출하지 않으므로 `fsync(2)`만 사용합니다 — 프로세스 비정상 종료는 완전히 보호되고, 전원 손실은 group commit 창(기본 5ms)만 노출됩니다.
-
-상태 파일이 손상되면 daemon은 **빈 상태로 조용히 시작하지 않고** 중단합니다. 이때 `~/.acp-gateway/state.recovery-required`에 이유를 기록하고 exit 78로 종료하며, Control MCP 연결 실패 메시지에 그 내용이 표면화됩니다. 복구는 명시적으로 선택합니다.
-
-| 환경 변수 | 기본값 | 설명 |
-| --- | --- | --- |
-| `ACP_GATEWAY_WAL` | `on` | `off`면 WAL 없이 critical mutation마다 snapshot을 동기 기록(동일한 내구성 약속, 더 큰 쓰기 비용) |
-| `ACP_GATEWAY_WAL_GROUP_COMMIT_MS` | `5` | 비임계 전이의 group commit 간격 |
-| `ACP_GATEWAY_WAL_ROTATE_BYTES` / `_RECORDS` / `_INTERVAL_MS` | `4MiB` / `10000` / `15m` | WAL 회전 조건 |
-| `ACP_GATEWAY_WAL_INLINE_RESULT_BYTES` | `4096` | 이 크기를 넘는 Task 결과는 artifact로 분리하고 WAL은 참조 + preview만 기록 |
-| `ACP_GATEWAY_FSYNC` | `normal` | `off`는 테스트·임시 볼륨 전용 |
-| `ACP_GATEWAY_STATE_RECOVERY` | (없음) | `truncate`: 손상 직전까지 WAL replay 후 시작 / `snapshot-drop`: snapshot 폐기 후 `state.json`에서 복구 / `cold`: 빈 상태로 시작 |
-| `ACP_GATEWAY_TASK_RETENTION_MS` | `24h` | Task 레코드와 결과 artifact의 디스크 생존 기간(세션 보존과 독립) |
-| `ACP_GATEWAY_MAX_QUEUE_BYTES` | `4000000` | control 연결당 OS+channel 합산 쓰기 예산. HIGH는 전체, NORMAL은 7/8, LOW는 1/2까지 사용 |
-| `ACP_GATEWAY_WRITE_TIMEOUT_MS` | `10000` | 이 시간 동안 OS가 한 바이트도 받지 않으면 해당 연결·프로바이더를 종료 |
-| `ACP_GATEWAY_MAX_PROMPT_BYTES` | `1000000` | 초과 prompt는 턴을 만들기 전에 `PROMPT_TOO_LARGE`로 거부 |
-| `ACP_GATEWAY_MAX_FILE_READ_BYTES` | `500000` | worker의 `fs/read_text_file` 응답 바이트 상한(거부 대신 절단) |
-| `ACP_GATEWAY_MAX_TERMINAL_OUTPUT_BYTES` | `10000000` | terminal 출력 버퍼 상한(기존 하드코딩 값과 동일) |
-| `ACP_GATEWAY_MAX_SESSIONS_PER_ROOT` | `64` | Main당 동시 세션 상한. 초과 시 `SESSION_LIMIT_EXCEEDED` |
-| `ACP_GATEWAY_MAX_INBOX_ITEM_BYTES` | `65536` | worker permission/elicitation 한 건의 보관 바이트 상한 |
-| `ACP_GATEWAY_MAX_PENDING_INBOX_BYTES_PER_SESSION` | `524288` | 세션당 pending inbox 합산 바이트 상한 |
-| `ACP_GATEWAY_MAX_PENDING_INBOX_BYTES_PER_ROOT` | `4194304` | Main당 pending inbox 합산 바이트 상한 |
-| `ACP_GATEWAY_MAX_INBOX_HISTORY_PER_ROOT` | `1000` | Main당 보관하는 처리 완료 inbox 건수(pending은 제거 대상 아님) |
-
-persistence가 불건강해지면 **새 Task 생성만** `PERSISTENCE_UNHEALTHY`로 거부합니다(핸들 = 내구성 약속). `session_open`과 직접 `prompt`는 계속 동작하며, 다음 성공한 write에서 건강 상태가 회복됩니다. `setup().persistence`에 `mode`, `walSeq`, `walBytes`, `snapshotEpoch`, `fsyncCount`, `lastRecovery`가 함께 보고됩니다.
-
-## ACP와 MCP란?
-
-[ACP(Agent Client Protocol)](https://agentclientprotocol.com/)는 코드 에디터·IDE와 AI 코딩 에이전트 사이의 통신을 표준화하는 프로토콜입니다. 에디터마다 Claude, Codex, Grok 같은 에이전트를 별도로 통합하는 대신, ACP라는 공통 규격으로 세션 생성, prompt 전달, tool 호출, 권한 요청, 진행 이벤트와 결과를 주고받습니다. 언어 도구 연결을 LSP가 표준화했다면, ACP는 코딩 에이전트 연결을 표준화하는 역할에 가깝습니다.
-
-ACP 규격에서 로컬 agent는 일반적으로 JSON-RPC over stdio로 실행되며, 원격 agent는 HTTP 또는 WebSocket 연결을 사용할 수 있습니다. **현재 ACP Gateway 구현 범위는 로컬 단일 머신의 ACP agent와 Unix socket 통신입니다.** 원격 agent 연결은 아직 지원하지 않습니다.
-
-- **ACP**는 에이전트 자체를 실행하고 대화하며 작업 상태를 관리하는 규격입니다.
-- **MCP(Model Context Protocol)**는 AI가 외부 도구, 데이터, 애플리케이션과 연결되는 공통 인터페이스입니다.
-- **ACP Gateway**는 내부에서 ACP로 Worker를 관리하고, 오케스트레이터에는 MCP 도구로 그 제어 기능을 제공합니다.
-
-즉, MCP와 ACP 중 하나를 고르는 구조가 아닙니다. MCP는 오케스트레이터가 Gateway를 조작하는 입구이고, ACP는 Gateway가 다른 AI 에이전트와 실제로 작업하는 통신로입니다.
-
-현재 최신 명세는 [MCP 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28)입니다. ACP Gateway는 이 명세 전체를 구현한다고 주장하지 않으며, 그중 장시간 작업을 task handle로 시작하고 상태·결과를 다시 조회하는 **MCP Tasks extension 흐름**을 지원합니다. 현재 로컬 stdio MCP 서버에는 stateless HTTP core나 OAuth/OIDC 인증이 적용되지 않습니다. MCP 2026-07-28의 전체 변경 사항은 [MCP 공식 명세](https://modelcontextprotocol.io/specification/2026-07-28)와 [Anthropic의 소개](https://claude.com/blog/bringing-mcp-2026-07-28-to-claude)를 참고하세요.
-
-## Agent CLI 직접 활용·단순 MCP 호출과 무엇이 다른가요?
-
-여기서 **Agent CLI 직접 활용**은 사람이 터미널을 번갈아 조작하는 경우가 아니라, 사용자가 대화 중인 오케스트레이터가 shell tool로 `claude`, `grok` 같은 다른 AI CLI 프로세스를 실행하고 stdout 결과를 받는 방식을 뜻합니다. **단순 MCP 호출**은 그 CLI 실행을 MCP tool 하나로 감싼 일반적인 wrapper 방식입니다.
-
-`O`는 일반적인 기본 사용 흐름에서 지원한다는 뜻이고, `X`는 별도의 daemon, session 저장소 또는 양방향 protocol을 직접 구현해야 한다는 뜻입니다. CLI나 MCP protocol 자체의 이론적 한계를 의미하지는 않습니다.
-
-| 기능 | Agent CLI 직접 활용 | 단순 MCP wrapper | ACP Gateway | 실제 차이 |
-|---|:---:|:---:|:---:|---|
-| 다른 AI 실행 | O | O | O | 세 방식 모두 Worker를 호출할 수 있음 |
-| provider·model 선택 | O | O | O | CLI는 agent별 flag, Gateway는 공통 입력 사용 |
-| 같은 session에 후속 피드백 | O | X | O | CLI는 resume ID를 오케스트레이터가 직접 관리, Gateway는 session ID로 관리 |
-| Worker의 built-in 서브에이전트 사용 | O | O | O | prompt로 요청 가능하지만 Gateway는 child event까지 회수 |
-| 여러 Worker 동시 실행 | O | O | O | CLI·wrapper는 호출 관계를 오케스트레이터가 직접 관리 |
-| 연결과 분리된 장시간 작업 | X | X | O | Gateway는 MCP Task handle로 나중에 다시 조회 가능 |
-| 진행 event 조회·재생 | X | X | O | Gateway는 cursor 이후의 새 event만 다시 조회 가능 |
-| Worker permission 요청에 응답 | X | X | O | Gateway가 요청을 Inbox에 보존하고 오케스트레이터의 승인·거부를 전달 |
-| Worker의 중간 질문에 응답 | X | X | O | 단발 호출은 같은 실행 흐름으로 답하기 어렵고 Gateway는 elicitation으로 왕복 |
-| Worker process까지 상태를 확정하며 취소 | X | X | O | Gateway가 ACP cancel과 하위 process 종료를 함께 관리 |
-| 오케스트레이터·MCP 재시작 후 작업 재연결 | X | X | O | 별도 daemon이 Worker와 session을 유지 |
-| 중복 없는 증분 결과 회수 | X | X | O | cursor와 `includeResult`로 필요한 데이터만 회수 |
-| 방치 session 자동 정리 | X | X | O | idle unload와 retention GC 적용 |
-| 구조화된 실패 진단·복구 상태 | X | X | O | event, task 상태와 checkpoint를 분리해 확인 |
-
-## 동작 개념도
+## How it works
 
 ```mermaid
 flowchart LR
-    U["사용자"] <--> M["오케스트레이터 AI<br/>(Main Agent)"]
+    U["User"] <--> M["Orchestrator AI<br/>(Main Agent)"]
     M <-->|"Control MCP"| G["ACP Gateway daemon"]
     G <-->|"ACP"| C["Claude Worker"]
     G <-->|"ACP"| X["Grok Worker"]
     G <-->|"ACP"| O["Codex Worker"]
-    G <-->|"ACP"| A["그 밖의 발견된 AI Worker"]
-    G --- S[("세션·Task·Inbox 상태")]
+    G <-->|"ACP"| A["Other discovered AI Workers"]
+    G --- S[("Session · Task · Inbox state")]
 ```
 
-오케스트레이터는 MCP를 통해 작업을 지시하고, Gateway는 각 Worker와 ACP로 통신합니다. Gateway daemon은 Unix socket, ACP 연결, 세션, 이벤트, permission 요청과 최소 복구 상태를 관리하므로 오케스트레이터나 MCP 연결이 다시 시작되어도 진행 중인 Worker를 이어서 제어할 수 있습니다.
+The orchestrator directs work through MCP, and the Gateway talks to each Worker over ACP. The Gateway daemon manages the Unix socket, ACP connections, sessions, events, permission requests, and the minimal recovery state, so it can keep controlling in-progress Workers even when the orchestrator or the MCP connection restarts.
 
-## 작업 파이프라인
+### Work pipeline
 
-1. **발견·설치** — installer가 로컬 AI를 찾고 ACP 공식 registry에서 대응 agent와 adapter를 준비합니다.
-2. **작업 생성** — 오케스트레이터가 Control MCP로 provider, 모델, 작업 경로와 권한 정책을 지정해 세션을 엽니다.
-3. **Worker 실행** — Gateway가 해당 provider 프로세스를 시작하거나 기존 프로세스·세션을 재사용합니다.
-4. **ACP 작업 전달** — prompt, 파일 작업, tool event와 중간 결과가 ACP를 통해 오갑니다.
-5. **권한·질문 처리** — Worker의 permission 요청이나 질문은 Gateway Inbox를 거쳐 오케스트레이터에게 전달되고, 그 응답이 다시 Worker로 돌아갑니다.
-6. **결과 회수·재사용** — 오케스트레이터는 MCP Task 또는 poll로 상태와 결과를 받고, 필요하면 같은 세션을 다시 호출하거나 복구합니다.
+1. **Discovery and installation** — The installer finds the local AIs and prepares the matching agents and adapters from the official ACP registry.
+2. **Task creation** — The orchestrator opens a session through the Control MCP, specifying the provider, model, working path, and permission policy.
+3. **Worker execution** — The Gateway starts that provider's process, or reuses an existing process and session.
+4. **Task handover over ACP** — Prompts, file operations, tool events, and intermediate results flow through ACP.
+5. **Permission and question handling** — A Worker's permission requests and questions travel through the Gateway Inbox to the orchestrator, and the orchestrator's response goes back to the Worker.
+6. **Result retrieval and reuse** — The orchestrator receives status and results through an MCP Task or poll, and can call the same session again or recover it if needed.
 
-## v1.6.0 변경 사항
+### Reliability
 
-어느 Main이 세션을 열고 턴을 시작했는지 Gateway가 직접 기록하는 릴리스입니다. 지금까지는 한 PC의 모든 Main이 같은 `rootId`를 써서 Gateway 응답만으로는 Main을 구분할 수 없었습니다. 그래서 모니터 같은 소비자가 각 Main의 transcript를 읽어 연결을 추측했습니다. API major **1**과 state schema **5**는 유지되며, 새 필드는 모두 additive입니다.
+The Gateway also tells the orchestrator where delegated work stands, so it does not have to guess after a restart or a long silence.
 
-- **호출자 식별(`caller`):** Control MCP 서버는 자신을 띄운 에이전트 CLI를 호출자로 보고합니다. 요청마다 `caller: {provider, sessionId, pid, instanceId}`를 함께 보냅니다.
-  - `provider`: 부모 프로세스 이름으로 정합니다(`claude` / `codex` / `grok`).
-  - `sessionId`: CLI가 내보낸 세션 id입니다(`CLAUDE_CODE_SESSION_ID`, `GROK_SESSION_ID`, `CODEX_THREAD_ID`). Codex는 MCP 서버에 thread id를 넘기지 않으므로 `null`입니다.
-  - `pid`: 부모 CLI의 pid입니다.
-  - `instanceId`: Control MCP 서버 프로세스마다 새로 만드는 값입니다. Codex처럼 세션 id가 없을 때도 같은 thread가 한 요청끼리 묶입니다.
-- **`openedBy`:** 세션을 연(또는 처음 복구한) Main입니다. 한 번 정해지면 바뀌지 않습니다. `session_open`·`session_restore` 응답, `session list`, 재시작 후 상태에 남습니다.
-- **`promptedBy`:** 턴을 시작한 Main입니다. `turn_start` 이벤트와 세션의 최신 값에 들어갑니다. 그 턴의 응답을 받을 쪽입니다. `prompt`·`run`·`task_prompt` 모두 기록합니다.
-- **호환성:** 1.6.0 이전 Control 서버는 `caller`를 보내지 않으므로 세 필드가 모두 없습니다. 기존 응답 형태는 그대로입니다. observer 연결이 보낸 `caller`는 기록하지 않습니다. 형식이 잘못된 `caller`는 호출을 막지 않고 기록만 하지 않습니다.
-- **개인정보:** 기록하는 값은 provider, 세션 id, pid, 무작위 instance id뿐입니다. 명령줄과 환경 변수는 저장하지 않습니다.
+- **Why a session is in its status** — Each status change records a reason and a time. A running Worker that has sent nothing for a while (5 minutes by default) is flagged as a possible stall; this is only a hint, and nothing is cancelled.
+- **What an interruption left unknown** — A task cut short by a restart or a lost Worker says whether the Worker may already have acted on the prompt, and what to do next. `agent_acp_session {action: "check"}` reports, read-only and without starting anything, whether a session can come back.
+- **Attention inbox** — `agent_acp_inbox {action: "attention"}` lists the requests waiting on the orchestrator and the finished results it has not received yet; `ack` marks them as seen.
+- **Declared task links** — A run can name the task it follows up (`parentTaskId`) and the tasks whose results it used (`inputTaskIds`). With `scope: "mine"`, session and task lists show only the calling orchestrator's own work.
+- **Quarantine after repeated restore failures** — After 3 failed restores in a row (by default), the Gateway stops restoring the session on its own and returns `SESSION_QUARANTINED` with the remaining options; a successful explicit restore lifts it.
 
-## v1.5.2 변경 사항
+## What are ACP and MCP?
 
-v1.5.1 이후 Codex·Grok 자문과 실사용 matrix에서 나온 결함을 한 번에 정리한 강화 릴리스입니다. API major **1**과 state schema **5**는 유지되며, 새 필드와 오류 코드는 모두 additive입니다.
+[ACP (Agent Client Protocol)](https://agentclientprotocol.com/) is a protocol that standardizes communication between code editors or IDEs and AI coding agents. Instead of each editor integrating agents such as Claude, Codex, and Grok separately, they exchange session creation, prompt delivery, tool calls, permission requests, progress events, and results through the common ACP specification.
 
-**보안·권한**
-- **경로 기반 자동 승인:** 자동 승인이 `toolCall.locations`와 `rawInput`의 경로를 세션 루트와 비교합니다(symlink 해석 포함). 루트 밖 요청은 `read_only`에서 거절되고, `auto_approve`에서는 Main에게 넘어갑니다.
-- **Gateway 보호 경로:** `~/.acp-gateway`, state·settings 디렉터리, control socket은 정책과 무관하게 거절됩니다. 워커가 `install.json`의 Control token을 읽을 수 없습니다. `ask` 세션에서도 사람에게 묻지 않고 바로 거절합니다.
-  - 셸 명령 문자열도 검사합니다. `~`·`$HOME`·따옴표 표기와 `link/..` 같은 symlink 경유 경로가 대상이며, `terminal/create` 인자도 포함됩니다.
-- **Grok 샌드박스:** Grok은 Gateway가 만든 프로필(`.grok/sandbox.toml`, `ACP_GATEWAY_GROK_SANDBOX_DIR`)로 프로세스 전체에 OS 샌드박스(Seatbelt/Landlock)를 적용해 보호 경로를 거부합니다. 내장 `grep`처럼 ACP를 거치지 않는 도구도 토큰 파일을 읽을 수 없습니다.
-- **Claude 세션 규칙:** Claude 세션에는 `_meta.claudeCode.options.disallowedTools`를 전달합니다. `read_only`는 Bash·Edit·Write를 막고, 모든 정책에서 보호 경로 읽기를 막습니다. v1.5.1까지 Claude가 권한 요청 없이 실행하던 셸 명령과 루트 밖 읽기가 이제 차단됩니다.
-- **거절 옵션 선택:** 자동 거절이 "계속 진행" 성격의 옵션(Codex의 `decline`)을 "턴 중단" 옵션(`cancel`)보다 우선 고릅니다. 예전에는 셸 명령 하나가 거절되면 Codex 턴 전체가 끝났습니다.
+Under the ACP specification, a local agent is normally run as JSON-RPC over stdio, and a remote agent can use an HTTP or WebSocket connection. **The current ACP Gateway implementation covers ACP agents on a single local machine, over a Unix socket.** Connecting to remote agents is not supported yet.
 
-**작업 안전성**
-- **`workspace: "snapshot"`:** `session_open`에 지정하면 워커가 cwd의 사본에서 일하고 원본은 건드리지 않습니다. 변경은 `agent_acp_session {action: "workspace_diff"}`로 패치를 받아 Main이 직접 적용합니다. Codex처럼 루트 안 편집을 막을 수 없는 provider에 편집이 절대 일어나면 안 되는 작업을 맡길 때 씁니다.
-  - **비교 기준:** 스냅샷 시점의 baseline과 비교하므로, 그 뒤에 원본에서 한 사용자 수정이 역패치로 섞이지 않습니다.
-  - **symlink:** 트리 안을 가리키는 링크는 사본 안으로 다시 연결되고, 밖을 가리키는 링크는 복사하지 않습니다(`droppedLinks`).
-  - **제외 대상:** 보호 디렉터리는 복사하지 않습니다.
-  - **diff 크기:** 64MB로 제한됩니다.
-  - **위치·수명:** 사본은 close 시 삭제되며 `ACP_GATEWAY_WORKSPACES`(기본 `~/.cache/acp-gateway/workspaces`)에 생성됩니다. APFS·reflink를 지원하는 파일시스템에서는 clone으로 복사합니다.
-- **idempotencyKey 충돌:** 같은 키로 다른 prompt·model을 보내면 `IDEMPOTENCY_CONFLICT`(details에 기존 `taskId`)를 반환합니다. 예전에는 이전 결과를 조용히 돌려줬습니다. 대기·결과 예산 옵션만 바꾼 재시도는 그대로 attach됩니다. digest는 WAL에 저장되어 재시작 뒤에도 유지됩니다.
+- **ACP** is the specification for running an agent itself, talking to it, and managing its work state.
+- **MCP (Model Context Protocol)** is a common interface for AI to connect to external tools, data, and applications.
+- **ACP Gateway** manages Workers over ACP internally and offers that control to the orchestrator as MCP tools.
 
-**신뢰성·운영**
-- **ACP 오류 코드:** 워커의 JSON-RPC 오류는 `ACP_ERROR`로 전달되며, restore 대상이 없으면 `UNKNOWN_SESSION`입니다. `details.acpCode`·`acpMessage`에 원본 오류가 담깁니다.
-- **adapter 세대 관리:** adapter 정의(버전 pin)가 바뀌면 기존 프로세스는 보유 세션만 마저 처리하고, 새 세션은 새 프로세스로 엽니다. 할 일이 없어진 구 프로세스는 GC가 정리합니다. `setup`의 `started`는 실제 생존 여부를 보여 주고(예전엔 항상 false), provider 상세에 `runningVersion`과 `retiredProcesses`가 추가되었습니다.
-- **격리 state의 provider 파일:** `ACP_GATEWAY_STATE`를 기본 위치 밖으로 지정하면 `providers.json`과 registry cache도 그 디렉터리를 씁니다. 파일이 없을 때는 전역 정의를 읽고, 첫 쓰기 때 전역 내용을 복사합니다. 격리 daemon의 자동 업데이트가 더 이상 전역 파일을 바꾸지 않습니다.
-- **원자적 `--update`:** 새 upstream commit을 임시 `git worktree`에서 `npm ci`와 `npm run ci`로 먼저 검증한 뒤에만 live checkout을 fast-forward합니다.
-  - **직렬화:** 동시 update는 lock으로 막습니다.
-  - **HEAD 재확인:** merge 직전에 HEAD와 clean 상태를 다시 확인합니다.
-  - **롤백:** 이후 의존성 설치가 실패하면 이전 commit으로 되돌립니다. 되돌리기는 HEAD가 이번 update의 결과이고 트리가 깨끗할 때만 수행하며, 롤백 실패는 실패로 보고합니다.
-- **종료 호출은 daemon을 띄우지 않음:** `daemon_shutdown`·`shutdown_if_idle`은 daemon이 없으면 새로 띄우지 않고 `{ok:true, alreadyStopped:true}`를 반환합니다.
+In other words, it is not a choice between MCP and ACP. MCP is the entrance through which the orchestrator operates the Gateway, and ACP is the channel through which the Gateway actually works with the other AI agents.
 
-**테스트**
-- **mock 회귀 테스트:** `test/hardening.test.js`에 기능별 회귀 테스트 23개를 추가했고, `test/source-update.test.js`는 staging·lock·CAS·롤백 11개로 다시 작성했습니다(전체 397개).
-- **live 시나리오:** `npm run usecases:live`는 격리 daemon과 실제 Claude·Codex·Grok으로 22개 시나리오(setup, 세션, run, 권한 8종, snapshot, 오류, `kill -9` 복구)를 돌려 provider별 pass / known-limit / fail 표를 만듭니다. 구독 할당량을 쓰므로 릴리스 전 수동 게이트로 실행합니다. 결과는 [Live use cases](docs/live-usecases.md)에 누적합니다.
+The latest specification is currently [MCP 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28). ACP Gateway does not claim to implement this entire specification; it supports the **MCP Tasks extension flow**, in which a long-running job is started as a task handle and its status and result are queried again later. The current local stdio MCP server does not apply the stateless HTTP core or OAuth/OIDC authentication. For the full set of changes in MCP 2026-07-28, see the [official MCP specification](https://modelcontextprotocol.io/specification/2026-07-28) and [Anthropic's introduction](https://claude.com/blog/bringing-mcp-2026-07-28-to-claude).
 
-**알려진 한계:** 세션의 `permission_policy_partial` 경고의 `scope`가 막을 수 없는 항목을 정확히 나열합니다. live matrix는 이 범위 안의 누출만 known-limit으로 인정합니다.
-- **Codex** (`edit_inside_roots`, `shell_write_inside_roots`, `read_outside_roots`, `read_protected`): codex-acp는 자기 도구로 파일을 다루며 진짜 읽기 전용 sandbox가 없습니다. 편집을 막으려면 `workspace: "snapshot"`을 쓰고, Control token이 있는 머신에서는 Codex에 신뢰할 수 없는 입력을 맡기지 마세요.
-- **Grok** (`read_outside_roots`): 내장 `grep`이 루트 밖 일반 파일을 읽을 수 있습니다. 보호 경로는 샌드박스가 거부합니다.
-- **Claude:** 경고가 없습니다. live matrix의 모든 권한 시나리오를 통과합니다.
-- **`auto_approve`:** 루트 안에서 신뢰한다는 정책입니다. 경로를 확인할 수 없는 셸 명령은 자동 승인되며, 보호 경로를 가리키는 명령만 거절됩니다.
+## How is this different from using an agent CLI directly or a plain MCP call?
 
-## v1.5.1 변경 사항
+Here, **using an agent CLI directly** does not mean a person switching between terminals; it means the orchestrator you are talking to runs another AI CLI process, such as `claude` or `grok`, through a shell tool and receives the stdout result. A **plain MCP call** is the common wrapper approach that packages that CLI execution as a single MCP tool.
 
-실제 Claude·Codex·Grok Worker로 오케스트레이션 사용 사례를 돌려 보며 찾은 결함을 고친 패치 릴리스입니다. 사용 사례와 재현 절차는 [Live use cases](docs/live-usecases.md)에 기록했습니다. API major **1**과 state schema **5**는 바뀌지 않습니다.
+`O` means it is supported in the ordinary default usage flow, and `X` means you would have to build a separate daemon, session store, or bidirectional protocol yourself. It does not describe a theoretical limit of the CLI or of the MCP protocol itself.
 
-- **재시작 뒤 Claude·Codex 세션 복구 실패 수정:** daemon 재시작, provider 종료, idle unload(기본 30분) 뒤에 Claude·Codex 세션을 다시 쓰면 `required model=…, actual=<missing>`가 나고 세션이 `unavailable`로 바뀌던 문제를 고쳤습니다. 원인은 세션마다 모델을 고르는 registry provider도 프로세스 시작 시점에 모델을 검사한 것이었습니다. 이 검사는 provider 프로세스가 이미 떠 있으면 건너뛰어졌기 때문에 실행 순서에 따라 성공과 실패가 갈렸습니다. 이제 세션 단위 provider의 모델은 세션을 연 뒤 `configOptions`로만 확인합니다. 콜드 상태의 `session_open`에서 `model`을 명시해도 거부되지 않습니다.
-- **Codex 권한 정책 완화와 명시:** Codex adapter는 자기 도구로 파일을 고치며, 기본 `agent` preset은 승인을 자체 `auto_review`로 처리합니다. 그래서 `read_only`·`ask` 세션에서도 permission 요청 없이 편집이 일어났습니다. 이제 Gateway는 `read_only`·`ask` 세션을 열 때와 복구할 때마다 Worker가 광고한 `mode` 옵션 중 `read-only`를 선택합니다. 이 설정으로 세션 루트 밖 쓰기, 네트워크, 권한 상승이 차단되거나 Gateway로 올라옵니다. codex-acp에는 진짜 읽기 전용 sandbox preset이 없어서 루트 **안** 편집은 막을 수 없습니다. 이런 세션에는 `session_open`의 `relevantAlerts` 맨 앞에 `permission_policy_partial` 경고를 붙입니다. 편집이 절대 일어나면 안 되는 작업은 버려도 되는 작업 사본을 `cwd`로 지정하세요.
-- **skill 문서 정정:** prompt 수준 `model`과 `agent_acp_config` 모델 변경은 한 턴이 아니라 이후 모든 턴에 적용됩니다. 위 버그를 피하려고 넣었던 "기본 모델을 다시 명시하면 거부될 수 있다"는 안내도 삭제했습니다. 설치된 skill은 `acp-gateway-bootstrap --update-skill`로 갱신하세요.
+| Capability | Direct agent CLI use | Plain MCP wrapper | ACP Gateway | Actual difference |
+|---|:---:|:---:|:---:|---|
+| Run another AI | O | O | O | All three approaches can call a Worker |
+| Choose provider/model | O | O | O | A CLI uses per-agent flags; the Gateway uses a common input |
+| Follow-up feedback in the same session | O | X | O | With a CLI the orchestrator manages the resume ID itself; the Gateway manages it by session ID |
+| Use the Worker's built-in subagents | O | O | O | Can be requested through the prompt, but the Gateway also retrieves child events |
+| Run multiple Workers concurrently | O | O | O | With a CLI or wrapper, the orchestrator manages the call relationships itself |
+| Long-running work detached from the connection | X | X | O | The Gateway lets you query it again later through an MCP Task handle |
+| Query and replay progress events | X | X | O | The Gateway can re-query only the new events after a cursor |
+| Respond to Worker permission requests | X | X | O | The Gateway keeps the request in the Inbox and relays the orchestrator's approval or denial |
+| Answer a Worker's mid-run questions | X | X | O | A one-shot call can hardly answer within the same run; the Gateway round-trips through elicitation |
+| Cancel with a confirmed state down to the Worker process | X | X | O | The Gateway manages the ACP cancel and the termination of child processes together |
+| Reconnect to work after an orchestrator or MCP restart | X | X | O | A separate daemon keeps the Worker and session alive |
+| Incremental result retrieval without duplicates | X | X | O | Retrieve only the data you need with a cursor and `includeResult` |
+| Automatic cleanup of abandoned sessions | X | X | O | Idle unload and retention GC apply |
+| Structured failure diagnosis and recovery state | X | X | O | Event, task state, and checkpoint are inspected separately |
 
-## v1.5.0 변경 사항
+## What installation changes on your machine
 
-**Gateway가 엔진과 실행 정책을 소유하고, AgenLynk 등 앱과 CLI는 공개 API를 소비합니다.** 소비자가 설정 파일을 직접 쓰거나 provider 실행 차단·보존·안전 종료 정책을 별도로 구현하지 않아도 되도록 관리 계약을 추가했습니다.
+Here is what `acp-gateway-bootstrap --install-all` actually does. With `--dry-run`, it only prints the plan and makes no actual changes.
 
-- **Observer 역할:** `GatewayRpcClient({access: "observer"})`는 서버가 읽기 전용 method를 집행합니다. 모니터 연결은 Main의 owner presence를 유지하지 않으며, 설정 조회 때문에 Worker를 복구하지 않습니다. 동일 Control token의 역할 제한이며 독립적인 observer credential을 제공하는 것은 아닙니다.
-- **Provider 정책:** `provider`의 `list`, `set_enabled`, `install`을 제공합니다. Off는 Gateway가 새 세션·새 restore 등록 단계에서 거부합니다(`PROVIDER_DISABLED`). 이미 등록된 세션은 계속 수행·복구할 수 있습니다. 설치는 기존 Gateway installer를 사용하고 기본적으로 dry-run입니다.
-- **엔진 설정:** `gateway_config`로 지원 옵션·활성값·저장값·revision·재시작 필요 여부를 조회하고 갱신합니다. `expectedRevision`이 낡았으면 `CONFIG_CONFLICT`로 거부합니다. `~/.acp-gateway/settings.json`이 엔진 설정의 기준이며, 해당 파일이 없으면 기존 `install.json`의 지원 설정을 읽고 최초 변경 시 migration합니다. 환경변수는 가장 우선합니다.
-- **안전 종료:** `shutdown_if_idle`과 기본 `daemon_shutdown`은 작업·Inbox·세션 생성/복구·관리 요청·background update가 남으면 `SHUTDOWN_BLOCKED`와 blockers를 반환합니다. 통과하면 새 mutation을 막고 종료합니다. 강제 종료는 명시적인 `daemon_shutdown {force:true}` 또는 OS signal입니다.
-- **정직한 replay:** live-only message/thought 유실 및 daemon 재시작 뒤 이력 단절을 subscription의 `cursorTruncated`와 새 `replay` 메타데이터로 알립니다. 실시간 연결 회복이 과거 메시지 복구를 뜻하지 않습니다. 완료 Task 결과는 `task_result`로 별도로 회수합니다.
-- **보존 미리보기:** `retention_preview`는 실제 GC와 공유하는 판정으로 세션·Task·Inbox·결과의 정리 예상 건수를 반환합니다. 진행 중 Task는 보존 기간만으로 지우지 않습니다. preview는 조회 시점의 advisory이며, 참조 보호가 적용되는 artifact의 정확한 삭제 건수를 추정하지 않습니다.
-- **오류 경로:** 취소된 `run` 대기의 waiter를 즉시 회수하고, 잘못된 cursor의 subscribe를 등록 전에 거부합니다. root당 구독 수는 64개로 제한합니다. 세션 생성 예산은 Worker 호출 전 예약합니다.
-- **실행본 식별:** full setup에 `gatewayBuildId`(실행 시점 src 파일 SHA-256), `runtimeRoot`, `instanceId`, `sourceCommit`(release manifest가 있는 경우), 적용 `configRevision`, 관리 `capabilities`를 제공합니다.
-- **의존성:** fast-uri, ip-address, hono, qs의 보안 수정 버전을 lockfile에 반영했습니다.
+- **ACP agent/adapter installation** — It finds AIs installed on the PATH, in common CLI locations, and among global npm packages, matches them against the official ACP registry, and installs or updates, globally, the `npx` and `uvx` packages the registry names (`npm install --global` or `uv tool install --force`). AIs that are not in the registry are not registered automatically.
+- **MCP registration** — It registers two MCP servers with each CLI's `mcp add` command (`mcp add-json` for Auggie). The orchestrator-only Control MCP `agent-acp` is registered with just the one CLI you chose as the front door (`--front-door`; Codex in non-interactive installs), and the read-only Guide MCP `agent-acp-guide` is registered with every discovered supported CLI (Codex, Claude, Grok, Auggie). When the Control MCP is registered, the Control token and the Main ID are passed to the server as environment variables (`ACP_GATEWAY_CONTROL_TOKEN`, `ACP_GATEWAY_ROOT_ID`), so install the Control MCP only on local agents you trust. If an entry with the same name that the installer did not create already exists, it is not overwritten without `--force`; the installer stops with an error instead.
+- **`agent-delegator` skill installation** — It copies the skill bundled in the repository into each discovered AI's skills directory.
 
-기존 API major **1**, state schema **5**, public client 4개 export는 유지합니다. State v4 병행 기록도 1.5.x에서 계속 유지해 명시적 rollback을 지원합니다. `daemon_shutdown` 기본 거부 조건과 subscription truncation 의미의 보강은 소비자가 확인해야 하는 동작 변경입니다. 기존 AgenLynk는 새 관리 API를 호출하고 capability를 소비하도록 별도 업데이트해야 합니다. 엔진 업그레이드만으로 앱의 자체 설정 쓰기·501 endpoint가 바뀌지는 않습니다.
+  | AI | Install path | Environment variable that changes the path |
+  |---|---|---|
+  | Codex | `~/.codex/skills` | `CODEX_HOME` (when set, `$CODEX_HOME/skills`) |
+  | Claude | `~/.claude/skills` | `CLAUDE_HOME` (when set, `$CLAUDE_HOME/skills`) |
+  | Grok | `~/.grok/skills` | `GROK_HOME` (when set, `$GROK_HOME/skills`) |
+  | Auggie | `~/.augment/skills` | `AUGMENT_HOME` (when set, `$AUGMENT_HOME/skills`) |
+  | Other registry providers | `~/.agents/skills` | None |
 
-`artifactSessionLimit`, `workerThoughtStream`, `workerSubagentTranscript`는 1.5.0 엔진 지원 설정이 아닙니다. Legacy 값은 `unsupportedLegacySettings`로 보고하며 적용된 것처럼 표시하지 않습니다. Monitor/Pet/화면 설정은 소비자 책임입니다.
+  When several providers share a path, the skill files are copied only once. The skill is installed only by the first `--install-all`, and `--update` does not touch it. If a skill with the same name that the installer does not manage already exists, it is not overwritten without `--force`; the installer stops with an error instead.
+- **State files in `~/.acp-gateway/`** — It creates these files:
+  - `install.json` (permission `0600`): the Control token, the Main ID, records of the MCP servers and skills the installer registered, and the ACP agent auto-update and notification settings
+  - `registry.json`: a 24-hour cache of the official ACP registry
+  - `providers.json`: the execution definitions of the discovered providers
 
-### 공개 관리 API와 CLI
+  Once the daemon is running, session state (`state.snapshot.json`, `state.wal.ndjson`) and an `artifacts` directory also appear in the same directory.
+- **Starting the daemon** — After installation, a health check starts the Gateway daemon and verifies authentication, and replaces a running daemon if its version differs. You can skip this step with `--skip-health-check`.
 
-정확한 요청·응답, 소유권과 migration 절차는 [관리 API 계약](docs/management-api.md)을 참고하세요. 관리 CLI도 같은 `acp-gateway/client` RPC를 사용하며 이미 실행 중인 daemon에 연결합니다.
+The Gateway source is updated only when you run `acp-gateway-bootstrap --update`. The installer has no uninstall command, so to undo the changes you have to remove the items above yourself.
 
-```bash
-acp-gateway-admin setup
-acp-gateway-admin gateway_config
-acp-gateway-admin gateway_config '{"action":"set","expectedRevision":0,"values":{"idleUnloadMs":1800000}}'
-acp-gateway-admin provider '{"action":"set_enabled","provider":"claude","enabled":false}'
-acp-gateway-admin provider '{"action":"install","registryId":"claude-acp","dryRun":true}'
-acp-gateway-admin retention_preview '{"values":{"sessionRetentionMs":86400000}}'
-acp-gateway-admin shutdown_if_idle
-```
+## Documentation
 
-`expectedRevision`은 예시의 0을 복사하지 말고 직전 조회값을 사용하세요. 설정은 안전 종료 후 새 daemon 시작에 적용됩니다. 재시작·runtime 교체를 수행하는 소비자는 자동 재연결 client를 먼저 닫고, 선택한 runtime으로 새 daemon을 시작한 뒤 setup의 실행본 식별과 적용값을 확인해야 합니다.
+- [Management API contract](docs/management-api.md) — engine settings, provider policy, safe shutdown, and the public client (`acp-gateway/client`) contract
+- [Live use cases](docs/live-usecases.md) (Korean) — a record of use cases run with real Claude, Codex, and Grok Workers
+- [Operations guide](docs/operations.md) — installer options, updating, host reconnection, Worker parameter control, and session and data management
+- [Changelog](CHANGELOG.md) — changes by version
 
-### 1.5.x·1.6.0 runtime 빌드
+## License
 
-1.5.x(`v1.5.0`~`v1.5.2`)와 `v1.6.0` builder는 tag와 별도로 검토한 전체 source SHA를 요구합니다. tag가 해당 SHA와 다르면 빌드와 검증을 거부하며, 새 runtime의 엔진과 public client는 모두 같은 source commit에서 추출합니다. 기존 1.4.0 태그의 고정 SHA 검증은 유지합니다.
-
-```bash
-npm run release:runtime -- --source-tag v1.6.0 --source-commit FULL_REVIEWED_SOURCE_SHA --output-dir dist
-npm run release:verify -- --source-commit FULL_REVIEWED_SOURCE_SHA \
-  --archive dist/acp-gateway-runtime-darwin-arm64.tar.gz \
-  --sha256 dist/acp-gateway-runtime-darwin-arm64.tar.gz.sha256 \
-  --build-record dist/acp-gateway-runtime-darwin-arm64.tar.gz.build-record.json
-```
-
-위 명령은 로컬 산출물을 생성·검증합니다. GitHub Release 업로드와 attestation은 별도의 `Release runtime` workflow로 수행하며 기존 asset은 덮어쓰지 않습니다. 소비자는 게시된 새 asset의 checksum과 source SHA로 자신의 lock을 갱신해야 합니다.
-
-## v1.4.0 변경 사항
-
-**Durable · Bounded · Quiet** — 재시작 후에도 정확하고, 주요 자원이 명시된 상한 안에 머물며, Main을 불필요하게 깨우지 않는 안정화 릴리스입니다.
-
-### 버전 정보
-
-| 항목 | 버전·요구사항 | 의미 |
-|---|---|---|
-| ACP Gateway | `1.4.0` | daemon, Control MCP와 installer의 릴리스 버전 |
-| Gateway Control API | `1` | 공개 control method와 응답 계약. additive 변경에는 올리지 않음 |
-| State schema | `5` | `state.snapshot.json` + checksummed `state.wal.ndjson` |
-| Legacy state schema | `4` | rollback을 위해 병행 기록하며 1.5.x에서도 rollback 호환을 위해 유지 |
-| Runtime | Node.js `>=22` | macOS와 Linux 지원 |
-| 호환 기준 | `1.3.2` | 인자 없는 핵심 호출의 응답 형태와 기존 method 유지 |
-
-`package.json`, daemon과 Control MCP가 모두 `1.4.0`을 보고해야 정상입니다. `agent_acp_setup`에서는 `gatewayVersion`, `gatewayApiVersion`, `stateSchemaVersion`으로 각각 확인할 수 있습니다. MCP 호스트가 이전 tool schema를 캐시한 경우에는 `staleFrontDoor`가 표시되므로 [호스트 재연결 절차](#호스트-재연결-절차)를 수행하세요.
-
-## 1.4.0 불변 runtime release 기록
-
-1.4.0 downstream 앱은 이동하는 branch나 `src/` private subpath 대신 `v1.4.0` Release의 `acp-gateway-runtime-darwin-arm64.tar.gz`와 `acp-gateway/client`만 소비합니다. 공개 client 계약은 `GatewayRpcClient`, `GatewayError`, `ERROR_CODES`, `GATEWAY_API_VERSION` 네 항목이며 다른 package subpath는 `exports` 경계에서 차단됩니다.
-
-릴리스 빌더는 고정된 `v1.4.0` 소스 커밋 `a1fdb353777337ca6ec481f8563d77efaea55e95`에 public client와 production dependency를 결합하고, allowlist와 파일별 digest를 담은 `runtime-manifest.json`을 생성합니다. 로컬 산출물 옆에는 SHA-256과 서명되지 않은 build record(`*.build-record.json`)가 생성됩니다. 이 파일은 attestation이 아니며, GitHub Actions 밖에서는 `origin: local`로 표시됩니다. 공식 서명은 GitHub Actions의 `actions/attest-build-provenance`이며, workflow는 게시 전에 `gh attestation verify`로 아카이브를 검증합니다. 이미 올라간 세 asset은 덮어쓰지 않습니다.
-
-```bash
-npm run release:runtime -- --source-tag v1.4.0 --output-dir dist
-npm run release:verify -- \
-  --archive dist/acp-gateway-runtime-darwin-arm64.tar.gz \
-  --sha256 dist/acp-gateway-runtime-darwin-arm64.tar.gz.sha256 \
-  --build-record dist/acp-gateway-runtime-darwin-arm64.tar.gz.build-record.json
-```
-
-builder checkout은 clean 상태여야 합니다. `v1.4.0` 태그가 pinned commit에서 이동하면 builder와 verifier가 모두 거부합니다. manifest에는 source tag/commit과 builder commit이 모두 기록되고 tar entry 순서·정규화된 mode·mtime·소유권과 gzip OS header가 고정되므로 동일한 두 commit에서는 동일한 bytes가 생성됩니다.
-
-### 릴리스 변경 이력
-
-1. **오류 계약과 characterization 기반 확립** — 안정적인 Gateway error code와 `{code,message,details}` wire envelope를 추가하고, 1.3.2의 prompt·poll·Task·Inbox 기본 동작을 characterization test로 고정했습니다.
-2. **SessionActor-lite 도입** — 세션별 mailbox와 명시적 FSM guard로 prompt·cancel·close·restore·provider-exit을 직렬화했습니다. 늦은 callback과 중복 terminal 처리도 idempotent하게 만들었습니다.
-3. **TaskStore v2 전환** — Task TTL을 `createdAt` 기준으로 통일하고, terminal-first-wins, blocking result waiter, 취소 의미론, root 격리, waiter·Task 상한과 keyset pagination을 구현했습니다.
-4. **State schema v5와 crash-safe 복구** — snapshot과 checksummed WAL, fsync barrier, replay idempotency, state-directory lock, v4 migration·downgrade 감지를 추가했습니다. 손상된 내부 WAL이나 snapshot에서는 빈 상태로 시작하지 않고 안전하게 중단합니다.
-5. **Bounded transport와 자원 예산** — 모든 NDJSON 전송 구간에 frame·queue·lane·write-timeout 상한을 적용하고, prompt·파일 읽기·terminal 출력·session·Inbox·artifact에도 명시적인 예산을 추가했습니다. 대용량 파일은 전체 `readFile` 대신 bounded streaming read로 처리합니다.
-6. **Control/telemetry 분리** — permission·질문·Task 상태 같은 control event를 telemetry flood에서 보호합니다. raw message/thought chunk는 live subscription으로만 전달하고, usage는 ring 저장이나 poll wake-up 없이 turn/session 누계로 집계합니다.
-7. **Compact API와 실행 경로 단순화** — `agent_acp_run`, `current|compact|diagnostic` 응답 프로파일, setup summary, 결과 byte budget, Inbox 필터·페이징과 idempotency key를 추가했습니다.
-
-마무리 안정화에서는 close flush timer의 참조가 사라져 shutdown이 멈출 수 있던 문제, transport 종료가 worker-death로 정규화되지 않던 문제, aggregate transport·Inbox budget 우회, 구조적 오류 누락과 compact run의 복구 중 중복 실행 가능성을 수정했습니다. CI에는 session race, resource budget, transport backpressure, Task conformance, state corruption과 18개 crash cut-point 검증이 포함됩니다.
-
-### 주요 API 추가
-
-- **`agent_acp_run` 신설** — prompt를 보내고 결과까지 기다리는 단일 도구입니다. 직접 반환값과 MCP Task 결과가 **같은 객체**라서 처리할 shape가 하나뿐입니다. 대기 시간이 끝나면 오류가 아니라 `{status:"working", taskId}`를 돌려주므로, 실패 시에는 prompt를 다시 보내지 말고 `{taskId}`로만 재시도하면 됩니다(중복 실행이 구조적으로 불가능). permission이 필요하면 `{status:"input_required", pending}`으로 제어권을 즉시 돌려줍니다. `idempotencyKey`로 재시도 안전성을 한 겹 더 확보할 수 있습니다.
-- **응답 프로파일** — `agent_acp_poll`에 `responseProfile: "compact"`를 주면 세션 봉투를 제거하고 `events`·최종 `result`만 남겨 **약 3분의 1 크기**로 줄어듭니다(빈 poll 483 → 152 bytes, permission poll 814 → 483 bytes). `"diagnostic"`은 큐 깊이·대기 요청 수 등 진단 정보를 더합니다. 인자를 생략하면 기존 응답 그대로입니다.
-- **`setup mode:"summary"`** — 버전·프로파일·persistence·alert·provider 목록만 담은 요약(363 bytes, 전체의 약 19%)입니다. 세션마다 필요한 값은 `agent_acp_session_open` 응답이 직접 실어 보내므로(`responseProfiles`, `limits`, `relevantAlerts`) 위임할 때마다 setup을 다시 부를 필요가 없습니다.
-- **결과 예산** — `resultBudgetBytes`(0–65,536)·`resultDelivery`로 돌려받을 결과 크기를 호출마다 제한할 수 있습니다. 초과분은 잘린 본문과 함께 전체 답변 기준 `totalBytes`·`omittedBytes`·완전한 `textArtifact` 포인터로 전달되며, 같은 답변에 대한 spill은 한 번만 일어납니다.
-- **Inbox 필터·페이징** — `sessionId`, `type`, `limit`, `cursor`, `detail:"summary"`를 지원합니다. 인자 없는 호출은 기존과 완전히 동일한 전체 목록입니다.
-- **내구성·경계·정숙성(PR 1~6)** — state v5 snapshot + WAL과 crash-safe 복구, MCP Task 의미론(TTL은 생성 시점 기준), 세션별 mailbox와 명시적 상태 전이, 모든 전송 구간의 프레임·큐·타임아웃 예산, control/telemetry 레인 분리와 usage 집계가 포함됩니다.
-- **호스트 재연결 감지** — 프론트 도어와 daemon 버전이 어긋나면 `staleFrontDoor`로 알립니다. 위의 [호스트 재연결 절차](#호스트-재연결-절차)를 따르세요.
-
-### 호환성 참고
-
-- 인자 없는 `task_list`와 Inbox list, 기본 `current` poll 응답 형태는 1.3.2 공개 계약을 유지합니다. compact·diagnostic profile, pagination과 summary는 opt-in입니다.
-- raw message/thought chunk는 보존형 poll history가 아니라 live subscription 전용입니다. 재연결 후 과거 chunk replay가 필요한 consumer는 자체 저장 계층이 필요합니다.
-- 큰 Inbox payload는 메모리에 전문을 중복 보관하지 않고 preview와 artifact pointer를 반환합니다.
-- 새 resource budget을 넘는 요청은 무제한으로 수용하는 대신 안정적인 error code로 거부됩니다. 기존에 상한을 초과하던 workload는 setup의 `limits`를 확인해 설정을 조정해야 합니다.
-- State v5를 사용한 뒤 1.3.2로 rollback하면 병행 기록된 legacy v4 상태를 읽습니다. downgrade 감지 alert를 확인한 뒤 다시 1.4.0으로 복귀하세요.
-
-## v1.3.2 변경 사항
-
-- **최종 결과 중심 poll** — poll은 raw message/thought chunk를 보관하거나 전달하지 않고, 종료 시 최종 `result`와 Main이 처리해야 하는 permission·질문을 중심으로 응답합니다. raw chunk는 명시적으로 구독한 live observer에만 전달되며, 저장된 중간 증거는 `eventTypes`, `includeToolEvents`, `includeInspection`, 결과 thought는 `includeThoughts`로 요청합니다.
-- **usage 이벤트 집계** — 반복되는 ACP `usage_update` 원문은 event ring에 저장하거나 poll을 깨우지 않고 turn/session 누계로 합산합니다. poll의 `includeUsage`, session 상세 조회, 명시적으로 요청한 Task 결과에서만 작은 summary를 노출합니다.
-- **간결한 Worker 반환 기본** — `agent-delegator`가 상세 보고서가 필요하지 않은 요청에 결론·필수 근거·변경 경로·테스트 상태만 간결히 반환하도록 지시합니다.
-
-## v1.3.1 변경 사항
-
-- **ACP/MCP 실행 가이드 완성** — `agent-delegator`가 routing 결과를 실제 Control MCP 호출로 옮기는 전 과정을 설명합니다. provider·정확한 모델 검증, session 경계와 `mcpServers`, 직접 prompt와 MCP Task, cursor polling, permission·structured input, 복구·정리, bounded result·artifact 회수 계약을 포함합니다.
-- **Skill 전용 안전 업데이트** — `--update-skill`이 Gateway runtime을 건드리지 않고 installer 관리본만 갱신합니다. 설치 시 기록한 SHA-256 tree digest로 사용자 수정 여부를 확인하며 customized·legacy install은 기본적으로 보존하고 `--force`에서만 덮어씁니다.
-- **초기 설치와 갱신 분리** — `--install-skill`은 최초 설치 경로로 고정하여 기존 관리본을 암묵적으로 교체하지 않습니다. `--dry-run`, 대상 검증, 공용 skill root 중복 제거와 상태 기록도 두 경로에서 유지합니다.
-
-## v1.3.0 변경 사항
-
-v1.2.x 대비 Worker 위임 턴 1회당 오케스트레이터로 유입되는 토큰 사용량이 실측 기준 **최대 87% 감소**합니다(동일 시나리오 재생 벤치마크, 전체 턴 기준 약 84~87%). 누적 결과 재전송과 tool 페이로드 이중 전달을 기본 경로에서 제거한 결과이며, 절감치는 `agent_acp_setup`의 `metrics`로 직접 확인할 수 있습니다.
-
-- **Poll 기본값 절약형 전환** — 턴이 진행 중일 때 누적 `result`를 반복 전송하지 않고 종료 후에만 포함하며, `tool_call*` 이벤트는 poll과 subscribe 모두 `includeToolEvents: true`로 요청할 때만 전달합니다.
-- **결과 모델 분리** — Worker 턴의 누적 transcript에서 최종 답변을 분리합니다. `result.text`는 마지막 작업 경계(`tool_call` 시작, permission, elicitation) 이후의 메시지 텍스트만 담고, 진행 narration은 `includeInspection: true`(세그먼트별 4KB 미리보기 + artifact 포인터, `inspectionDropped` 카운트)로 조회합니다. `includeTranscript: true`는 bounded inline transcript를 반환하고 overflow 전체본은 `resultArtifact`로 회수합니다. 진행 업데이트(`tool_call_update`)·thought·usage 등은 경계를 만들지 않아 답변을 자르거나 지울 수 없으며, 최종 세그먼트가 비면 retained transcript로 안전하게 폴백합니다.
-- **Cap-and-point 전달** — 상한에 걸리는 모든 페이로드가 정보 손실 없이 디스크 포인터를 갖습니다. 4KB(UTF-8 byte 기준)를 넘는 tool 이벤트 `data`·permission `toolCall`·elicitation schema·메시지 청크 사본은 잘린 미리보기와 함께 `dataArtifact`로, 64KB(`maxInlineResultBytes`)를 넘는 최종 답변은 `textArtifact`로 스필됩니다. 응답용 Inbox 레코드는 전문을 유지합니다.
-- **Poll 조회 표면 확장** — `toCursor`와 `eventTypes`(정확 일치, 후행 `*`만 접두어)로 보존된 이벤트 이력을 대기 없이 범위 조회할 수 있고, `filteredCount`로 커서가 건너뛴 이벤트 수를 확인합니다. 대기는 호출자가 실제로 받을 이벤트나 상태 변화가 있을 때만 깨어나며, 숫자 인자는 음수·NaN·소수를 명시적으로 거부합니다.
-- **생명주기 안정화** — 새 턴 시작 시 retention 타이머를 리셋하고 진행 중인 턴은 transient 정리에서 제외합니다. orphan 취소도 결과 모델을 거쳐 발행하며, 라이브 세션이 참조하는 artifact는 24시간 prune에서 보존됩니다.
-- **전송량 계측** — Gateway가 poll 응답 수, byte, event type별 전달량을 누적해 `agent_acp_setup`의 `metrics`로 노출합니다. 토큰 절감을 추정이 아닌 운영 지표로 확인할 수 있습니다.
-- **Skill 가이드 갱신** — `agent-delegator`에 결과 회수 경로 표(final/narration/transcript/tool evidence/oversized payload)와 포인터 기반 Worker 핸드오프(경로만 전달, 하류 Worker가 직접 읽는 콜드 스타트) 지침을 추가했습니다.
-
-## v1.2.1 변경 사항
-
-- **Claude 프론트 도어 설치 수정** — Claude Code 2.1.220의 variadic `-e` 파싱 규칙에 맞춰 MCP 이름을 환경변수보다 먼저 전달합니다. `--install-all --front-door claude`가 `Invalid environment variable format: agent-acp`로 중단되던 문제를 해결했습니다.
-- **Claude MCP 회귀 테스트** — Control MCP 등록 명령에서 `agent-acp` 이름이 환경변수 앞에 위치하는지 검증합니다.
-
-## v1.2.0 변경 사항
-
-- **Worker 파라미터 제어** — `agent_acp_config`로 ACP Worker가 공개한 설정 목록과 현재값을 조회하고, 지원되는 select·boolean 값을 세션 단위로 변경할 수 있습니다.
-- **자율 오케스트레이션 기반** — 모델, 모드, 추론 수준과 모델 설정 category를 공통 형식으로 노출하고 변경 이력을 `config_changed` 이벤트로 남겨 향후 DAG 노드별 파라미터 정책에 사용할 수 있게 했습니다.
-- **안전한 동적 검증** — Worker가 광고하지 않은 옵션, 허용 목록 밖의 select 값, 잘못된 boolean 타입, 실행 중 세션의 변경을 차단합니다. process 단위 모델 변경은 새 세션을 요구합니다.
-- **완전한 수동 업데이트** — `--update`가 상류 확인과 전체 테스트를 daemon 교체 전에 수행하며, GitHub Actions 없이 snapshot·adapter pin을 갱신하는 `npm run update:upstream`을 추가했습니다.
-
-## v1.1.0 변경 사항
-
-- **프론트 도어 선택 설치** — `--install-all` 실행 시 Codex, Claude, Grok 중 사용자가 대화할 오케스트레이터 하나를 선택합니다. 선택한 AI에는 Control MCP를, 발견된 AI 전체에는 Guide MCP와 `agent-delegator` 스킬을 설치합니다. 자동화 환경에서는 `--front-door codex|claude|grok`으로 명시할 수 있습니다.
-- **ACP adapter 자동 업데이트** — Gateway daemon이 시작될 때와 이후 24시간마다 ACP agent registry를 확인합니다. 더 최신인 `npx`·`uvx` adapter는 자동으로 갱신하며, 이미 실행 중인 작업은 종료하지 않고 다음 Worker 실행부터 새 버전을 적용합니다.
-- **업데이트 상태 알림** — health check에서 adapter 업데이트 적용·실패, 수동 업데이트 필요, 오래된 registry, downgrade 위험을 확인할 수 있습니다. `agent-delegator`는 이 알림을 사용자에게 전달합니다.
-- **Gateway 새 버전 알림** — GitHub `main`에 로컬보다 높은 버전이 있으면 health check로 알려줍니다. Gateway 소스는 임의로 변경하지 않으며, 사용자가 `acp-gateway-bootstrap --update`를 실행할 때만 갱신합니다.
-- **상류 변경 자동 모니터링** — GitHub Actions가 ACP protocol release와 공식 registry의 agent 버전을 매일 확인하고, 변경이 발견되면 `dev` 브랜치 대상 업데이트 PR을 생성하거나 갱신합니다.
-- **설치·업데이트 안정화** — 이전 버전 daemon이 남아 health check가 실패하던 문제를 보완해 버전 불일치 시 daemon을 교체합니다. `--version`을 추가했고, `--update`는 사용자가 수정한 `agent-delegator` 스킬을 덮어쓰지 않습니다.
-- **의존성 기준 갱신** — Claude ACP `0.64.1`, Codex ACP `1.1.9`, MCP SDK `1.30.0` 기준으로 registry snapshot과 런타임 의존성을 갱신했습니다.
+Apache License 2.0 — see [LICENSE](LICENSE).
 
 ---
 
