@@ -2,13 +2,15 @@
   "name": "acp-gateway",
   "version": "1.7.0",
   "description": "Persistent local ACP gateway with Main-only control and worker-safe guidance.",
+  "license": "Apache-2.0",
   "type": "module",
   "private": true,
   "files": [
     "src/",
     "gateway-client/",
     "skills/",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "exports": {
     ".": "./gateway-client/index.js",
