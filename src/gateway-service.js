@@ -28,6 +28,10 @@ import { taskInterruption, TaskStore, TERMINAL_TASK_STATUSES } from "./task-stor
 import { GATEWAY_API_VERSION, GATEWAY_VERSION, LEGACY_STATE_SCHEMA_VERSION, STATE_SCHEMA_VERSION } from "./version.js";
 
 import { authorizeCall, isReadOnlyCall } from "./access.js";
+import {
+  ATTENTION_DEFAULT_LIMIT, ATTENTION_MAX_LIMIT, compareKeys as compareAttentionKeys, decodeAttentionCursor,
+  DEFAULT_ATTENTION_STALE_MS, encodeAttentionCursor, isTaskCreator, pageAfter, requestKey, requireAckTaskIds, updateKey
+} from "./attention.js";
 import { normalizeCaller } from "./caller.js";
 import { MANAGEMENT_CAPABILITIES, RUNTIME_IDENTITY } from "./runtime-identity.js";
 import { validateSetting } from "./settings.js";
@@ -162,6 +166,9 @@ export class GatewayService {
     // How long a running worker may send nothing before session reads flag
     // stallSuspected. Read-time only: nothing is cancelled or restarted.
     stallHintMs = DEFAULT_STALL_HINT_MS,
+    // How long a worker request may wait for Main before attention calls it
+    // stale. A label only: nothing is answered or cancelled.
+    attentionStaleMs = DEFAULT_ATTENTION_STALE_MS,
     agentUpdateManager = null,
     // Canonical paths no worker may read or write (Control token, settings,
     // state, socket). Injectable so tests can point them at a temp directory.
@@ -187,7 +194,7 @@ export class GatewayService {
     this.draining = false;
     this.inflightMutations = 0;
     this.pendingSessions = new Map();
-    this.observability = { thoughtCapture: normalizeThoughtCapture(thoughtCapture), stallHintMs };
+    this.observability = { thoughtCapture: normalizeThoughtCapture(thoughtCapture), stallHintMs, attentionStaleMs };
     this.statePath = statePath;
     this.clients = new Map();
     // Processes started from an adapter definition that has since changed (an
@@ -680,7 +687,8 @@ export class GatewayService {
     const names = provider ? [requireProvider(provider)] : [];
     const agentUpdates = this.agentUpdateManager?.snapshot() ?? null;
     const alerts = [
-      ...(agentUpdates?.alerts ?? []), ...this.stateAlerts, ...this.#legacyAlerts(), ...this.#stallAlerts(context.rootId)
+      ...(agentUpdates?.alerts ?? []), ...this.stateAlerts, ...this.#legacyAlerts(), ...this.#stallAlerts(context.rootId),
+      ...this.#attentionAlerts(context)
     ];
     const liveSessions = this.store.list().filter((session) => session.client?.alive).length;
     // The omitted blocks are the ones a delegating Main re-reads on every hop
@@ -800,6 +808,33 @@ export class GatewayService {
         + "This is a hint only: the Gateway does not cancel or restart them. Check agent_acp_session get "
         + "or a diagnostic poll, then decide whether to keep waiting or cancel."
     }];
+  }
+
+  // What agent_acp_inbox attention would say, as counts, for the same Main: its
+  // root's worker requests that have waited past attentionStaleMs, and the
+  // finished tasks it started but has not received. Only when non-zero.
+  #attentionAlerts(context) {
+    const rootId = context?.rootId ?? null;
+    const now = this.now();
+    const { attentionStaleMs } = this.observability;
+    const stale = this.#attentionRequests(rootId).filter((item) => this.#requestAgeMs(item, now) >= attentionStaleMs).length;
+    const unseen = this.#attentionUpdates(rootId, this.#requester(context)).length;
+    return [
+      ...(stale ? [{
+        level: "warning",
+        code: "attention_stale_requests",
+        count: stale,
+        message: `${stale} worker request(s) have waited at least ${attentionStaleMs}ms for Main. `
+          + "Read them with agent_acp_inbox {action: \"attention\"}, then answer or cancel."
+      }] : []),
+      ...(unseen ? [{
+        level: "info",
+        code: "attention_unseen_updates",
+        count: unseen,
+        message: `${unseen} task(s) you started have finished without their result reaching you. `
+          + "Read agent_acp_inbox {action: \"attention\"}, then collect each with agent_acp_run {taskId} or ack it."
+      }] : [])
+    ];
   }
 
   // The caller as recorded on a session or turn. A caller whose own session id
@@ -1592,7 +1627,9 @@ export class GatewayService {
         pollInterval: args.pollInterval,
         origin,
         idempotencyKey: origin === "run" ? args.idempotencyKey : null,
-        requestDigest: origin === "run" && args.idempotencyKey ? runRequestDigest(args) : null
+        requestDigest: origin === "run" && args.idempotencyKey ? runRequestDigest(args) : null,
+        // Whose result this is: only this Main's delivery marks it seen.
+        caller: this.#attributed(context)
       }));
       this.#rememberDelivery(task.taskId, args);
       // The barrier is BEFORE the ACP turn starts. After it, a crash can only
@@ -1707,7 +1744,7 @@ export class GatewayService {
       timeoutMs: args.waitMs ?? 120_000,
       signal: context?.signal
     }));
-    return this.#storeCall(() => {
+    const delivered = this.#storeCall(() => {
       // The store hands back the stored payload as-is, possibly null, so it never
       // invents an envelope. The legacy fallback is the caller's, and it stays
       // here: agent_acp_run reuses this method, not a second copy.
@@ -1721,6 +1758,34 @@ export class GatewayService {
       if (typeof stored !== "object" || Array.isArray(stored) || Object.hasOwn(stored, "taskId")) return stored;
       return { taskId: task.taskId, ...stored };
     });
+    // agent_acp_run (start and attach) and tasks/result all end here. After the
+    // envelope is built, so the bookkeeping cannot change what is delivered.
+    this.#markDelivered(task.taskId, context);
+    return delivered;
+  }
+
+  // The requester a delivery or an attention read is judged for. Observers are
+  // nobody's Main: they never mark anything seen and see the whole root.
+  #requester(context) {
+    return context?.access === "observer" ? null : normalizeCaller(context?.caller);
+  }
+
+  // A terminal result reaching the Main that started the task marks it seen.
+  // Any other Main on the root (they all share it) leaves it unread for its
+  // owner; an observer never counts.
+  #markDelivered(taskId, context) {
+    if (context?.access === "observer") return;
+    const task = this.taskStore.find(taskId);
+    if (!task || task.seenAt || !TERMINAL_TASK_STATUSES.has(task.status)) return;
+    if (!isTaskCreator(task.caller, this.#requester(context))) return;
+    this.#recordSeen(taskId);
+  }
+
+  // T1: losing the record only brings a delivered task back as an update.
+  #recordSeen(taskId) {
+    const task = this.taskStore.markSeen(taskId, new Date(this.now()).toISOString());
+    if (task.seenAt) this.stateStore?.append(WAL_TYPES.TASK_SEEN, taskId, { seenAt: task.seenAt });
+    return task;
   }
 
   // Delivery preferences travel with the handle, not with the session: the
@@ -1791,6 +1856,8 @@ export class GatewayService {
   inboxManage(args, context) {
     const rootId = requireRoot(context);
     const action = args.action ?? "list";
+    if (action === "attention") return this.#attentionView(args, context);
+    if (action === "ack") return this.#ackTasks(args, context);
     if (action === "list") {
       const status = args.status;
       const detail = requireInboxDetail(args.detail);
@@ -1831,6 +1898,98 @@ export class GatewayService {
       return { ok: true, item: publicInboxItem(item) };
     }
     throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `Unknown inbox action: ${action}`);
+  }
+
+  // Read-only. Two lists, each oldest first and paged by the same cursor: the
+  // worker requests blocked on a Main (the whole root: a request is the root's,
+  // not one caller's), and the finished tasks this requester started but never
+  // received. Counts are always of the full sets.
+  #attentionView(args, context) {
+    const rootId = requireRoot(context);
+    const limit = args.limit == null
+      ? ATTENTION_DEFAULT_LIMIT
+      : Math.min(ATTENTION_MAX_LIMIT, Math.max(1, requireNonNegativeNumber(args.limit, "limit")));
+    const cursor = args.cursor == null ? null : decodeAttentionCursor(args.cursor);
+    const now = this.now();
+    const { attentionStaleMs } = this.observability;
+    const requests = this.#attentionRequests(rootId);
+    const updates = this.#attentionUpdates(rootId, this.#requester(context));
+    const requestPage = pageAfter(requests, requestKey, cursor?.needsMain, limit);
+    const updatePage = pageAfter(updates, updateKey, cursor?.updates, limit);
+    const requestRow = (item) => {
+      const ageMs = this.#requestAgeMs(item, now);
+      return { ...projectInboxItem(publicInboxItem(item), "summary"), ageMs, stale: ageMs >= attentionStaleMs };
+    };
+    return {
+      ok: true,
+      needsMain: requestPage.items.map(requestRow),
+      updates: updatePage.items.map((task) => ({
+        taskId: task.taskId,
+        sessionId: task.sessionId,
+        provider: this.store.get(task.sessionId)?.provider ?? null,
+        status: task.status,
+        statusMessage: task.statusMessage,
+        ...(task.interruption ? { interruption: task.interruption } : {}),
+        lastUpdatedAt: task.lastUpdatedAt
+      })),
+      counts: {
+        needsMain: requests.length,
+        stale: requests.filter((item) => this.#requestAgeMs(item, now) >= attentionStaleMs).length,
+        updates: updates.length
+      },
+      nextCursor: requestPage.more || updatePage.more
+        ? encodeAttentionCursor(requestPage.position, updatePage.position)
+        : null
+    };
+  }
+
+  // Explicit "I have this": the same creator rule as a delivery, so one Main
+  // cannot clear another's updates. Idempotent; each id is either acked or
+  // skipped with a reason from ACK_SKIP_REASONS.
+  #ackTasks(args, context) {
+    const rootId = requireRoot(context);
+    const taskIds = requireAckTaskIds(args.taskIds);
+    const requester = this.#requester(context);
+    const acked = [];
+    const skipped = [];
+    for (const taskId of taskIds) {
+      const task = this.taskStore.find(taskId);
+      const reason = !task ? "unknown_task"
+        : task.ownerRootId !== rootId ? "not_task_owner"
+          : !TERMINAL_TASK_STATUSES.has(task.status) ? "not_terminal"
+            : !isTaskCreator(task.caller, requester) ? "not_creator"
+              : null;
+      if (reason) {
+        skipped.push({ taskId, reason });
+        continue;
+      }
+      if (!task.seenAt) this.#recordSeen(taskId);
+      acked.push(taskId);
+    }
+    return { ok: true, acked, skipped };
+  }
+
+  // rootId null (an embedded setup with no root) means every root, as the
+  // stall alert does.
+  #attentionRequests(rootId) {
+    return [...this.inbox.values()]
+      .filter((item) => item.status === "pending" && (rootId == null || item.ownerRootId === rootId))
+      .sort((left, right) => compareAttentionKeys(requestKey(left), requestKey(right)));
+  }
+
+  // requester null: nobody to scope to, so every unseen task of the root.
+  #attentionUpdates(rootId, requester) {
+    this.taskStore.expireSweep();
+    return [...this.taskStore.records.values()]
+      .filter((task) => (rootId == null || task.ownerRootId === rootId)
+        && TERMINAL_TASK_STATUSES.has(task.status) && !task.seenAt
+        && (requester == null || isTaskCreator(task.caller, requester)))
+      .sort((left, right) => compareAttentionKeys(updateKey(left), updateKey(right)));
+  }
+
+  #requestAgeMs(item, now) {
+    const createdAt = Date.parse(item.createdAt ?? "");
+    return Number.isFinite(createdAt) ? Math.max(0, now - createdAt) : 0;
   }
 
   async sessionPoll(args, context) {
@@ -1918,7 +2077,21 @@ export class GatewayService {
     // Measured on what actually goes out, so the compact saving shows up in the
     // gateway's own metrics rather than only in the benchmark.
     this.recordPollMetrics(projected);
+    if (includeResult && !active) this.#markPollDelivered(session, context);
     return projected;
+  }
+
+  // A poll carrying the result of a turn this process finalized has delivered
+  // that turn's task. Not after a restart (the seal is not persisted): the
+  // session result is then empty and says nothing about the interruption.
+  #markPollDelivered(session, context) {
+    if (session.turnId == null || session.turnSeal !== session.turnId) return;
+    for (const task of this.taskStore.records.values()) {
+      if (task.sessionId === session.id && task.turnId === session.turnId) {
+        this.#markDelivered(task.taskId, context);
+        return;
+      }
+    }
   }
 
   // The one call site shape used by poll AND by all three terminal envelopes.
@@ -2538,7 +2711,9 @@ export class GatewayService {
       origin: task.origin ?? "prompt",
       // Additive (1.7.0), only on a task that was cut short, so an ordinary
       // handle keeps its exact shape.
-      ...(task.interruption ? { interruption: task.interruption } : {})
+      ...(task.interruption ? { interruption: task.interruption } : {}),
+      // Additive (1.7.0): the Main that created the task, only when it said so.
+      ...(task.caller ? { caller: { ...task.caller } } : {})
     };
   }
 

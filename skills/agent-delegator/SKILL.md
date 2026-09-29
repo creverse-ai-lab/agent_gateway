@@ -29,6 +29,8 @@ ACP execution only: `Main -> agent_acp_* Control tools over MCP -> local Gateway
 
 Call `agent_acp_setup` on a cold start, when choosing or installing a provider, or when an alert needs the full picture.
 
+After a reconnect or Gateway restart, call `agent_acp_inbox {action: "attention"}`: it lists requests waiting on you and finished runs whose result never reached you (collect with `agent_acp_run {taskId}`).
+
 **Capability rule: declaration only.** Decide from `responseProfiles` in this response and from whether `agent_acp_run` is in the live tool list. Never probe by sending a new argument: an older Gateway ignores unknown arguments silently and answers in the old shape, so a probe cannot tell support from silence. Either one missing means an older Gateway — use `agent_acp_prompt` + `agent_acp_poll` with no new arguments, which is fully supported.
 
 A response carrying `staleFrontDoor` means this front door and the running Gateway are different versions: do what its `action` says before continuing. With `reason: "gateway_older"` the daemon is the old side, and reconnecting would only reattach to it; otherwise reconnect the `agent-acp` MCP server (`references/recovery.md`).

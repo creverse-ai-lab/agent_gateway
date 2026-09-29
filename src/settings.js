@@ -35,6 +35,9 @@ export const SETTING_DEFINITIONS = Object.freeze([
   // How long a running worker may send nothing before session reads report
   // stallSuspected. A hint only; below 10s it would flag ordinary model latency.
   number("stallHintMs", "observability", "ACP_GATEWAY_STALL_HINT_MS", 5 * 60_000, 10_000),
+  // How long a worker request may wait for Main before the attention view and
+  // setup call it stale. A label only: nothing is answered or cancelled.
+  number("attentionStaleMs", "observability", "ACP_GATEWAY_ATTENTION_STALE_MS", 10 * 60_000, 10_000),
   boolean("wal", "persistence", "ACP_GATEWAY_WAL", true),
   number("walGroupCommitMs", "persistence", "ACP_GATEWAY_WAL_GROUP_COMMIT_MS", 5, 0),
   number("walRotateBytes", "persistence", "ACP_GATEWAY_WAL_ROTATE_BYTES", 4 * 1024 * 1024, 1024),

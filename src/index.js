@@ -442,18 +442,19 @@ function controlTools() {
     },
     {
       name: "agent_acp_inbox",
-      description: "List or inspect durable worker permission requests and questions owned by this Main.",
+      description: "List or inspect durable worker permission requests and questions owned by this Main. attention (read-only) returns what needs you, oldest first: needsMain (pending requests in summary form, with ageMs and stale) and updates (finished tasks you started whose result has not reached you), with counts and nextCursor. A result you take with agent_acp_run, tasks/result or a terminal poll is marked seen; ack {taskIds} marks the rest.",
       inputSchema: {
         type: "object",
         properties: {
-          action: { type: "string", enum: ["list", "get"] },
+          action: { type: "string", enum: ["list", "get", "attention", "ack"] },
           inboxId: { type: "string" },
+          taskIds: { type: "array", items: { type: "string", minLength: 1 }, minItems: 1, maxItems: 100, description: "ack only: the updates to mark seen. Only tasks you started (or that no Main is recorded for) are acked; the rest come back in skipped with a reason." },
           status: { type: "string", enum: ["pending", "answered", "interrupted"] },
           sessionId: { type: "string", description: "List only rows belonging to one session." },
           type: { type: "string", enum: ["permission_request", "worker_question"], description: "List only one kind of request." },
           detail: { type: "string", enum: ["full", "summary"], description: "summary drops options, message and requestedSchema and reduces toolCall to its id, title and kind. Use get for the full row before answering." },
-          limit: { type: "integer", minimum: 1, maximum: 100, description: "Page size. Passing limit or cursor switches the response to paged mode, which adds nextCursor (null on the last page). Without either, the response is the unpaged 1.3.x list." },
-          cursor: { type: "string", description: "Opaque keyset cursor from a previous page's nextCursor." }
+          limit: { type: "integer", minimum: 1, maximum: 100, description: "Page size. Passing limit or cursor switches the response to paged mode, which adds nextCursor (null on the last page). Without either, the response is the unpaged 1.3.x list. attention is always paged (default 50, per list)." },
+          cursor: { type: "string", description: "Opaque keyset cursor from a previous page's nextCursor (list and attention cursors are not interchangeable)." }
         },
         required: ["action"]
       }

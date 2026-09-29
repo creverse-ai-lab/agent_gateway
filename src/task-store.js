@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
+import { normalizeCaller } from "./caller.js";
 
 export const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "cancelled"]);
 const ACTIVE_TASK_STATUSES = new Set(["working", "input_required"]);
@@ -34,6 +35,17 @@ function sanitizeInterruption(value) {
   if (typeof value.at !== "string" || !Number.isFinite(Date.parse(value.at))) return null;
   return { reason: value.reason, executionOutcome: value.executionOutcome, at: value.at };
 }
+
+// Who created the task: the caller as the gateway recorded it (normalized, plus
+// viaSession when the caller was one of this root's workers). Allowlisted on the
+// way in and on the way back from disk, so neither path can carry other keys.
+function sanitizeCaller(value) {
+  const caller = normalizeCaller(value);
+  if (!caller) return null;
+  return typeof value.viaSession === "string" && value.viaSession ? { ...caller, viaSession: value.viaSession } : caller;
+}
+
+const isIsoDate = (value) => typeof value === "string" && Number.isFinite(Date.parse(value));
 
 function taskError(code, message) {
   const error = new Error(message);
@@ -199,7 +211,10 @@ export class TaskStore {
       // Digest of the work the key was first used for, so a retry can be told
       // apart from different work reusing the same key. Opaque to the store.
       requestDigest = null,
-      statusMessage = DEFAULT_STATUS_MESSAGE
+      statusMessage = DEFAULT_STATUS_MESSAGE,
+      // The Main that asked for the work. Absent for a caller that said nothing
+      // (pre-1.6 front doors), which keeps that handle's shape unchanged.
+      caller = null
     } = options ?? {};
     requireNonEmptyString(sessionId, "sessionId");
     requireNonEmptyString(ownerRootId, "ownerRootId");
@@ -214,6 +229,7 @@ export class TaskStore {
     if (typeof statusMessage !== "string") throw taskError("INVALID_ARGUMENT", "statusMessage must be a string");
     const normalizedTtl = this.#normalizeTtl(ttl, true);
     const normalizedPollInterval = this.#normalizePollInterval(pollInterval, true);
+    const recordedCaller = sanitizeCaller(caller);
 
     // Sweep before inserting (never after): expired records release budget slots,
     // and create() must still return the handle it just minted even when ttl=0
@@ -251,6 +267,7 @@ export class TaskStore {
       origin,
       ...(origin === "run" && idempotencyKey ? { idempotencyKey } : {}),
       ...(origin === "run" && idempotencyKey && typeof requestDigest === "string" ? { requestDigest } : {}),
+      ...(recordedCaller ? { caller: recordedCaller } : {}),
       result: null
     };
     this.#tasks.set(record.taskId, record);
@@ -391,6 +408,22 @@ export class TaskStore {
     const record = this.#requireRecord(taskId, options?.ownerRootId);
     if (record.promptDispatchedAt) return snapshot(record);
     record.promptDispatchedAt = at;
+    this.#emit("updated", record);
+    return snapshot(record);
+  }
+
+  // Delivery bookkeeping, not state: when the terminal outcome reached the Main
+  // that asked for it. Set once, only on a terminal record whose outcome may be
+  // handed out, and like turnId it carries no lastUpdatedAt bump, so a delivered
+  // task never moves under an attention cursor. Whether a delivery counts is the
+  // gateway's call; the store only records it.
+  markSeen(taskId, at, options = {}) {
+    if (!isIsoDate(at)) throw taskError("INVALID_ARGUMENT", "seenAt must be an ISO date string");
+    const record = this.#requireRecord(taskId, options?.ownerRootId);
+    if (record.seenAt || !TERMINAL_TASK_STATUSES.has(record.status) || this.#deferredTerminal.has(record.taskId)) {
+      return snapshot(record);
+    }
+    record.seenAt = at;
     this.#emit("updated", record);
     return snapshot(record);
   }
@@ -636,6 +669,7 @@ export class TaskStore {
     if (!ALL_TASK_STATUSES.has(status)) return null;
     if (typeof createdAt !== "string" || !Number.isFinite(Date.parse(createdAt))) return null;
     const interruption = sanitizeInterruption(raw.interruption);
+    const caller = sanitizeCaller(raw.caller);
     return {
       taskId,
       sessionId,
@@ -669,6 +703,9 @@ export class TaskStore {
           : createdAt
       }),
       ...(interruption ? { interruption } : {}),
+      ...(caller ? { caller } : {}),
+      // Only a terminal record can have been delivered.
+      ...(TERMINAL_TASK_STATUSES.has(status) && isIsoDate(raw.seenAt) ? { seenAt: raw.seenAt } : {}),
       result: raw.result ?? null
     };
   }

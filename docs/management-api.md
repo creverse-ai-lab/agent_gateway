@@ -8,7 +8,7 @@ Import `GatewayRpcClient`, `GatewayError`, `ERROR_CODES`, `GATEWAY_API_VERSION` 
 
 `GatewayRpcClient({token, rootId, access: "control"|"observer", autoStart})` defaults to control for old consumers. Role is bound on the first authenticated request and cannot change on that connection. Observer uses the existing token, so this is server-enforced read-only behavior, **not** a separate credential boundary against an actor that possesses the control token.
 
-Observer calls: setup without provider/refresh; session list/get; config list without worker restore; poll; task_get/list/result; inbox list/get; subscribe/unsubscribe; gateway_config get; provider list; retention_preview. All other calls fail with `OBSERVER_ACCESS_DENIED`. Observer traffic never attaches owner presence or touches owner activity. Credentials are still required for every method except public guide.
+Observer calls: setup without provider/refresh; session list/get; config list without worker restore; poll; task_get/list/result; inbox list/get/attention; subscribe/unsubscribe; gateway_config get; provider list; retention_preview. All other calls fail with `OBSERVER_ACCESS_DENIED`. Observer traffic never attaches owner presence or touches owner activity. Credentials are still required for every method except public guide.
 
 ## Engine settings
 

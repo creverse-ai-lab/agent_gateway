@@ -37,6 +37,10 @@ export const WAL_TYPES = Object.freeze({
   TASK_STATUS_CHANGED: "task.status_changed",
   TASK_RESULT_COMMITTED: "task.result_committed",
   TASK_REMOVED: "task.removed",
+  // Additive (1.7.0): the creating Main received the terminal result. T1 (no
+  // fsync of its own): losing it only makes a delivered task show up as an
+  // unread update again, never hides one.
+  TASK_SEEN: "task.seen",
   INBOX_CREATED: "inbox.created",
   INBOX_RESOLVED: "inbox.resolved",
   INBOX_REMOVED: "inbox.removed"
@@ -459,6 +463,14 @@ export class StateStore {
         // Additive (1.7.0): kept beside the result, so a result that comes back
         // only as a degraded preview still says how the task was cut short.
         if (payload?.interruption) task.interruption = payload.interruption;
+        return true;
+      }
+      case WAL_TYPES.TASK_SEEN: {
+        const task = state.tasks.get(key);
+        // First delivery wins, and only a terminal record can have been delivered.
+        if (task && !task.seenAt && TERMINAL_STATUSES.has(task.status) && typeof payload?.seenAt === "string") {
+          task.seenAt = payload.seenAt;
+        }
         return true;
       }
       case WAL_TYPES.TASK_REMOVED:
