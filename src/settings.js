@@ -32,6 +32,9 @@ export const SETTING_DEFINITIONS = Object.freeze([
   number("maxSessionsPerRoot", "resourceLimits", "ACP_GATEWAY_MAX_SESSIONS_PER_ROOT", 64, 1),
   number("maxInboxHistoryPerRoot", "resourceLimits", "ACP_GATEWAY_MAX_INBOX_HISTORY_PER_ROOT", 1_000, 1),
   enumeration("thoughtCapture", "observability", "ACP_GATEWAY_THOUGHT_CAPTURE", "tail", ["none", "tail", "full"]),
+  // How long a running worker may send nothing before session reads report
+  // stallSuspected. A hint only; below 10s it would flag ordinary model latency.
+  number("stallHintMs", "observability", "ACP_GATEWAY_STALL_HINT_MS", 5 * 60_000, 10_000),
   boolean("wal", "persistence", "ACP_GATEWAY_WAL", true),
   number("walGroupCommitMs", "persistence", "ACP_GATEWAY_WAL_GROUP_COMMIT_MS", 5, 0),
   number("walRotateBytes", "persistence", "ACP_GATEWAY_WAL_ROTATE_BYTES", 4 * 1024 * 1024, 1024),

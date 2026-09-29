@@ -25,6 +25,13 @@ const PUBLIC_SESSION_KEYS = [
   "pinned", "lastOwnerActivityAt", "turnId", "stopReason", "error", "createdAt", "updatedAt",
   "eventCount", "resultArtifact"
 ];
+// GOLDEN DIFF (1.7.0 W3): session get/list, and open/restore which spread the
+// same projection, gain four read-model facts: why the status is what it is
+// (statusReason, a closed list), since when, when the worker itself last sent
+// an update, and whether a running turn has been silent past stallHintMs. The
+// poll envelope below does NOT gain them (Quiet): it still spreads exactly
+// PUBLIC_SESSION_KEYS. Additive; nothing renamed or removed.
+const SESSION_READ_MODEL_KEYS = ["statusReason", "statusChangedAt", "lastWorkerActivityAt", "stallSuspected"];
 const ACTIVE_POLL_KEYS = sorted([
   "ok", ...PUBLIC_SESSION_KEYS, "nextCursor", "cursorTruncated", "events", "filteredCount"
 ]);
@@ -173,6 +180,24 @@ test("characterization: poll response carries exactly the session envelope plus 
     assert.deepEqual(sorted(Object.keys(JSON.parse(JSON.stringify(done.result)))), WIRE_RESULT_KEYS);
     assert.equal(done.status, "idle");
     assert.equal(done.stopReason, "end_turn");
+  } finally {
+    await service.shutdown().catch(() => {});
+  }
+});
+
+test("characterization: session get and list carry the poll envelope plus the read-model facts", async () => {
+  const service = new GatewayService({ createClient: mockClientFactory("read_only"), gcIntervalMs: 0 });
+  try {
+    const opened = await openMockSession(service, "read_only");
+    // attribution: this embedded caller sent no caller identity (1.6.0 W1).
+    const expected = sorted([...PUBLIC_SESSION_KEYS, ...SESSION_READ_MODEL_KEYS, "attribution"]);
+    const [listed] = (await service.call("session", { action: "list" }, MAIN)).sessions;
+    assert.deepEqual(sorted(Object.keys(listed)), expected);
+    const got = await service.call("session", { action: "get", sessionId: opened.sessionId }, MAIN);
+    for (const key of expected) assert.ok(Object.hasOwn(got, key), `session get carries ${key}`);
+    assert.equal(listed.statusReason, "session_created");
+    assert.equal(listed.lastWorkerActivityAt, null);
+    assert.equal(listed.stallSuspected, false);
   } finally {
     await service.shutdown().catch(() => {});
   }

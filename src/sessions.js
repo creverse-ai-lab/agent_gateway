@@ -356,11 +356,13 @@ export class SessionStore {
     return deleted;
   }
 
-  push(session, event) {
+  // touch:false records an event without making the session look recently
+  // changed, for bookkeeping the Gateway did to the record rather than on it.
+  push(session, event, { touch = true } = {}) {
     const stored = { i: session.eventSequence++, ts: new Date().toISOString(), turnId: session.turnId, ...event };
     session.events.push(stored);
     this.#evict(session);
-    session.updatedAt = new Date().toISOString();
+    if (touch) session.updatedAt = new Date().toISOString();
     for (const wake of session.waiters) wake();
     this.onEvent?.(session, stored);
     this.onChange?.(session, stored);
@@ -491,6 +493,11 @@ export class SessionStore {
       eventsEvictedThrough: session.eventsEvictedThrough ?? -1,
       turnId: session.turnId ?? null,
       stopReason: session.stopReason ?? null,
+      // Additive: why the session is in its status, and when the worker last
+      // spoke. Both must survive a restart to tell an unload from a crash.
+      statusReason: session.statusReason ?? null,
+      statusChangedAt: session.statusChangedAt ?? null,
+      lastWorkerActivityAt: session.lastWorkerActivityAt ?? null,
       // Additive: a capture policy chosen per session must survive a restart, or
       // a restored session silently reverts to the gateway default.
       thoughtCapture: session.thoughtCapture ?? null,
@@ -603,18 +610,51 @@ function thoughtLimitFor(session, maxTextBytes) {
   return session.thoughtCapture === "full" ? maxTextBytes : THOUGHT_TAIL_BYTES;
 }
 
-export function publicSession(session) {
+export const DEFAULT_STALL_HINT_MS = 5 * 60_000;
+
+// Read-time, never stored, never acted on: how long a running worker has sent
+// nothing. The clock starts at the later of its last update and the moment the
+// session last entered running (the turn start, or Main answering its request),
+// because a worker waiting on Main is not silent by choice. No other status is
+// ever stalled, so there is no silence to report there.
+export function workerSilence(session, now, stallHintMs = DEFAULT_STALL_HINT_MS) {
+  if (session.status !== "running") return { silentForMs: null, stallSuspected: false };
+  const since = Math.max(timeOrNone(session.lastWorkerActivityAt), timeOrNone(session.statusChangedAt));
+  if (!Number.isFinite(since)) return { silentForMs: null, stallSuspected: false };
+  const silentForMs = Math.max(0, now - since);
+  return { silentForMs, stallSuspected: silentForMs >= stallHintMs };
+}
+
+function timeOrNone(value) {
+  const parsed = Date.parse(value ?? "");
+  return Number.isFinite(parsed) ? parsed : -Infinity;
+}
+
+// Read-model facts: session get/list and the diagnostic poll carry them, the
+// default and compact polls never do (Quiet).
+export const POLL_OMITTED_SESSION_KEYS = Object.freeze([
+  "statusReason", "statusChangedAt", "lastWorkerActivityAt", "stallSuspected", "attribution"
+]);
+
+export function publicSession(session, { now = Date.now(), stallHintMs = DEFAULT_STALL_HINT_MS } = {}) {
   return {
     sessionId: session.id,
     acpSessionId: session.acpSessionId,
     provider: session.provider,
     status: session.status,
+    // Additive (1.7.0): why the status is what it is, and since when.
+    statusReason: session.statusReason ?? null,
+    statusChangedAt: session.statusChangedAt ?? null,
     cwd: session.cwd,
     permissionPolicy: session.permissionPolicy,
     model: session.model ?? null,
     title: session.title,
     pinned: session.pinned === true,
     lastOwnerActivityAt: session.lastOwnerActivityAt ?? null,
+    // Additive (1.7.0): the last update the worker itself sent, and whether a
+    // running turn has been silent past stallHintMs. A hint, never a status.
+    lastWorkerActivityAt: session.lastWorkerActivityAt ?? null,
+    stallSuspected: workerSilence(session, now, stallHintMs).stallSuspected,
     turnId: session.turnId,
     stopReason: session.stopReason,
     error: session.error,
@@ -628,7 +668,7 @@ export function publicSession(session) {
     ...(session.promptedBy ? { promptedBy: session.promptedBy } : {}),
     // The absence said out loud: opened by a front door that sent no caller
     // (pre-1.6, or restored from state written before 1.6), so no Main can
-    // claim it. Poll strips it (Quiet).
+    // claim it. Poll strips it (Quiet, POLL_OMITTED_SESSION_KEYS).
     ...(session.openedBy ? {} : { attribution: "none" }),
     // Only present for workspace=snapshot, so the default shape is unchanged.
     ...(session.workspace ? {

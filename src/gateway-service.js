@@ -20,7 +20,8 @@ import {
 } from "./response-profile.js";
 import { SessionQueue } from "./session-queue.js";
 import {
-  CHUNK_EVENT_TYPES, DURABLE_EVENT_TYPES, normalizeThoughtCapture, publicSession, SessionStore
+  CHUNK_EVENT_TYPES, DEFAULT_STALL_HINT_MS, DURABLE_EVENT_TYPES, normalizeThoughtCapture, POLL_OMITTED_SESSION_KEYS,
+  publicSession, SessionStore, workerSilence
 } from "./sessions.js";
 import { crashAfter, StateStore, WAL_TYPES } from "./state-store.js";
 import { TaskStore, TERMINAL_TASK_STATUSES } from "./task-store.js";
@@ -58,6 +59,26 @@ const STATUS_TRANSITIONS = {
   cancelled: new Set(["running", "restoring", "disconnected", "closed"]),
   closed: new Set()
 };
+// Why a session is in its status: the vocabulary the #setStatus call sites
+// already spoke, plus the two paths that set a status without it (registration
+// and the restart conversion in init). Closed, because monitors branch on it; a
+// test pins every call site to this list.
+export const STATUS_REASONS = Object.freeze([
+  "session_created", "turn_start", "turn_end", "turn_failed", "cancel_requested",
+  "permission_request", "elicitation_request", "input_state_sync",
+  "session_restore_start", "session_restored", "session_restore_failed",
+  "session_unloaded", "provider_disconnected", "orphan_cancelled", "daemon_restart", "session_closed"
+]);
+const STATUS_REASON_SET = new Set(STATUS_REASONS);
+// The updates that prove the worker itself is doing something. Left out on
+// purpose: user_message_chunk (Main's own prompt echoed back or replayed),
+// available_commands_update (advertised at session start), the mode/config
+// updates a Gateway config call provokes, and accounting or metadata
+// (usage_update, session_info_update), which a stuck worker can keep streaming.
+const WORKER_ACTIVITY_TYPES = new Set([
+  "agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update", "plan", "plan_update",
+  "permission_request", "elicitation_request"
+]);
 // Only the start of new work closes a message segment. Progress updates
 // (tool_call_update), thoughts, and bookkeeping types never do — a boundary
 // mid-answer would amputate the text before it, and a trailing one would
@@ -69,6 +90,8 @@ const ACTOR_UPDATE_TYPES = new Set(["permission_request", "elicitation_request",
 // every streamed chunk into another frontdoor tool result.
 const DEFAULT_POLL_EVENT_TYPES = new Set(["permission_request", "elicitation_request"]);
 const EVENT_PAYLOAD_CAP_BYTES = 4000;
+// Bounds the setup alert; count still carries the total.
+const MAX_STALL_ALERT_SESSION_IDS = 16;
 const CLOSED_STATUSES = new Set(["closed"]);
 // A live client is not enough to start work in these states: the record is
 // known to be out of sync with the worker, so it has to be resumed first.
@@ -123,6 +146,9 @@ export class GatewayService {
     // Gateway-wide default for how much worker reasoning a session retains.
     // Per-session overrides ride session_open/session_restore.
     thoughtCapture = "tail",
+    // How long a running worker may send nothing before session reads flag
+    // stallSuspected. Read-time only: nothing is cancelled or restarted.
+    stallHintMs = DEFAULT_STALL_HINT_MS,
     agentUpdateManager = null,
     // Canonical paths no worker may read or write (Control token, settings,
     // state, socket). Injectable so tests can point them at a temp directory.
@@ -144,7 +170,7 @@ export class GatewayService {
     this.draining = false;
     this.inflightMutations = 0;
     this.pendingSessions = new Map();
-    this.observability = { thoughtCapture: normalizeThoughtCapture(thoughtCapture) };
+    this.observability = { thoughtCapture: normalizeThoughtCapture(thoughtCapture), stallHintMs };
     this.statePath = statePath;
     this.clients = new Map();
     // Processes started from an adapter definition that has since changed (an
@@ -268,9 +294,16 @@ export class GatewayService {
     // not read, because a silent empty start is how durable handles disappear.
     const loaded = this.stateStore.open();
     for (const record of loaded.sessions) {
+      const status = record.status === "closed" ? "closed" : "disconnected";
+      // This bypasses #setStatus, so it records the reason itself, under the
+      // same rule: a record that was already disconnected (unloaded, or its
+      // provider exited) keeps the reason that says which.
+      const restarted = status !== record.status;
       this.store.create({
         ...record,
-        status: record.status === "closed" ? "closed" : "disconnected",
+        status,
+        statusReason: restarted ? "daemon_restart" : knownStatusReason(record.statusReason),
+        statusChangedAt: restarted ? new Date(this.now()).toISOString() : record.statusChangedAt ?? null,
         client: null,
         waiters: new Set(),
         events: [],
@@ -342,13 +375,22 @@ export class GatewayService {
     return session._queue;
   }
 
+  // stallSuspected is computed per read, so every public projection needs the
+  // service's clock and threshold.
+  #publicSession(session) {
+    return publicSession(session, { now: this.now(), stallHintMs: this.observability.stallHintMs });
+  }
+
   // Single choke point for session.status. Returns false when the move was
   // refused, so callers can skip the bookkeeping that belonged to it.
+  //
+  // Only a real move records statusReason/statusChangedAt: a same-status call
+  // must not make an old status look new, and a refused one never happened.
   #setStatus(session, next, reason) {
     const from = session.status;
     if (from === next) return true;
     if (STATUS_TRANSITIONS[from]?.has(next)) {
-      session.status = next;
+      this.#applyStatus(session, next, reason);
       return true;
     }
     // A fire-and-forget finalizer that lost the race stays silent: the session
@@ -358,7 +400,7 @@ export class GatewayService {
     // must not pull it back into an input wait.
     if (from === "cancelling") {
       if (next === "idle") {
-        session.status = "cancelled";
+        this.#applyStatus(session, "cancelled", reason);
         return true;
       }
       if (next === "waiting_permission" || next === "waiting_input") return false;
@@ -369,6 +411,12 @@ export class GatewayService {
       throw new Error(`Illegal session status transition ${from} -> ${next} (${reason})`);
     }
     return false;
+  }
+
+  #applyStatus(session, next, reason) {
+    session.status = next;
+    session.statusReason = knownStatusReason(reason);
+    session.statusChangedAt = new Date(this.now()).toISOString();
   }
 
   // Claims the current turn for the caller that is finalizing it. Every
@@ -414,7 +462,7 @@ export class GatewayService {
       this.legacyControlRequests += 1;
     }
     const handlers = {
-      setup: () => this.setup(args),
+      setup: () => this.setup(args, context),
       gateway_config: () => this.gatewayConfig(args),
       provider: () => this.providerManage(args),
       retention_preview: () => this.retentionPreview(args, context),
@@ -553,7 +601,7 @@ export class GatewayService {
     this.subscriptions.set(subscriptionId, subscription);
     return {
       subscriptionId,
-      sessions: sessions.map(publicSession),
+      sessions: sessions.map((item) => this.#publicSession(item)),
       events,
       replay,
       cursorTruncated
@@ -598,7 +646,7 @@ export class GatewayService {
     };
   }
 
-  async setup({ provider, refreshAgentUpdates = false, mode = "full" } = {}) {
+  async setup({ provider, refreshAgentUpdates = false, mode = "full" } = {}, context = {}) {
     if (mode !== "full" && mode !== "summary") {
       throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `Unknown setup mode: ${mode}`);
     }
@@ -606,7 +654,9 @@ export class GatewayService {
     const detected = await detectProviders();
     const names = provider ? [requireProvider(provider)] : [];
     const agentUpdates = this.agentUpdateManager?.snapshot() ?? null;
-    const alerts = [...(agentUpdates?.alerts ?? []), ...this.stateAlerts, ...this.#legacyAlerts()];
+    const alerts = [
+      ...(agentUpdates?.alerts ?? []), ...this.stateAlerts, ...this.#legacyAlerts(), ...this.#stallAlerts(context.rootId)
+    ];
     const liveSessions = this.store.list().filter((session) => session.client?.alive).length;
     // The omitted blocks are the ones a delegating Main re-reads on every hop
     // without acting on them: `detected` (install-time paths, and the only
@@ -704,6 +754,26 @@ export class GatewayService {
       message: `${this.legacyControlRequests} control request(s) since the Gateway started opened or prompted `
         + "sessions without saying which Main sent them. An older (pre-1.6) agent-acp front door is connected, "
         + "and the sessions and turns it starts cannot be attributed. Reconnect or reinstall that agent's agent-acp MCP server."
+    }];
+  }
+
+  // A hint about this Main's own sessions, so the ids are ones it can act on.
+  // Only raised when there is something to say; the Gateway itself does nothing
+  // about a quiet worker.
+  #stallAlerts(rootId) {
+    const now = this.now();
+    const { stallHintMs } = this.observability;
+    const stalled = this.store.list().filter((session) => (rootId == null || session.ownerRootId === rootId)
+      && workerSilence(session, now, stallHintMs).stallSuspected);
+    if (!stalled.length) return [];
+    return [{
+      level: "info",
+      code: "sessions_stall_suspected",
+      count: stalled.length,
+      sessionIds: stalled.slice(0, MAX_STALL_ALERT_SESSION_IDS).map((session) => session.id),
+      message: `${stalled.length} running session(s) have sent no worker update for at least ${stallHintMs}ms. `
+        + "This is a hint only: the Gateway does not cancel or restart them. Check agent_acp_session get "
+        + "or a diagnostic poll, then decide whether to keep waiting or cancel."
     }];
   }
 
@@ -872,7 +942,7 @@ export class GatewayService {
         this.store.push(existing, { type: "session_restored", method });
         return {
           ok: true,
-          ...publicSession(existing),
+          ...this.#publicSession(existing),
           capabilities: configured.response,
           restoredWith: method,
           ...this.bindTimeFacts(existing)
@@ -953,6 +1023,10 @@ export class GatewayService {
       ),
       lastOwnerActivityAt: new Date(this.now()).toISOString(),
       _ownerActivityPersistedAt: this.now(),
+      // The store's default "idle" never went through #setStatus; this is its reason.
+      statusReason: "session_created",
+      statusChangedAt: new Date(this.now()).toISOString(),
+      lastWorkerActivityAt: null,
       ...(fields.workspace ? { workspace: fields.workspace } : {}),
       // Set once, like ownerRootId: the Main that opened (or first restored)
       // the session. A later restore by another Main does not rewrite history.
@@ -965,7 +1039,7 @@ export class GatewayService {
     this.#appendSessionRegistered(session);
     return {
       ok: true,
-      ...publicSession(session),
+      ...this.#publicSession(session),
       capabilities: fields.created ?? {},
       restoredWith: fields.restoredWith,
       ...this.bindTimeFacts(session)
@@ -1737,8 +1811,10 @@ export class GatewayService {
     const active = ACTIVE_STATUSES.has(session.status);
     const includeResult = args.includeResult === true || (args.includeResult !== false && !active);
     const diagnostic = profile === "diagnostic";
-    // Polls must not grow (Quiet): attribution is a session get/list fact.
-    const { attribution: _attribution, ...envelope } = publicSession(session);
+    // Polls must not grow (Quiet): the read-model keys are session get/list
+    // facts; diagnostic adds them back through #pollDiagnostics.
+    const envelope = this.#publicSession(session);
+    for (const key of POLL_OMITTED_SESSION_KEYS) delete envelope[key];
     const response = {
       ok: true,
       ...envelope,
@@ -1787,12 +1863,22 @@ export class GatewayService {
   #pollDiagnostics(session) {
     const pending = session.client?.pendingSessionInput?.(session.acpSessionId)
       ?? { permissions: 0, elicitations: 0 };
+    const { silentForMs, stallSuspected } = workerSilence(session, this.now(), this.observability.stallHintMs);
     return {
       // PR 2's deferred question, answered without touching the status
       // vocabulary: "admitted but not yet running" is a queue fact, not a status.
       queue: { depth: session._queue?.depth ?? 0, reserved: session._reserved ?? null },
       illegalTransitions: session._illegalTransitions ?? 0,
-      pending: { permissions: pending.permissions, elicitations: pending.elicitations }
+      pending: { permissions: pending.permissions, elicitations: pending.elicitations },
+      // The read-model facts the default poll omits, plus the number
+      // stallSuspected was decided from (null unless running).
+      activity: {
+        statusReason: session.statusReason ?? null,
+        statusChangedAt: session.statusChangedAt ?? null,
+        lastWorkerActivityAt: session.lastWorkerActivityAt ?? null,
+        stallSuspected,
+        silentForMs
+      }
     };
   }
 
@@ -1870,7 +1956,7 @@ export class GatewayService {
       && session.client?.alive === true;
     if (!cancellable) {
       this.schedulePersist();
-      return { ok: true, ...publicSession(session) };
+      return { ok: true, ...this.#publicSession(session) };
     }
     // Inside the active branch: a cancel that decides to do nothing must not
     // still interrupt Main's outstanding worker requests.
@@ -1880,7 +1966,7 @@ export class GatewayService {
     this.#setStatus(session, "cancelling", "cancel_requested");
     this.store.push(session, { type: "cancel_requested" });
     this.updateTaskForSession(session, "working", "Cancellation requested");
-    return { ok: true, ...publicSession(session) };
+    return { ok: true, ...this.#publicSession(session) };
   }
 
   // Telling the worker is best effort, and it has to be: the notify underneath
@@ -1906,14 +1992,16 @@ export class GatewayService {
     if (args.action === "list") {
       return {
         ok: true,
-        sessions: this.store.list().filter((item) => item.ownerRootId === root).map(publicSession)
+        sessions: this.store.list()
+          .filter((item) => item.ownerRootId === root)
+          .map((item) => this.#publicSession(item))
       };
     }
     const session = requireOwnedSession(this.requireSession(args.sessionId), context);
     if (args.action === "get") {
       return {
         ok: true,
-        ...publicSession(session),
+        ...this.#publicSession(session),
         // The narrated transcript can be up to maxTextBytes; hand it out only
         // when the caller explicitly asks for it.
         ...(args.includeTranscript === true ? { resultText: session.resultText } : {}),
@@ -1957,7 +2045,7 @@ export class GatewayService {
       if (session.pinned) session.orphanedAt = null;
       session.updatedAt = new Date(this.now()).toISOString();
       this.schedulePersist();
-      return { ok: true, ...publicSession(session) };
+      return { ok: true, ...this.#publicSession(session) };
     }
     if (args.action === "clean") {
       const closed = [];
@@ -2050,6 +2138,12 @@ export class GatewayService {
 
   handleUpdate(session, update) {
     const type = update.sessionUpdate ?? update.type ?? "unknown";
+    // Stamped on arrival, not when the mailbox gets to a queued request. Not
+    // persisted per chunk: it rides the next checkpoint, which every turn
+    // boundary writes.
+    if (WORKER_ACTIVITY_TYPES.has(type) && this.store.get(session.id) && !CLOSED_STATUSES.has(session.status)) {
+      session.lastWorkerActivityAt = new Date(this.now()).toISOString();
+    }
     if (ACTOR_UPDATE_TYPES.has(type)) {
       this.#queueFor(session).post(`update:${type}`, () => this.#handleUpdateLocked(session, update, type));
       return;
@@ -2084,7 +2178,7 @@ export class GatewayService {
       // A cancel Main has already been notified of outranks a late worker
       // request: the event stays on the record, but it must not pull the session
       // back into an input wait or grow a new obligation Main cannot discharge.
-      const admitted = this.#setStatus(session, "waiting_permission", type);
+      const admitted = this.#setStatus(session, "waiting_permission", "permission_request");
       // Serialized and, if oversized, spilled exactly once. The inbox row points
       // at the same artifact the delivered event does instead of keeping a second
       // full copy of the same tool call.
@@ -2114,7 +2208,7 @@ export class GatewayService {
       return;
     }
     if (type === "elicitation_request") {
-      const admitted = this.#setStatus(session, "waiting_input", type);
+      const admitted = this.#setStatus(session, "waiting_input", "elicitation_request");
       const schema = this.#capture(session, `${type}-schema`, update.requestedSchema);
       const message = typeof update.message === "string"
         ? utf8ByteHead(update.message, EVENT_PAYLOAD_CAP_BYTES)
@@ -3047,6 +3141,10 @@ export class GatewayService {
     session.client = null;
     this.#setStatus(session, "disconnected", "session_unloaded");
     session.error = null;
+    // Evidence for an inspection read or a subscriber, not an obligation: it
+    // is neither a default poll type nor durable, and it must not move the
+    // updatedAt that idle and retention clocks fall back on.
+    this.store.push(session, { type: "session_unloaded" }, { touch: false });
     if (!this.store.list().some((item) => item.client === client)) {
       await client.stop().catch(() => {});
       for (const [key, candidate] of this.clients) {
@@ -3271,6 +3369,12 @@ function restoreMethod(initResult, requested) {
 function canRestoreSession(initResult) {
   const capabilities = initResult?.agentCapabilities ?? {};
   return Boolean(capabilities.sessionCapabilities?.resume) || capabilities.loadSession === true;
+}
+
+// Off-list reads as "unknown" rather than leaking into a closed vocabulary: a
+// state file written by a newer Gateway may carry a reason this one never spoke.
+function knownStatusReason(reason) {
+  return STATUS_REASON_SET.has(reason) ? reason : null;
 }
 
 function extractText(update) {

@@ -727,7 +727,8 @@ test("ACP_GATEWAY_THOUGHT_CAPTURE selects the gateway-wide default and rejects n
   const original = process.env.ACP_GATEWAY_THOUGHT_CAPTURE;
   try {
     delete process.env.ACP_GATEWAY_THOUGHT_CAPTURE;
-    assert.deepEqual(gatewayObservabilityConfig(), { thoughtCapture: "tail" });
+    // stallHintMs (1.7.0) shares the group: it is read-time observability too.
+    assert.deepEqual(gatewayObservabilityConfig(), { thoughtCapture: "tail", stallHintMs: 300_000 });
     process.env.ACP_GATEWAY_THOUGHT_CAPTURE = "full";
     assert.equal(gatewayObservabilityConfig().thoughtCapture, "full");
     process.env.ACP_GATEWAY_THOUGHT_CAPTURE = "sometimes";

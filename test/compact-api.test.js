@@ -283,9 +283,15 @@ test("T4: the profiles are a containment chain, not three independent shapes", a
     for (const key of Object.keys(current)) {
       assert.ok(Object.hasOwn(diagnostic, key), `current key ${key} must exist in diagnostic`);
     }
+    // GOLDEN DIFF (1.7.0 W3): diagnostic also carries the status reason and the
+    // worker-activity facts, which current and compact leave out (Quiet), plus
+    // silentForMs, the number stallSuspected is decided from. Additive.
     assert.deepEqual(
       Object.keys(diagnostic).filter((key) => !Object.hasOwn(current, key)).sort(),
-      ["illegalTransitions", "pending", "queue"]
+      [
+        "illegalTransitions", "lastWorkerActivityAt", "pending", "queue", "silentForMs", "stallSuspected",
+        "statusChangedAt", "statusReason"
+      ]
     );
     // Explicit "current" is the same object as no argument at all.
     assert.equal(

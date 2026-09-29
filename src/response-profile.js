@@ -201,6 +201,7 @@ export function projectPoll(profile, response, diagnostics = null) {
   if (profile === "diagnostic") {
     return {
       ...response,
+      ...(diagnostics?.activity ?? {}),
       queue: diagnostics?.queue ?? { depth: 0, reserved: null },
       illegalTransitions: diagnostics?.illegalTransitions ?? 0,
       pending: diagnostics?.pending ?? { permissions: 0, elicitations: 0 }
