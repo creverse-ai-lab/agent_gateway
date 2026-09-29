@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { stat } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import { AcpClient, PERMISSION_POLICIES, requirePermissionPolicy } from "./acp-client.js";
 import { ArtifactStore, defaultArtifactRoot } from "./artifacts.js";
 import { utf8ByteHead } from "./bounded-utf8.js";
@@ -107,13 +107,20 @@ const RESTORE_OUTCOMES = new Set(["resumed", "loaded", "failed"]);
 // Gateway cannot tell without trying, and the rest only warn.
 export const CHECK_CAVEATS = Object.freeze([
   "session_closed", "acp_session_id_missing", "provider_not_installed", "provider_restore_unsupported",
-  "cwd_missing", "workspace_missing", "provider_capabilities_unknown", "restore_in_progress", "last_restore_failed"
+  "cwd_missing", "workspace_missing", "provider_capabilities_unknown", "restore_in_progress", "last_restore_failed",
+  "session_quarantined"
 ]);
 const CHECK_BLOCKING_CAVEATS = new Set([
   "session_closed", "acp_session_id_missing", "provider_not_installed", "provider_restore_unsupported",
   "cwd_missing", "workspace_missing"
 ]);
 const CHECK_UNDECIDED_CAVEATS = new Set(["provider_capabilities_unknown", "restore_in_progress"]);
+// maxConsecutiveRestoreFailures' default (src/settings.js): the third failed
+// restore in a row quarantines the session, and the third failed start in a
+// row marks the provider degraded in setup.
+const DEFAULT_MAX_CONSECUTIVE_RESTORE_FAILURES = 3;
+// Bounds the lastError a provider_degraded alert repeats from the start error.
+const PROVIDER_ALERT_ERROR_BYTES = 300;
 const CONTROL_SERVER_PATTERN = /(?:acp-gateway-control|acp-mcp-bridge|gateway-daemon|control-mcp)/i;
 // The calls that record a caller. One of them arriving over the control socket
 // with no caller is work nobody can attribute; management calls (admin CLI,
@@ -170,6 +177,10 @@ export class GatewayService {
     // How long a worker request may wait for Main before attention calls it
     // stale. A label only: nothing is answered or cancelled.
     attentionStaleMs = DEFAULT_ATTENTION_STALE_MS,
+    // Failed restores in a row before a session is quarantined (no more
+    // transparent restores), and failed provider starts in a row before setup
+    // calls the provider degraded. Nothing else is automatic.
+    maxConsecutiveRestoreFailures = DEFAULT_MAX_CONSECUTIVE_RESTORE_FAILURES,
     agentUpdateManager = null,
     // Canonical paths no worker may read or write (Control token, settings,
     // state, socket). Injectable so tests can point them at a temp directory.
@@ -196,6 +207,15 @@ export class GatewayService {
     this.inflightMutations = 0;
     this.pendingSessions = new Map();
     this.observability = { thoughtCapture: normalizeThoughtCapture(thoughtCapture), stallHintMs, attentionStaleMs };
+    this.recovery = {
+      maxConsecutiveRestoreFailures: Number.isSafeInteger(maxConsecutiveRestoreFailures) && maxConsecutiveRestoreFailures >= 1
+        ? maxConsecutiveRestoreFailures
+        : DEFAULT_MAX_CONSECUTIVE_RESTORE_FAILURES
+    };
+    // provider -> { failures, lastError }: client starts that failed in a row,
+    // reset by the next one that succeeds. In memory on purpose: a restarted
+    // daemon has not failed to start anything yet. An alert, never a block.
+    this.providerStartFailures = new Map();
     this.statePath = statePath;
     this.clients = new Map();
     // Processes started from an adapter definition that has since changed (an
@@ -343,6 +363,10 @@ export class GatewayService {
         generation: Number.isInteger(record.generation) && record.generation >= 1 ? record.generation : 1,
         lastRestore: normalizeLastRestore(record.lastRestore),
         restoreCapabilities: normalizeRestoreCapabilities(record.restoreCapabilities),
+        // A restart is not a restore attempt: the count and the quarantine
+        // carry over unchanged (a pre-1.7 record has neither).
+        restoreFailures: normalizeRestoreFailures(record.restoreFailures),
+        quarantined: normalizeQuarantine(record.quarantined),
         // No worker survived the restart, so no session owns a live handle. The
         // task's own restart conversion below is what the caller observes.
         activeTaskId: null,
@@ -689,7 +713,7 @@ export class GatewayService {
     const agentUpdates = this.agentUpdateManager?.snapshot() ?? null;
     const alerts = [
       ...(agentUpdates?.alerts ?? []), ...this.stateAlerts, ...this.#legacyAlerts(), ...this.#stallAlerts(context.rootId),
-      ...this.#attentionAlerts(context)
+      ...this.#attentionAlerts(context), ...this.#providerAlerts()
     ];
     const liveSessions = this.store.list().filter((session) => session.client?.alive).length;
     // The omitted blocks are the ones a delegating Main re-reads on every hop
@@ -838,6 +862,25 @@ export class GatewayService {
     ];
   }
 
+  // A provider whose process failed to start maxConsecutiveRestoreFailures
+  // times in a row, with the head of the last error. Said, never enforced: the
+  // next open or restore still tries, and the first start that works clears it.
+  #providerAlerts() {
+    const limit = this.recovery.maxConsecutiveRestoreFailures;
+    return [...this.providerStartFailures]
+      .filter(([, record]) => record.failures >= limit)
+      .map(([provider, record]) => ({
+        level: "warning",
+        code: "provider_degraded",
+        provider,
+        failures: record.failures,
+        lastError: record.lastError,
+        message: `${provider} failed to start ${record.failures} time(s) in a row. Nothing is blocked and the Gateway `
+          + "retries only when asked. Check its install and auth (agent_acp_setup {provider}) before opening or "
+          + "restoring more sessions on it."
+      }));
+  }
+
   // The caller as recorded on a session or turn. A caller whose own session id
   // is one of this root's live workers' ACP ids is that worker acting as a Main.
   // Best effort: it only fires when the worker exports the same id to its MCP
@@ -947,7 +990,72 @@ export class GatewayService {
 
   async sessionRestore(args, context, existing = null, attempt = null) {
     if (existing) return this.restoreSession(args, context, existing, attempt);
-    return this.withSessionAdmission(requireProvider(args.provider), context, () => this.restoreSession(args, context));
+    const provider = requireProvider(args.provider);
+    // A provider session this Main already holds is restored in place, never
+    // registered twice. That is also how Main lifts a quarantine: its decision,
+    // made explicitly, on the same record.
+    const known = this.#ownedRecordFor(provider, args.acpSessionId, context);
+    if (known) return this.#restoreKnown(known, args, context);
+    return this.withSessionAdmission(provider, context, () => this.restoreSession(args, context));
+  }
+
+  // The caller's own open record of this provider session, if any. Records of
+  // another Main, and closed ones, keep the registration path's answer.
+  #ownedRecordFor(provider, acpSessionId, context) {
+    if (typeof acpSessionId !== "string" || !acpSessionId) return null;
+    const root = requireRoot(context);
+    return this.store.list().find((item) => item.provider === provider && item.acpSessionId === acpSessionId
+      && item.ownerRootId === root && !CLOSED_STATUSES.has(item.status)) ?? null;
+  }
+
+  // Explicit agent_acp_session_restore of a record Main already has. The same
+  // attempt a transparent restore makes (#restoreLocked), counted the same way,
+  // but Main asked for it, so a quarantine does not stop it. The record's own
+  // cwd, MCP servers and directories are what its worker was opened with; the
+  // call may change what a restore records (model, policy, method, capture, pin).
+  async #restoreKnown(session, args, context) {
+    assertProviderEnabled(session.provider);
+    // Argument mistakes are refused here, before the attempt, so they never
+    // count as the worker failing to come back. A snapshot session may be named
+    // by its copy (its cwd) or by the directory it was copied from.
+    requireString(args.cwd, "cwd");
+    optionalString(args.model, "model");
+    if (args.permissionPolicy != null) requirePermissionPolicy(args.permissionPolicy);
+    if (!(await samePath(args.cwd, session.cwd)) && !(await samePath(args.cwd, session.workspace?.source))) {
+      throw new GatewayError(
+        ERROR_CODES.INVALID_ARGUMENT,
+        `Session ${session.id} restores in its own cwd: ${session.cwd}`,
+        { sessionId: session.id, cwd: session.cwd }
+      );
+    }
+    // Synchronous from here to the reservation, like #admitTurn.
+    if (!this.#needsRestore(session)) {
+      throw new GatewayError(
+        ERROR_CODES.INVALID_ARGUMENT,
+        `ACP session is already registered as ${session.id}`,
+        { sessionId: session.id, acpSessionId: session.acpSessionId }
+      );
+    }
+    if (session._reserved || ACTIVE_STATUSES.has(session.status)) {
+      throw new GatewayError(ERROR_CODES.SESSION_ACTIVE, `Session ${session.id} is still active`);
+    }
+    this.#reserve(session, "restore");
+    try {
+      return await this.#queueFor(session).run("session_restore", async () => {
+        if (CLOSED_STATUSES.has(session.status) || !this.store.get(session.id)) {
+          throw new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`);
+        }
+        return this.#restoreLocked(session, context, {
+          model: args.model,
+          permissionPolicy: args.permissionPolicy,
+          method: args.method,
+          thoughtCapture: args.thoughtCapture,
+          pinned: args.pinned
+        });
+      });
+    } finally {
+      this.#release(session, "restore");
+    }
   }
 
   // attempt, when given, learns the method as soon as it is chosen, so a
@@ -1007,6 +1115,9 @@ export class GatewayService {
         existing.generation = (existing.generation ?? 1) + 1;
         existing.lastRestore = restoreRecord(this.now(), method);
         existing.restoreCapabilities = restoreCapabilitiesOf(client.initResult);
+        // Any success ends the streak, and with it a quarantine.
+        existing.restoreFailures = 0;
+        existing.quarantined = null;
         client.onSessionUpdate(acpSessionId, (update) => this.handleUpdate(existing, update));
         this.store.push(existing, { type: "session_restored", method, outcome: existing.lastRestore.outcome });
         return {
@@ -1154,27 +1265,69 @@ export class GatewayService {
   // command holding the mailbox would wait on itself.
   ensureConnected(session, context) {
     requireOwnedSession(session, context);
-    if (session.client?.alive && !RESTORE_REQUIRED_STATUSES.has(session.status)) return Promise.resolve(session);
+    if (!this.#needsRestore(session)) return Promise.resolve(session);
     // One resume per session, mirroring the client-start dedupe: two callers
     // must never hand the same ACP session two session/resume requests.
     if (session._restoring) return session._restoring;
-    const start = this.#restoreLocked(session, context).finally(() => {
+    // Quarantined: no transparent restore, so no provider is started or asked.
+    // Only Main's explicit session_restore tries again.
+    if (session.quarantined) return Promise.reject(this.#quarantinedError(session));
+    const start = this.#restoreLocked(session, context).then(() => session).finally(() => {
       if (session._restoring === start) session._restoring = null;
     });
     session._restoring = start;
     return start;
   }
 
+  // ensureConnected's test: a live client is enough unless the record is known
+  // to be out of sync with its worker.
+  #needsRestore(session) {
+    return !(session.client?.alive && !RESTORE_REQUIRED_STATUSES.has(session.status));
+  }
+
+  // Refused before any work: no task, no reservation, no provider contact.
+  #assertNotQuarantined(session) {
+    if (session.quarantined && this.#needsRestore(session)) throw this.#quarantinedError(session);
+  }
+
+  // The stop, and Main's options as data. The Gateway takes none of them.
+  #quarantinedError(session) {
+    const { failures, lastErrorCode } = session.quarantined;
+    return new GatewayError(
+      ERROR_CODES.SESSION_QUARANTINED,
+      `Session ${session.id} is quarantined: its worker failed to come back ${failures} time(s) in a row `
+        + `(last error ${lastErrorCode ?? "unknown"}), so the Gateway no longer restores it automatically. `
+        + "Check it (agent_acp_session {action: \"check\"}), restore it explicitly (agent_acp_session_restore "
+        + "with its provider, acpSessionId and cwd), or open a new session.",
+      {
+        sessionId: session.id,
+        failures,
+        lastErrorCode,
+        next: [
+          { action: "session_check", sessionId: session.id },
+          {
+            action: "session_restore", sessionId: session.id,
+            provider: session.provider, acpSessionId: session.acpSessionId, cwd: session.cwd
+          },
+          { action: "session_open" }
+        ]
+      }
+    );
+  }
+
   // A failed resume ends here, at unavailable. It never falls back to
   // session/new: a fresh session would silently drop everything the worker
   // knew, and whether to start over is Main's call.
-  async #restoreLocked(session, context) {
+  //
+  // Every attempt, transparent (ensureConnected) or explicit (#restoreKnown),
+  // runs here, so every failure is counted once; the success path in
+  // restoreSession resets the count.
+  async #restoreLocked(session, context, args = {}) {
     this.#setStatus(session, "restoring", "session_restore_start");
     this.store.push(session, { type: "session_restore_start" });
     const attempt = { method: null };
     try {
-      await this.sessionRestore({}, context, session, attempt);
-      return session;
+      return await this.sessionRestore(args, context, session, attempt);
     } catch (error) {
       // The record can be gone (closed, retention) by the time the resume
       // fails. Reporting a restore failure on it would push an event for a
@@ -1183,10 +1336,28 @@ export class GatewayService {
         this.#setStatus(session, "unavailable", "session_restore_failed");
         session.error = error?.message ?? String(error);
         session.lastRestore = restoreRecord(this.now(), attempt.method, error);
+        // Before the push: the durable event is what schedules the snapshot.
+        this.#countRestoreFailure(session, error);
         const { method, outcome, errorCode } = session.lastRestore;
         this.store.push(session, { type: "session_restore_failed", text: session.error, method, outcome, errorCode });
       }
       throw error;
+    }
+  }
+
+  // One more failed restore in a row. At the limit the session is quarantined;
+  // past it (only an explicit restore can get there) the quarantine keeps its
+  // start time and follows the count and the latest code. A Gateway that is
+  // shutting down refused the attempt itself, which says nothing about the worker.
+  #countRestoreFailure(session, error) {
+    if (error?.code === ERROR_CODES.GATEWAY_DRAINING) return;
+    session.restoreFailures = (session.restoreFailures ?? 0) + 1;
+    const failures = session.restoreFailures;
+    const lastErrorCode = session.lastRestore?.errorCode ?? ERROR_CODES.GATEWAY_ERROR;
+    if (session.quarantined) {
+      session.quarantined = { at: session.quarantined.at, failures, lastErrorCode };
+    } else if (failures >= this.recovery.maxConsecutiveRestoreFailures) {
+      session.quarantined = { at: new Date(this.now()).toISOString(), failures, lastErrorCode };
     }
   }
 
@@ -1315,6 +1486,9 @@ export class GatewayService {
     if (CLOSED_STATUSES.has(session.status)) {
       throw new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`);
     }
+    // In admission as well as in ensureConnected, so a quarantined session
+    // costs no reservation and mints no Task handle that would only fail.
+    this.#assertNotQuarantined(session);
     if (typeof args.prompt !== "string" && !Array.isArray(args.prompt)) {
       throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "prompt must be a string or ACP content array");
     }
@@ -2210,7 +2384,11 @@ export class GatewayService {
         stallSuspected,
         silentForMs,
         generation: session.generation ?? 1,
-        lastRestore: session.lastRestore ?? null
+        lastRestore: session.lastRestore ?? null,
+        // Only when set, as on session get: a healthy session's diagnostic
+        // poll keeps its shape.
+        ...(session.restoreFailures > 0 ? { restoreFailures: session.restoreFailures } : {}),
+        ...(session.quarantined ? { quarantined: session.quarantined } : {})
       }
     };
   }
@@ -2424,6 +2602,8 @@ export class GatewayService {
     if (!capabilities) caveats.push("provider_capabilities_unknown");
     else if (!method) caveats.push("provider_restore_unsupported");
     if (session.lastRestore?.outcome === "failed") caveats.push("last_restore_failed");
+    // Not blocking: the transparent path is stopped, an explicit restore is not.
+    if (session.quarantined) caveats.push("session_quarantined");
     if (caveats.some((code) => CHECK_BLOCKING_CAVEATS.has(code))) return verdict("not_restorable", null);
     if (caveats.some((code) => CHECK_UNDECIDED_CAVEATS.has(code))) return verdict("unknown", method);
     return verdict(caveats.length ? "restorable_with_caveats" : "restorable", method);
@@ -2732,8 +2912,13 @@ export class GatewayService {
     const client = this.createClient
       ? this.createClient(provider, options, config)
       : new AcpClient(config, options);
+    let started = false;
     try {
       await client.start();
+      started = true;
+      // The provider came up: whatever follows (a model mismatch) is not the
+      // provider failing to start.
+      this.providerStartFailures.delete(provider);
       const actualModel = currentModelId(client.initResult);
       if (config.expectedModel && actualModel !== config.expectedModel) {
         await client.stop();
@@ -2752,15 +2937,26 @@ export class GatewayService {
     } catch (error) {
       if (this.clients.get(clientKey) === client) this.clients.delete(clientKey);
       await client.stop().catch(() => {});
-      if (error instanceof GatewayError && error.code !== ERROR_CODES.ACP_ERROR) throw error;
       // A worker that refuses initialize still gets the stderr tail: that is
       // where adapters explain missing auth or a broken install.
-      throw new GatewayError(
-        error?.code === ERROR_CODES.ACP_ERROR ? ERROR_CODES.ACP_ERROR : ERROR_CODES.GATEWAY_ERROR,
-        `${provider} ACP setup failed: ${error?.message ?? error}; ${(client.stderr ?? "").slice(-1000)}`,
-        error?.details
-      );
+      const failure = error instanceof GatewayError && error.code !== ERROR_CODES.ACP_ERROR
+        ? error
+        : new GatewayError(
+          error?.code === ERROR_CODES.ACP_ERROR ? ERROR_CODES.ACP_ERROR : ERROR_CODES.GATEWAY_ERROR,
+          `${provider} ACP setup failed: ${error?.message ?? error}; ${(client.stderr ?? "").slice(-1000)}`,
+          error?.details
+        );
+      if (!started) this.#countProviderStartFailure(provider, failure);
+      throw failure;
     }
+  }
+
+  #countProviderStartFailure(provider, error) {
+    const previous = this.providerStartFailures.get(provider);
+    this.providerStartFailures.set(provider, {
+      failures: (previous?.failures ?? 0) + 1,
+      lastError: utf8ByteHead(error?.message ?? String(error), PROVIDER_ALERT_ERROR_BYTES)
+    });
   }
 
   requireSession(id) {
@@ -3832,6 +4028,21 @@ function normalizeLastRestore(value) {
   };
 }
 
+function normalizeRestoreFailures(value) {
+  return Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
+function normalizeQuarantine(value) {
+  if (!value || typeof value !== "object" || typeof value.at !== "string" || !Number.isFinite(Date.parse(value.at))) {
+    return null;
+  }
+  return {
+    at: value.at,
+    failures: Number.isSafeInteger(value.failures) && value.failures > 0 ? value.failures : 1,
+    lastErrorCode: typeof value.lastErrorCode === "string" ? value.lastErrorCode : null
+  };
+}
+
 function taskStatusPayload(task) {
   return {
     status: task.status,
@@ -3840,6 +4051,15 @@ function taskStatusPayload(task) {
     turnId: task.turnId ?? null,
     ...(task.promptDispatchedAt ? { promptDispatchedAt: task.promptDispatchedAt } : {})
   };
+}
+
+// Equal as given, or equal once both resolve on disk (a symlinked tmpdir, a
+// canonicalized snapshot source). A path that does not exist compares as given.
+async function samePath(a, b) {
+  if (typeof a !== "string" || typeof b !== "string" || !a || !b) return false;
+  if (resolve(a) === resolve(b)) return true;
+  const [left, right] = await Promise.all([realpath(a).catch(() => null), realpath(b).catch(() => null)]);
+  return left != null && left === right;
 }
 
 async function directoryExists(path) {

@@ -297,7 +297,7 @@ function controlTools() {
     },
     {
       name: "agent_acp_session_restore",
-      description: "Restore a worker session through ACP session/resume or session/load.",
+      description: "Restore a worker session through ACP session/resume or session/load. Naming a session this Main already holds (same provider and acpSessionId, its cwd) restores that record in place; that is how a session refused with SESSION_QUARANTINED is retried.",
       inputSchema: {
         type: "object",
         properties: {

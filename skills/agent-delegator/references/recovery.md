@@ -17,12 +17,13 @@ If the work is expensive to duplicate and you have no handle yet, pass `idempote
 | `UNKNOWN_TASK` | the TTL elapsed or the handle was swept | the outcome is gone; re-run the work deliberately |
 | `TASK_NOT_COMPLETE` | a result was read before the task ended | wait for terminal, honouring `pollInterval` |
 | `status: "error"` / `unavailable` | the turn or the provider failed | read `error`, collect what exists, then restore or re-run |
+| `SESSION_QUARANTINED` | the session failed to restore `failures` times in a row; the Gateway stopped retrying it | pick from `details.next`: `check` it, retry once with `agent_acp_session_restore` (same provider, acpSessionId, cwd), or open a new session |
 | `disconnected` | the worker process is gone | collect retained results and inbox history, then reuse the session — prompt and config reconnect automatically for a resumable provider |
 
 ## Restore and inspect
 
 - Reuse a relevant `sessionId` for follow-up work. Prompt and config attempt reconnect automatically for a resumable disconnected provider; a failed automatic restore leaves the session `unavailable`.
-- Use `agent_acp_session_restore` only to register or explicitly restore a known raw provider `acpSessionId`, preferring `method: "auto"`. Inspect existing Gateway sessions first, and never register the same provider session twice.
+- Use `agent_acp_session_restore` only to register or explicitly restore a known raw provider `acpSessionId`, preferring `method: "auto"`. Inspect existing Gateway sessions first; naming one you already hold restores that record in place instead of registering it twice.
 - `agent_acp_session {action: "list"| "get"}` before opening duplicates. Ask for `includeTranscript` or `includeEvents` only when needed; raw event `data` is omitted, and surviving `dataArtifact` pointers hold the complete payloads.
 - Pin only while retention must be suspended, then unpin.
 - Close a specific disposable non-active session after recovering evidence. Closing an active session also cancels it, so normally cancel and poll first.

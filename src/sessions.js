@@ -504,6 +504,11 @@ export class SessionStore {
       generation: session.generation ?? 1,
       lastRestore: session.lastRestore ?? null,
       restoreCapabilities: session.restoreCapabilities ?? null,
+      // Additive (1.7.0): consecutive failed restores and the quarantine they
+      // led to. A restart must not hand a quarantined session back to the
+      // transparent restore path, nor restart its count.
+      restoreFailures: session.restoreFailures ?? 0,
+      quarantined: session.quarantined ?? null,
       // Additive: a capture policy chosen per session must survive a restart, or
       // a restored session silently reverts to the gateway default.
       thoughtCapture: session.thoughtCapture ?? null,
@@ -640,7 +645,7 @@ function timeOrNone(value) {
 // default and compact polls never do (Quiet).
 export const POLL_OMITTED_SESSION_KEYS = Object.freeze([
   "statusReason", "statusChangedAt", "lastWorkerActivityAt", "stallSuspected", "generation", "lastRestore",
-  "attribution"
+  "restoreFailures", "quarantined", "attribution"
 ]);
 
 export function publicSession(session, { now = Date.now(), stallHintMs = DEFAULT_STALL_HINT_MS } = {}) {
@@ -667,6 +672,12 @@ export function publicSession(session, { now = Date.now(), stallHintMs = DEFAULT
     // record written before 1.7 has had one as far as anyone can tell.
     generation: session.generation ?? 1,
     lastRestore: session.lastRestore ?? null,
+    // Additive (1.7.0), only when there is something to say, so a healthy
+    // session keeps its exact shape: restores that failed in a row since the
+    // last success, and the stop that follows maxConsecutiveRestoreFailures
+    // ({at, failures, lastErrorCode}) until Main restores explicitly.
+    ...(session.restoreFailures > 0 ? { restoreFailures: session.restoreFailures } : {}),
+    ...(session.quarantined ? { quarantined: session.quarantined } : {}),
     turnId: session.turnId,
     stopReason: session.stopReason,
     error: session.error,

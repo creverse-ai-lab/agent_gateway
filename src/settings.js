@@ -14,6 +14,12 @@ export const SETTING_DEFINITIONS = Object.freeze([
   number("inboxRetentionMs", "lifecycle", "ACP_GATEWAY_INBOX_RETENTION_MS", 24 * 60 * 60_000, 0),
   number("taskRetentionMs", "lifecycle", "ACP_GATEWAY_TASK_RETENTION_MS", 24 * 60 * 60_000, 0),
   number("sessionRetentionMs", "lifecycle", "ACP_GATEWAY_SESSION_RETENTION_MS", 7 * 24 * 60 * 60_000, 0),
+  // How many restores of one session may fail in a row before the Gateway stops
+  // restoring it transparently (prompt/run/config then fail with
+  // SESSION_QUARANTINED; an explicit session_restore stays allowed). The same
+  // count of consecutive provider start failures raises setup's
+  // provider_degraded alert, which never blocks anything.
+  number("maxConsecutiveRestoreFailures", "lifecycle", "ACP_GATEWAY_MAX_CONSECUTIVE_RESTORE_FAILURES", 3, 1),
   number("maxEvents", "resourceLimits", "ACP_GATEWAY_MAX_EVENTS", 200, 1),
   number("maxTextBytes", "resourceLimits", "ACP_GATEWAY_MAX_TEXT_BYTES", 1_000_000, 1),
   number("maxArtifactBytes", "resourceLimits", "ACP_GATEWAY_MAX_ARTIFACT_BYTES", 100 * 1024 * 1024, 1),

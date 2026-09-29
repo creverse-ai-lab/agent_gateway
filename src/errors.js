@@ -21,6 +21,11 @@ export const ERROR_CODES = Object.freeze({
   SESSION_ACTIVE: "SESSION_ACTIVE",
   SESSION_CLOSED: "SESSION_CLOSED",
   SESSION_NOT_WAITING: "SESSION_NOT_WAITING",
+  // The session's worker failed to come back maxConsecutiveRestoreFailures
+  // times in a row, so the Gateway stopped restoring it behind Main's back.
+  // Refused before any provider is started or contacted; details carry the
+  // failure count, the last error code and Main's options (next).
+  SESSION_QUARANTINED: "SESSION_QUARANTINED",
   TASK_NOT_COMPLETE: "TASK_NOT_COMPLETE",
   // Raised by TaskStore budgets and waits. The store itself stays
   // dependency-free and tags plain Errors with these same strings; the gateway
