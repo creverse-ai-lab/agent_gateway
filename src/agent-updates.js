@@ -1,4 +1,5 @@
 import { loadOfficialRegistry, selectDistribution } from "./acp-registry.js";
+import { gatewayUpdateMessage } from "./gateway-source-monitor.js";
 import { parseInstallerArgs, runInstaller } from "./installer.js";
 import { detectProviders } from "./providers.js";
 
@@ -94,11 +95,14 @@ export class AgentUpdateManager {
           message: `ACP agent updates still require attention: ${formatUpdates(this.state.available)}`
         });
       }
+      // One code for a Gateway update wherever it comes from (Git main or the
+      // npm registry), so the session-relevance filter and every reader keep
+      // working; the message names the source and the commands.
       if (this.state.gatewaySource?.updateAvailable) {
         alerts.push({
           level: "info",
           code: "gateway_source_update_available",
-          message: `ACP Gateway ${this.state.gatewaySource.mainVersion} is available on main. Run acp-gateway-bootstrap --update when ready.`
+          message: gatewayUpdateMessage(this.state.gatewaySource)
         });
       }
     }

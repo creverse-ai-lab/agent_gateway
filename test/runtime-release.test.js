@@ -9,10 +9,16 @@ import {
   GZIP_OS_UNKNOWN,
   PUBLIC_CLIENT_EXPORTS,
   REQUIRED_ALLOWED_ROOTS,
+  RUNTIME_LOCKFILE_NAME,
+  RUNTIME_PACKAGE_NAME,
   V140_SOURCE_COMMIT,
   assertBuilderCommit,
   assertPinnedSourceCommit,
   assertRuntimeManifestMetadata,
+  assertRuntimePackageIdentity,
+  installRuntimeLockfile,
+  runtimeLockfilePlan,
+  withRuntimeIdentity,
   assertSymlinkContained,
   assertUnsignedBuildRecord,
   createDeterministicArchive,
@@ -213,4 +219,51 @@ test("verifier rejects --provenance so local files are not treated as attestatio
   const result = spawnSync(process.execPath, [verifier, "--provenance", "x"], { encoding: "utf8" });
   assert.notEqual(result.status, 0);
   assert.match(`${result.stderr}\n${result.stdout}`, /unsigned build record/);
+});
+
+test("the tag's lockfile is archived as package-lock.json, shrinkwrap or not", async (t) => {
+  const shrinkwrapTag = runtimeLockfilePlan((path) => ["package.json", "npm-shrinkwrap.json"].includes(path));
+  assert.deepEqual(shrinkwrapTag, { source: "npm-shrinkwrap.json", target: "package-lock.json" });
+  const olderTag = runtimeLockfilePlan((path) => ["package.json", "package-lock.json"].includes(path));
+  assert.deepEqual(olderTag, { source: "package-lock.json", target: "package-lock.json" });
+  assert.equal(RUNTIME_LOCKFILE_NAME, "package-lock.json");
+  assert.ok(REQUIRED_ALLOWED_ROOTS.includes(RUNTIME_LOCKFILE_NAME), "the app verifies gateway/package-lock.json");
+
+  const root = await mkdtemp(join(tmpdir(), "acp-gateway-lockfile-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  for (const [plan, file] of [[shrinkwrapTag, "npm-shrinkwrap.json"], [olderTag, "package-lock.json"]]) {
+    const runtimeRoot = join(root, file);
+    await mkdir(runtimeRoot);
+    await writeFile(join(runtimeRoot, file), `{"from":"${file}"}\n`);
+    await installRuntimeLockfile(runtimeRoot, plan);
+    assert.deepEqual(JSON.parse(await readFile(join(runtimeRoot, "package-lock.json"), "utf8")), { from: file });
+    await assert.rejects(readFile(join(runtimeRoot, "npm-shrinkwrap.json")), { code: "ENOENT" });
+  }
+});
+
+test("the runtime tree keeps the acp-gateway package identity after the npm rename", () => {
+  const npmPackage = { name: "acp-gateway-daemon", version: "1.7.0", dependencies: { a: "1.0.0" } };
+  const shrinkwrap = {
+    name: "acp-gateway-daemon",
+    version: "1.6.9",
+    lockfileVersion: 3,
+    packages: { "": { name: "acp-gateway-daemon", version: "1.6.9" }, "node_modules/a": { version: "1.0.0" } }
+  };
+  const { packageDocument, lockDocument } = withRuntimeIdentity(npmPackage, shrinkwrap);
+  assert.equal(RUNTIME_PACKAGE_NAME, "acp-gateway");
+  assert.equal(packageDocument.name, "acp-gateway");
+  assert.equal(lockDocument.name, "acp-gateway");
+  assert.equal(lockDocument.packages[""].name, "acp-gateway");
+  assert.equal(lockDocument.version, "1.7.0");
+  assert.equal(lockDocument.packages[""].version, "1.7.0");
+  assert.deepEqual(lockDocument.packages["node_modules/a"], { version: "1.0.0" }, "the dependency tree is untouched");
+  assert.equal(npmPackage.name, "acp-gateway-daemon", "the source documents are not mutated");
+  assertRuntimePackageIdentity(packageDocument, lockDocument, { version: "1.7.0" });
+
+  assert.throws(() => assertRuntimePackageIdentity(npmPackage, lockDocument), /package\.json name must be acp-gateway/);
+  assert.throws(() => assertRuntimePackageIdentity(packageDocument, shrinkwrap), /package-lock\.json name must be acp-gateway/);
+  assert.throws(
+    () => assertRuntimePackageIdentity(packageDocument, lockDocument, { version: "1.6.0" }),
+    /versions must be 1\.6\.0/
+  );
 });

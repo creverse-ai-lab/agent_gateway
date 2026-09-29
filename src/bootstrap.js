@@ -5,7 +5,7 @@ import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gatewayStatePath } from "./config.js";
 import { preflightStateVersion } from "./state-store.js";
-import { updateSourceCheckout } from "./source-update.js";
+import { prepareUpdate } from "./source-update.js";
 import { GATEWAY_VERSION } from "./version.js";
 
 try {
@@ -19,34 +19,41 @@ try {
   } else if (isUpdate && !isExplicitDryRun && !applyStage) {
     const bootstrapPath = fileURLToPath(import.meta.url);
     const root = dirname(dirname(bootstrapPath));
-    const source = await updateSourceCheckout(root);
-    process.stderr.write(`${JSON.stringify({ phase: "source-update", ...source }, null, 2)}\n`);
-    const code = await runUpdatedBootstrap(bootstrapPath, argv);
-    process.exitCode = code;
+    // A source checkout is pulled and the updated bootstrap re-executed; an npm
+    // or app-managed install is never touched by Git, and this same process
+    // goes on to refresh its registrations (install-mode.js).
+    const { reexec, ...update } = await prepareUpdate(root);
+    process.stderr.write(`${JSON.stringify(update, null, 2)}\n`);
+    if (reexec) process.exitCode = await runUpdatedBootstrap(bootstrapPath, argv);
+    else await runInstallerCli(argv);
   } else {
-    const { installerHelp, parseInstallerArgs, runInstaller } = await import("./installer.js");
-    const options = parseInstallerArgs(argv);
-    // The only moment a human is watching. After the install, the daemon starts
-    // detached: a runtime that reads an older state schema than the one on disk
-    // would fail invisibly, so it is refused here instead.
-    if (!options.help) {
-      const preflight = preflightStateVersion(gatewayStatePath());
-      if (!preflight.ok) throw new Error(preflight.error);
-    }
-    await chooseFrontDoor(options);
-    if (options.help) {
-      process.stdout.write(`${installerHelp()}\n`);
-    } else {
-      if (options.update && !options.dryRun) {
-        const plan = await runInstaller({ ...options, dryRun: true, healthCheck: false });
-        process.stderr.write(`${JSON.stringify({ phase: "dry-run", ...plan }, null, 2)}\n`);
-      }
-      process.stdout.write(`${JSON.stringify(await runInstaller(options), null, 2)}\n`);
-    }
+    await runInstallerCli(argv);
   }
 } catch (error) {
   process.stderr.write(`acp-gateway-bootstrap: ${error?.message ?? String(error)}\n`);
   process.exitCode = 1;
+}
+
+async function runInstallerCli(argv) {
+  const { installerHelp, parseInstallerArgs, runInstaller } = await import("./installer.js");
+  const options = parseInstallerArgs(argv);
+  // The only moment a human is watching. After the install, the daemon starts
+  // detached: a runtime that reads an older state schema than the one on disk
+  // would fail invisibly, so it is refused here instead.
+  if (!options.help) {
+    const preflight = preflightStateVersion(gatewayStatePath());
+    if (!preflight.ok) throw new Error(preflight.error);
+  }
+  await chooseFrontDoor(options);
+  if (options.help) {
+    process.stdout.write(`${installerHelp()}\n`);
+  } else {
+    if (options.update && !options.dryRun) {
+      const plan = await runInstaller({ ...options, dryRun: true, healthCheck: false });
+      process.stderr.write(`${JSON.stringify({ phase: "dry-run", ...plan }, null, 2)}\n`);
+    }
+    process.stdout.write(`${JSON.stringify(await runInstaller(options), null, 2)}\n`);
+  }
 }
 
 async function chooseFrontDoor(options) {

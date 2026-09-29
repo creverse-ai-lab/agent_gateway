@@ -10,12 +10,17 @@ import {
   REQUIRED_ALLOWED_ROOTS,
   RUNTIME_ASSET_NAME,
   RUNTIME_ROOT_NAME,
+  RUNTIME_LOCKFILE_NAME,
   assertBuilderCommit,
   assertPinnedSourceCommit,
+  assertRuntimePackageIdentity,
   createDeterministicArchive,
   createUnsignedBuildRecord,
+  installRuntimeLockfile,
   manifestFiles,
-  sha256File
+  runtimeLockfilePlan,
+  sha256File,
+  withRuntimeIdentity
 } from "./runtime-release-lib.js";
 
 const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -30,6 +35,15 @@ function option(name, fallback) {
 
 function run(command, args, options = {}) {
   return execFileSync(command, args, { cwd: repositoryRoot, stdio: options.capture ? "pipe" : "inherit", encoding: "utf8" });
+}
+
+function sourceHasFile(commit, path) {
+  try {
+    execFileSync("git", ["cat-file", "-e", `${commit}:${path}`], { cwd: repositoryRoot, stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 const sourceTag = option("--source-tag", "v1.7.0");
@@ -48,27 +62,33 @@ const archivePath = join(outputDirectory, RUNTIME_ASSET_NAME);
 try {
   await mkdir(runtimeRoot, { recursive: true });
   const sourceArchive = join(temporary, "source.tar");
+  // Tags before 1.7.0 carry package-lock.json; from 1.7.0 the lockfile is
+  // npm-shrinkwrap.json (it ships in the npm package). The runtime layout is
+  // unchanged either way: the app verifies gateway/package-lock.json, so the
+  // tag's lockfile is always installed under that name.
+  const lockfile = runtimeLockfilePlan((path) => sourceHasFile(sourceCommit, path));
   run("git", [
     "archive", "--format=tar", `--output=${sourceArchive}`, sourceCommit, "--",
-    "src", "skills", "package.json", "package-lock.json", ...(sourceTag === "v1.4.0" ? [] : ["gateway-client"])
+    "src", "skills", "package.json", lockfile.source, ...(sourceTag === "v1.4.0" ? [] : ["gateway-client"])
   ]);
   execFileSync("tar", ["-xf", sourceArchive, "-C", runtimeRoot], { stdio: "inherit" });
+  await installRuntimeLockfile(runtimeRoot, lockfile);
   if (sourceTag === "v1.4.0") await cp(join(repositoryRoot, "gateway-client"), join(runtimeRoot, "gateway-client"), { recursive: true });
 
   const packagePath = join(runtimeRoot, "package.json");
-  const packageDocument = JSON.parse(await readFile(packagePath, "utf8"));
-  assert.equal(`v${packageDocument.version}`, sourceTag, "source tag and package version must agree");
-  packageDocument.files = ["src/", "gateway-client/", "skills/"];
-  packageDocument.exports = { ".": "./gateway-client/index.js", "./client": "./gateway-client/index.js" };
-  packageDocument.scripts = Object.fromEntries(
-    Object.entries(packageDocument.scripts ?? {}).filter(([name]) => ["start", "daemon", "guide", "bootstrap"].includes(name))
+  const sourcePackage = JSON.parse(await readFile(packagePath, "utf8"));
+  assert.equal(`v${sourcePackage.version}`, sourceTag, "source tag and package version must agree");
+  sourcePackage.files = ["src/", "gateway-client/", "skills/"];
+  sourcePackage.exports = { ".": "./gateway-client/index.js", "./client": "./gateway-client/index.js" };
+  sourcePackage.scripts = Object.fromEntries(
+    Object.entries(sourcePackage.scripts ?? {}).filter(([name]) => ["start", "daemon", "guide", "bootstrap"].includes(name))
   );
+  const lockPath = join(runtimeRoot, RUNTIME_LOCKFILE_NAME);
+  // From 1.7.0 the source is published to npm as acp-gateway-daemon; the
+  // runtime tree keeps the acp-gateway identity of every earlier release.
+  const { packageDocument, lockDocument } = withRuntimeIdentity(sourcePackage, JSON.parse(await readFile(lockPath, "utf8")));
+  assertRuntimePackageIdentity(packageDocument, lockDocument);
   await writeFile(packagePath, `${JSON.stringify(packageDocument, null, 2)}\n`);
-
-  const lockPath = join(runtimeRoot, "package-lock.json");
-  const lockDocument = JSON.parse(await readFile(lockPath, "utf8"));
-  lockDocument.version = packageDocument.version;
-  lockDocument.packages[""].version = packageDocument.version;
   await writeFile(lockPath, `${JSON.stringify(lockDocument, null, 2)}\n`);
 
   execFileSync("npm", ["ci", "--omit=dev", "--ignore-scripts", "--os=darwin", "--cpu=arm64"], {

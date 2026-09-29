@@ -479,7 +479,7 @@ export function installerHelp() {
     "Usage: acp-gateway-bootstrap [options]",
     "",
     "  --version, -V          Print the installed ACP Gateway version",
-    "  --update               Pull source, preview, update adapters/MCPs, and restart",
+    "  --update               Pull a source checkout (npm/app installs skip Git), preview, update adapters/MCPs, and restart",
     "  --install-all          Install adapters, Control, Guide, and agent-delegator",
     "  --front-door <agent>   Choose codex, claude, or grok as the install-all Control MCP",
     "  --install-adapters     Install missing ACP adapters",

@@ -5,7 +5,7 @@ import { ERROR_CODES as internalCodes, GatewayError as InternalGatewayError } fr
 import { GatewayRpcClient as InternalGatewayRpcClient } from "../src/socket-rpc.js";
 import { GATEWAY_API_VERSION as internalApiVersion } from "../src/version.js";
 import { PUBLIC_CLIENT_EXPORTS } from "../scripts/runtime-release-lib.js";
-import * as publicClient from "acp-gateway/client";
+import * as publicClient from "acp-gateway-daemon/client";
 
 test("the public client entrypoint exposes the complete consumer contract", () => {
   assert.deepEqual(Object.keys(publicClient).sort(), [...PUBLIC_CLIENT_EXPORTS]);
@@ -17,7 +17,7 @@ test("the public client entrypoint exposes the complete consumer contract", () =
 
 test("package exports reject private Gateway subpaths", async () => {
   await assert.rejects(
-    import("acp-gateway/src/socket-rpc.js"),
+    import("acp-gateway-daemon/src/socket-rpc.js"),
     (error) => error?.code === "ERR_PACKAGE_PATH_NOT_EXPORTED"
   );
 });

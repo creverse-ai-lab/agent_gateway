@@ -7,8 +7,10 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import {
   PUBLIC_CLIENT_EXPORTS,
+  RUNTIME_LOCKFILE_NAME,
   RUNTIME_ROOT_NAME,
   assertRuntimeManifestMetadata,
+  assertRuntimePackageIdentity,
   assertUnsignedBuildRecord,
   manifestFiles,
   readJson,
@@ -50,6 +52,11 @@ try {
   assert.equal(buildRecord.builderCommit, manifest.builder.commit, "build record builder commit differs from manifest");
   assert.equal(buildRecord.builderDirty, manifest.builder.dirty, "build record dirty state differs from manifest");
   assert.deepEqual(await manifestFiles(runtimeRoot), manifest.files, "runtime payload differs from its manifest");
+  assertRuntimePackageIdentity(
+    await readJson(join(runtimeRoot, "package.json")),
+    await readJson(join(runtimeRoot, RUNTIME_LOCKFILE_NAME)),
+    { version: manifest.version }
+  );
 
   for (const file of manifest.files) {
     const root = file.path.split("/", 1)[0] + (file.path.includes("/") ? "/" : "");

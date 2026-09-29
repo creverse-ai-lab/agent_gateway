@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
-import { lstat, readFile, readlink, readdir } from "node:fs/promises";
+import { lstat, readFile, readlink, readdir, rename } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -8,6 +8,10 @@ import { createGzip } from "node:zlib";
 
 export const RUNTIME_ASSET_NAME = "acp-gateway-runtime-darwin-arm64.tar.gz";
 export const RUNTIME_ROOT_NAME = "acp-gateway-runtime";
+// The runtime tree keeps the identity every earlier release had: package
+// "acp-gateway" with a package-lock.json, whatever the npm publish name is.
+export const RUNTIME_PACKAGE_NAME = "acp-gateway";
+export const RUNTIME_LOCKFILE_NAME = "package-lock.json";
 export const BUILD_RECORD_NAME = `${RUNTIME_ASSET_NAME}.build-record.json`;
 export const CHECKSUM_NAME = `${RUNTIME_ASSET_NAME}.sha256`;
 export const RELEASE_ASSET_NAMES = Object.freeze([RUNTIME_ASSET_NAME, CHECKSUM_NAME, BUILD_RECORD_NAME]);
@@ -32,6 +36,48 @@ export const REQUIRED_ALLOWED_ROOTS = Object.freeze([
   "package.json",
   "runtime-manifest.json"
 ]);
+
+// Which lockfile a source commit carries: npm-shrinkwrap.json from 1.7.0 (it
+// ships in the npm package), package-lock.json before. `hasSourceFile(path)`
+// answers for the commit being released. The runtime root always receives it
+// as package-lock.json, the name the desktop app verifies.
+export function runtimeLockfilePlan(hasSourceFile) {
+  const source = hasSourceFile("npm-shrinkwrap.json") ? "npm-shrinkwrap.json" : RUNTIME_LOCKFILE_NAME;
+  return { source, target: RUNTIME_LOCKFILE_NAME };
+}
+
+export async function installRuntimeLockfile(runtimeRoot, plan) {
+  if (plan.source !== plan.target) await rename(join(runtimeRoot, plan.source), join(runtimeRoot, plan.target));
+}
+
+// package.json and lockfile documents rewritten to the runtime identity: the
+// runtime package name, and the lockfile version pinned to the package's.
+export function withRuntimeIdentity(packageDocument, lockDocument) {
+  const runtimePackage = { ...packageDocument, name: RUNTIME_PACKAGE_NAME };
+  const runtimeLock = {
+    ...lockDocument,
+    name: RUNTIME_PACKAGE_NAME,
+    version: packageDocument.version,
+    packages: {
+      ...lockDocument.packages,
+      "": { ...lockDocument.packages[""], name: RUNTIME_PACKAGE_NAME, version: packageDocument.version }
+    }
+  };
+  return { packageDocument: runtimePackage, lockDocument: runtimeLock };
+}
+
+export function assertRuntimePackageIdentity(packageDocument, lockDocument, { version } = {}) {
+  if (packageDocument?.name !== RUNTIME_PACKAGE_NAME) {
+    throw new Error(`runtime package.json name must be ${RUNTIME_PACKAGE_NAME}: ${packageDocument?.name}`);
+  }
+  if (lockDocument?.name !== RUNTIME_PACKAGE_NAME || lockDocument?.packages?.[""]?.name !== RUNTIME_PACKAGE_NAME) {
+    throw new Error(`runtime ${RUNTIME_LOCKFILE_NAME} name must be ${RUNTIME_PACKAGE_NAME}`);
+  }
+  const expected = version ?? packageDocument.version;
+  if (packageDocument.version !== expected || lockDocument.version !== expected || lockDocument.packages[""].version !== expected) {
+    throw new Error(`runtime package and ${RUNTIME_LOCKFILE_NAME} versions must be ${expected}`);
+  }
+}
 
 function comparePath(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;

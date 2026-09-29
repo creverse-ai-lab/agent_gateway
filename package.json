@@ -1,15 +1,30 @@
 {
-  "name": "acp-gateway",
+  "name": "acp-gateway-daemon",
   "version": "1.7.0",
   "description": "Persistent local ACP gateway with Main-only control and worker-safe guidance.",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/creverse-ai-lab/agent_gateway.git"
+  },
+  "homepage": "https://github.com/creverse-ai-lab/agent_gateway#readme",
+  "bugs": {
+    "url": "https://github.com/creverse-ai-lab/agent_gateway/issues"
+  },
   "type": "module",
-  "private": true,
+  "publishConfig": {
+    "access": "public"
+  },
   "files": [
     "src/",
     "gateway-client/",
     "skills/",
+    "docs/",
+    "npm-shrinkwrap.json",
     "README.md",
+    "README.*.md",
+    "CHANGELOG.md",
+    "CHANGELOG.*.md",
     "LICENSE"
   ],
   "exports": {
@@ -37,6 +52,7 @@
     "release:verify": "node scripts/verify-runtime-release.js",
     "smoke": "node test/live-smoke.js",
     "smoke:subagents": "node test/live-subagent-smoke.js",
+    "smoke:npm": "node scripts/npm-smoke.js",
     "usecases:live": "node scripts/live-usecases.js",
     "ci": "node scripts/ci-check.js && node scripts/acp-upstream-monitor.js --validate && npm test && node scripts/bench-payload.js",
     "monitor:check": "node scripts/acp-upstream-monitor.js",

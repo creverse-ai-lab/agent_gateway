@@ -1,0 +1,59 @@
+name: Publish npm
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Gateway version to publish (must equal package.json and GATEWAY_VERSION, e.g. 1.7.0)
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: npm-shrinkwrap.json
+      - name: Check the requested version
+        run: |
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            import { GATEWAY_VERSION } from "./src/version.js";
+            const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+            const wanted = process.env.VERSION;
+            const problems = [];
+            if (!/^\d+\.\d+\.\d+$/.test(wanted)) problems.push(`input version ${wanted} is not X.Y.Z`);
+            if (pkg.name !== "acp-gateway-daemon") problems.push(`package name is ${pkg.name}`);
+            if (pkg.version !== wanted) problems.push(`package.json version ${pkg.version} != ${wanted}`);
+            if (GATEWAY_VERSION !== wanted) problems.push(`GATEWAY_VERSION ${GATEWAY_VERSION} != ${wanted}`);
+            if (problems.length) { console.error(problems.join("\n")); process.exit(1); }
+            console.log(`publishing ${pkg.name}@${wanted} from ${process.env.GITHUB_SHA}`);
+          '
+      - name: Refuse a version that is already on npm
+        run: |
+          status="$(curl -sS -o /dev/null -w '%{http_code}' "https://registry.npmjs.org/acp-gateway-daemon/$VERSION")"
+          if [ "$status" = "200" ]; then
+            echo "acp-gateway-daemon@$VERSION is already published; npm versions are immutable" >&2
+            exit 1
+          elif [ "$status" != "404" ]; then
+            echo "Could not check the npm registry (HTTP $status)" >&2
+            exit 1
+          fi
+      - run: npm ci
+      - run: npm run ci
+      - run: npm run smoke:npm
+      - name: Publish with provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public

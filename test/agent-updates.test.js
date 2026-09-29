@@ -115,3 +115,44 @@ test("agent updater exposes a notification without changing Gateway source", asy
   assert.equal(result.gatewaySource.mainVersion, "1.2.0");
   assert.equal(result.alerts[0].code, "gateway_source_update_available");
 });
+
+test("an npm install is told to update through npm, not main", async () => {
+  const manager = new AgentUpdateManager({
+    enabled: false,
+    registryLoader: async () => ({ registry, source: "network", stale: false }),
+    detect: async () => [],
+    sourceChecker: async () => ({
+      status: "ready",
+      installMode: "npm",
+      currentVersion: "1.7.0",
+      mainVersion: null,
+      latestVersion: "1.8.0",
+      updateAvailable: true
+    })
+  });
+  const result = await manager.refresh();
+  assert.equal(result.gatewaySource.installMode, "npm");
+  assert.deepEqual(result.alerts, [{
+    level: "info",
+    code: "gateway_source_update_available",
+    message: "ACP Gateway 1.8.0 is available on npm. Run `npm install -g acp-gateway-daemon@latest`, then `acp-gateway-bootstrap --update` when idle."
+  }]);
+});
+
+test("a managed runtime or a failed Gateway check raises no alert", async () => {
+  for (const gatewaySource of [
+    { status: "managed", installMode: "runtime", currentVersion: "1.7.0", mainVersion: null, updateAvailable: false },
+    { status: "error", installMode: "npm", currentVersion: null, mainVersion: null, updateAvailable: false, error: "fetch failed" }
+  ]) {
+    const manager = new AgentUpdateManager({
+      enabled: false,
+      registryLoader: async () => ({ registry, source: "network", stale: false }),
+      detect: async () => [],
+      sourceChecker: async () => gatewaySource
+    });
+    const result = await manager.refresh();
+    assert.equal(result.status, "ready");
+    assert.deepEqual(result.gatewaySource, gatewaySource);
+    assert.deepEqual(result.alerts, []);
+  }
+});

@@ -2,6 +2,68 @@ import { spawn } from "node:child_process";
 import { mkdtemp, open, readFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { checkNpmRelease, NPM_UPGRADE_COMMAND } from "./gateway-source-monitor.js";
+import { detectInstallMode } from "./install-mode.js";
+import { GATEWAY_VERSION } from "./version.js";
+
+// The first half of `acp-gateway-bootstrap --update`, by install mode. Only a
+// source checkout (or a tree whose mode is unknown, where Git itself decides)
+// is pulled and validated, after which the updated bootstrap is re-executed.
+// An npm install or an app-managed runtime is replaced by its owner, never by
+// Git: nothing here runs git or npm for them, and the caller goes straight on
+// to refresh this install's registrations. An npm install also learns whether
+// the registry has a newer release and the command that installs it.
+export async function prepareUpdate(root, {
+  installMode = detectInstallMode(root),
+  run = runSourceCommand,
+  updateSource = updateSourceCheckout,
+  checkRelease = checkNpmRelease
+} = {}) {
+  if (installMode === "runtime") {
+    return {
+      phase: "package-update",
+      installMode,
+      reexec: false,
+      status: "managed",
+      currentVersion: GATEWAY_VERSION,
+      message: "This ACP Gateway is managed by the app that installed it; update it through that app. Registrations are refreshed for this install."
+    };
+  }
+  if (installMode === "npm") {
+    let release;
+    try {
+      release = await checkRelease();
+    } catch (error) {
+      return {
+        phase: "package-update",
+        installMode,
+        reexec: false,
+        status: "error",
+        currentVersion: GATEWAY_VERSION,
+        latestVersion: null,
+        updateAvailable: null,
+        warning: `npm registry check failed: ${error?.message ?? String(error)}`
+      };
+    }
+    return {
+      phase: "package-update",
+      installMode,
+      reexec: false,
+      status: "ready",
+      currentVersion: GATEWAY_VERSION,
+      latestVersion: release.latestVersion,
+      updateAvailable: release.updateAvailable,
+      ...(release.updateAvailable
+        ? {
+            command: NPM_UPGRADE_COMMAND,
+            message: `ACP Gateway ${release.latestVersion} is available on npm. Run \`${NPM_UPGRADE_COMMAND}\`, then \`acp-gateway-bootstrap --update\` again.`
+          }
+        : {})
+    };
+  }
+  const source = await updateSource(root, { run });
+  return { phase: "source-update", installMode, reexec: true, ...source };
+}
 
 // Validate before touching the live checkout. The running daemon and every MCP
 // front door execute this very checkout (npm link), so the old order (pull, then

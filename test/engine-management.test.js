@@ -8,7 +8,7 @@ import { AcpClient } from "../src/acp-client.js";
 import { GatewayService } from "../src/gateway-service.js";
 import { GatewaySettings } from "../src/settings.js";
 import { GATEWAY_VERSION } from "../src/version.js";
-import { GatewayRpcClient } from "acp-gateway/client";
+import { GatewayRpcClient } from "acp-gateway-daemon/client";
 import { startDaemon, writeMockProviders } from "./helpers/daemon-harness.js";
 
 const context = { rootId: "main-a" };

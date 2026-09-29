@@ -4,7 +4,8 @@ import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { updateSourceCheckout } from "../src/source-update.js";
+import { prepareUpdate, updateSourceCheckout } from "../src/source-update.js";
+import { GATEWAY_VERSION } from "../src/version.js";
 
 const OLD = "1".repeat(40);
 const NEW = "2".repeat(40);
@@ -262,4 +263,88 @@ test("a real update lock held by a live process refuses a second update", async 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("--update on an npm install runs no git and names the npm upgrade", async () => {
+  const calls = [];
+  const run = async (command, args) => {
+    calls.push([command, ...args].join(" "));
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const newer = await prepareUpdate("/usr/local/lib/node_modules/acp-gateway-daemon", {
+    run,
+    checkRelease: async () => ({ latestVersion: "9.0.0", updateAvailable: true })
+  });
+  assert.deepEqual(calls, [], "no git or npm command may run for an npm install");
+  assert.equal(newer.installMode, "npm");
+  assert.equal(newer.phase, "package-update");
+  assert.equal(newer.reexec, false);
+  assert.equal(newer.updateAvailable, true);
+  assert.equal(newer.command, "npm install -g acp-gateway-daemon@latest");
+  assert.equal(
+    newer.message,
+    "ACP Gateway 9.0.0 is available on npm. Run `npm install -g acp-gateway-daemon@latest`, then `acp-gateway-bootstrap --update` again."
+  );
+
+  const current = await prepareUpdate("/usr/local/lib/node_modules/acp-gateway-daemon", {
+    installMode: "npm",
+    run,
+    checkRelease: async () => ({ latestVersion: GATEWAY_VERSION, updateAvailable: false })
+  });
+  assert.equal(current.updateAvailable, false);
+  assert.equal(current.command, undefined);
+
+  const offline = await prepareUpdate("/usr/local/lib/node_modules/acp-gateway-daemon", {
+    installMode: "npm",
+    run,
+    checkRelease: async () => { throw new Error("fetch failed"); }
+  });
+  assert.equal(offline.reexec, false, "a registry failure must not block the registration refresh");
+  assert.equal(offline.updateAvailable, null);
+  assert.equal(offline.warning, "npm registry check failed: fetch failed");
+  assert.deepEqual(calls, []);
+});
+
+test("--update on an app-managed runtime runs no git and asks no registry", async () => {
+  const run = async (command, args) => assert.fail(`unexpected ${command} ${args.join(" ")}`);
+  for (const root of [
+    "/Users/me/.acp-gateway/runtime/versions/1.7.0-0123abcd/gateway",
+    "/Users/me/.acp-gateway/runtime/versions/1.8.0/node_modules/acp-gateway-daemon"
+  ]) {
+    const result = await prepareUpdate(root, {
+      run,
+      checkRelease: async () => assert.fail("the app updates a runtime install; npm is not asked")
+    });
+    assert.equal(result.installMode, "runtime", root);
+    assert.equal(result.status, "managed");
+    assert.equal(result.reexec, false);
+    assert.equal(result.command, undefined);
+  }
+});
+
+test("--update on a source checkout still pulls through git and re-executes", async () => {
+  const run = async () => assert.fail("the stubbed source update runs the commands");
+  let received;
+  const result = await prepareUpdate("/repo", {
+    installMode: "source",
+    run,
+    checkRelease: async () => assert.fail("a checkout is not compared with npm"),
+    updateSource: async (root, options) => {
+      received = { root, run: options.run };
+      return { root, pull: "Already up to date." };
+    }
+  });
+  assert.equal(received.root, "/repo");
+  assert.equal(received.run, run, "the injected runner reaches the Git update");
+  assert.equal(result.phase, "source-update");
+  assert.equal(result.installMode, "source");
+  assert.equal(result.reexec, true);
+  assert.equal(result.pull, "Already up to date.");
+
+  // An unknown layout takes the same path, and Git itself refuses a non-checkout.
+  const { run: gitRun, calls } = scripted([
+    ["git rev-parse --is-inside-work-tree", 0, "false\n"]
+  ]);
+  await assert.rejects(prepareUpdate("/copied-tree", { installMode: "unknown", run: gitRun }), /not inside a Git worktree/);
+  assert.deepEqual(calls.map((call) => call.line), ["git rev-parse --is-inside-work-tree"]);
 });

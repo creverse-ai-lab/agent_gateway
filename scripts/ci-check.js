@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { parseInstallerArgs } from "../src/installer.js";
 import { CRASH_POINTS } from "../src/state-store.js";
@@ -9,13 +10,27 @@ import { ACP_PROTOCOL_VERSION } from "../src/acp-version.js";
 import { compareSnapshots, validateMonitorConfig, validateSnapshot } from "./acp-upstream-monitor.js";
 
 const packageDocument = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
-const lockDocument = JSON.parse(await readFile(new URL("../package-lock.json", import.meta.url), "utf8"));
+// npm-shrinkwrap.json, not package-lock.json: it ships inside the npm package,
+// so `npm install -g acp-gateway-daemon` resolves exactly the tree CI tested.
+const lockDocument = JSON.parse(await readFile(new URL("../npm-shrinkwrap.json", import.meta.url), "utf8"));
 const monitorConfig = JSON.parse(await readFile(new URL("../config/acp-monitor.json", import.meta.url), "utf8"));
 const upstreamSnapshot = JSON.parse(await readFile(new URL("../config/acp-upstream.snapshot.json", import.meta.url), "utf8"));
 
 assert.equal(packageDocument.version, GATEWAY_VERSION, "package and Gateway versions must match");
 assert.equal(lockDocument.version, GATEWAY_VERSION, "lockfile and Gateway versions must match");
 assert.equal(lockDocument.packages[""].version, GATEWAY_VERSION, "lockfile root package version must match");
+// Published to npm as acp-gateway-daemon (acp-gateway belongs to someone else).
+// The bin names and the runtime-release manifest identity stay acp-gateway.
+assert.equal(packageDocument.name, "acp-gateway-daemon", "npm package name must be acp-gateway-daemon");
+assert.equal(lockDocument.name, packageDocument.name, "lockfile and package names must match");
+assert.equal(lockDocument.packages[""].name, packageDocument.name, "lockfile root package name must match");
+assert.equal(packageDocument.private, undefined, "the package is published; it must not be private");
+assert.equal(packageDocument.publishConfig?.access, "public", "the package must publish publicly");
+assert.ok(packageDocument.files.includes("npm-shrinkwrap.json"), "the shrinkwrap must ship in the package");
+assert.ok(
+  !existsSync(new URL("../package-lock.json", import.meta.url)),
+  "package-lock.json must not exist beside npm-shrinkwrap.json; npm would silently ignore it"
+);
 assert.deepEqual(
   packageDocument.exports,
   { ".": "./gateway-client/index.js", "./client": "./gateway-client/index.js" },
