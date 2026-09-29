@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { accessSync, constants } from "node:fs";
-import { access, chmod, cp, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { access, chmod, cp, lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,7 +18,7 @@ import {
 import { GatewayRpcClient } from "./socket-rpc.js";
 import { gatewaySocketPath } from "./config.js";
 import { GatewaySettings, settingsPaths } from "./settings.js";
-import { GATEWAY_VERSION } from "./version.js";
+import { compareReleases, GATEWAY_VERSION } from "./version.js";
 
 const CONTROL_NAME = "agent-acp";
 const GUIDE_NAME = "agent-acp-guide";
@@ -31,6 +31,11 @@ const bundledSkillSource = join(dirname(sourceDirectory), "skills", DELEGATOR_SK
 
 export function defaultInstallStatePath() {
   return process.env.ACP_GATEWAY_INSTALL_STATE || join(homedir(), ".acp-gateway", "install.json");
+}
+
+// Where `claude mcp add --scope user` records user-scope servers (mcpServers).
+function defaultClaudeConfigPath() {
+  return join(process.env.CLAUDE_CONFIG_DIR || homedir(), ".claude.json");
 }
 
 export function parseInstallerArgs(argv) {
@@ -165,6 +170,7 @@ export async function runInstaller(options, dependencies = {}) {
   const registryLoader = dependencies.registryLoader ?? loadOfficialRegistry;
   const registryDiscover = dependencies.registryDiscover ?? discoverRegistryAgents;
   const providerRegistryPath = dependencies.providerRegistryPath ?? defaultProviderRegistryPath();
+  const claudeConfigPath = dependencies.claudeConfigPath ?? defaultClaudeConfigPath();
   const skillRoots = dependencies.skillRoots ?? {
     codex: join(process.env.CODEX_HOME || join(homedir(), ".codex"), "skills"),
     claude: join(process.env.CLAUDE_HOME || join(homedir(), ".claude"), "skills"),
@@ -342,11 +348,11 @@ export async function runInstaller(options, dependencies = {}) {
       warnings.push(`${target} is not installed; MCP registration skipped`);
     } else if (controlTargets.includes(target)) {
       const spec = mcpSpec(target, "control", identity);
-      await installMcp(spec, { options, state, run, actions });
+      await installMcp(spec, { options, state, run, actions, warnings, claudeConfigPath });
     }
     if (guideTargets.includes(target) && providerInstalled) {
       const spec = mcpSpec(target, "guide", identity);
-      await installMcp(spec, { options, state, run, actions });
+      await installMcp(spec, { options, state, run, actions, warnings, claudeConfigPath });
     }
     const managedSkill = state?.managedSkills?.[`${target}:${DELEGATOR_SKILL_NAME}`];
     const canManageSkill = installedProviderIds.has(target) || (options.updateSkill && managedSkill?.path);
@@ -503,27 +509,72 @@ function parseOnOff(value, option) {
   throw new Error(`${option} requires on or off`);
 }
 
-async function installMcp(spec, { options, state, run, actions }) {
+async function installMcp(spec, { options, state, run, actions, warnings, claudeConfigPath }) {
   const key = `${spec.agent}:${spec.name}`;
-  actions.push({ type: "mcp", agent: spec.agent, name: spec.name, command: spec.command, args: redactArgs(spec.args) });
-  if (options.dryRun) return;
+  const action = { type: "mcp", agent: spec.agent, name: spec.name, command: spec.command, args: redactArgs(spec.args) };
+  actions.push(action);
 
-  const existing = await run(spec.command, spec.getArgs);
-  const exists = inspectMcpExists(spec, existing);
-  if (!exists && spec.inspectMode !== "list-json" && !/no mcp server|not found|does not exist/i.test(`${existing.stdout}\n${existing.stderr}`)) {
-    throw commandError(spec.command, spec.getArgs, existing, `inspect ${key}`);
+  // A dry run inspects too, but never through a command that starts the
+  // server: `claude mcp get` health-checks the entry by launching it, and a
+  // launched front door can autostart a daemon. Codex `mcp get` and the Grok
+  // and Auggie lists only read configuration.
+  const inspected = options.dryRun && spec.agent === "claude"
+    ? await readClaudeEntry(claudeConfigPath, spec.name)
+    : await inspectWithCli(spec, run, key);
+  if (inspected.error) {
+    action.status = "unknown";
+    warnings.push(`${key}: ${inspected.error}; the dry run could not inspect it`);
+    return;
   }
+  const { exists, registered } = inspected;
   if (exists && !state?.managedMcp?.[key] && !options.force) {
     throw new Error(`${key} already exists and is not managed by this installer; rerun with --force to replace it`);
   }
   if (exists && state?.managedMcp?.[key] && !options.force && !options.rotateToken) {
-    actions.at(-1).status = "unchanged";
-    return;
+    const decision = await repointDecision(registered, spec.launch);
+    if (decision !== "repoint") {
+      action.status = "unchanged";
+      if (decision === "unknown") warnings.push(`${key}: could not verify the registered path; rerun with --force to re-register it`);
+      if (decision === "keep-stale") {
+        warnings.push(`${key}: the registered path goes through a symlink to an older gateway; update it with the app that manages that link, or rerun with --force to re-register it`);
+      }
+      return;
+    }
+    action.status = options.dryRun ? "would-update" : "updated";
+    action.previous = { command: registered.command, args: redactArgs(registered.args) };
+    action.next = { command: spec.launch.command, args: redactArgs(spec.launch.args) };
+  } else if (options.dryRun) {
+    action.status = exists ? "would-replace" : "would-install";
   }
+  if (options.dryRun) return;
   if (exists) await requireSuccess(run, spec.command, spec.removeArgs, `remove existing ${key}`);
   await requireSuccess(run, spec.command, spec.args, `install ${key}`);
   state.managedMcp ??= {};
   state.managedMcp[key] = { agent: spec.agent, name: spec.name, kind: spec.kind, installedAt: new Date().toISOString() };
+}
+
+async function inspectWithCli(spec, run, key) {
+  const result = await run(spec.command, spec.getArgs);
+  const exists = inspectMcpExists(spec, result);
+  if (!exists && spec.inspectMode !== "list-json" && !/no mcp server|not found|does not exist/i.test(`${result.stdout}\n${result.stderr}`)) {
+    throw commandError(spec.command, spec.getArgs, result, `inspect ${key}`);
+  }
+  return { exists, registered: exists ? registeredLaunch(spec, result) : null };
+}
+
+// Claude's user-scope entry straight from its config file, read-only.
+async function readClaudeEntry(path, name) {
+  let text;
+  try {
+    text = await readFile(path, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return { exists: false, registered: null };
+    return { error: `could not read ${path}: ${error.message}` };
+  }
+  const config = parseJson(text);
+  if (!config || typeof config !== "object") return { error: `could not parse ${path}` };
+  const entry = config.mcpServers?.[name];
+  return { exists: Boolean(entry), registered: entry ? launchFields(entry) : null };
 }
 
 async function installBundledSkill(agent, { source, destinationRoot, options, state, actions, warnings }) {
@@ -665,12 +716,14 @@ function mcpSpec(agent, kind, identity) {
   const script = join(sourceDirectory, isControl ? "index.js" : "guide.js");
   const serverCommand = stableNodeCommand();
   const serverArgs = [script];
+  // What the host will launch, as opposed to the CLI call that registers it.
+  const launch = { command: serverCommand, args: serverArgs };
   if (agent === "codex") {
     const envArgs = isControl
       ? ["--env", `ACP_GATEWAY_CONTROL_TOKEN=${identity.token}`, "--env", `ACP_GATEWAY_ROOT_ID=${identity.rootId}`]
       : [];
     return {
-      agent, kind, name, command: "codex",
+      agent, kind, name, command: "codex", launch,
       getArgs: ["mcp", "get", name, "--json"],
       removeArgs: ["mcp", "remove", name],
       args: ["mcp", "add", ...envArgs, name, "--", serverCommand, ...serverArgs]
@@ -681,7 +734,7 @@ function mcpSpec(agent, kind, identity) {
       ? ["--env", `ACP_GATEWAY_CONTROL_TOKEN=${identity.token}`, "--env", `ACP_GATEWAY_ROOT_ID=${identity.rootId}`]
       : [];
     return {
-      agent, kind, name, command: "grok", inspectMode: "list-json",
+      agent, kind, name, command: "grok", inspectMode: "list-json", launch,
       getArgs: ["mcp", "list", "--json"],
       removeArgs: ["mcp", "remove", name],
       args: ["mcp", "add", "--scope", "user", ...envArgs, name, "--", serverCommand, ...serverArgs]
@@ -693,7 +746,7 @@ function mcpSpec(agent, kind, identity) {
       : {};
     const config = { type: "stdio", command: serverCommand, args: serverArgs, env };
     return {
-      agent, kind, name, command: "auggie", inspectMode: "list-json",
+      agent, kind, name, command: "auggie", inspectMode: "list-json", launch,
       getArgs: ["mcp", "list", "--json"],
       removeArgs: ["mcp", "remove", name],
       args: ["mcp", "add-json", name, JSON.stringify(config), "--replace"]
@@ -704,7 +757,7 @@ function mcpSpec(agent, kind, identity) {
     ? ["-e", `ACP_GATEWAY_CONTROL_TOKEN=${identity.token}`, "-e", `ACP_GATEWAY_ROOT_ID=${identity.rootId}`]
     : [];
   return {
-    agent, kind, name, command: "claude",
+    agent, kind, name, command: "claude", launch,
     getArgs: ["mcp", "get", name],
     removeArgs: ["mcp", "remove", "--scope", "user", name],
     args: ["mcp", "add", "--scope", "user", name, ...envArgs, "--", serverCommand, ...serverArgs]
@@ -721,6 +774,95 @@ function inspectMcpExists(spec, result) {
     return servers.some((item) => item?.name === spec.name);
   } catch (error) {
     throw new Error(`inspect ${spec.agent}:${spec.name} returned invalid JSON: ${error.message}`);
+  }
+}
+
+// The command and args an existing entry launches, read from the inspect
+// output; null fields mean that output does not say. Shapes, per CLI:
+//   codex  `mcp get --json`  {transport: {command, args, env}}
+//   grok   `mcp list --json` [{name, scope, command, args, env}]
+//   auggie `mcp list --json` {servers: [{name, source, transport: "stdio", command}]} (no args)
+//   claude `mcp get`         text lines "  Command: <cmd>" and "  Args: <args joined by spaces>"
+function registeredLaunch(spec, result) {
+  if (spec.inspectMode === "list-json") {
+    const parsed = parseJson(result.stdout);
+    const servers = (Array.isArray(parsed) ? parsed : parsed?.servers ?? []).filter((item) => item?.name === spec.name);
+    // A same-named project or registry entry can sit beside the user-scope one this installer adds.
+    return launchFields(servers.find((item) => item.scope === "user" || item.source === "user") ?? servers[0]);
+  }
+  if (spec.getArgs.includes("--json")) return launchFields(parseJson(result.stdout));
+  const command = /^[ \t]*Command:[ \t]*(.*?)[ \t]*$/m.exec(result.stdout)?.[1];
+  if (!command) return { command: null, args: null };
+  // Claude joins args with spaces, so the line is kept whole: the gateway
+  // registers exactly one argument, and extra ones then read as a difference.
+  const args = /^[ \t]*Args:[ \t]*(.*?)[ \t]*$/m.exec(result.stdout)?.[1];
+  return { command, args: args == null ? null : args ? [args] : [] };
+}
+
+function launchFields(entry) {
+  const holder = typeof entry?.command === "string"
+    ? entry
+    : entry?.transport && typeof entry.transport === "object" ? entry.transport : null;
+  const command = typeof holder?.command === "string" && holder.command ? holder.command : null;
+  const args = Array.isArray(holder?.args) && holder.args.every((arg) => typeof arg === "string") ? holder.args : null;
+  return { command, args };
+}
+
+function parseJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+// Whether a managed entry should launch this install instead: "repoint",
+// "keep", "keep-stale" (a pointer to an older gateway, kept with a warning), or
+// "unknown" when the inspect output does not say. Another manager
+// (AgenLynk's runtime/current) may own the registered path, so only an entry
+// that is provably stale moves, and never to an older gateway.
+async function repointDecision(registered, launch) {
+  const script = registered?.args?.length === 1 ? registered.args[0] : null;
+  if (!registered?.command || !script) return "unknown";
+  let resolved;
+  try {
+    resolved = await realpath(script);
+  } catch {
+    return "repoint";
+  }
+  // A path through a symlink is a pointer someone else moves forward. When it
+  // resolves to an older gateway the entry still stays, but says so: the
+  // pointer's manager (or --force) has to move it, and an OS alias such as
+  // /var -> /private/var must not hide a stale fixed path silently.
+  if (resolved !== script) {
+    const order = compareReleases(await gatewayVersionAt(dirname(resolved)), GATEWAY_VERSION);
+    return order !== null && order < 0 ? "keep-stale" : "keep";
+  }
+  if (await samePath(script, launch.args[0])) {
+    return await samePath(registered.command, launch.command) ? "keep" : "repoint";
+  }
+  const order = compareReleases(await gatewayVersionAt(dirname(script)), GATEWAY_VERSION);
+  if (order === null) return "unknown";
+  return order < 0 ? "repoint" : "keep";
+}
+
+// The GATEWAY_VERSION of the install a script belongs to, read as text: the
+// file is someone else's code, not something to import.
+async function gatewayVersionAt(directory) {
+  try {
+    const source = await readFile(join(directory, "version.js"), "utf8");
+    return /\bGATEWAY_VERSION\s*=\s*["']([^"']+)["']/.exec(source)?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function samePath(left, right) {
+  if (left === right) return true;
+  try {
+    return await realpath(left) === await realpath(right);
+  } catch {
+    return false;
   }
 }
 

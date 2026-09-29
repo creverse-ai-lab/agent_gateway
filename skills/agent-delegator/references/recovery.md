@@ -42,4 +42,4 @@ The host caches this MCP server's tool list for the life of a session, and a dae
 2. Reconnect the front door: Claude `/mcp reconnect` or a new session; Codex, Grok, Auggie need a new session.
 3. Verify: `agent_acp_run` is in the tool list, and no response carries `staleFrontDoor`.
 
-`staleFrontDoor` on a `setup` or `session_open` response reports `frontDoorVersion` and `gatewayVersion`. Do not parse either as semver to decide compatibility — they are release labels, and the check is exact equality.
+`staleFrontDoor` on a `setup` or `session_open` response reports `frontDoorVersion`, `gatewayVersion`, `action` and, when the two order, `reason`. Follow `action` rather than parsing the versions yourself. `reason: "front_door_older"` (or no `reason`) means reconnect as above. `reason: "gateway_older"` means the daemon predates the front door: reconnecting reattaches to the same daemon, so restart it when idle as `action` describes; the next `agent-acp` call starts the front door's version.

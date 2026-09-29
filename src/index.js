@@ -14,6 +14,7 @@ import {
 import { callerForCall, callerFromProcess } from "./caller.js";
 import { controlToken, rootId } from "./config.js";
 import { errorEnvelope } from "./errors.js";
+import { staleFrontDoorNotice } from "./front-door.js";
 import { GatewayRpcClient } from "./socket-rpc.js";
 import { PERMISSION_POLICIES } from "./acp-client.js";
 import { GATEWAY_VERSION } from "./version.js";
@@ -223,15 +224,9 @@ async function announceTask(extra, taskId) {
 function withFrontDoorNotice(method, result) {
   if (method !== "setup" && method !== "session_open" && method !== "session_restore") return result;
   if (typeof result?.gatewayVersion === "string") daemonVersion = result.gatewayVersion;
-  if (!daemonVersion || daemonVersion === GATEWAY_VERSION || !result || typeof result !== "object") return result;
-  return {
-    ...result,
-    staleFrontDoor: {
-      frontDoorVersion: GATEWAY_VERSION,
-      gatewayVersion: daemonVersion,
-      action: "reconnect the agent-acp MCP server"
-    }
-  };
+  if (!result || typeof result !== "object") return result;
+  const notice = staleFrontDoorNotice(GATEWAY_VERSION, daemonVersion);
+  return notice ? { ...result, staleFrontDoor: notice } : result;
 }
 
 // Who sent this one request. SDK 1.30 hands the raw params._meta to every

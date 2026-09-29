@@ -9,3 +9,20 @@ export const STATE_SCHEMA_VERSION = 5;
 // older daemon rolled back onto this machine reads it and recovers every session.
 // Retained through 1.5.x for explicit 1.4.0 rollback compatibility.
 export const LEGACY_STATE_SCHEMA_VERSION = 4;
+
+// Numeric major.minor.patch order of two release labels (-1, 0 or 1); null
+// when either does not parse. A suffix such as -rc.1 is ignored.
+export function compareReleases(left, right) {
+  const a = releaseParts(left);
+  const b = releaseParts(right);
+  if (!a || !b) return null;
+  for (let index = 0; index < 3; index += 1) {
+    if (a[index] !== b[index]) return a[index] < b[index] ? -1 : 1;
+  }
+  return 0;
+}
+
+function releaseParts(value) {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.+-]*)?$/.exec(String(value));
+  return match ? match.slice(1, 4).map(Number) : null;
+}
