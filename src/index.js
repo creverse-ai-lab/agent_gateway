@@ -360,6 +360,8 @@ function controlTools() {
           includeUsage: { type: "boolean", description: "Include result.usageSummary in the terminal envelope." },
           includeThoughts: { type: "boolean", description: "Include the bounded thought capture in the terminal result." },
           idempotencyKey: { type: "string", minLength: 1, maxLength: 256, description: "Retry-safe start. A repeat with the same key on the same session attaches to the existing durable run instead of prompting the worker again." },
+          parentTaskId: { type: "string", minLength: 1, description: "Start mode: the task this run follows up. Recorded on the task, never inferred; must be a task this Main can see." },
+          inputTaskIds: { type: "array", items: { type: "string", minLength: 1 }, minItems: 1, maxItems: 16, uniqueItems: true, description: "Start mode: tasks whose results you used to write this prompt. Same rules as parentTaskId; both are part of the idempotencyKey match." },
           ttl: { type: "integer", minimum: 0, description: "Milliseconds the Task handle stays collectable, measured from creation." },
           pollInterval: { type: "integer", minimum: 0, description: "Milliseconds the client should wait between status checks." }
         }
@@ -435,7 +437,8 @@ function controlTools() {
           action: { type: "string", enum: ["list", "get", "check", "close", "clean", "pin", "unpin", "workspace_diff"] },
           sessionId: { type: "string" },
           includeEvents: { type: "boolean" },
-          includeTranscript: { type: "boolean", description: "Include the narrated transcript (resultText) on get. Defaults to false; transcriptBytes always reports its size. The in-memory copy is bounded (maxTextBytes) - when it overflowed, resultArtifact points at the complete spill." }
+          includeTranscript: { type: "boolean", description: "Include the narrated transcript (resultText) on get. Defaults to false; transcriptBytes always reports its size. The in-memory copy is bounded (maxTextBytes) - when it overflowed, resultArtifact points at the complete spill." },
+          scope: { type: "string", enum: ["mine"], description: "list only: just the sessions you opened (openedBy matched by your session id, else your front door's instance id). INVALID_ARGUMENT when your front door sends no caller identity." }
         },
         required: ["action"]
       }

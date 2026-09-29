@@ -24,13 +24,14 @@ import {
   publicSession, SessionStore, workerSilence
 } from "./sessions.js";
 import { crashAfter, StateStore, WAL_TYPES } from "./state-store.js";
-import { taskInterruption, TaskStore, TERMINAL_TASK_STATUSES } from "./task-store.js";
+import { requireTaskLinks, taskInterruption, TaskStore, TERMINAL_TASK_STATUSES } from "./task-store.js";
 import { GATEWAY_API_VERSION, GATEWAY_VERSION, LEGACY_STATE_SCHEMA_VERSION, STATE_SCHEMA_VERSION } from "./version.js";
 
 import { authorizeCall, isReadOnlyCall } from "./access.js";
 import {
   ATTENTION_DEFAULT_LIMIT, ATTENTION_MAX_LIMIT, compareKeys as compareAttentionKeys, decodeAttentionCursor,
-  DEFAULT_ATTENTION_STALE_MS, encodeAttentionCursor, isTaskCreator, pageAfter, requestKey, requireAckTaskIds, updateKey
+  DEFAULT_ATTENTION_STALE_MS, encodeAttentionCursor, isSameCaller, isTaskCreator, pageAfter, requestKey, requireAckTaskIds,
+  updateKey
 } from "./attention.js";
 import { normalizeCaller } from "./caller.js";
 import { MANAGEMENT_CAPABILITIES, RUNTIME_IDENTITY } from "./runtime-identity.js";
@@ -1350,6 +1351,12 @@ export class GatewayService {
         "agent_acp_run starts a turn with {sessionId, prompt} or attaches to one with {taskId}, never both"
       );
     }
+    if (attaching && hasTaskLinks(args)) {
+      throw new GatewayError(
+        ERROR_CODES.INVALID_ARGUMENT,
+        "parentTaskId and inputTaskIds describe a new run; attaching with {taskId} starts nothing to link"
+      );
+    }
     // 55s stays under the SDK host's 60s default tool timeout, so an ordinary
     // wait fails on OUR terms (a legible ok:true handoff) rather than as a
     // transport timeout the gateway never gets to explain.
@@ -1383,13 +1390,25 @@ export class GatewayService {
 
   async #startRunTask(args, context) {
     const session = requireOwnedSession(this.requireSession(args.sessionId), context);
+    // Shape first: the links are part of the retry digest.
+    const links = this.#storeCall(() => requireTaskLinks(args));
     const existing = this.#idempotentRun(session, args.idempotencyKey);
     if (existing) {
+      // A retry naming the run its key already started would make that run
+      // its own parent or input.
+      if (links.parentTaskId === existing || links.inputTaskIds?.includes(existing)) {
+        throw new GatewayError(
+          ERROR_CODES.INVALID_ARGUMENT,
+          `A task cannot reference itself: idempotencyKey ${args.idempotencyKey} already names ${existing}`,
+          { taskId: existing }
+        );
+      }
       // Same key, different work: attaching would hand back another prompt's
-      // result and silently drop this one. Tasks from before the digest existed
-      // carry none and keep the old attach behaviour.
+      // result and silently drop this one. Links are part of the work, so a
+      // retry with other links conflicts too. Tasks from before the digest
+      // existed carry none and keep the old attach behaviour.
       const stored = this.taskStore.find(existing)?.requestDigest;
-      if (stored && stored !== runRequestDigest(args)) {
+      if (stored && stored !== runRequestDigest(args, links)) {
         throw new GatewayError(
           ERROR_CODES.IDEMPOTENCY_CONFLICT,
           `idempotencyKey ${args.idempotencyKey} already names a different run on this session`,
@@ -1484,6 +1503,14 @@ export class GatewayService {
   }
 
   async sessionPrompt(args, context) {
+    // A plain prompt mints no Task, so there is no record to carry the links.
+    // Refused rather than dropped: Main would believe they were recorded.
+    if (hasTaskLinks(args)) {
+      throw new GatewayError(
+        ERROR_CODES.INVALID_ARGUMENT,
+        "parentTaskId and inputTaskIds are recorded on a Task; use agent_acp_run (prompt creates no task)"
+      );
+    }
     const session = this.#admitTurn(args, context);
     try {
       return await this.#queueFor(session).run("prompt", () => this.#promptLocked(session, args, context));
@@ -1611,6 +1638,8 @@ export class GatewayService {
   // `origin` is a parameter, not an argument: a wire caller must not be able to
   // claim a handle came from agent_acp_run when it came from a prompt.
   async taskPrompt(args, context, origin = "prompt") {
+    // Before admission, so a bad link costs no reservation.
+    const links = this.#visibleTaskLinks(args, context);
     const session = this.#admitTurn(args, context);
     // Everything past admission is inside the finally: a budget rejection must
     // release the reservation, or one refused task would leave the session
@@ -1627,9 +1656,10 @@ export class GatewayService {
         pollInterval: args.pollInterval,
         origin,
         idempotencyKey: origin === "run" ? args.idempotencyKey : null,
-        requestDigest: origin === "run" && args.idempotencyKey ? runRequestDigest(args) : null,
+        requestDigest: origin === "run" && args.idempotencyKey ? runRequestDigest(args, links) : null,
         // Whose result this is: only this Main's delivery marks it seen.
-        caller: this.#attributed(context)
+        caller: this.#attributed(context),
+        links
       }));
       this.#rememberDelivery(task.taskId, args);
       // The barrier is BEFORE the ACP turn starts. After it, a crash can only
@@ -1713,13 +1743,16 @@ export class GatewayService {
 
   async taskList(args = {}, context = {}) {
     const ownerRootId = requireRoot(context);
-    const paged = args?.cursor != null || args?.limit != null || args?.status != null;
+    const where = this.#taskListFilter(args ?? {}, context);
+    // A filter is a new-style request, like status: it answers paged.
+    const paged = args?.cursor != null || args?.limit != null || args?.status != null || where != null;
     if (paged) {
       const page = this.#storeCall(() => this.taskStore.listPage({
         ownerRootId,
         cursor: args.cursor ?? null,
         limit: args.limit,
-        status: args.status
+        status: args.status,
+        where
       }));
       return { tasks: page.tasks.map((task) => this.publicTask(task)), nextCursor: page.nextCursor };
     }
@@ -1735,6 +1768,56 @@ export class GatewayService {
       cursor = page.nextCursor;
     } while (cursor);
     return { tasks };
+  }
+
+  // task_list's additive filters, ANDed; null when none was given.
+  #taskListFilter(args, context) {
+    const parentTaskId = optionalString(args.parentTaskId, "parentTaskId");
+    const callerSessionId = optionalString(args.callerSessionId, "callerSessionId");
+    const callerInstanceId = optionalString(args.callerInstanceId, "callerInstanceId");
+    const mine = this.#scopeMine(args.scope, context);
+    const tests = [
+      parentTaskId && ((task) => task.parentTaskId === parentTaskId),
+      callerSessionId && ((task) => task.caller?.sessionId === callerSessionId),
+      callerInstanceId && ((task) => task.caller?.instanceId === callerInstanceId),
+      mine && ((task) => isSameCaller(task.caller, mine))
+    ].filter(Boolean);
+    return tests.length ? (task) => tests.every((matches) => matches(task)) : null;
+  }
+
+  // scope "mine" (opt-in, session list and task_list): records whose recorded
+  // caller is the requester, by the creator rule. Unattributed records are
+  // nobody's. A requester the Gateway cannot identify (no caller, or an
+  // observer) is refused rather than answered with an empty list that would
+  // read as "you have nothing".
+  #scopeMine(scope, context) {
+    if (scope == null) return null;
+    if (scope !== "mine") throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "scope must be \"mine\"");
+    const requester = this.#requester(context);
+    if (!requester) {
+      throw new GatewayError(
+        ERROR_CODES.INVALID_ARGUMENT,
+        "scope \"mine\" needs a caller identity, which this request does not carry (observer, or a pre-1.6 front door)"
+      );
+    }
+    return requester;
+  }
+
+  // The links a new task declares, each id checked against this root. Every
+  // unknown id is named at once; another root's task counts as unknown.
+  #visibleTaskLinks(args, context) {
+    const links = this.#storeCall(() => requireTaskLinks(args));
+    const rootId = requireRoot(context);
+    const ids = [...new Set([links.parentTaskId, ...(links.inputTaskIds ?? [])].filter(Boolean))];
+    const unknown = ids.filter((taskId) => this.taskStore.find(taskId)?.ownerRootId !== rootId);
+    if (unknown.length) {
+      throw new GatewayError(
+        ERROR_CODES.INVALID_ARGUMENT,
+        `parentTaskId/inputTaskIds name tasks this Main cannot see: ${unknown.join(", ")}`,
+        { unknownTaskIds: unknown }
+      );
+    }
+    return links;
   }
 
   async taskResult(args, context) {
@@ -2240,10 +2323,11 @@ export class GatewayService {
   async sessionManage(args, context) {
     const root = requireRoot(context);
     if (args.action === "list") {
+      const mine = this.#scopeMine(args.scope, context);
       return {
         ok: true,
         sessions: this.store.list()
-          .filter((item) => item.ownerRootId === root)
+          .filter((item) => item.ownerRootId === root && (!mine || isSameCaller(item.openedBy, mine)))
           .map((item) => this.#publicSession(item))
       };
     }
@@ -2713,7 +2797,10 @@ export class GatewayService {
       // handle keeps its exact shape.
       ...(task.interruption ? { interruption: task.interruption } : {}),
       // Additive (1.7.0): the Main that created the task, only when it said so.
-      ...(task.caller ? { caller: { ...task.caller } } : {})
+      ...(task.caller ? { caller: { ...task.caller } } : {}),
+      // Additive (1.7.0): links the creating Main declared, only when it did.
+      ...(task.parentTaskId ? { parentTaskId: task.parentTaskId } : {}),
+      ...(task.inputTaskIds?.length ? { inputTaskIds: [...task.inputTaskIds] } : {})
     };
   }
 
@@ -3618,11 +3705,20 @@ function clientFingerprint(config) {
 // What makes two runs "the same work" for idempotency: the prompt and the model
 // that runs it. Wait and budget options only shape how the caller reads the
 // result, so a retry may change them freely.
-function runRequestDigest(args) {
+// Links join the digest only when present, so a run without them hashes as it
+// did before they existed (digests are durable). inputTaskIds is a set.
+function runRequestDigest(args, links = {}) {
   return createHash("sha256")
-    .update(JSON.stringify({ prompt: args.prompt ?? null, model: args.model ?? null }))
+    .update(JSON.stringify({
+      prompt: args.prompt ?? null,
+      model: args.model ?? null,
+      ...(links.parentTaskId ? { parentTaskId: links.parentTaskId } : {}),
+      ...(links.inputTaskIds ? { inputTaskIds: [...links.inputTaskIds].sort() } : {})
+    }))
     .digest("hex");
 }
+
+const hasTaskLinks = (args) => args?.parentTaskId != null || args?.inputTaskIds != null;
 
 function findModelOption(configOptions) {
   if (!Array.isArray(configOptions)) return null;

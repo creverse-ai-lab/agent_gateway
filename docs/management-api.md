@@ -105,9 +105,16 @@ Since 1.6.0 a control request may carry `caller: {provider, sessionId, pid, inst
 - Only `control` connections are recorded. An `observer`'s `caller` is ignored. A malformed `caller` drops attribution, never the call.
 - `sessionId` can go stale when the CLI switches sessions (for example Claude `/clear`) while the MCP server keeps running; `pid` and `instanceId` stay valid.
 
+## Task links and scope
+
+- `run`, `task_prompt` and `task_run` accept `parentTaskId` (the task this one follows up) and `inputTaskIds` (1 to 16 unique ids of tasks whose results went into the prompt). Every id must name a task on the caller's root; otherwise `INVALID_ARGUMENT` with `details.unknownTaskIds`, and nothing starts. The Gateway records them as declared and never infers links. `prompt` creates no task, so it refuses them, as does a `run` attach (`{taskId}`).
+- Task reads carry `parentTaskId`/`inputTaskIds` only when declared. They survive restarts.
+- `task_list` filters `parentTaskId`, `callerSessionId`, `callerInstanceId` combine with `status` and paging. Any of them selects the paged response.
+- `scope:"mine"` on `session list` and `task_list` keeps records whose `openedBy`/`caller` is the requester: session ids decide when both sides have one, else `instanceId`. Records with no caller are nobody's. A Codex front door that sends no thread id matches by `instanceId`, so its threads are one Main. A request without a caller (observer, pre-1.6.0 front door) gets `INVALID_ARGUMENT`. Without `scope` the lists are unchanged.
+
 ## Idempotency and worker errors
 
-A `run` whose `idempotencyKey` already names a run on the same session attaches only when the prompt and model digest match. Otherwise it fails with `IDEMPOTENCY_CONFLICT`, and `details.taskId` holds the existing task. Changing `waitMs` or `resultBudgetBytes` on a retry is not a conflict. Runs recorded before 1.5.2 carry no digest and keep the old attach behavior.
+A `run` whose `idempotencyKey` already names a run on the same session attaches only when the prompt, model and declared links digest match (input order aside). Otherwise it fails with `IDEMPOTENCY_CONFLICT`, and `details.taskId` holds the existing task. Changing `waitMs` or `resultBudgetBytes` on a retry is not a conflict. Runs recorded before 1.5.2 carry no digest and keep the old attach behavior.
 
 A JSON-RPC error from the worker becomes `ACP_ERROR`, or `UNKNOWN_SESSION` for a `session/load|resume` of a session the worker does not know. The message keeps the historical `ACP error <code>: <message>` text, and `details.{method,acpCode,acpMessage,acpData?}` preserve the original.
 

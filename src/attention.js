@@ -21,10 +21,20 @@ export const ACK_SKIP_REASONS = Object.freeze(["unknown_task", "not_task_owner",
  * requester with no caller can prove nothing and matches only those.
  */
 export function isTaskCreator(creator, requester) {
-  if (!creator) return true;
-  if (!requester) return false;
-  if (creator.sessionId && requester.sessionId) return creator.sessionId === requester.sessionId;
-  return creator.instanceId === requester.instanceId;
+  return !creator || isSameCaller(creator, requester);
+}
+
+/**
+ * The same rule without the unattributed pass: whether a recorded caller
+ * (task.caller, session.openedBy) is `requester`. What scope "mine" filters on,
+ * so a record no Main is recorded for is nobody's. An old Codex front door that
+ * sends no thread id falls back to its instanceId, so every thread of that one
+ * process is the same Main.
+ */
+export function isSameCaller(recorded, requester) {
+  if (!recorded || !requester) return false;
+  if (recorded.sessionId && requester.sessionId) return recorded.sessionId === requester.sessionId;
+  return recorded.instanceId === requester.instanceId;
 }
 
 // Oldest first for both lists. A request is keyed by when it was raised, an

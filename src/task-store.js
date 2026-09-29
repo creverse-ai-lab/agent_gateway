@@ -47,6 +47,44 @@ function sanitizeCaller(value) {
 
 const isIsoDate = (value) => typeof value === "string" && Number.isFinite(Date.parse(value));
 
+// Links a Main declares when it creates a task (1.7.0): parentTaskId, the task
+// this one follows up, and inputTaskIds, the tasks whose results went into this
+// prompt. Declared, never inferred. Whether the ids name visible tasks is the
+// gateway's check; the store owns only their shape.
+export const MAX_INPUT_TASK_IDS = 16;
+const isLinkId = (value) => typeof value === "string" && value.trim() !== "" && value.length <= 256;
+
+/** The links in a request, shape-checked. Only the keys that are present. */
+export function requireTaskLinks({ parentTaskId = null, inputTaskIds = null } = {}) {
+  if (parentTaskId != null && !isLinkId(parentTaskId)) {
+    throw taskError("INVALID_ARGUMENT", "parentTaskId must be a non-empty string of at most 256 characters");
+  }
+  if (inputTaskIds != null) {
+    if (!Array.isArray(inputTaskIds) || inputTaskIds.length === 0 || inputTaskIds.length > MAX_INPUT_TASK_IDS
+      || !inputTaskIds.every(isLinkId)) {
+      throw taskError("INVALID_ARGUMENT", `inputTaskIds must be an array of 1 to ${MAX_INPUT_TASK_IDS} task ids`);
+    }
+    if (new Set(inputTaskIds).size !== inputTaskIds.length) {
+      throw taskError("INVALID_ARGUMENT", "inputTaskIds must not repeat a task id");
+    }
+  }
+  return {
+    ...(parentTaskId != null ? { parentTaskId } : {}),
+    ...(inputTaskIds != null ? { inputTaskIds: [...inputTaskIds] } : {})
+  };
+}
+
+// From disk a bad link is dropped, never the handle it hangs on.
+function sanitizeLinks(raw) {
+  const inputs = Array.isArray(raw.inputTaskIds)
+    ? [...new Set(raw.inputTaskIds.filter(isLinkId))].slice(0, MAX_INPUT_TASK_IDS)
+    : [];
+  return {
+    ...(isLinkId(raw.parentTaskId) ? { parentTaskId: raw.parentTaskId } : {}),
+    ...(inputs.length ? { inputTaskIds: inputs } : {})
+  };
+}
+
 function taskError(code, message) {
   const error = new Error(message);
   error.code = code;
@@ -214,7 +252,10 @@ export class TaskStore {
       statusMessage = DEFAULT_STATUS_MESSAGE,
       // The Main that asked for the work. Absent for a caller that said nothing
       // (pre-1.6 front doors), which keeps that handle's shape unchanged.
-      caller = null
+      caller = null,
+      // {parentTaskId?, inputTaskIds?}, already checked against the root by
+      // the gateway. Absent keys stay absent on the record.
+      links = null
     } = options ?? {};
     requireNonEmptyString(sessionId, "sessionId");
     requireNonEmptyString(ownerRootId, "ownerRootId");
@@ -230,6 +271,7 @@ export class TaskStore {
     const normalizedTtl = this.#normalizeTtl(ttl, true);
     const normalizedPollInterval = this.#normalizePollInterval(pollInterval, true);
     const recordedCaller = sanitizeCaller(caller);
+    const recordedLinks = requireTaskLinks(links ?? {});
 
     // Sweep before inserting (never after): expired records release budget slots,
     // and create() must still return the handle it just minted even when ttl=0
@@ -268,6 +310,7 @@ export class TaskStore {
       ...(origin === "run" && idempotencyKey ? { idempotencyKey } : {}),
       ...(origin === "run" && idempotencyKey && typeof requestDigest === "string" ? { requestDigest } : {}),
       ...(recordedCaller ? { caller: recordedCaller } : {}),
+      ...recordedLinks,
       result: null
     };
     this.#tasks.set(record.taskId, record);
@@ -497,9 +540,12 @@ export class TaskStore {
   }
 
   listPage(options = {}) {
-    const { ownerRootId, cursor = null, limit = 50, status } = options ?? {};
+    // `where` narrows further (the gateway's caller and link filters). It is
+    // applied before paging, so the keyset cursor stays exact.
+    const { ownerRootId, cursor = null, limit = 50, status, where = null } = options ?? {};
     // Root scoping is mandatory: there is no "list everything" mode.
     requireNonEmptyString(ownerRootId, "ownerRootId");
+    if (where != null && typeof where !== "function") throw taskError("INVALID_ARGUMENT", "where must be a function");
     if (limit != null && (typeof limit !== "number" || Number.isNaN(limit))) {
       throw taskError("INVALID_ARGUMENT", "limit must be a number");
     }
@@ -509,7 +555,8 @@ export class TaskStore {
     this.expireSweep();
 
     const matching = [...this.#tasks.values()]
-      .filter((record) => record.ownerRootId === ownerRootId && (!wanted || wanted.has(record.status)))
+      .filter((record) => record.ownerRootId === ownerRootId && (!wanted || wanted.has(record.status))
+        && (!where || where(snapshot(record))))
       .sort(compareRecords)
       .filter((record) => isAfterCursor(record, decoded));
     const page = matching.slice(0, effectiveLimit).map(snapshot);
@@ -670,6 +717,7 @@ export class TaskStore {
     if (typeof createdAt !== "string" || !Number.isFinite(Date.parse(createdAt))) return null;
     const interruption = sanitizeInterruption(raw.interruption);
     const caller = sanitizeCaller(raw.caller);
+    const links = sanitizeLinks(raw);
     return {
       taskId,
       sessionId,
@@ -704,6 +752,7 @@ export class TaskStore {
       }),
       ...(interruption ? { interruption } : {}),
       ...(caller ? { caller } : {}),
+      ...links,
       // Only a terminal record can have been delivered.
       ...(TERMINAL_TASK_STATUSES.has(status) && isIsoDate(raw.seenAt) ? { seenAt: raw.seenAt } : {}),
       result: raw.result ?? null

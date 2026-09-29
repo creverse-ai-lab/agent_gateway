@@ -674,6 +674,12 @@ test("C18: the create and the result commit each raise the fsync counter", async
         `create must barrier: ${before.fsyncCount} -> ${afterCreate.fsyncCount}`
       );
       assert.ok(afterCreate.walSeq > before.walSeq);
+      // The worker raises the permission after task_prompt has answered, so a
+      // loaded machine can still show "working" here for a moment.
+      for (let attempt = 0; attempt < 60; attempt += 1) {
+        if ((await client.call("task_get", { taskId: task.taskId })).status === "input_required") break;
+        await new Promise((done) => setTimeout(done, 25));
+      }
       assert.equal((await client.call("task_get", { taskId: task.taskId })).status, "input_required");
 
       const pending = (await client.call("inbox", { action: "list", status: "pending" })).items[0];
