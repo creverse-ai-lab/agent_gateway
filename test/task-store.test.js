@@ -603,7 +603,12 @@ test("recover converts in-flight records with the legacy restart message", () =>
     const record = store.get(id);
     assert.equal(record.status, "failed");
     assert.equal(record.statusMessage, "Gateway restarted before this task completed");
-    assert.deepEqual(record.result, { ok: false, error: "Gateway restarted before this task completed" });
+    // GOLDEN DIFF (1.7.0 W4): the legacy result keeps its exact wording and
+    // gains what is known about the worker. These records were never stamped as
+    // dispatched, so the worker cannot have acted on them. Additive.
+    const interruption = { reason: "gateway_restarted", executionOutcome: "not_started", at: iso(5_000) };
+    assert.deepEqual(record.interruption, interruption);
+    assert.deepEqual(record.result, { ok: false, error: "Gateway restarted before this task completed", interruption });
     assert.equal(record.lastUpdatedAt, iso(5_000), "only failed conversions bump lastUpdatedAt");
     assert.equal(record.createdAt, iso(0), "the TTL anchor survives recovery");
   }

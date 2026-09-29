@@ -286,11 +286,13 @@ test("T4: the profiles are a containment chain, not three independent shapes", a
     // GOLDEN DIFF (1.7.0 W3): diagnostic also carries the status reason and the
     // worker-activity facts, which current and compact leave out (Quiet), plus
     // silentForMs, the number stallSuspected is decided from. Additive.
+    // GOLDEN DIFF (1.7.0 W4): and the restore facts, generation and
+    // lastRestore, which current and compact leave out too. Additive.
     assert.deepEqual(
       Object.keys(diagnostic).filter((key) => !Object.hasOwn(current, key)).sort(),
       [
-        "illegalTransitions", "lastWorkerActivityAt", "pending", "queue", "silentForMs", "stallSuspected",
-        "statusChangedAt", "statusReason"
+        "generation", "illegalTransitions", "lastRestore", "lastWorkerActivityAt", "pending", "queue", "silentForMs",
+        "stallSuspected", "statusChangedAt", "statusReason"
       ]
     );
     // Explicit "current" is the same object as no argument at all.

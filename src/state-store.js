@@ -456,6 +456,9 @@ export class StateStore {
         task.statusMessage = payload?.statusMessage ?? task.statusMessage;
         task.lastUpdatedAt = payload?.lastUpdatedAt ?? task.lastUpdatedAt;
         task.result = this.#materializeResult(key, payload);
+        // Additive (1.7.0): kept beside the result, so a result that comes back
+        // only as a degraded preview still says how the task was cut short.
+        if (payload?.interruption) task.interruption = payload.interruption;
         return true;
       }
       case WAL_TYPES.TASK_REMOVED:

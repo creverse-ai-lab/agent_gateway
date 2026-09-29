@@ -428,11 +428,11 @@ function controlTools() {
     },
     {
       name: "agent_acp_session",
-      description: "List, inspect, close, or clean sessions owned by this Main. workspace_diff returns the patch from the original cwd to a snapshot session's copy.",
+      description: "List, inspect, check, close, or clean sessions owned by this Main. workspace_diff returns the patch from the original cwd to a snapshot session's copy. check is read-only and starts nothing: {restorable: restorable|restorable_with_caveats|not_restorable|unknown, method: live|resume|load|null, caveats: [code]}. A failed restore never opens a fresh session. A task the Gateway cut short carries interruption {reason, executionOutcome: not_started|unknown, at} and its result lists next steps; nothing is re-run for you.",
       inputSchema: {
         type: "object",
         properties: {
-          action: { type: "string", enum: ["list", "get", "close", "clean", "pin", "unpin", "workspace_diff"] },
+          action: { type: "string", enum: ["list", "get", "check", "close", "clean", "pin", "unpin", "workspace_diff"] },
           sessionId: { type: "string" },
           includeEvents: { type: "boolean" },
           includeTranscript: { type: "boolean", description: "Include the narrated transcript (resultText) on get. Defaults to false; transcriptBytes always reports its size. The in-memory copy is bounded (maxTextBytes) - when it overflowed, resultArtifact points at the complete spill." }

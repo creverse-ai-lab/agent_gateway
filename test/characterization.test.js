@@ -31,7 +31,13 @@ const PUBLIC_SESSION_KEYS = [
 // an update, and whether a running turn has been silent past stallHintMs. The
 // poll envelope below does NOT gain them (Quiet): it still spreads exactly
 // PUBLIC_SESSION_KEYS. Additive; nothing renamed or removed.
-const SESSION_READ_MODEL_KEYS = ["statusReason", "statusChangedAt", "lastWorkerActivityAt", "stallSuspected"];
+// GOLDEN DIFF (1.7.0 W4): two more read-model facts on the same projections:
+// generation (1 at open, +1 per successful restore) and lastRestore ({at,
+// method, outcome, errorCode} or null). Poll still spreads exactly
+// PUBLIC_SESSION_KEYS. Additive.
+const SESSION_READ_MODEL_KEYS = [
+  "statusReason", "statusChangedAt", "lastWorkerActivityAt", "stallSuspected", "generation", "lastRestore"
+];
 const ACTIVE_POLL_KEYS = sorted([
   "ok", ...PUBLIC_SESSION_KEYS, "nextCursor", "cursorTruncated", "events", "filteredCount"
 ]);
@@ -198,6 +204,8 @@ test("characterization: session get and list carry the poll envelope plus the re
     assert.equal(listed.statusReason, "session_created");
     assert.equal(listed.lastWorkerActivityAt, null);
     assert.equal(listed.stallSuspected, false);
+    assert.equal(listed.generation, 1);
+    assert.equal(listed.lastRestore, null);
   } finally {
     await service.shutdown().catch(() => {});
   }

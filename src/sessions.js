@@ -498,6 +498,12 @@ export class SessionStore {
       statusReason: session.statusReason ?? null,
       statusChangedAt: session.statusChangedAt ?? null,
       lastWorkerActivityAt: session.lastWorkerActivityAt ?? null,
+      // Additive (1.7.0): the restore history a check or a restarted Gateway
+      // reads, plus what the provider said it can restore with at the last
+      // initialize, so a check after a restart needs no provider process.
+      generation: session.generation ?? 1,
+      lastRestore: session.lastRestore ?? null,
+      restoreCapabilities: session.restoreCapabilities ?? null,
       // Additive: a capture policy chosen per session must survive a restart, or
       // a restored session silently reverts to the gateway default.
       thoughtCapture: session.thoughtCapture ?? null,
@@ -633,7 +639,8 @@ function timeOrNone(value) {
 // Read-model facts: session get/list and the diagnostic poll carry them, the
 // default and compact polls never do (Quiet).
 export const POLL_OMITTED_SESSION_KEYS = Object.freeze([
-  "statusReason", "statusChangedAt", "lastWorkerActivityAt", "stallSuspected", "attribution"
+  "statusReason", "statusChangedAt", "lastWorkerActivityAt", "stallSuspected", "generation", "lastRestore",
+  "attribution"
 ]);
 
 export function publicSession(session, { now = Date.now(), stallHintMs = DEFAULT_STALL_HINT_MS } = {}) {
@@ -655,6 +662,11 @@ export function publicSession(session, { now = Date.now(), stallHintMs = DEFAULT
     // running turn has been silent past stallHintMs. A hint, never a status.
     lastWorkerActivityAt: session.lastWorkerActivityAt ?? null,
     stallSuspected: workerSilence(session, now, stallHintMs).stallSuspected,
+    // Additive (1.7.0): how many ACP connections this record has had (1 at
+    // open, +1 per successful restore), and how the last restore went. A
+    // record written before 1.7 has had one as far as anyone can tell.
+    generation: session.generation ?? 1,
+    lastRestore: session.lastRestore ?? null,
     turnId: session.turnId,
     stopReason: session.stopReason,
     error: session.error,

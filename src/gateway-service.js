@@ -5,7 +5,7 @@ import { stat } from "node:fs/promises";
 import { AcpClient, PERMISSION_POLICIES, requirePermissionPolicy } from "./acp-client.js";
 import { ArtifactStore, defaultArtifactRoot } from "./artifacts.js";
 import { utf8ByteHead } from "./bounded-utf8.js";
-import { ERROR_CODES, GatewayError } from "./errors.js";
+import { ERROR_CODES, GatewayError, isGatewayErrorCode } from "./errors.js";
 import {
   assertProviderEnabled, currentModelId, detectProviders, isGrokProvider, partialPolicyEnforcement, providerConfig,
   setProviderEnabled, workerSessionMeta
@@ -24,7 +24,7 @@ import {
   publicSession, SessionStore, workerSilence
 } from "./sessions.js";
 import { crashAfter, StateStore, WAL_TYPES } from "./state-store.js";
-import { TaskStore, TERMINAL_TASK_STATUSES } from "./task-store.js";
+import { taskInterruption, TaskStore, TERMINAL_TASK_STATUSES } from "./task-store.js";
 import { GATEWAY_API_VERSION, GATEWAY_VERSION, LEGACY_STATE_SCHEMA_VERSION, STATE_SCHEMA_VERSION } from "./version.js";
 
 import { authorizeCall, isReadOnlyCall } from "./access.js";
@@ -96,6 +96,19 @@ const CLOSED_STATUSES = new Set(["closed"]);
 // A live client is not enough to start work in these states: the record is
 // known to be out of sync with the worker, so it has to be resumed first.
 const RESTORE_REQUIRED_STATUSES = new Set(["disconnected", "unavailable"]);
+const RESTORE_OUTCOMES = new Set(["resumed", "loaded", "failed"]);
+// session check's stable caveat codes, split by what they do to the verdict:
+// a blocking one means a restore is known to fail, an undecided one means the
+// Gateway cannot tell without trying, and the rest only warn.
+export const CHECK_CAVEATS = Object.freeze([
+  "session_closed", "acp_session_id_missing", "provider_not_installed", "provider_restore_unsupported",
+  "cwd_missing", "workspace_missing", "provider_capabilities_unknown", "restore_in_progress", "last_restore_failed"
+]);
+const CHECK_BLOCKING_CAVEATS = new Set([
+  "session_closed", "acp_session_id_missing", "provider_not_installed", "provider_restore_unsupported",
+  "cwd_missing", "workspace_missing"
+]);
+const CHECK_UNDECIDED_CAVEATS = new Set(["provider_capabilities_unknown", "restore_in_progress"]);
 const CONTROL_SERVER_PATTERN = /(?:acp-gateway-control|acp-mcp-bridge|gateway-daemon|control-mcp)/i;
 // The calls that record a caller. One of them arriving over the control socket
 // with no caller is work nobody can attribute; management calls (admin CLI,
@@ -159,11 +172,15 @@ export class GatewayService {
     // injects its own client factory, unless asked for explicitly.
     grokSandbox = createClient == null,
     grokSandboxDir = null,
+    // What session check reads for "is the provider installed". Injectable so a
+    // test does not depend on what this machine happens to have on PATH.
+    providerDetector = detectProviders,
     now = () => Date.now()
   } = {}) {
     this.workspaceRoot = workspaceRoot;
     this.grokSandbox = grokSandbox;
     this.grokSandboxDir = grokSandboxDir;
+    this.providerDetector = providerDetector;
     this.settings = settings;
     this.protectedPaths = protectedPaths
       ?? gatewayProtectedPaths(statePath ? { statePath } : {});
@@ -313,6 +330,11 @@ export class GatewayService {
         // A checkpoint written before this field existed restores on the current
         // gateway default rather than on a hardcoded one.
         thoughtCapture: normalizeThoughtCapture(record.thoughtCapture, this.observability.thoughtCapture),
+        // A checkpoint from before 1.7 has had one connection as far as anyone
+        // can tell, no restore on record, and no capabilities a check can use.
+        generation: Number.isInteger(record.generation) && record.generation >= 1 ? record.generation : 1,
+        lastRestore: normalizeLastRestore(record.lastRestore),
+        restoreCapabilities: normalizeRestoreCapabilities(record.restoreCapabilities),
         // No worker survived the restart, so no session owns a live handle. The
         // task's own restart conversion below is what the caller observes.
         activeTaskId: null,
@@ -321,8 +343,11 @@ export class GatewayService {
     }
     // The store owns the restart conversion (in-flight -> failed with the
     // legacy message) and drops handles whose TTL elapsed while we were down.
-    // Replay has already folded the WAL into these records as plain data.
-    this.taskStore.recover(loaded.tasks);
+    // Replay has already folded the WAL into these records as plain data. The
+    // sessions are loaded first so the conversion can name what Main may do next.
+    this.taskStore.recover(loaded.tasks, {
+      next: (record, interruption) => this.#interruptionNext(record.sessionId, interruption)
+    });
     for (const record of loaded.inbox) {
       const item = compactRecoveredInbox(record, this.resourceLimits.maxInboxItemBytes);
       // An ACP permission request is tied to the old worker process. It cannot
@@ -884,12 +909,14 @@ export class GatewayService {
     }
   }
 
-  async sessionRestore(args, context, existing = null) {
-    if (existing) return this.restoreSession(args, context, existing);
+  async sessionRestore(args, context, existing = null, attempt = null) {
+    if (existing) return this.restoreSession(args, context, existing, attempt);
     return this.withSessionAdmission(requireProvider(args.provider), context, () => this.restoreSession(args, context));
   }
 
-  async restoreSession(args, context, existing = null) {
+  // attempt, when given, learns the method as soon as it is chosen, so a
+  // restore that fails after that point can still say what it tried.
+  async restoreSession(args, context, existing = null, attempt = null) {
     const provider = requireProvider(args.provider ?? existing?.provider);
     if (!existing) assertProviderEnabled(provider);
     const cwd = await requireDirectory(args.cwd ?? existing?.cwd);
@@ -901,6 +928,7 @@ export class GatewayService {
       args.permissionPolicy ?? existing?.permissionPolicy ?? "ask"
     );
     const method = restoreMethod(client.initResult, args.method ?? "auto");
+    if (attempt) attempt.method = method;
     const restored = await client.sessionRestore({
       method: `session/${method}`,
       sessionId: acpSessionId,
@@ -938,8 +966,13 @@ export class GatewayService {
         }
         if (args.pinned != null) existing.pinned = args.pinned === true;
         existing.orphanedAt = null;
+        // Same ACP session id, new connection: the counter is how a reader tells
+        // the worker it talked to before from the one it talks to now.
+        existing.generation = (existing.generation ?? 1) + 1;
+        existing.lastRestore = restoreRecord(this.now(), method);
+        existing.restoreCapabilities = restoreCapabilitiesOf(client.initResult);
         client.onSessionUpdate(acpSessionId, (update) => this.handleUpdate(existing, update));
-        this.store.push(existing, { type: "session_restored", method });
+        this.store.push(existing, { type: "session_restored", method, outcome: existing.lastRestore.outcome });
         return {
           ok: true,
           ...this.#publicSession(existing),
@@ -1027,6 +1060,11 @@ export class GatewayService {
       statusReason: "session_created",
       statusChangedAt: new Date(this.now()).toISOString(),
       lastWorkerActivityAt: null,
+      // An explicit restore mints a new record too: its first connection is
+      // generation 1, and the restore that made it is its last restore.
+      generation: 1,
+      lastRestore: fields.restoredWith ? restoreRecord(this.now(), fields.restoredWith) : null,
+      restoreCapabilities: restoreCapabilitiesOf(fields.client.initResult),
       ...(fields.workspace ? { workspace: fields.workspace } : {}),
       // Set once, like ownerRootId: the Main that opened (or first restored)
       // the session. A later restore by another Main does not rewrite history.
@@ -1091,11 +1129,15 @@ export class GatewayService {
     return start;
   }
 
+  // A failed resume ends here, at unavailable. It never falls back to
+  // session/new: a fresh session would silently drop everything the worker
+  // knew, and whether to start over is Main's call.
   async #restoreLocked(session, context) {
     this.#setStatus(session, "restoring", "session_restore_start");
     this.store.push(session, { type: "session_restore_start" });
+    const attempt = { method: null };
     try {
-      await this.sessionRestore({}, context, session);
+      await this.sessionRestore({}, context, session, attempt);
       return session;
     } catch (error) {
       // The record can be gone (closed, retention) by the time the resume
@@ -1104,7 +1146,9 @@ export class GatewayService {
       if (this.store.get(session.id) && !CLOSED_STATUSES.has(session.status)) {
         this.#setStatus(session, "unavailable", "session_restore_failed");
         session.error = error?.message ?? String(error);
-        this.store.push(session, { type: "session_restore_failed", text: session.error });
+        session.lastRestore = restoreRecord(this.now(), attempt.method, error);
+        const { method, outcome, errorCode } = session.lastRestore;
+        this.store.push(session, { type: "session_restore_failed", text: session.error, method, outcome, errorCode });
       }
       throw error;
     }
@@ -1417,7 +1461,8 @@ export class GatewayService {
 
   // Registers a turn and returns. It must never await the turn itself: that one
   // rule is what keeps the mailbox from being held for a whole worker turn.
-  async #promptLocked(session, args, context) {
+  // taskId is the handle this turn answers to, when there is one.
+  async #promptLocked(session, args, context, taskId = null) {
     if (CLOSED_STATUSES.has(session.status) || !this.store.get(session.id)) {
       throw new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`);
     }
@@ -1440,6 +1485,9 @@ export class GatewayService {
       session.capabilities = configured.response;
       this.store.push(session, { type: "model_changed", model: session.model });
     }
+    // Last thing before the worker can hear about this prompt, and nothing
+    // between here and the send awaits. If it throws, the session is untouched.
+    if (taskId) this.#stampPromptDispatched(taskId);
     session.turnId = `turn-${randomUUID()}`;
     session.turnSeal = null;
     this.#setStatus(session, "running", "turn_start");
@@ -1494,11 +1542,17 @@ export class GatewayService {
     session.turnSeal = token;
     session.completedAt = new Date(this.now()).toISOString();
     if (outcome.error) {
-      this.#setStatus(session, session.client?.alive ? "error" : "disconnected", "turn_failed");
+      // A failure from a worker that is gone is the provider disconnecting under
+      // the turn (reported before its exit notice reached the mailbox), not an
+      // answer the worker gave. It records what #providerExitLocked would, so
+      // the session reason does not depend on which callback won the race.
+      const workerGone = !session.client?.alive;
+      if (workerGone) this.#setStatus(session, "disconnected", "provider_disconnected");
+      else this.#setStatus(session, "error", "turn_failed");
       session.error = outcome.error?.message ?? String(outcome.error);
       this.store.finalizeResult(session);
       this.store.push(session, { type: "error", text: session.error });
-      this.finishTaskForSession(session);
+      this.finishTaskForSession(session, workerGone ? "provider_disconnected" : null);
       return;
     }
     // The turn's token breakdown lives here, not on usage_update: PromptResponse
@@ -1566,7 +1620,7 @@ export class GatewayService {
         // be collected. The store enforces that itself now (terminal is final),
         // but the single command is still what keeps turnId and status agreeing.
         return await this.#queueFor(session).run("task_prompt", async () => {
-          const started = await this.#promptLocked(session, args, context);
+          const started = await this.#promptLocked(session, args, context, task.taskId);
           // The handle can already be gone: ttl=0 expires on the first read after
           // create. The turn is running either way, so the ack reports the handle
           // that was minted instead of failing work that has already started.
@@ -1591,6 +1645,27 @@ export class GatewayService {
       }
     } finally {
       this.#release(session, "prompt");
+    }
+  }
+
+  // Durable before the prompt leaves, like the create barrier: this stamp is
+  // the only evidence that separates "the worker may have acted" from "it never
+  // saw the prompt", and a crash must not be able to take it back after the
+  // send. Without it a restart would call a prompt the worker received
+  // not_started, inviting Main to repeat its side effects.
+  #stampPromptDispatched(taskId) {
+    const task = this.taskStore.find(taskId);
+    if (!task || TERMINAL_TASK_STATUSES.has(task.status)) return;
+    const stamped = this.taskStore.markPromptDispatched(taskId, new Date(this.now()).toISOString());
+    try {
+      this.stateStore?.appendDurable(WAL_TYPES.TASK_STATUS_CHANGED, taskId, taskStatusPayload(stamped));
+      if (this.stateStore) this.persistError = null;
+    } catch (error) {
+      this.persistError = error?.message ?? String(error);
+      throw new GatewayError(
+        ERROR_CODES.PERSISTENCE_UNHEALTHY,
+        `Gateway could not durably record that this Task's prompt was sent: ${this.persistError}`
+      );
     }
   }
 
@@ -1877,7 +1952,9 @@ export class GatewayService {
         statusChangedAt: session.statusChangedAt ?? null,
         lastWorkerActivityAt: session.lastWorkerActivityAt ?? null,
         stallSuspected,
-        silentForMs
+        silentForMs,
+        generation: session.generation ?? 1,
+        lastRestore: session.lastRestore ?? null
       }
     };
   }
@@ -2016,6 +2093,7 @@ export class GatewayService {
         events: args.includeEvents ? session.events.map(({ data, ...rest }) => rest) : undefined
       };
     }
+    if (args.action === "check") return this.#checkSession(session);
     if (args.action === "close") {
       await this.closeSession(session);
       return { ok: true, closed: session.id };
@@ -2059,6 +2137,47 @@ export class GatewayService {
       return { ok: true, closed };
     }
     throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `Unknown action: ${args.action}`);
+  }
+
+  // Could this session be brought back, and how, without trying: a dry run of
+  // ensureConnected's decision. Read-only by construction — it starts no
+  // provider process, sends the worker nothing and does not take the mailbox —
+  // so it answers even while a turn or a restore holds the session.
+  async #checkSession(session) {
+    const caveats = [];
+    const verdict = (restorable, method) => ({ ok: true, sessionId: session.id, restorable, method, caveats });
+    if (CLOSED_STATUSES.has(session.status)) {
+      caveats.push("session_closed");
+      return verdict("not_restorable", null);
+    }
+    // A snapshot session's cwd is its copy, so a missing copy is named as such.
+    const workspacePath = session.workspace?.path ?? null;
+    if (workspacePath && !(await directoryExists(workspacePath))) caveats.push("workspace_missing");
+    if (session.cwd !== workspacePath && !(await directoryExists(session.cwd))) caveats.push("cwd_missing");
+    // The same test ensureConnected makes: nothing to restore while this holds.
+    if (session.client?.alive && !RESTORE_REQUIRED_STATUSES.has(session.status) && session.status !== "restoring") {
+      return verdict(caveats.length ? "restorable_with_caveats" : "restorable", "live");
+    }
+    if (session.status === "restoring") caveats.push("restore_in_progress");
+    if (!session.acpSessionId) caveats.push("acp_session_id_missing");
+    const detected = (await this.providerDetector()).find((item) => item.id === session.provider);
+    if (!detected?.agentInstalled || !detected?.adapterInstalled) caveats.push("provider_not_installed");
+    const capabilities = this.#knownRestoreCapabilities(session);
+    const method = capabilities?.resume ? "resume" : capabilities?.load ? "load" : null;
+    if (!capabilities) caveats.push("provider_capabilities_unknown");
+    else if (!method) caveats.push("provider_restore_unsupported");
+    if (session.lastRestore?.outcome === "failed") caveats.push("last_restore_failed");
+    if (caveats.some((code) => CHECK_BLOCKING_CAVEATS.has(code))) return verdict("not_restorable", null);
+    if (caveats.some((code) => CHECK_UNDECIDED_CAVEATS.has(code))) return verdict("unknown", method);
+    return verdict(caveats.length ? "restorable_with_caveats" : "restorable", method);
+  }
+
+  // A live process of the provider is the freshest word on what a restore can
+  // use; failing that, what the provider said when this session last connected.
+  #knownRestoreCapabilities(session) {
+    const live = [...this.clients.values(), ...this.retiredClients]
+      .find((client) => client?.alive && client.initResult && client.gatewayProvider === session.provider);
+    return live ? restoreCapabilitiesOf(live.initResult) : session.restoreCapabilities ?? null;
   }
 
   async closeSession(session) {
@@ -2416,11 +2535,14 @@ export class GatewayService {
       statusMessage: task.statusMessage,
       // Which tool minted this handle. A recovered pre-1.4.0 record has no
       // origin and was necessarily a prompt.
-      origin: task.origin ?? "prompt"
+      origin: task.origin ?? "prompt",
+      // Additive (1.7.0), only on a task that was cut short, so an ordinary
+      // handle keeps its exact shape.
+      ...(task.interruption ? { interruption: task.interruption } : {})
     };
   }
 
-  updateTaskForSession(session, status, statusMessage, result = undefined) {
+  updateTaskForSession(session, status, statusMessage, result = undefined, { interruption = null } = {}) {
     const taskId = session.activeTaskId;
     // The handle can be gone (TTL sweep, session retention) by the time a turn
     // callback reports its outcome; that is a silent no-op, as it always was.
@@ -2437,13 +2559,13 @@ export class GatewayService {
       }
       return;
     }
-    this.#commitTaskTerminal(session, taskId, status, statusMessage, result);
+    this.#commitTaskTerminal(session, taskId, status, statusMessage, result, interruption);
     // Keyed off the requested status, not the resulting one: a terminal report
     // that lost to an earlier terminal writer still ends this session's claim.
     session.activeTaskId = null;
   }
 
-  #commitTaskTerminal(session, taskId, status, statusMessage, result) {
+  #commitTaskTerminal(session, taskId, status, statusMessage, result, interruption = null) {
     const before = this.taskStore.find(taskId);
     if (!before || TERMINAL_TASK_STATUSES.has(before.status)) return before;
     const lastUpdatedAt = new Date(this.now()).toISOString();
@@ -2453,6 +2575,7 @@ export class GatewayService {
       provisional = this.taskStore.transition(taskId, status, statusMessage, {
         lastUpdatedAt,
         ...(result === undefined ? {} : { result }),
+        ...(interruption ? { interruption } : {}),
         deferWaiters: true
       });
     }
@@ -2461,7 +2584,8 @@ export class GatewayService {
         status,
         statusMessage,
         lastUpdatedAt,
-        ...(durable ?? { result: null })
+        ...(durable ?? { result: null }),
+        ...(interruption ? { interruption } : {})
       });
       if (this.stateStore) this.persistError = null;
     } catch (error) {
@@ -2498,7 +2622,8 @@ export class GatewayService {
     // observe an outcome that a process restart can take back.
     const committed = this.taskStore.transition(taskId, status, statusMessage, {
       lastUpdatedAt,
-      ...(result === undefined ? {} : { result })
+      ...(result === undefined ? {} : { result }),
+      ...(interruption ? { interruption } : {})
     });
     this.#publishTaskStatus(committed);
     return committed;
@@ -2537,12 +2662,7 @@ export class GatewayService {
   }
 
   #appendTaskStatus(task) {
-    this.stateStore?.append(WAL_TYPES.TASK_STATUS_CHANGED, task.taskId, {
-      status: task.status,
-      statusMessage: task.statusMessage,
-      lastUpdatedAt: task.lastUpdatedAt,
-      turnId: task.turnId ?? null
-    });
+    this.stateStore?.append(WAL_TYPES.TASK_STATUS_CHANGED, task.taskId, taskStatusPayload(task));
   }
 
   #publishTaskStatus(task) {
@@ -2604,15 +2724,45 @@ export class GatewayService {
     };
   }
 
-  finishTaskForSession(session) {
+  // interruptedBy names why the Gateway, not the worker, ended the turn.
+  finishTaskForSession(session, interruptedBy = null) {
     if (!session.activeTaskId) return;
     const status = session.status === "cancelled" ? "cancelled" : session.status === "idle" ? "completed" : "failed";
     const message = session.error ?? session.stopReason ?? status;
+    const interruption = interruptedBy ? this.#taskInterruption(session, interruptedBy) : null;
     this.updateTaskForSession(session, status, message, this.taskTerminalEnvelope(session, {
       ok: status === "completed" || status === "cancelled",
       status: session.status,
-      error: session.error
-    }));
+      error: session.error,
+      interruption
+    }), { interruption });
+  }
+
+  // What is known about the active task's worker at the moment it is cut
+  // short. Null when there is no live handle to describe.
+  #taskInterruption(session, reason) {
+    const task = session.activeTaskId ? this.taskStore.find(session.activeTaskId) : null;
+    if (!task || TERMINAL_TASK_STATUSES.has(task.status)) return null;
+    return taskInterruption(reason, task, new Date(this.now()).toISOString());
+  }
+
+  // The steps Main may take about an interrupted task, as data. The Gateway
+  // takes none of them itself: it never re-runs a prompt or opens a new session.
+  // The diff is offered only when the worker may have acted, because for a
+  // prompt it never saw the diff would show earlier turns' changes, not this one's.
+  #interruptionNext(sessionId, interruption) {
+    const session = this.store.get(sessionId);
+    const mayHaveActed = interruption.executionOutcome !== "not_started";
+    return [
+      ...(session ? [{ action: "session_check", sessionId }] : []),
+      ...(session?.workspace && mayHaveActed ? [{ action: "workspace_diff", sessionId }] : []),
+      {
+        action: "decide_rerun",
+        note: mayHaveActed
+          ? "re-running may repeat side effects the worker already made"
+          : "the worker never received this prompt, so re-running repeats nothing"
+      }
+    ];
   }
 
   // One terminal envelope, three producers (turn end, close, orphan cancel).
@@ -2620,7 +2770,7 @@ export class GatewayService {
   // carried usage, and none of them could honour a caller's result budget. The
   // envelope a Task hands back is the same object on every path now, which is
   // also what makes agent_acp_run and tasks/result byte-identical for free.
-  taskTerminalEnvelope(session, { ok, status, stopReason, error = null } = {}) {
+  taskTerminalEnvelope(session, { ok, status, stopReason, error = null, interruption = null } = {}) {
     const taskId = session.activeTaskId ?? null;
     const delivery = (taskId ? this.taskDelivery.get(taskId) : null) ?? {};
     const diagnostic = delivery.profile === "diagnostic";
@@ -2636,6 +2786,9 @@ export class GatewayService {
       ...(delivery.includeUsage === true || diagnostic
         ? { usage: this.store.usageSnapshot(session).turn }
         : {}),
+      // Same reasoning, and only on a task the Gateway cut short: an ordinary
+      // envelope is byte-identical to what it always was.
+      ...(interruption ? { interruption, next: this.#interruptionNext(session.id, interruption) } : {}),
       result: this.projectSessionResult(session, {
         profile: delivery.profile ?? "current",
         ...(stopReason === undefined ? {} : { stopReason }),
@@ -3084,11 +3237,13 @@ export class GatewayService {
     // Snapshot through the result model, not the raw transcript: the task
     // result must honor the final-segment split and the inline cap.
     this.store.finalizeResult(session);
+    const interruption = this.#taskInterruption(session, "orphan_cancelled");
     this.updateTaskForSession(
       session,
       "cancelled",
       "Cancelled after Main disconnect",
-      this.taskTerminalEnvelope(session, { ok: true, status: "cancelled", stopReason: "cancelled" })
+      this.taskTerminalEnvelope(session, { ok: true, status: "cancelled", stopReason: "cancelled", interruption }),
+      { interruption }
     );
     this.store.push(session, { type: "turn_end", stopReason: "cancelled" });
     return true;
@@ -3106,7 +3261,7 @@ export class GatewayService {
     if (finalizing) {
       session.completedAt = new Date(this.now()).toISOString();
       this.store.finalizeResult(session);
-      this.finishTaskForSession(session);
+      this.finishTaskForSession(session, "provider_disconnected");
     }
     this.schedulePersist();
   }
@@ -3369,6 +3524,60 @@ function restoreMethod(initResult, requested) {
 function canRestoreSession(initResult) {
   const capabilities = initResult?.agentCapabilities ?? {};
   return Boolean(capabilities.sessionCapabilities?.resume) || capabilities.loadSession === true;
+}
+
+// What the provider's initialize said about restoring, reduced to the two
+// facts a check needs. Null when there was no initialize to read.
+function restoreCapabilitiesOf(initResult) {
+  if (!initResult) return null;
+  const capabilities = initResult.agentCapabilities ?? {};
+  return { resume: Boolean(capabilities.sessionCapabilities?.resume), load: capabilities.loadSession === true };
+}
+
+function normalizeRestoreCapabilities(value) {
+  if (!value || typeof value.resume !== "boolean" || typeof value.load !== "boolean") return null;
+  return { resume: value.resume, load: value.load };
+}
+
+// method is null when the restore failed before one was chosen (no provider
+// process, no restore capability). errorCode is a registry code; anything else
+// reads as GATEWAY_ERROR, as on the wire.
+function restoreRecord(now, method, error = null) {
+  return {
+    at: new Date(now).toISOString(),
+    method: method ?? null,
+    outcome: error ? "failed" : method === "load" ? "loaded" : "resumed",
+    errorCode: error ? (isGatewayErrorCode(error?.code) ? error.code : ERROR_CODES.GATEWAY_ERROR) : null
+  };
+}
+
+function normalizeLastRestore(value) {
+  if (!value || !RESTORE_OUTCOMES.has(value.outcome) || typeof value.at !== "string") return null;
+  return {
+    at: value.at,
+    method: value.method === "resume" || value.method === "load" ? value.method : null,
+    outcome: value.outcome,
+    errorCode: typeof value.errorCode === "string" ? value.errorCode : null
+  };
+}
+
+function taskStatusPayload(task) {
+  return {
+    status: task.status,
+    statusMessage: task.statusMessage,
+    lastUpdatedAt: task.lastUpdatedAt,
+    turnId: task.turnId ?? null,
+    ...(task.promptDispatchedAt ? { promptDispatchedAt: task.promptDispatchedAt } : {})
+  };
+}
+
+async function directoryExists(path) {
+  if (typeof path !== "string" || !path) return false;
+  try {
+    return (await stat(path)).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 // Off-list reads as "unknown" rather than leaking into a closed vocabulary: a

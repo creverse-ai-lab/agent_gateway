@@ -17,6 +17,24 @@ const TTL_ELAPSED_MESSAGE = "Task TTL elapsed before completion";
 const CANCELLATION_REQUESTED_MESSAGE = "Cancellation requested";
 const DEFAULT_STATUS_MESSAGE = "Prompt accepted";
 
+// Why a task stopped without the worker finishing it, and whether the worker
+// can have acted on it. Closed lists: Main branches on them. not_started is a
+// safety claim (re-running repeats nothing), so it is only ever derived from the
+// absence of a promptDispatchedAt stamp that is written before the prompt is sent.
+export const INTERRUPTION_REASONS = Object.freeze(["gateway_restarted", "provider_disconnected", "orphan_cancelled"]);
+export const EXECUTION_OUTCOMES = Object.freeze(["not_started", "unknown"]);
+
+export function taskInterruption(reason, record, at) {
+  return { reason, executionOutcome: record?.promptDispatchedAt ? "unknown" : "not_started", at };
+}
+
+function sanitizeInterruption(value) {
+  if (!value || typeof value !== "object") return null;
+  if (!INTERRUPTION_REASONS.includes(value.reason) || !EXECUTION_OUTCOMES.includes(value.executionOutcome)) return null;
+  if (typeof value.at !== "string" || !Number.isFinite(Date.parse(value.at))) return null;
+  return { reason: value.reason, executionOutcome: value.executionOutcome, at: value.at };
+}
+
 function taskError(code, message) {
   const error = new Error(message);
   error.code = code;
@@ -271,6 +289,9 @@ export class TaskStore {
     record.status = status;
     if (statusMessage != null) record.statusMessage = statusMessage;
     if (options?.result !== undefined) record.result = options.result;
+    // Only a terminal commit can say how the task was cut short.
+    const interruption = TERMINAL_TASK_STATUSES.has(status) ? sanitizeInterruption(options?.interruption) : null;
+    if (interruption) record.interruption = interruption;
     record.lastUpdatedAt = options?.lastUpdatedAt ?? new Date(this.#now()).toISOString();
     this.#emit("updated", record);
     if (TERMINAL_TASK_STATUSES.has(status)) {
@@ -316,6 +337,9 @@ export class TaskStore {
     record.status = "failed";
     record.statusMessage = statusMessage;
     record.result = result;
+    // The persistence failure is now the outcome, exactly as on the
+    // non-deferred path, which never records the interruption it replaced.
+    delete record.interruption;
     record.lastUpdatedAt = options?.lastUpdatedAt ?? new Date(this.#now()).toISOString();
     this.#deferredTerminal.delete(record.taskId);
     this.#emit("updated", record);
@@ -354,6 +378,19 @@ export class TaskStore {
     const record = this.#requireRecord(taskId, options?.ownerRootId);
     if (record.turnId === turnId) return snapshot(record);
     record.turnId = turnId;
+    this.#emit("updated", record);
+    return snapshot(record);
+  }
+
+  // Provenance like turnId: the moment the Gateway handed the prompt to the
+  // worker. Set once; its absence is what makes an interruption not_started.
+  markPromptDispatched(taskId, at, options = {}) {
+    if (typeof at !== "string" || !Number.isFinite(Date.parse(at))) {
+      throw taskError("INVALID_ARGUMENT", "promptDispatchedAt must be an ISO date string");
+    }
+    const record = this.#requireRecord(taskId, options?.ownerRootId);
+    if (record.promptDispatchedAt) return snapshot(record);
+    record.promptDispatchedAt = at;
     this.#emit("updated", record);
     return snapshot(record);
   }
@@ -503,7 +540,9 @@ export class TaskStore {
     return removed;
   }
 
-  recover(records) {
+  // `next` lets the owner of session facts (the gateway) name what Main may do
+  // about an interrupted handle; the store knows nothing about sessions.
+  recover(records, { next = null } = {}) {
     if (!Array.isArray(records)) throw taskError("INVALID_ARGUMENT", "recover expects an array of task records");
     const now = this.#now();
     const summary = { loaded: 0, restarted: 0, dropped: 0 };
@@ -519,11 +558,16 @@ export class TaskStore {
       }
       if (ACTIVE_TASK_STATUSES.has(record.status)) {
         // An in-flight ACP request cannot survive a daemon restart. Keep the
-        // durable handle, but make the restart visible with the legacy wording.
+        // durable handle, but make the restart visible with the legacy wording;
+        // what is known about the worker rides alongside it, additively.
+        const at = new Date(now).toISOString();
+        const interruption = taskInterruption("gateway_restarted", record, at);
+        const steps = typeof next === "function" ? next(record, interruption) : null;
         record.status = "failed";
         record.statusMessage = RESTART_MESSAGE;
-        record.result = { ok: false, error: RESTART_MESSAGE };
-        record.lastUpdatedAt = new Date(now).toISOString();
+        record.interruption = interruption;
+        record.result = { ok: false, error: RESTART_MESSAGE, interruption, ...(steps ? { next: steps } : {}) };
+        record.lastUpdatedAt = at;
         summary.restarted += 1;
       }
       // Budgets are not enforced here: recovery must never drop a durable handle.
@@ -591,6 +635,7 @@ export class TaskStore {
     if (typeof sessionId !== "string" || typeof ownerRootId !== "string") return null;
     if (!ALL_TASK_STATUSES.has(status)) return null;
     if (typeof createdAt !== "string" || !Number.isFinite(Date.parse(createdAt))) return null;
+    const interruption = sanitizeInterruption(raw.interruption);
     return {
       taskId,
       sessionId,
@@ -615,6 +660,15 @@ export class TaskStore {
       ...(raw.origin === "run" && typeof raw.requestDigest === "string" && /^[0-9a-f]{64}$/.test(raw.requestDigest)
         ? { requestDigest: raw.requestDigest }
         : {}),
+      // Repaired, never dropped: dropping a stamp would turn a prompt the worker
+      // did receive into not_started. An unreadable one still proves dispatch;
+      // createdAt stands in for its time (internal only, never on the wire).
+      ...(raw.promptDispatchedAt == null ? {} : {
+        promptDispatchedAt: typeof raw.promptDispatchedAt === "string" && Number.isFinite(Date.parse(raw.promptDispatchedAt))
+          ? raw.promptDispatchedAt
+          : createdAt
+      }),
+      ...(interruption ? { interruption } : {}),
       result: raw.result ?? null
     };
   }
