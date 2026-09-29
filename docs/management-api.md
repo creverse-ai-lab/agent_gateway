@@ -4,7 +4,7 @@ ACP Gateway is the engine. AgenLynk and other consumers render and invoke this c
 
 ## Public boundary
 
-Import `GatewayRpcClient`, `GatewayError`, `ERROR_CODES`, `GATEWAY_API_VERSION` from `acp-gateway/client`. No private engine imports are needed. `client.call(method, arguments, timeoutMs, {signal})` returns the RPC result or throws an error with stable `code` and optional `details`. A failed call is never evidence that an already-started worker did not execute; use the Task handle and idempotency key to reconcile.
+Import `GatewayRpcClient`, `GatewayError`, `ERROR_CODES`, `GATEWAY_API_VERSION` from `acp-gateway-daemon/client` (the npm package and a source checkout). A runtime release that an app installs and mounts keeps the package name `acp-gateway`, so there the same four exports come from `acp-gateway/client`. No private engine imports are needed. `client.call(method, arguments, timeoutMs, {signal})` returns the RPC result or throws an error with stable `code` and optional `details`. A failed call is never evidence that an already-started worker did not execute; use the Task handle and idempotency key to reconcile.
 
 `GatewayRpcClient({token, rootId, access: "control"|"observer", autoStart})` defaults to control for old consumers. Role is bound on the first authenticated request and cannot change on that connection. Observer uses the existing token, so this is server-enforced read-only behavior, **not** a separate credential boundary against an actor that possesses the control token.
 

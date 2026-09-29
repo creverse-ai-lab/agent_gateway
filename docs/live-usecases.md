@@ -4,7 +4,7 @@
 
 ## 실행 환경 (2026-09-26, v1.5.0 `56a50d1`)
 
-- 격리 daemon: `ACP_GATEWAY_SOCKET/STATE/ARTIFACTS/SETTINGS/INSTALL_STATE`를 임시 디렉터리로 지정, `acp-gateway/client`의 `GatewayRpcClient`로 직접 호출 (MCP front door 미경유).
+- 격리 daemon: `ACP_GATEWAY_SOCKET/STATE/ARTIFACTS/SETTINGS/INSTALL_STATE`를 임시 디렉터리로 지정, `acp-gateway/client`의 `GatewayRpcClient`로 직접 호출 (MCP front door 미경유). 당시 패키지 이름 기준이며, 1.7.0부터는 npm 패키지와 소스 checkout에서 `acp-gateway-daemon/client`, 앱이 마운트한 runtime에서는 그대로 `acp-gateway/client`다.
 - Provider: claude-acp 0.74.0 (`opus`), codex-acp 1.10.0 (`gpt-5.6-sol`), grok-build 1.0.41 (`grok-4.7`). 실행 중 adapter 자동 업데이트가 일어남(UC-01).
 - 작업 대상: 의도적 off-by-one 버그가 있는 `calc.js` 하나.
 

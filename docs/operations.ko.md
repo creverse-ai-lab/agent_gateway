@@ -16,13 +16,22 @@ README에서 다루지 않는 설치 옵션, 업데이트 절차, Worker 제어,
 acp-gateway-bootstrap --install-all --dry-run
 ```
 
-새 버전으로 갱신할 때는 다음 명령 하나만 실행합니다.
+갱신 방법은 Gateway를 설치한 방식에 따라 다릅니다(아래 참고). 소스 checkout이라면 다음 명령 하나면 됩니다.
 
 ```bash
 acp-gateway-bootstrap --update
 ```
 
-`--update`는 `git pull --ff-only`와 `npm ci`를 실행하고, ACP protocol·공식 registry의 상류 변경을 확인한 다음 `npm run ci`로 snapshot 검증과 전체 자동 테스트를 통과해야 다음 단계로 진행합니다. 이후 내부 dry-run 계획을 출력하고 ACP registry와 adapter, MCP 등록을 갱신합니다. 마지막으로 실행 중인 Gateway daemon을 새 버전으로 다시 시작하고 실제 버전까지 확인합니다. 설치 상태, Control identity와 최초 설치에서 선택한 프론트 도어는 그대로 유지됩니다. 상류 확인이 일시적으로 실패하면 경고를 남기되 이미 받은 소스의 로컬 검증은 계속하며, 테스트 실패는 daemon을 교체하기 전에 update 전체를 중단합니다.
+소스 checkout에서 `--update`는 상류 commit을 받아 임시 worktree에 설치하고 테스트한 뒤(`npm ci`, 이어서 `npm run ci`)에야 checkout을 fast-forward합니다. ACP protocol·공식 registry의 상류 변경도 확인하며, snapshot 검증과 전체 자동 테스트를 통과해야 다음 단계로 진행합니다. 이후 내부 dry-run 계획을 출력하고 ACP registry와 adapter, MCP 등록을 갱신합니다. 마지막으로 실행 중인 Gateway daemon을 새 버전으로 다시 시작하고 실제 버전까지 확인합니다. 설치 상태, Control identity와 최초 설치에서 선택한 프론트 도어는 그대로 유지됩니다. 상류 확인이 일시적으로 실패하면 경고를 남기되 이미 받은 소스의 로컬 검증은 계속하며, 테스트 실패는 daemon을 교체하기 전에 update 전체를 중단합니다.
+
+`--update`는 먼저 패키지가 놓인 위치를 보고 Gateway가 어떻게 설치됐는지 판단합니다. 위처럼 pull과 검증을 하는 것은 소스 checkout(`.git`이 있는 디렉터리)뿐입니다. npm 설치본(`node_modules` 안의 패키지)에서는 Git도 npm도 실행하지 않습니다. npm registry에서 `acp-gateway-daemon`의 `latest` 버전을 확인해 새 버전이 있으면 `npm install -g acp-gateway-daemon@latest`를 안내하고, 곧바로 dry-run 계획, registry·adapter·MCP 갱신, daemon 재시작으로 넘어갑니다. 그러니 새 버전을 먼저 설치한 뒤 `--update`를 실행하세요.
+
+```bash
+npm install -g acp-gateway-daemon@latest --omit=optional
+acp-gateway-bootstrap --update
+```
+
+앱이 관리하는 runtime(`~/.acp-gateway/runtime/versions/` 아래)은 `managed`로 보고합니다. Gateway 교체는 그 앱이 맡고, `--update`는 이 설치본의 등록 정보만 갱신합니다.
 
 사용자가 수정한 `agent-delegator`를 보호하기 위해 skill은 최초 `--install-all`에서만 설치하며 `--update`에서는 건드리지 않습니다. `--install-skill`도 최초 설치용이므로 이미 installer가 관리하는 복사본을 자동으로 덮어쓰지 않습니다. 로컬 소스 변경을 보호하기 위해 Git 작업 트리가 깨끗하지 않으면 update를 중단하므로 먼저 변경 사항을 commit하거나 stash해야 합니다. 소스와 직접 연결되는 `npm link`는 최초 설치 후 다시 할 필요가 없습니다.
 
@@ -56,7 +65,7 @@ acp-gateway-bootstrap --update-skill    # 2. skill 갱신 (수정본이면 --for
 | 옵션 | 설명 |
 |---|---|
 | `--version`, `-V` | 현재 설치된 ACP Gateway 버전 확인 |
-| `--update` | 소스 pull·상류 확인·전체 테스트·dry-run 후 Adapter, MCP, daemon 갱신—사용자 skill 유지 |
+| `--update` | 소스 pull·상류 확인·전체 테스트(소스 checkout만 해당, npm·앱 관리 설치본은 Git을 건너뜀)와 dry-run 후 Adapter, MCP, daemon 갱신—사용자 skill 유지 |
 | `--install-all` | Adapter, Guide, skill 전체 설치 후 프론트 도어 하나에 Control 등록 |
 | `--front-door codex\|claude\|grok` | `--install-all`의 Control MCP 대상 명시 |
 | `--install-control` | 오케스트레이터용 Control MCP만 설치 |
@@ -107,7 +116,7 @@ v1.1.0부터 daemon은 시작 시점과 이후 24시간마다 ACP 공식 registr
 
 `agent_acp_setup` health 응답의 `agentUpdates`에는 확인 시각, 적용된 버전, 남은 수동 업데이트와 오류가 포함됩니다. 알림이 켜져 있으면 같은 응답의 `alerts`에 사용자에게 보여줄 메시지가 들어갑니다. 즉 Gateway가 임의로 화면에 push하는 방식은 아니며, 오케스트레이터가 health check 결과를 받을 때 알림을 사용자에게 전달합니다. 즉시 다시 확인하려면 `refreshAgentUpdates: true`로 setup을 호출합니다.
 
-Gateway 자체 소스는 자동으로 pull하거나 설치하지 않습니다. 같은 주기에서 현재 Git 저장소의 원격 `main`에 게시된 `package.json` 버전만 확인하며, 더 높은 버전이 있으면 health의 `gatewayUpdate`와 `gateway_source_update_available` 알림으로 `acp-gateway-bootstrap --update` 실행을 안내합니다. 따라서 로컬 source, 설치 상태와 사용자 정의 skill은 사용자가 명시적으로 업데이트하기 전까지 변경되지 않습니다.
+Gateway 자체는 자동으로 pull하거나 설치하지 않습니다. 같은 주기에서 소스 checkout은 Git 저장소의 원격 `main`에 게시된 `package.json` 버전만, npm 설치본은 npm registry에 있는 `acp-gateway-daemon`의 `latest` 버전만 확인합니다. 더 높은 버전이 있으면 health의 `gatewayUpdate`(`installMode` 포함)와 `gateway_source_update_available` 알림으로, 소스 checkout에는 `acp-gateway-bootstrap --update`를, npm 설치본에는 `npm install -g acp-gateway-daemon@latest` 다음 `acp-gateway-bootstrap --update`를 안내합니다. 앱이 관리하는 runtime은 아무것도 확인하지 않고 `status: "managed"`로 보고하며, 업데이트는 그 앱이 맡습니다. 따라서 설치된 Gateway, 설치 상태와 사용자 정의 skill은 사용자가 명시적으로 업데이트하기 전까지 변경되지 않습니다.
 
 자동 업데이트와 알림은 기본으로 켜집니다. 설치 후 다음처럼 각각 끄거나 다시 켤 수 있으며, 사용자 정의 skill은 변경하지 않습니다.
 
@@ -120,6 +129,27 @@ acp-gateway-bootstrap --agent-update-notifications on
 ```
 
 Dependabot 설정은 GitHub의 기본 브랜치에 존재해야 활성화되며, `dev` 대상 PR을 위해 원격 `dev` 브랜치를 유지해야 합니다.
+
+### npm 배포 (maintainer용)
+
+Gateway는 npm에 `acp-gateway-daemon`으로 게시합니다(명령 이름은 그대로 `acp-gateway-*`). 릴리스 버전이 `package.json`, `npm-shrinkwrap.json`, `src/version.js`의 `GATEWAY_VERSION`, 두 변경 이력의 최신 제목에 모두 반영된 commit만 게시하세요. 이 값들이 서로 맞는지는 `npm run ci`가 검사합니다. npm 버전은 바꿀 수 없습니다. 한 번 게시한 버전 번호는 unpublish한 뒤에도 다시 쓸 수 없으므로, 잘못 게시했다면 새 버전을 내는 수밖에 없습니다.
+
+- **GitHub Actions(기본 경로):** 릴리스 태그에서 `Publish npm` workflow(`.github/workflows/publish-npm.yml`, 수동 `workflow_dispatch`)를 입력 `version`과 함께 실행합니다. 예: `gh workflow run publish-npm.yml --ref v1.7.0 -f version=1.7.0`. workflow는 입력 버전이 `package.json` 버전·`GATEWAY_VERSION`과 같은지, 패키지 이름이 `acp-gateway-daemon`인지 확인하고, npm에 이미 있는 버전이면 거부합니다. 이어서 `npm ci`, `npm run ci`, `npm run smoke:npm`을 모두 통과해야 `npm publish --provenance --access public`을 실행합니다.
+  - 저장소 secret `NPM_TOKEN`이 필요합니다. 이 패키지에 publish 권한이 있고 2FA 코드를 묻지 않는 npm granular access token을 넣으세요. CI 작업은 2FA 입력에 답할 수 없습니다.
+  - npm은 공개 GitHub 저장소에서 온 provenance만 받으므로, 저장소가 비공개인 동안에는 이 workflow로 게시할 수 없습니다.
+- **로컬 게시:** 릴리스 태그를 깨끗하게 checkout한 상태에서 검사를 돌리고, 로그인한 뒤 게시합니다. 이 경로로 게시하면 provenance가 붙지 않습니다.
+
+```bash
+git clone --branch v1.7.0 https://github.com/creverse-ai-lab/agent_gateway.git
+cd agent_gateway
+npm ci
+npm run ci
+npm run smoke:npm
+npm login
+npm publish --access public
+```
+
+npm 게시가 데스크톱 앱이 설치하는 GitHub runtime 릴리스(`acp-gateway-runtime-darwin-arm64.tar.gz`)를 대신하지는 않습니다. runtime 릴리스는 지금처럼 `Release runtime` workflow로 따로 빌드하며, 패키지 이름도 그대로 `acp-gateway`입니다. 한쪽을 게시한다고 다른 쪽이 만들어지지는 않습니다.
 
 ## Worker 파라미터 제어
 

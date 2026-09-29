@@ -31,14 +31,15 @@ Node.js 22 이상과 macOS 또는 Linux가 필요합니다.
 
 ### 설치
 
+npm으로 Gateway를 설치한 뒤, bootstrap으로 이 컴퓨터의 agent에 연결합니다.
+
 ```bash
-git clone https://github.com/creverse-ai-lab/agent_gateway.git
-cd agent_gateway
-npm ci
-npm link
+npm install -g acp-gateway-daemon --omit=optional
 acp-gateway-bootstrap --install-all --refresh-registry --dry-run
 acp-gateway-bootstrap --install-all --refresh-registry
 ```
+
+`--omit=optional`을 붙이면 의존성에 딸려 오는 약 245MB짜리 Claude Code 바이너리를 받지 않습니다. Gateway는 이 바이너리를 쓰지 않고, Claude Worker는 이미 설치된 Claude CLI를 사용합니다.
 
 마지막 두 명령 중 첫 번째는 설치 계획만 확인하는 dry-run이고, 두 번째가 실제 설치입니다. `--install-all`은 ACP 공식 registry가 지정한 `npx`·`uvx` 패키지를 전역으로 설치하거나 갱신할 수 있으므로 dry-run 결과에서 대상과 버전을 먼저 확인하세요. Registry manifest는 ACP가 관리하지만 실제 package와 binary는 각 공급자의 배포처에서 내려받습니다. 설치가 내 환경에서 무엇을 바꾸는지는 [설치가 내 환경에 바꾸는 것](#설치가-내-환경에-바꾸는-것)에 정리했습니다.
 
@@ -49,6 +50,21 @@ acp-gateway-bootstrap --install-all --front-door codex
 acp-gateway-bootstrap --install-all --front-door claude
 acp-gateway-bootstrap --install-all --front-door grok
 ```
+
+#### 소스에서 설치
+
+코드를 고치려는 경우처럼 Git checkout에서 바로 실행하려면 저장소를 받아 연결합니다.
+
+```bash
+git clone https://github.com/creverse-ai-lab/agent_gateway.git
+cd agent_gateway
+npm ci
+npm link
+acp-gateway-bootstrap --install-all --refresh-registry --dry-run
+acp-gateway-bootstrap --install-all --refresh-registry
+```
+
+`npm link`를 하면 같은 명령을 PATH에서 쓸 수 있고, 명령은 checkout에서 바로 실행됩니다. 마지막 두 명령과 프론트 도어 선택은 위와 같습니다.
 
 ### 첫 위임
 
@@ -72,7 +88,7 @@ Grok 4.5에게 현재 설계의 보안 취약점을 red-team 검토시키고, pe
 6. 필요한 경우 `agent_acp_permission` 또는 `agent_acp_answer`로 응답
 7. 완료 후 세션을 재사용하거나 `agent_acp_session`으로 종료
 
-기본 제공되는 `agent-delegator`는 범용 사용을 위한 시작점입니다. 자주 사용하는 Worker, 기본 모델, 권한 정책, 리뷰 순서나 결과 형식이 있다면 설치된 skill을 사용자 작업 방식에 맞게 수정해 사용할 수 있습니다. `acp-gateway-bootstrap --update`와 일반 `--update-skill`은 사용자 수정본을 덮어쓰지 않습니다. 저장소의 최신 기본본으로 되돌리고 싶을 때만 `--update-skill --force`를 명시적으로 실행하세요.
+기본 제공되는 `agent-delegator`는 범용 사용을 위한 시작점입니다. 자주 사용하는 Worker, 기본 모델, 권한 정책, 리뷰 순서나 결과 형식이 있다면 설치된 skill을 사용자 작업 방식에 맞게 수정해 사용할 수 있습니다. `acp-gateway-bootstrap --update`와 일반 `--update-skill`은 사용자 수정본을 덮어쓰지 않습니다. 설치된 Gateway에 들어 있는 기본본으로 되돌리고 싶을 때만 `--update-skill --force`를 명시적으로 실행하세요.
 
 ### 권한 정책
 
@@ -88,11 +104,24 @@ Control token, 오케스트레이터 식별자(Main ID)와 Gateway socket 경로
 
 ### 업데이트
 
-새 버전으로 갱신할 때는 다음 명령 하나만 실행합니다.
+업데이트 방법은 Gateway를 어떻게 설치했는지에 따라 다릅니다.
+
+**npm으로 설치한 경우** — 새 버전을 설치한 다음, 등록 정보를 갱신하고 daemon을 다시 시작합니다.
+
+```bash
+npm install -g acp-gateway-daemon@latest --omit=optional
+acp-gateway-bootstrap --update
+```
+
+npm 설치본에서는 `--update`가 Git이나 npm을 직접 실행하지 않습니다. ACP registry, adapter, MCP 등록을 갱신하고, npm이 설치한 버전으로 daemon을 다시 시작합니다. npm에 새 버전이 나오면 Gateway가 health check 알림으로도 알려 줍니다.
+
+**소스에서 설치한 경우** — 다음 명령 하나만 실행합니다.
 
 ```bash
 acp-gateway-bootstrap --update
 ```
+
+**앱이 관리하는 runtime** — 데스크톱 앱이 Gateway를 설치했다면(`~/.acp-gateway/runtime/versions/` 아래) 업데이트도 그 앱이 맡습니다. 이때 `acp-gateway-bootstrap --update`는 Gateway 파일은 건드리지 않고 등록 정보만 갱신합니다.
 
 갱신한 뒤에는 호스트(Claude/Codex/Grok/Auggie) 세션을 다시 연결해야 새 tool과 인자가 보입니다. 자세한 동작과 skill 갱신, 호스트 재연결 절차는 [운영 가이드](docs/operations.ko.md)를 참고하세요.
 
@@ -169,11 +198,12 @@ ACP 규격에서 로컬 agent는 일반적으로 JSON-RPC over stdio로 실행�
 
 ## 설치가 내 환경에 바꾸는 것
 
-`acp-gateway-bootstrap --install-all`이 실제로 하는 일은 다음과 같습니다. `--dry-run`을 붙이면 실제 변경 없이 계획만 출력합니다.
+패키지 설치와 `acp-gateway-bootstrap --install-all`이 실제로 바꾸는 것은 다음과 같습니다. `--dry-run`을 붙이면 bootstrap은 실제 변경 없이 계획만 출력합니다.
 
+- **Gateway 패키지(npm 설치)** — `npm install -g`는 npm 전역 prefix 아래에 패키지를 설치합니다. 파일은 `$(npm root -g)/acp-gateway-daemon`에, `acp-gateway-*` 명령은 `$(npm prefix -g)/bin`에 들어가며, 아래에서 등록하는 MCP 서버도 여기서 실행됩니다. 소스에서 설치하면 `npm link`가 같은 위치에 checkout을 연결합니다.
 - **ACP agent/adapter 설치** — PATH, 일반 CLI 경로, 전역 npm 패키지에서 설치된 AI를 찾아 ACP 공식 registry와 대조하고, registry가 지정한 `npx`·`uvx` 패키지를 전역으로 설치하거나 갱신합니다(`npm install --global` 또는 `uv tool install --force`). registry에 등록되지 않은 AI는 자동 등록하지 않습니다.
 - **MCP 등록** — 각 CLI의 `mcp add` 명령(Auggie는 `mcp add-json`)으로 MCP 서버 두 개를 등록합니다. 오케스트레이터 전용 Control MCP `agent-acp`는 프론트 도어로 고른 CLI 하나에만(`--front-door`, 비대화형 설치에서는 Codex), 읽기 전용 Guide MCP `agent-acp-guide`는 발견된 지원 CLI(Codex, Claude, Grok, Auggie)에 등록합니다. Control MCP를 등록할 때 Control token과 Main ID가 서버 실행 환경 변수(`ACP_GATEWAY_CONTROL_TOKEN`, `ACP_GATEWAY_ROOT_ID`)로 함께 전달되므로, Control MCP는 신뢰하는 로컬 agent에만 설치하세요. installer가 만들지 않은 같은 이름의 항목이 이미 있으면 `--force` 없이는 덮어쓰지 않고 오류로 중단합니다.
-- **`agent-delegator` skill 설치** — 저장소에 포함된 skill을 발견된 AI 각각의 skills 디렉터리에 복사합니다.
+- **`agent-delegator` skill 설치** — Gateway에 포함된 skill을 발견된 AI 각각의 skills 디렉터리에 복사합니다.
 
   | AI | 설치 경로 | 경로를 바꾸는 환경 변수 |
   |---|---|---|
@@ -192,11 +222,11 @@ ACP 규격에서 로컬 agent는 일반적으로 JSON-RPC over stdio로 실행�
   daemon이 실행되면 같은 디렉터리에 세션 상태(`state.snapshot.json`, `state.wal.ndjson`)와 `artifacts` 디렉터리도 생깁니다.
 - **daemon 실행** — 설치 후 health check로 Gateway daemon을 시작하고 인증 상태를 확인하며, 실행 중인 daemon의 버전이 다르면 새 버전으로 교체합니다. `--skip-health-check`로 이 단계를 건너뛸 수 있습니다.
 
-Gateway 소스는 `acp-gateway-bootstrap --update`를 실행할 때만 갱신됩니다. installer에는 제거(uninstall) 명령이 없으므로, 되돌리려면 위 항목을 직접 제거해야 합니다.
+Gateway 자체는 직접 업데이트할 때만 바뀝니다. npm 설치본은 `npm install -g`로, 소스 checkout은 `acp-gateway-bootstrap --update`로, 앱이 관리하는 runtime은 그 앱으로 업데이트합니다. installer에는 제거(uninstall) 명령이 없으므로, 되돌리려면 위 항목을 직접 제거해야 합니다. npm 패키지는 `npm uninstall -g acp-gateway-daemon`으로 지웁니다.
 
 ## 문서
 
-- [관리 API 계약](docs/management-api.md)(영어) — 엔진 설정, provider 정책, 안전 종료와 공개 client(`acp-gateway/client`) 계약
+- [관리 API 계약](docs/management-api.md)(영어) — 엔진 설정, provider 정책, 안전 종료와 공개 client 계약(`acp-gateway-daemon/client`, 앱이 마운트한 runtime에서는 `acp-gateway/client`)
 - [Live use cases](docs/live-usecases.md) — 실제 Claude·Codex·Grok Worker로 돌려 본 사용 사례 기록
 - [운영 가이드](docs/operations.ko.md) — installer 옵션, 업데이트, 호스트 재연결, Worker 파라미터 제어, 세션·데이터 관리
 - [변경 이력](CHANGELOG.ko.md) — 버전별 변경 사항

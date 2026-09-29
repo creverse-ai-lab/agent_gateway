@@ -16,13 +16,22 @@ To review the installation plan again later:
 acp-gateway-bootstrap --install-all --dry-run
 ```
 
-To update to a new version, run just this one command.
+How you update depends on how the Gateway was installed (see below). In a source checkout it is this one command:
 
 ```bash
 acp-gateway-bootstrap --update
 ```
 
-`--update` runs `git pull --ff-only` and `npm ci`, checks upstream changes to the ACP protocol and the official registry, and then only proceeds to the next step once snapshot verification and the full automated test suite pass in `npm run ci`. It then prints the internal dry-run plan and updates the ACP registry, the adapters, and the MCP registrations. Finally, it restarts the running Gateway daemon on the new version and verifies the actual version. The installation state, the Control identity, and the front door selected at first installation are kept as they are. If the upstream check fails temporarily, it logs a warning but continues the local verification of the source it already fetched, and a test failure aborts the whole update before the daemon is replaced.
+In a source checkout, `--update` fetches the upstream commit, installs and tests it in a temporary worktree (`npm ci`, then `npm run ci`), and only then fast-forwards the checkout. It also checks upstream changes to the ACP protocol and the official registry, and proceeds only once snapshot verification and the full automated test suite pass. It then prints the internal dry-run plan and updates the ACP registry, the adapters, and the MCP registrations. Finally, it restarts the running Gateway daemon on the new version and verifies the actual version. The installation state, the Control identity, and the front door selected at first installation are kept as they are. If the upstream check fails temporarily, it logs a warning but continues the local verification of the source it already fetched, and a test failure aborts the whole update before the daemon is replaced.
+
+`--update` first works out how this Gateway was installed, from where its package sits. Only a source checkout (a directory with `.git`) is pulled and verified as described above. For an npm install (a package inside `node_modules`), `--update` runs neither Git nor npm: it checks the `latest` version of `acp-gateway-daemon` on the npm registry, reports `npm install -g acp-gateway-daemon@latest` when a newer release exists, and then goes straight on to the dry-run plan, the registry, adapter and MCP refresh, and the daemon restart. Install the new release first, then run `--update`:
+
+```bash
+npm install -g acp-gateway-daemon@latest --omit=optional
+acp-gateway-bootstrap --update
+```
+
+An app-managed runtime (under `~/.acp-gateway/runtime/versions/`) reports `managed`: its app replaces the Gateway, and `--update` only refreshes this install's registrations.
 
 To protect a user-modified `agent-delegator`, the skill is installed only on the first `--install-all` and is not touched by `--update`. `--install-skill` is also meant for first installation, so it does not automatically overwrite a copy that the installer already manages. To protect local source changes, the update aborts if the Git working tree is not clean, so commit or stash your changes first. The `npm link` that connects directly to the source does not need to be repeated after the first installation.
 
@@ -56,7 +65,7 @@ acp-gateway-bootstrap --update-skill    # 2. Update the skill (use --force if it
 | Option | Description |
 |---|---|
 | `--version`, `-V` | Show the currently installed ACP Gateway version |
-| `--update` | After source pull, upstream check, full tests and dry-run, update the Adapter, MCP and daemon — user skills are kept |
+| `--update` | After source pull, upstream check and full tests (source checkouts only; npm and app-managed installs skip Git) and a dry-run, update the Adapter, MCP and daemon — user skills are kept |
 | `--install-all` | Install all Adapters, the Guide and the skill, then register Control with one front door |
 | `--front-door codex\|claude\|grok` | Explicitly specify the Control MCP target of `--install-all` |
 | `--install-control` | Install only the Control MCP for the orchestrator |
@@ -107,7 +116,7 @@ Since v1.1.0, the daemon checks the official ACP registry at startup and every 2
 
 The `agentUpdates` field of the `agent_acp_setup` health response contains the check time, the applied versions, the remaining manual updates, and errors. When notifications are on, `alerts` in the same response contains messages to show to the user. In other words, the Gateway does not push anything to the screen on its own; the orchestrator relays the notifications to the user when it receives the health check result. To check again immediately, call setup with `refreshAgentUpdates: true`.
 
-The Gateway's own source is never pulled or installed automatically. On the same cycle, it checks only the `package.json` version published on the remote `main` of the current Git repository, and if a higher version exists, it directs you to run `acp-gateway-bootstrap --update` through `gatewayUpdate` in health and the `gateway_source_update_available` alert. As a result, the local source, the installation state, and custom skills do not change until the user explicitly updates.
+The Gateway itself is never pulled or installed automatically. On the same cycle, a source checkout checks only the `package.json` version published on the remote `main` of its Git repository, and an npm install checks only the `latest` version of `acp-gateway-daemon` on the npm registry. If a higher version exists, `gatewayUpdate` in health (which carries `installMode`) and the `gateway_source_update_available` alert direct you to run `acp-gateway-bootstrap --update` for a source checkout, or `npm install -g acp-gateway-daemon@latest` followed by `acp-gateway-bootstrap --update` for an npm install. An app-managed runtime checks nothing and reports `status: "managed"`; its app updates it. As a result, the installed Gateway, the installation state, and custom skills do not change until the user explicitly updates.
 
 Automatic updates and notifications are on by default. After installation, you can turn each off or back on as follows, and custom skills are not changed.
 
@@ -120,6 +129,27 @@ acp-gateway-bootstrap --agent-update-notifications on
 ```
 
 The Dependabot configuration must exist on GitHub's default branch to be activated, and the remote `dev` branch must be kept for PRs targeting `dev`.
+
+### Publishing to npm (maintainers)
+
+The Gateway is published to npm as `acp-gateway-daemon` (the command names stay `acp-gateway-*`). Publish only a commit whose release version is already in `package.json`, `npm-shrinkwrap.json`, `GATEWAY_VERSION` in `src/version.js` and the newest heading of both changelogs; `npm run ci` checks that they agree. npm versions are immutable: a published version number can never be reused, even after an unpublish, so a mistake is fixed only by a new version.
+
+- **GitHub Actions (the usual path):** Run the `Publish npm` workflow (`.github/workflows/publish-npm.yml`, manual `workflow_dispatch`) from the release tag with the input `version`, for example `gh workflow run publish-npm.yml --ref v1.7.0 -f version=1.7.0`. It checks that the input equals the `package.json` version and `GATEWAY_VERSION` and that the package name is `acp-gateway-daemon`, refuses a version that is already on npm, runs `npm ci`, `npm run ci` and `npm run smoke:npm`, and only then runs `npm publish --provenance --access public`.
+  - It needs the repository secret `NPM_TOKEN`: an npm granular access token with publish rights to the package that does not ask for a 2FA code, since a CI job cannot answer one.
+  - npm accepts provenance only from a public GitHub repository, so the workflow cannot publish while the repository is private.
+- **Local publish:** From a clean checkout of the release tag, run the checks, log in and publish. This path publishes without provenance.
+
+```bash
+git clone --branch v1.7.0 https://github.com/creverse-ai-lab/agent_gateway.git
+cd agent_gateway
+npm ci
+npm run ci
+npm run smoke:npm
+npm login
+npm publish --access public
+```
+
+Publishing to npm does not replace the GitHub runtime release (`acp-gateway-runtime-darwin-arm64.tar.gz`) that the desktop app installs. That release is still built separately by the `Release runtime` workflow and keeps the package name `acp-gateway`; publishing one does not produce the other.
 
 ## Worker parameter control
 

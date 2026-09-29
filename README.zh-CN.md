@@ -31,14 +31,15 @@ ACP Gateway 是一个中间件：让你直接对话的 AI —— 即 **编排器
 
 ### 安装
 
+先用 npm 安装 Gateway，再用 bootstrap 把它接入本机的各个 agent：
+
 ```bash
-git clone https://github.com/creverse-ai-lab/agent_gateway.git
-cd agent_gateway
-npm ci
-npm link
+npm install -g acp-gateway-daemon --omit=optional
 acp-gateway-bootstrap --install-all --refresh-registry --dry-run
 acp-gateway-bootstrap --install-all --refresh-registry
 ```
+
+`--omit=optional` 会跳过依赖中附带的一个约 245 MB 的 Claude Code 二进制文件。Gateway 并不会用到它，Claude Worker 使用的是你已经安装的 Claude CLI。
 
 最后两条命令中，第一条是只确认安装计划的 dry-run，第二条才是真正的安装。`--install-all` 可能会全局安装或更新 ACP 官方 registry 所指定的 `npx`、`uvx` 包，因此请先在 dry-run 的输出中确认目标和版本。Registry manifest 由 ACP 维护，但实际的包和二进制文件是从各提供方的分发渠道下载的。安装会对你的机器做哪些改动，见[安装会对你的机器做哪些改动](#安装会对你的机器做哪些改动)。
 
@@ -49,6 +50,21 @@ acp-gateway-bootstrap --install-all --front-door codex
 acp-gateway-bootstrap --install-all --front-door claude
 acp-gateway-bootstrap --install-all --front-door grok
 ```
+
+#### 从源码安装
+
+如果想直接从 Git checkout 运行（比如需要修改代码），就克隆仓库并链接：
+
+```bash
+git clone https://github.com/creverse-ai-lab/agent_gateway.git
+cd agent_gateway
+npm ci
+npm link
+acp-gateway-bootstrap --install-all --refresh-registry --dry-run
+acp-gateway-bootstrap --install-all --refresh-registry
+```
+
+执行 `npm link` 后，同样的命令会出现在 PATH 中，并直接从 checkout 运行。最后两条命令以及 front door 的选择与上面完全相同。
 
 ### 第一次委派
 
@@ -72,7 +88,7 @@ acp-gateway-bootstrap --install-all --front-door grok
 6. 如有需要，用 `agent_acp_permission` 或 `agent_acp_answer` 作出响应
 7. 完成后可以复用会话，或用 `agent_acp_session` 结束
 
-默认提供的 `agent-delegator` 是通用场景的起点。如果你有常用的 Worker、默认模型、权限策略、review 顺序或结果格式，可以按自己的工作方式修改已安装的 skill。`acp-gateway-bootstrap --update` 和普通的 `--update-skill` 不会覆盖你修改过的副本。只有想恢复成仓库中最新的默认版本时，才需要显式执行 `--update-skill --force`。
+默认提供的 `agent-delegator` 是通用场景的起点。如果你有常用的 Worker、默认模型、权限策略、review 顺序或结果格式，可以按自己的工作方式修改已安装的 skill。`acp-gateway-bootstrap --update` 和普通的 `--update-skill` 不会覆盖你修改过的副本。只有想恢复成已安装的 Gateway 自带的默认版本时，才需要显式执行 `--update-skill --force`。
 
 ### 权限策略
 
@@ -88,11 +104,24 @@ Control token、编排器标识符（Main ID）和 Gateway socket 路径都会�
 
 ### 更新
 
-更新到新版本时，只需执行下面这一条命令。
+更新方式取决于 Gateway 是如何安装的。
+
+**通过 npm 安装** — 先安装新版本，再刷新注册信息并重启 daemon：
+
+```bash
+npm install -g acp-gateway-daemon@latest --omit=optional
+acp-gateway-bootstrap --update
+```
+
+对于 npm 安装，`--update` 自身不会运行 Git 或 npm：它会刷新 ACP registry、adapter 和 MCP 注册，并用 npm 安装的版本重启 daemon。npm 上有新版本发布时，Gateway 的 health check 提醒也会告诉你。
+
+**从源码安装** — 只需执行下面这一条命令：
 
 ```bash
 acp-gateway-bootstrap --update
 ```
+
+**由应用管理的 runtime** — 如果 Gateway 是由桌面应用安装的（位于 `~/.acp-gateway/runtime/versions/` 下），则由该应用负责更新。此时 `acp-gateway-bootstrap --update` 不会改动 Gateway 的文件，只刷新注册信息。
 
 更新之后，需要重新连接宿主（Claude/Codex/Grok/Auggie）会话，新的工具和参数才会显示出来。具体行为、skill 更新以及重新连接的步骤，请参阅[运维指南](docs/operations.md)（英文）。
 
@@ -169,11 +198,12 @@ Gateway 还会告诉编排器委派出去的工作进展到了哪一步，因此
 
 ## 安装会对你的机器做哪些改动
 
-`acp-gateway-bootstrap --install-all` 实际会做的事情如下。加上 `--dry-run` 时，只输出计划，不做任何实际改动。
+安装软件包以及执行 `acp-gateway-bootstrap --install-all` 实际会做的改动如下。加上 `--dry-run` 时，bootstrap 只输出计划，不做任何实际改动。
 
+- **Gateway 软件包（npm 安装）** — `npm install -g` 会把软件包安装到 npm 的全局 prefix 下：文件位于 `$(npm root -g)/acp-gateway-daemon`，`acp-gateway-*` 命令位于 `$(npm prefix -g)/bin`，下面注册的 MCP 服务器也从这里运行。从源码安装时，则由 `npm link` 把 checkout 链接到相同的位置。
 - **安装 ACP agent/adapter** — 从 PATH、常见的 CLI 路径和全局 npm 包中查找已安装的 AI，与 ACP 官方 registry 比对，然后全局安装或更新 registry 所指定的 `npx`、`uvx` 包（`npm install --global` 或 `uv tool install --force`）。registry 中没有的 AI 不会被自动注册。
 - **注册 MCP** — 通过各 CLI 的 `mcp add` 命令（Auggie 为 `mcp add-json`）注册两个 MCP 服务器。面向编排器的 Control MCP `agent-acp` 只会注册到你选作 front door 的那一个 CLI（`--front-door`；非交互式安装时为 Codex），只读的 Guide MCP `agent-acp-guide` 则会注册到所有被发现的受支持 CLI（Codex、Claude、Grok、Auggie）。注册 Control MCP 时，Control token 和 Main ID 会作为服务器的运行环境变量（`ACP_GATEWAY_CONTROL_TOKEN`、`ACP_GATEWAY_ROOT_ID`）一并传入，所以请只在你信任的本地 agent 上安装 Control MCP。如果已经存在同名但并非由安装程序创建的条目，没有 `--force` 时不会覆盖，而是报错中止。
-- **安装 `agent-delegator` skill** — 把仓库中自带的 skill 复制到每个被发现的 AI 的 skills 目录。
+- **安装 `agent-delegator` skill** — 把 Gateway 自带的 skill 复制到每个被发现的 AI 的 skills 目录。
 
   | AI | 安装路径 | 用于改变路径的环境变量 |
   |---|---|---|
@@ -192,11 +222,11 @@ Gateway 还会告诉编排器委派出去的工作进展到了哪一步，因此
   daemon 运行之后，同一目录下还会出现会话状态（`state.snapshot.json`、`state.wal.ndjson`）和 `artifacts` 目录。
 - **启动 daemon** — 安装完成后，会通过 health check 启动 Gateway daemon 并确认认证状态；如果正在运行的 daemon 版本不同，则会替换为新版本。可以用 `--skip-health-check` 跳过这一步。
 
-只有执行 `acp-gateway-bootstrap --update` 时，Gateway 源码才会被更新。安装程序没有卸载命令，所以如果想还原，需要自行删除上述各项。
+Gateway 本身只会在你主动更新时才改变：npm 安装用 `npm install -g`，源码 checkout 用 `acp-gateway-bootstrap --update`，由应用管理的 runtime 则通过该应用更新。安装程序没有卸载命令，所以如果想还原，需要自行删除上述各项；npm 软件包可以用 `npm uninstall -g acp-gateway-daemon` 删除。
 
 ## 文档
 
-- [管理 API 契约](docs/management-api.md)（英文）— 引擎设置、provider 策略、安全关闭以及公开 client（`acp-gateway/client`）的契约
+- [管理 API 契约](docs/management-api.md)（英文）— 引擎设置、provider 策略、安全关闭以及公开 client 的契约（`acp-gateway-daemon/client`；在应用挂载的 runtime 中为 `acp-gateway/client`）
 - [Live use cases](docs/live-usecases.md)（韩文）— 用真实的 Claude、Codex、Grok Worker 跑过的使用案例记录
 - [运维指南](docs/operations.md)（英文）— 安装程序选项、更新、宿主重新连接、Worker 参数控制、会话与数据管理
 - [变更日志](CHANGELOG.md)（英文）— 各版本的变更

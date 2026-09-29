@@ -31,14 +31,15 @@ Node.js 22 or later, and macOS or Linux.
 
 ### Install
 
+Install the Gateway from npm, then let the bootstrap set it up for the agents on your machine:
+
 ```bash
-git clone https://github.com/creverse-ai-lab/agent_gateway.git
-cd agent_gateway
-npm ci
-npm link
+npm install -g acp-gateway-daemon --omit=optional
 acp-gateway-bootstrap --install-all --refresh-registry --dry-run
 acp-gateway-bootstrap --install-all --refresh-registry
 ```
+
+`--omit=optional` skips a bundled Claude Code binary of about 245 MB that the Gateway never uses: the Claude Worker runs the Claude CLI you have installed.
 
 Of the last two commands, the first is a dry-run that only shows the installation plan, and the second performs the actual installation. `--install-all` can install or update, globally, the `npx` and `uvx` packages named by the official ACP registry, so check the targets and versions in the dry-run output first. The registry manifest is maintained by ACP, but the actual packages and binaries are downloaded from each vendor's distribution site. What the installation changes on your machine is listed in [What installation changes on your machine](#what-installation-changes-on-your-machine).
 
@@ -49,6 +50,21 @@ acp-gateway-bootstrap --install-all --front-door codex
 acp-gateway-bootstrap --install-all --front-door claude
 acp-gateway-bootstrap --install-all --front-door grok
 ```
+
+#### From source
+
+To run the Gateway from a Git checkout instead, for example to change the code, clone and link it:
+
+```bash
+git clone https://github.com/creverse-ai-lab/agent_gateway.git
+cd agent_gateway
+npm ci
+npm link
+acp-gateway-bootstrap --install-all --refresh-registry --dry-run
+acp-gateway-bootstrap --install-all --refresh-registry
+```
+
+`npm link` puts the same commands on your PATH, running straight from the checkout. The last two commands and the front-door choice work exactly as above.
 
 ### First delegation
 
@@ -72,7 +88,7 @@ Internally it works in this order:
 6. If needed, `agent_acp_permission` or `agent_acp_answer` responds
 7. When done, reuse the session or close it with `agent_acp_session`
 
-The bundled `agent-delegator` is a general-purpose starting point. If you have a Worker you use often, a default model, a permission policy, a review order, or a result format, you can edit the installed skill to fit the way you work. `acp-gateway-bootstrap --update` and a plain `--update-skill` do not overwrite your edited copy. Run `--update-skill --force` explicitly only when you want to reset it to the latest bundled version in the repository.
+The bundled `agent-delegator` is a general-purpose starting point. If you have a Worker you use often, a default model, a permission policy, a review order, or a result format, you can edit the installed skill to fit the way you work. `acp-gateway-bootstrap --update` and a plain `--update-skill` do not overwrite your edited copy. Run `--update-skill --force` explicitly only when you want to reset it to the version bundled with the installed Gateway.
 
 ### Permission policies
 
@@ -88,11 +104,24 @@ The Control token, the orchestrator identifier (Main ID), and the Gateway socket
 
 ### Updating
 
-To update to a new version, run just this one command:
+How you update depends on how the Gateway was installed.
+
+**npm install** — install the new release, then refresh the registrations and restart the daemon:
+
+```bash
+npm install -g acp-gateway-daemon@latest --omit=optional
+acp-gateway-bootstrap --update
+```
+
+For an npm install, `--update` runs neither Git nor npm itself: it refreshes the ACP registry, the adapters and the MCP registrations, and restarts the daemon on the version npm installed. When a newer release is on npm, the Gateway's health check alert says so.
+
+**Source checkout** — run just this one command:
 
 ```bash
 acp-gateway-bootstrap --update
 ```
+
+**App-managed runtime** — when a desktop app installed the Gateway for you (under `~/.acp-gateway/runtime/versions/`), the app updates it. There, `acp-gateway-bootstrap --update` leaves the Gateway files alone and only refreshes the registrations.
 
 After updating, reconnect your host (Claude/Codex/Grok/Auggie) session so that the new tools and arguments become visible. For details on how this works, updating the skill, and the reconnection procedure, see the [Operations guide](docs/operations.md).
 
@@ -169,11 +198,12 @@ Here, **using an agent CLI directly** does not mean a person switching between t
 
 ## What installation changes on your machine
 
-Here is what `acp-gateway-bootstrap --install-all` actually does. With `--dry-run`, it only prints the plan and makes no actual changes.
+Here is what installing the package and running `acp-gateway-bootstrap --install-all` actually change. With `--dry-run`, the bootstrap only prints its plan and makes no actual changes.
 
+- **The Gateway package (npm install)** — `npm install -g` installs the package under npm's global prefix: its files in `$(npm root -g)/acp-gateway-daemon` and the `acp-gateway-*` commands in `$(npm prefix -g)/bin`. The MCP servers registered below run from there. A source install links your checkout into the same places with `npm link` instead.
 - **ACP agent/adapter installation** — It finds AIs installed on the PATH, in common CLI locations, and among global npm packages, matches them against the official ACP registry, and installs or updates, globally, the `npx` and `uvx` packages the registry names (`npm install --global` or `uv tool install --force`). AIs that are not in the registry are not registered automatically.
 - **MCP registration** — It registers two MCP servers with each CLI's `mcp add` command (`mcp add-json` for Auggie). The orchestrator-only Control MCP `agent-acp` is registered with just the one CLI you chose as the front door (`--front-door`; Codex in non-interactive installs), and the read-only Guide MCP `agent-acp-guide` is registered with every discovered supported CLI (Codex, Claude, Grok, Auggie). When the Control MCP is registered, the Control token and the Main ID are passed to the server as environment variables (`ACP_GATEWAY_CONTROL_TOKEN`, `ACP_GATEWAY_ROOT_ID`), so install the Control MCP only on local agents you trust. If an entry with the same name that the installer did not create already exists, it is not overwritten without `--force`; the installer stops with an error instead.
-- **`agent-delegator` skill installation** — It copies the skill bundled in the repository into each discovered AI's skills directory.
+- **`agent-delegator` skill installation** — It copies the skill bundled with the Gateway into each discovered AI's skills directory.
 
   | AI | Install path | Environment variable that changes the path |
   |---|---|---|
@@ -192,11 +222,11 @@ Here is what `acp-gateway-bootstrap --install-all` actually does. With `--dry-ru
   Once the daemon is running, session state (`state.snapshot.json`, `state.wal.ndjson`) and an `artifacts` directory also appear in the same directory.
 - **Starting the daemon** — After installation, a health check starts the Gateway daemon and verifies authentication, and replaces a running daemon if its version differs. You can skip this step with `--skip-health-check`.
 
-The Gateway source is updated only when you run `acp-gateway-bootstrap --update`. The installer has no uninstall command, so to undo the changes you have to remove the items above yourself.
+The Gateway itself changes only when you update it: an npm install with `npm install -g`, a source checkout with `acp-gateway-bootstrap --update`, and an app-managed runtime through its app. The installer has no uninstall command, so to undo the changes you have to remove the items above yourself; `npm uninstall -g acp-gateway-daemon` removes the npm package.
 
 ## Documentation
 
-- [Management API contract](docs/management-api.md) — engine settings, provider policy, safe shutdown, and the public client (`acp-gateway/client`) contract
+- [Management API contract](docs/management-api.md) — engine settings, provider policy, safe shutdown, and the public client contract (`acp-gateway-daemon/client`; `acp-gateway/client` in a runtime an app mounts)
 - [Live use cases](docs/live-usecases.md) (Korean) — a record of use cases run with real Claude, Codex, and Grok Workers
 - [Operations guide](docs/operations.md) — installer options, updating, host reconnection, Worker parameter control, and session and data management
 - [Changelog](CHANGELOG.md) — changes by version

@@ -31,14 +31,15 @@ Node.js 22 以上と、macOS または Linux が必要です。
 
 ### インストール
 
+npm で Gateway をインストールしてから、bootstrap でこのマシンのエージェントに組み込みます。
+
 ```bash
-git clone https://github.com/creverse-ai-lab/agent_gateway.git
-cd agent_gateway
-npm ci
-npm link
+npm install -g acp-gateway-daemon --omit=optional
 acp-gateway-bootstrap --install-all --refresh-registry --dry-run
 acp-gateway-bootstrap --install-all --refresh-registry
 ```
+
+`--omit=optional` を付けると、依存パッケージに同梱された約 245 MB の Claude Code バイナリをダウンロードせずに済みます。Gateway はこのバイナリを使わず、Claude Worker はインストール済みの Claude CLI を使います。
 
 最後の 2 つのコマンドのうち、1 つ目はインストール計画だけを確認する dry-run で、2 つ目が実際のインストールです。`--install-all` は ACP 公式レジストリが指定する `npx`・`uvx` パッケージをグローバルにインストールまたは更新することがあるため、まず dry-run の結果で対象とバージョンを確認してください。レジストリの manifest は ACP が管理していますが、実際のパッケージとバイナリは各提供元の配布元からダウンロードされます。インストールがマシンに加える変更は、[インストールがマシンに加える変更](#インストールがマシンに加える変更)にまとめています。
 
@@ -49,6 +50,21 @@ acp-gateway-bootstrap --install-all --front-door codex
 acp-gateway-bootstrap --install-all --front-door claude
 acp-gateway-bootstrap --install-all --front-door grok
 ```
+
+#### ソースからインストール
+
+コードを変更したいときなど、Git のチェックアウトから直接動かす場合は、リポジトリをクローンしてリンクします。
+
+```bash
+git clone https://github.com/creverse-ai-lab/agent_gateway.git
+cd agent_gateway
+npm ci
+npm link
+acp-gateway-bootstrap --install-all --refresh-registry --dry-run
+acp-gateway-bootstrap --install-all --refresh-registry
+```
+
+`npm link` を実行すると、同じコマンドが PATH から使えるようになり、チェックアウトから直接実行されます。最後の 2 つのコマンドとフロントドアの選択は、上と同じです。
 
 ### 最初の委任
 
@@ -72,7 +88,7 @@ Grok 4.5 に、現在の設計のセキュリティ上の弱点を red-team レ�
 6. 必要に応じて `agent_acp_permission` または `agent_acp_answer` で応答
 7. 完了後はセッションを再利用するか、`agent_acp_session` で終了
 
-標準で提供される `agent-delegator` は、汎用的に使うための出発点です。よく使う Worker、デフォルトのモデル、権限ポリシー、レビューの順序や結果の形式があれば、インストールされたスキルを自分の作業スタイルに合わせて編集できます。`acp-gateway-bootstrap --update` と通常の `--update-skill` は、ユーザーが編集したコピーを上書きしません。リポジトリの最新の標準版に戻したいときだけ、`--update-skill --force` を明示的に実行してください。
+標準で提供される `agent-delegator` は、汎用的に使うための出発点です。よく使う Worker、デフォルトのモデル、権限ポリシー、レビューの順序や結果の形式があれば、インストールされたスキルを自分の作業スタイルに合わせて編集できます。`acp-gateway-bootstrap --update` と通常の `--update-skill` は、ユーザーが編集したコピーを上書きしません。インストールされている Gateway に同梱の標準版に戻したいときだけ、`--update-skill --force` を明示的に実行してください。
 
 ### 権限ポリシー
 
@@ -88,11 +104,24 @@ Control token、オーケストレーターの識別子 (Main ID)、Gateway の�
 
 ### 更新
 
-新しいバージョンに更新するときは、次のコマンドを 1 つ実行するだけです。
+更新の方法は、Gateway をどのようにインストールしたかによって異なります。
+
+**npm でインストールした場合** — 新しいリリースをインストールしてから、登録情報を更新して daemon を再起動します。
+
+```bash
+npm install -g acp-gateway-daemon@latest --omit=optional
+acp-gateway-bootstrap --update
+```
+
+npm でインストールした場合、`--update` が Git や npm を自ら実行することはありません。ACP レジストリ、adapter、MCP の登録を更新し、npm がインストールしたバージョンで daemon を再起動します。npm に新しいリリースが出ると、Gateway がヘルスチェックの通知でも知らせます。
+
+**ソースからインストールした場合** — 次のコマンドを 1 つ実行するだけです。
 
 ```bash
 acp-gateway-bootstrap --update
 ```
+
+**アプリが管理するランタイム** — デスクトップアプリが Gateway をインストールした場合 (`~/.acp-gateway/runtime/versions/` の下)、更新もそのアプリが行います。このとき `acp-gateway-bootstrap --update` は Gateway のファイルには触れず、登録情報だけを更新します。
 
 更新後は、ホスト (Claude/Codex/Grok/Auggie) のセッションを再接続すると、新しいツールと引数が見えるようになります。動作の詳細、スキルの更新、再接続の手順は[運用ガイド](docs/operations.md)(英語)を参照してください。
 
@@ -169,11 +198,12 @@ ACP の仕様では、ローカルの agent は通常 JSON-RPC over stdio で起
 
 ## インストールがマシンに加える変更
 
-`acp-gateway-bootstrap --install-all` が実際に行うことは次のとおりです。`--dry-run` を付けると、実際の変更は行わず計画だけを出力します。
+パッケージのインストールと `acp-gateway-bootstrap --install-all` が実際に変更するものは次のとおりです。`--dry-run` を付けると、bootstrap は実際の変更を行わず計画だけを出力します。
 
+- **Gateway パッケージ (npm でのインストール)** — `npm install -g` は、npm のグローバル prefix の下にパッケージをインストールします。ファイルは `$(npm root -g)/acp-gateway-daemon` に、`acp-gateway-*` コマンドは `$(npm prefix -g)/bin` に置かれ、以下で登録する MCP サーバーもここから実行されます。ソースからインストールした場合は、`npm link` がチェックアウトを同じ場所にリンクします。
 - **ACP agent/adapter のインストール** — PATH、一般的な CLI のパス、グローバル npm パッケージからインストール済みの AI を探し、ACP 公式レジストリと照合して、レジストリが指定する `npx`・`uvx` パッケージをグローバルにインストールまたは更新します (`npm install --global` または `uv tool install --force`)。レジストリに登録されていない AI は自動では登録しません。
 - **MCP の登録** — 各 CLI の `mcp add` コマンド (Auggie は `mcp add-json`) で MCP サーバーを 2 つ登録します。オーケストレーター専用の Control MCP `agent-acp` は、フロントドアとして選んだ CLI 1 つにだけ (`--front-door`。非対話のインストールでは Codex)、読み取り専用の Guide MCP `agent-acp-guide` は、検出されたサポート対象の CLI (Codex、Claude、Grok、Auggie) に登録します。Control MCP を登録するとき、Control token と Main ID がサーバーの実行環境変数 (`ACP_GATEWAY_CONTROL_TOKEN`、`ACP_GATEWAY_ROOT_ID`) として一緒に渡されるため、Control MCP は信頼できるローカルの agent にだけインストールしてください。インストーラーが作成していない同名のエントリがすでにある場合は、`--force` なしでは上書きせず、エラーで中断します。
-- **`agent-delegator` スキルのインストール** — リポジトリに含まれるスキルを、検出された AI それぞれの skills ディレクトリにコピーします。
+- **`agent-delegator` スキルのインストール** — Gateway に同梱されたスキルを、検出された AI それぞれの skills ディレクトリにコピーします。
 
   | AI | インストール先 | パスを変更する環境変数 |
   |---|---|---|
@@ -192,11 +222,11 @@ ACP の仕様では、ローカルの agent は通常 JSON-RPC over stdio で起
   daemon が起動すると、同じディレクトリにセッション状態 (`state.snapshot.json`、`state.wal.ndjson`) と `artifacts` ディレクトリも作られます。
 - **daemon の起動** — インストール後、ヘルスチェックで Gateway daemon を起動して認証状態を確認し、実行中の daemon のバージョンが異なる場合は新しいバージョンに置き換えます。`--skip-health-check` でこの手順を省略できます。
 
-Gateway のソースは、`acp-gateway-bootstrap --update` を実行したときにだけ更新されます。インストーラーにアンインストールのコマンドはないため、元に戻すには上記の項目を自分で削除する必要があります。
+Gateway 本体は、自分で更新したときにだけ変わります。npm でのインストールは `npm install -g` で、ソースのチェックアウトは `acp-gateway-bootstrap --update` で、アプリが管理するランタイムはそのアプリで更新します。インストーラーにアンインストールのコマンドはないため、元に戻すには上記の項目を自分で削除する必要があります。npm パッケージは `npm uninstall -g acp-gateway-daemon` で削除できます。
 
 ## ドキュメント
 
-- [管理 API 契約](docs/management-api.md)(英語) — エンジン設定、provider ポリシー、安全なシャットダウン、公開クライアント (`acp-gateway/client`) の契約
+- [管理 API 契約](docs/management-api.md)(英語) — エンジン設定、provider ポリシー、安全なシャットダウン、公開クライアントの契約 (`acp-gateway-daemon/client`。アプリがマウントしたランタイムでは `acp-gateway/client`)
 - [Live use cases](docs/live-usecases.md)(韓国語) — 実際の Claude・Codex・Grok Worker で動かしたユースケースの記録
 - [運用ガイド](docs/operations.md)(英語) — インストーラーのオプション、更新、ホストの再接続、Worker パラメーターの制御、セッションとデータの管理
 - [変更履歴](CHANGELOG.md)(英語) — バージョンごとの変更点

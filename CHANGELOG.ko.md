@@ -4,7 +4,7 @@
 
 ## v1.7.0 변경 사항
 
-세션과 작업이 누구의 것인지, 왜 지금 상태에 있는지, 재시작이나 장애로 무엇을 모르게 되었는지를 Main이 Gateway 응답만 보고 알 수 있게 하는 릴리스입니다. v1.6.0에서는 Codex 프로세스 하나에 속한 여러 thread가 모두 한 Main으로 보였고, Worker는 daemon을 띄운 Main의 신원을 그대로 물려받았습니다. 작업이 중간에 끊기면 Worker가 이미 prompt를 받아 움직였는지도 Main이 알 수 없었습니다. API major **1**과 state schema **5**는 유지되며, 새 필드·action·설정·오류 코드는 모두 additive입니다.
+세션과 작업이 누구의 것인지, 왜 지금 상태에 있는지, 재시작이나 장애로 무엇을 모르게 되었는지를 Main이 Gateway 응답만 보고 알 수 있게 하는 릴리스입니다. v1.6.0에서는 Codex 프로세스 하나에 속한 여러 thread가 모두 한 Main으로 보였고, Worker는 daemon을 띄운 Main의 신원을 그대로 물려받았습니다. 작업이 중간에 끊기면 Worker가 이미 prompt를 받아 움직였는지도 Main이 알 수 없었습니다. API major **1**과 state schema **5**는 유지되며, 새 필드·action·설정·오류 코드는 모두 additive입니다. npm에 `acp-gateway-daemon`으로 게시하는 첫 릴리스이기도 합니다.
 
 - **thread 단위 호출자 기록:** 호출을 프론트 도어 프로세스가 아니라 그 호출을 보낸 thread 단위로 기록합니다.
   - Codex: Control MCP 서버가 tool 호출마다 `_meta`(`threadId`, `x-codex-turn-metadata`)에서 thread id와 turn id를 읽습니다. 그래서 한 Codex 프로세스 안의 서로 다른 thread가 연 세션과 턴을 구분할 수 있습니다. 프로세스 단위 `caller`는 바꾸지 않습니다.
@@ -46,8 +46,16 @@
   - `agent_acp_session_restore`는 이제 이 Main이 가진, live가 아닌 세션을 그 자리에서 복구합니다(예전에는 이미 등록된 세션이면 모두 거부). 복구에 성공하면 격리가 풀립니다. live 세션은 여전히 거부하되, 이제 provider를 부르기 전에 거부합니다.
   - `check`는 caveat `session_quarantined`를 보고합니다. `setup`은 provider 시작이 같은 횟수만큼 연달아 실패하면 `provider_degraded` 경고를 띄웁니다. 경고일 뿐 아무것도 막지 않습니다.
   - `restoreFailures`와 `quarantined`는 값이 있을 때만 나오며, 기본·compact poll에는 나오지 않습니다.
+- **npm 배포:**
+  - 패키지 이름: npm에서는 `acp-gateway`라는 이름이 이미 쓰이고 있어 `acp-gateway-daemon`으로 게시합니다. 명령 이름(`acp-gateway-bootstrap`, `acp-gateway-admin` 등)은 그대로이고, 공개 client는 `acp-gateway-daemon/client`로 import합니다. 패키지에는 README 네 개, 두 변경 이력, `docs/`, `LICENSE`가 들어 있습니다.
+  - lockfile: `package-lock.json` 대신 `npm-shrinkwrap.json`을 씁니다. shrinkwrap은 패키지 안에 함께 들어가므로 `npm install -g acp-gateway-daemon`은 CI에서 검증한 의존성 트리를 그대로 설치합니다. 소스 checkout은 전처럼 `npm ci`로 설치합니다.
+  - 설치 방식 감지: Gateway는 패키지가 놓인 위치로 설치 방식을 판단합니다. `source`(Git checkout), `npm`(`.git` 없이 `node_modules` 안), `runtime`(`~/.acp-gateway/runtime/versions/` 아래에 앱이 설치한 릴리스, 또는 runtime 빌드만 만드는 `runtime-manifest.json`이 있는 트리. `node_modules` 안에 있어도 이쪽이 우선), `unknown` 중 하나입니다. health의 `gatewayUpdate`에 `installMode`가 함께 나옵니다.
+  - 설치 방식별 업데이트: 소스 checkout은 전과 같이 `acp-gateway-bootstrap --update`가 pull, 검증, 재실행까지 합니다. npm 설치본은 Git 대신 npm registry의 `latest`를 확인하고, 더 새 버전이 있으면 `gateway_source_update_available` 알림과 `--update`가 `npm install -g acp-gateway-daemon@latest`를 실행한 뒤 `acp-gateway-bootstrap --update`를 실행하라고 안내합니다. 앱이 관리하는 runtime은 `managed`로 보고하며, 업데이트는 그 앱이 맡습니다. npm·runtime 설치본에서 `--update`는 Git이나 npm을 실행하지 않고 registry, adapter, MCP 등록을 갱신한 뒤 daemon을 다시 시작합니다.
+  - runtime 릴리스: 이름과 구성은 그대로입니다. GitHub runtime 릴리스의 패키지 이름은 여전히 `acp-gateway`이고 lockfile도 `package-lock.json`(shrinkwrap으로 만든 것)이며, `release:verify`가 둘 다 확인합니다. 이 릴리스를 마운트하는 앱은 계속 `acp-gateway/client`를 import합니다.
+  - CI: 두 CI OS에서 `npm run smoke:npm`이 돕니다. 패키지를 pack하고, shrinkwrap을 따르는 loopback registry에서 tarball을 설치한 뒤(임시 HOME·cache·npmrc, `--ignore-scripts`), 설치된 명령과 daemon을 격리된 환경에서 실제로 실행해 봅니다.
+  - 게시: 수동으로 실행하는 `Publish npm` workflow가 요청한 버전을 `package.json`·`GATEWAY_VERSION`과 대조하고, npm에 이미 있는 버전은 거부하며, `npm run ci`와 `npm run smoke:npm`을 통과한 뒤 provenance와 함께 게시합니다(secret `NPM_TOKEN`). 자세한 내용은 [운영 가이드](docs/operations.ko.md#npm-배포-maintainer용)를 참고하세요.
 - **호환성:** 모든 변경은 additive입니다. 기본·compact poll 응답과 일반 작업·run의 결과 envelope는 바이트 단위까지 같습니다. `interruption`과 `next`는 Gateway가 끊은 작업에만 붙습니다. 세션 `list`/`get`은 위에서 설명한 조회용 필드가 늘어난 것 말고는 형태가 같고, `setup`에는 `legacyControlRequests`가 추가됩니다. 접수 응답의 `promptedBy`는 프론트 도어가 자신을 밝힐 때만 붙습니다. 세션 목록을 읽는 모니터 같은 소비자는 새 필드를 무시해도 됩니다.
-- **업그레이드:** 새 버전이 실행되도록 한가할 때 daemon을 재시작하세요(`acp-gateway-admin shutdown_if_idle`, 그러면 다음 `agent-acp` 호출이 1.7.0을 띄웁니다). `acp-gateway-bootstrap --update`는 재시작까지 해 주며, 다시 실행하면 예전 설치본에 고정된 프론트 도어도 새 설치본을 가리키게 됩니다. 그다음 호스트 세션을 다시 연결해야 새 인자가 보이고, 바뀐 `agent-delegator` 안내는 `acp-gateway-bootstrap --update-skill`로 받으세요.
+- **업그레이드:** 새 버전이 실행되도록 한가할 때 daemon을 재시작하세요(`acp-gateway-admin shutdown_if_idle`, 그러면 다음 `agent-acp` 호출이 1.7.0을 띄웁니다). `acp-gateway-bootstrap --update`는 재시작까지 해 주며, 다시 실행하면 예전 설치본에 고정된 프론트 도어도 새 설치본을 가리키게 됩니다. 1.7.0부터 npm 설치본은 `npm install -g acp-gateway-daemon@latest --omit=optional`을 실행한 뒤 같은 `acp-gateway-bootstrap --update`로 업그레이드합니다. 그다음 호스트 세션을 다시 연결해야 새 인자가 보이고, 바뀐 `agent-delegator` 안내는 `acp-gateway-bootstrap --update-skill`로 받으세요.
 
 ## v1.6.0 변경 사항
 
