@@ -1,4 +1,4 @@
-import { appendFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 // Drives the Gateway's permission path directly. A prompt is a JSON line:
@@ -6,14 +6,17 @@ import { createInterface } from "node:readline";
 //   {"permission": {"kind": "execute", "command": "cat ~/x"}}      -> request with rawInput.command
 //   {"read": "/path"}                                              -> fs/read_text_file
 //   {"terminal": {"command": "/bin/cat", "args": ["/path"]}}      -> terminal/create
+//     (an optional "env": [{name, value}] rides along as the worker's own request)
 // The turn's stopReason reports what the Gateway decided (the selected optionId,
 // "cancelled", "read-ok" or "read-error"), so a test asserts on the outcome.
 // ACP_MOCK_PARAMS_LOG records every session/new|resume params object.
+// ACP_MOCK_ENV_LOG receives the environment this worker was started with.
 const rl = createInterface({ input: process.stdin });
 const pending = new Map();
 let nextId = 5000;
 let nextSession = 1;
 const paramsLog = process.env.ACP_MOCK_PARAMS_LOG || null;
+if (process.env.ACP_MOCK_ENV_LOG) writeFileSync(process.env.ACP_MOCK_ENV_LOG, JSON.stringify(process.env));
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -71,7 +74,12 @@ rl.on("line", async (line) => {
       const outcome = response.result?.outcome;
       stopReason = outcome?.outcome === "selected" ? outcome.optionId : "cancelled";
     } else if (command.terminal) {
-      const created = await request("terminal/create", { sessionId, command: command.terminal.command, args: command.terminal.args ?? [] });
+      const created = await request("terminal/create", {
+        sessionId,
+        command: command.terminal.command,
+        args: command.terminal.args ?? [],
+        ...(command.terminal.env ? { env: command.terminal.env } : {})
+      });
       if (created.error) stopReason = "terminal-error";
       else {
         await request("terminal/wait_for_exit", { sessionId, terminalId: created.result.terminalId });

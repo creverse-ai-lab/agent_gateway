@@ -1,4 +1,5 @@
 import { requireAccess } from "./access.js";
+import { withoutSessionMarkers } from "./caller.js";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -236,6 +237,9 @@ export class GatewayRpcClient {
     }
     const id = randomUUID();
     const signal = options?.signal;
+    // A per-call caller (one Codex thread among many in this process) wins over
+    // the connection's.
+    const caller = options?.caller ?? this.caller;
     return new Promise((resolve, reject) => {
       let settled = false;
       const finish = (callback, value) => {
@@ -269,7 +273,7 @@ export class GatewayRpcClient {
       // will ever arrive for.
       this.channel.write(
         HIGH_LANE_METHODS.has(method) ? LANE_HIGH : LANE_NORMAL,
-        { id, method, args, token: this.token, rootId: this.rootId, access: this.access, ...(this.caller ? { caller: this.caller } : {}) }
+        { id, method, args, token: this.token, rootId: this.rootId, access: this.access, ...(caller ? { caller } : {}) }
       );
       const timer = setTimeout(() => {
         this.pending.delete(id);
@@ -326,8 +330,10 @@ export class GatewayRpcClient {
     const child = spawn(process.execPath, [daemon], {
       detached: true,
       stdio: "ignore",
+      // The daemon outlives this Main and serves every other one: it must not
+      // carry this Main's session identity into the workers it starts.
       env: {
-        ...process.env,
+        ...withoutSessionMarkers(process.env),
         ACP_GATEWAY_SOCKET: this.socketPath,
         ...(this.token ? { ACP_GATEWAY_CONTROL_TOKEN: this.token } : {}),
         ...(this.rootId ? { ACP_GATEWAY_ROOT_ID: this.rootId } : {})

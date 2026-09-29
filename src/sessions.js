@@ -626,6 +626,10 @@ export function publicSession(session) {
     // so the default shape is unchanged.
     ...(session.openedBy ? { openedBy: session.openedBy } : {}),
     ...(session.promptedBy ? { promptedBy: session.promptedBy } : {}),
+    // The absence said out loud: opened by a front door that sent no caller
+    // (pre-1.6, or restored from state written before 1.6), so no Main can
+    // claim it. Poll strips it (Quiet).
+    ...(session.openedBy ? {} : { attribution: "none" }),
     // Only present for workspace=snapshot, so the default shape is unchanged.
     ...(session.workspace ? {
       workspace: {

@@ -27,6 +27,7 @@ import { TaskStore, TERMINAL_TASK_STATUSES } from "./task-store.js";
 import { GATEWAY_API_VERSION, GATEWAY_VERSION, LEGACY_STATE_SCHEMA_VERSION, STATE_SCHEMA_VERSION } from "./version.js";
 
 import { authorizeCall, isReadOnlyCall } from "./access.js";
+import { normalizeCaller } from "./caller.js";
 import { MANAGEMENT_CAPABILITIES, RUNTIME_IDENTITY } from "./runtime-identity.js";
 import { validateSetting } from "./settings.js";
 
@@ -73,6 +74,10 @@ const CLOSED_STATUSES = new Set(["closed"]);
 // known to be out of sync with the worker, so it has to be resumed first.
 const RESTORE_REQUIRED_STATUSES = new Set(["disconnected", "unavailable"]);
 const CONTROL_SERVER_PATTERN = /(?:acp-gateway-control|acp-mcp-bridge|gateway-daemon|control-mcp)/i;
+// The calls that record a caller. One of them arriving over the control socket
+// with no caller is work nobody can attribute; management calls (admin CLI,
+// installer health checks) are not front doors and do not count.
+const ATTRIBUTED_METHODS = new Set(["session_open", "session_restore", "prompt", "run", "task_prompt", "task_run"]);
 // Defined next to the ring that enforces it; re-exported here because the
 // transport lane table reads the same closed control-event inventory.
 export { DURABLE_EVENT_TYPES } from "./sessions.js";
@@ -172,6 +177,9 @@ export class GatewayService {
     // Alerts raised by recovery (downgrade detected, WAL truncated) ride the
     // setup().alerts array that Main already reads.
     this.stateAlerts = [];
+    // Since this process started. Not persisted: the question is whether an old
+    // front door is connected now, not whether one ever was.
+    this.legacyControlRequests = 0;
     // Per-task delivery preferences (profile, budget, usage) captured at prompt
     // time, because finishTaskForSession builds the envelope when no caller is
     // present to state them. Deliberately NOT on the session (a later poll would
@@ -401,6 +409,10 @@ export class GatewayService {
     const mutating = !isReadOnlyCall(method, args);
     if (this.draining && mutating) throw new GatewayError(ERROR_CODES.GATEWAY_DRAINING, "Gateway is draining");
     if (context.access !== "observer") this.touchOwnerActivity(args, context);
+    // Only the daemon states access, so an embedded caller never counts.
+    if (context.access === "control" && !context.caller && ATTRIBUTED_METHODS.has(method)) {
+      this.legacyControlRequests += 1;
+    }
     const handlers = {
       setup: () => this.setup(args),
       gateway_config: () => this.gatewayConfig(args),
@@ -594,7 +606,7 @@ export class GatewayService {
     const detected = await detectProviders();
     const names = provider ? [requireProvider(provider)] : [];
     const agentUpdates = this.agentUpdateManager?.snapshot() ?? null;
-    const alerts = [...(agentUpdates?.alerts ?? []), ...this.stateAlerts];
+    const alerts = [...(agentUpdates?.alerts ?? []), ...this.stateAlerts, ...this.#legacyAlerts()];
     const liveSessions = this.store.list().filter((session) => session.client?.alive).length;
     // The omitted blocks are the ones a delegating Main re-reads on every hop
     // without acting on them: `detected` (install-time paths, and the only
@@ -615,7 +627,8 @@ export class GatewayService {
           ok: item.agentInstalled && item.adapterInstalled,
           started: this.#providerStarted(item.id)
         })),
-        liveSessions
+        liveSessions,
+        legacyControlRequests: this.legacyControlRequests
       };
     }
     return {
@@ -651,6 +664,7 @@ export class GatewayService {
       agentUpdates,
       gatewayUpdate: agentUpdates?.gatewaySource ?? null,
       alerts,
+      legacyControlRequests: this.legacyControlRequests,
       detected,
       providers: provider ? await Promise.all(
         names.map(async (name) => {
@@ -680,6 +694,33 @@ export class GatewayService {
         started: this.#providerStarted(item.id)
       }))
     };
+  }
+
+  #legacyAlerts() {
+    if (!this.legacyControlRequests) return [];
+    return [{
+      level: "warning",
+      code: "front_door_without_caller",
+      message: `${this.legacyControlRequests} control request(s) since the Gateway started opened or prompted `
+        + "sessions without saying which Main sent them. An older (pre-1.6) agent-acp front door is connected, "
+        + "and the sessions and turns it starts cannot be attributed. Reconnect or reinstall that agent's agent-acp MCP server."
+    }];
+  }
+
+  // The caller as recorded on a session or turn. A caller whose own session id
+  // is one of this root's live workers' ACP ids is that worker acting as a Main.
+  // Best effort: it only fires when the worker exports the same id to its MCP
+  // servers as its ACP session id (a Codex thread id can be both).
+  // Normalized here too, not only in the daemon: an embedded caller must not
+  // be able to persist a forged viaSession or any other key.
+  #attributed(context) {
+    const caller = normalizeCaller(context?.caller);
+    if (!caller) return null;
+    const via = caller.sessionId
+      ? this.store.list().find((item) => item.acpSessionId === caller.sessionId
+        && item.ownerRootId === context.rootId && !CLOSED_STATUSES.has(item.status))
+      : null;
+    return { ...caller, ...(via ? { viaSession: via.id } : {}) };
   }
 
   // Grok gets a process-wide sandbox profile denying the protected paths; see
@@ -765,7 +806,7 @@ export class GatewayService {
         permissionPolicy,
         workspace,
         ownerRootId: requireRoot(context),
-        openedBy: context?.caller ?? null
+        openedBy: this.#attributed(context)
       });
     } catch (error) {
       await this.discardUnregisteredSession(client, created.sessionId);
@@ -849,7 +890,7 @@ export class GatewayService {
         restoredWith: method,
         permissionPolicy,
         ownerRootId: requireRoot(context),
-        openedBy: context?.caller ?? null
+        openedBy: this.#attributed(context)
       });
     } catch (error) {
       await this.discardUnregisteredSession(client, acpSessionId);
@@ -1160,10 +1201,12 @@ export class GatewayService {
     // wait fails on OUR terms (a legible ok:true handoff) rather than as a
     // transport timeout the gateway never gets to explain.
     const waitMs = Math.min(600_000, requireNonNegativeNumber(args.waitMs, "waitMs", 55_000));
-    const taskId = attaching
-      ? this.#storeCall(() => this.taskStore.get(args.taskId, { ownerRootId })).taskId
+    // promptedBy only when this call started the turn: an attach, or an
+    // idempotent retry that found its run, started nothing.
+    const { taskId, promptedBy } = attaching
+      ? { taskId: this.#storeCall(() => this.taskStore.get(args.taskId, { ownerRootId })).taskId }
       : await this.#startRunTask(args, context);
-    if (waitMs === 0) return this.#runHandoff(taskId, context);
+    if (waitMs === 0) return this.#runHandoff(taskId, context, { promptedBy });
     let record;
     try {
       // The TASK waiter, never store.wait: store.wait fires at finalizeResult,
@@ -1178,10 +1221,10 @@ export class GatewayService {
         stopOn: ["input_required"]
       });
     } catch (error) {
-      if (error?.code === "WAIT_TIMEOUT") return this.#runHandoff(taskId, context, { timedOut: true });
+      if (error?.code === "WAIT_TIMEOUT") return this.#runHandoff(taskId, context, { timedOut: true, promptedBy });
       return this.#storeCall(() => { throw error; });
     }
-    if (!TERMINAL_TASK_STATUSES.has(record.status)) return this.#runHandoff(taskId, context);
+    if (!TERMINAL_TASK_STATUSES.has(record.status)) return this.#runHandoff(taskId, context, { promptedBy });
     return this.taskResult({ taskId }, context);
   }
 
@@ -1200,21 +1243,24 @@ export class GatewayService {
           { taskId: existing, sessionId: session.id }
         );
       }
-      return existing;
+      return { taskId: existing };
     }
     const created = await this.taskPrompt(args, context, "run");
     this.#rememberRun(session, args.idempotencyKey, created.taskId);
-    return created.taskId;
+    return { taskId: created.taskId, promptedBy: created.promptedBy };
   }
 
   // Not an error return. A timeout or a pending worker request is a handoff: the
   // work is still running and the handle is still good, so the model is told what
   // to call next. Reporting isError here would make it retry the whole call —
   // which is exactly how one prompt becomes two.
-  #runHandoff(taskId, context, { timedOut = false } = {}) {
+  #runHandoff(taskId, context, { timedOut = false, promptedBy = null } = {}) {
     const ownerRootId = requireRoot(context);
     const task = this.#storeCall(() => this.taskStore.get(taskId, { ownerRootId }));
+    // The terminal envelope is never touched: it is the same object tasks/result
+    // returns. Only a handoff echoes who started the run.
     if (TERMINAL_TASK_STATUSES.has(task.status)) return this.taskResult({ taskId }, context);
+    const echo = promptedBy ? { promptedBy } : {};
     if (task.status === "input_required") {
       const pending = this.#pendingInboxRecord(task.sessionId);
       return {
@@ -1222,6 +1268,7 @@ export class GatewayService {
         status: "input_required",
         taskId,
         sessionId: task.sessionId,
+        ...echo,
         ...(pending ? { pending } : {}),
         next: {
           answerWith: pending?.type === "worker_question" ? "agent_acp_answer" : "agent_acp_permission",
@@ -1235,6 +1282,7 @@ export class GatewayService {
       ...(timedOut ? { incomplete: "wait_budget_exceeded" } : {}),
       taskId,
       sessionId: task.sessionId,
+      ...echo,
       next: {
         attach: { tool: "agent_acp_run", arguments: { taskId } },
         poll: { tool: "agent_acp_poll", arguments: { sessionId: task.sessionId, waitMs: 30_000 } }
@@ -1331,7 +1379,7 @@ export class GatewayService {
     session.completedAt = null;
     session.transientClearedAt = null;
     // The Main that started this turn: its reply is for that caller.
-    session.promptedBy = context?.caller ?? null;
+    session.promptedBy = this.#attributed(context);
     this.store.push(session, {
       type: "turn_start",
       turnId: session.turnId,
@@ -1347,7 +1395,14 @@ export class GatewayService {
         (result) => queue.post("turn_end", () => this.#finishTurn(session, token, { result })),
         (error) => queue.post("turn_fail", () => this.#finishTurn(session, token, { error }))
       );
-    return { ok: true, sessionId: session.id, turnId: session.turnId, status: session.status };
+    return {
+      ok: true,
+      sessionId: session.id,
+      turnId: session.turnId,
+      status: session.status,
+      // Echoed so a Main learns the identity its turns are recorded under.
+      ...(session.promptedBy ? { promptedBy: session.promptedBy } : {})
+    };
   }
 
   // The single terminal transition for a turn. Five guards, one per way the
@@ -1441,8 +1496,9 @@ export class GatewayService {
           // The handle can already be gone: ttl=0 expires on the first read after
           // create. The turn is running either way, so the ack reports the handle
           // that was minted instead of failing work that has already started.
+          const echo = started.promptedBy ? { promptedBy: started.promptedBy } : {};
           if (!this.taskStore.find(task.taskId)) {
-            return this.publicTask({ ...task, turnId: started.turnId });
+            return { ...this.publicTask({ ...task, turnId: started.turnId }), ...echo };
           }
           this.taskStore.attachTurn(task.taskId, started.turnId);
           const running = this.taskStore.transition(task.taskId, "working", "Prompt running");
@@ -1450,7 +1506,7 @@ export class GatewayService {
           // but no caller is holding a response for it.
           this.#appendTaskStatus(running);
           this.#publishTaskStatus(running);
-          return this.publicTask(running);
+          return { ...this.publicTask(running), ...echo };
         });
       } catch (error) {
         if (session.activeTaskId === task.taskId) {
@@ -1681,9 +1737,11 @@ export class GatewayService {
     const active = ACTIVE_STATUSES.has(session.status);
     const includeResult = args.includeResult === true || (args.includeResult !== false && !active);
     const diagnostic = profile === "diagnostic";
+    // Polls must not grow (Quiet): attribution is a session get/list fact.
+    const { attribution: _attribution, ...envelope } = publicSession(session);
     const response = {
       ok: true,
-      ...publicSession(session),
+      ...envelope,
       nextCursor: window.length ? window.at(-1).i + 1 : effectiveCursor,
       cursorTruncated: cursorTruncatedFor(session, cursor),
       events,

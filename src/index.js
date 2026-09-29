@@ -11,14 +11,15 @@ import {
   ListToolsRequestSchema,
   RELATED_TASK_META_KEY
 } from "@modelcontextprotocol/sdk/types.js";
-import { callerFromProcess } from "./caller.js";
+import { callerForCall, callerFromProcess } from "./caller.js";
 import { controlToken, rootId } from "./config.js";
 import { errorEnvelope } from "./errors.js";
 import { GatewayRpcClient } from "./socket-rpc.js";
 import { PERMISSION_POLICIES } from "./acp-client.js";
 import { GATEWAY_VERSION } from "./version.js";
 
-const rpc = new GatewayRpcClient({ token: controlToken(), rootId: rootId(), caller: callerFromProcess() });
+const processCaller = callerFromProcess();
+const rpc = new GatewayRpcClient({ token: controlToken(), rootId: rootId(), caller: processCaller });
 const tools = controlTools();
 const server = new Server(
   { name: "acp-gateway-control", version: GATEWAY_VERSION },
@@ -58,23 +59,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   try {
     const method = methods[request.params.name];
     if (!method) throw new Error(`Unknown tool: ${request.params.name}`);
+    const caller = callerOf(request, extra);
     const task = taskOptions(request.params);
     if (task && method === "run") {
       const created = await rpc.call(
         "task_run",
-        { ...(request.params.arguments ?? {}), ...task }
+        { ...(request.params.arguments ?? {}), ...task },
+        30_000,
+        { caller }
       );
       return { task: created, ...relatedTask(created.taskId) };
     }
     if (task) throw new Error(`Tool ${request.params.name} does not support task execution`);
     const args = request.params.arguments ?? {};
-    if (method === "run") return await runTool(args, extra);
+    if (method === "run") return await runTool(args, extra, caller);
     const timeoutMs = method === "poll"
       ? Math.max(30_000, Number(args.waitMs ?? 0) + 5_000)
       : method === "setup" && args.refreshAgentUpdates === true
         ? 120_000
         : 30_000;
-    return toolResult(withFrontDoorNotice(method, await rpc.call(method, args, timeoutMs)));
+    return toolResult(withFrontDoorNotice(method, await rpc.call(method, args, timeoutMs, { caller })));
   } catch (error) {
     return toolResult({
       ok: false,
@@ -83,19 +87,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   }
 });
 
-server.setRequestHandler(GetTaskRequestSchema, async (request) => {
-  const record = await rpc.call("task_get", { taskId: request.params.taskId });
+server.setRequestHandler(GetTaskRequestSchema, async (request, extra) => {
+  const record = await rpc.call("task_get", { taskId: request.params.taskId }, 30_000, { caller: callerOf(request, extra) });
   return record;
 });
 
-server.setRequestHandler(ListTasksRequestSchema, async (request) => {
+server.setRequestHandler(ListTasksRequestSchema, async (request, extra) => {
   // tasks/list carries only a cursor (no page size), so the front door picks the
   // page size itself: without a limit the gateway answers unpaged, which is the
   // contract the direct socket callers depend on but an unbounded reply here.
   // 200 is the store's maximum page, so a host with fewer handles sees exactly
   // what it saw before.
   const cursor = request.params?.cursor;
-  const listed = await rpc.call("task_list", { limit: 200, ...(cursor == null ? {} : { cursor }) });
+  const listed = await rpc.call(
+    "task_list",
+    { limit: 200, ...(cursor == null ? {} : { cursor }) },
+    30_000,
+    { caller: callerOf(request, extra) }
+  );
   // ListTasksResultSchema types nextCursor as an optional string, so the last
   // page omits the key rather than sending the gateway's null.
   return {
@@ -109,13 +118,13 @@ server.setRequestHandler(GetTaskPayloadRequestSchema, async (request, extra) => 
     "task_result",
     { taskId: request.params.taskId, waitMs: 120_000 },
     125_000,
-    { signal: extra.signal }
+    { signal: extra.signal, caller: callerOf(request, extra) }
   );
   return toolResult(result, result.ok === false, relatedTask(request.params.taskId));
 });
 
-server.setRequestHandler(CancelTaskRequestSchema, async (request) => {
-  const record = await rpc.call("task_cancel", { taskId: request.params.taskId });
+server.setRequestHandler(CancelTaskRequestSchema, async (request, extra) => {
+  const record = await rpc.call("task_cancel", { taskId: request.params.taskId }, 30_000, { caller: callerOf(request, extra) });
   return record;
 });
 
@@ -130,12 +139,12 @@ await server.connect(new StdioServerTransport());
 const RUN_DEFAULT_WAIT_MS = 55_000;
 const RUN_MAX_WAIT_MS = 600_000;
 
-async function runTool(args, extra) {
+async function runTool(args, extra, caller) {
   const requested = Number(args.waitMs ?? RUN_DEFAULT_WAIT_MS);
   const waitMs = Math.min(RUN_MAX_WAIT_MS, Number.isFinite(requested) ? Math.max(0, requested) : RUN_DEFAULT_WAIT_MS);
   let taskId = typeof args.taskId === "string" ? args.taskId : null;
   if (!taskId) {
-    const admitted = await rpc.call("run", { ...args, waitMs: 0 }, 30_000);
+    const admitted = await rpc.call("run", { ...args, waitMs: 0 }, 30_000, { caller });
     taskId = typeof admitted.taskId === "string" ? admitted.taskId : null;
     await announceTask(extra, taskId);
     if (!taskId || waitMs === 0) return toolResult(admitted, admitted.ok === false, relatedTask(taskId));
@@ -148,7 +157,7 @@ async function runTool(args, extra) {
       "run",
       { taskId, waitMs },
       Math.max(30_000, waitMs + 5_000),
-      { signal: waitController.signal }
+      { signal: waitController.signal, caller }
     ),
     extra?.signal,
     taskId,
@@ -223,6 +232,12 @@ function withFrontDoorNotice(method, result) {
       action: "reconnect the agent-acp MCP server"
     }
   };
+}
+
+// Who sent this one request. SDK 1.30 hands the raw params._meta to every
+// handler as extra._meta; the parsed request keeps unknown _meta keys too.
+function callerOf(request, extra) {
+  return callerForCall(processCaller, extra?._meta ?? request?.params?._meta);
 }
 
 // One place builds a tool envelope. `extra` carries result-level additions such

@@ -38,10 +38,15 @@ const WIRE_RESULT_KEYS = sorted(["text", "transcriptBytes", "artifact", "stopRea
 // unknown argument silently, so probing by sending one cannot detect support.
 // Everything else in full setup is frozen; mode:"summary" is a separate, opt-in
 // response and never changes this one.
+// GOLDEN DIFF (1.7.0 W1): legacyControlRequests joins setup (full and summary).
+// It counts session_open/restore/prompt/run calls that reached the control
+// socket without a caller since the daemon started — the only way to see that a
+// pre-1.6 front door is still attributing nothing. Additive; always a number.
 const SETUP_KEYS = sorted([
   "ok", "gatewayVersion", "gatewayApiVersion", "stateSchemaVersion", "responseProfiles", "persistence",
   "lifecycle", "resourceLimits", "metrics", "agentUpdates", "gatewayUpdate", "alerts", "detected", "providers",
-  "runtimeRoot", "gatewayBuildId", "sourceCommit", "instanceId", "capabilities", "configRevision"
+  "runtimeRoot", "gatewayBuildId", "sourceCommit", "instanceId", "capabilities", "configRevision",
+  "legacyControlRequests"
 ]);
 // GOLDEN DIFF (1.4.0 PR 4): taskRetentionMs joins lifecycle. A task's bytes now
 // have their own retention, separate from its session's, because a completed
@@ -196,6 +201,7 @@ test("characterization: setup reports gateway, API and state schema versions wit
     assert.equal(setup.agentUpdates, null);
     assert.equal(setup.gatewayUpdate, null);
     assert.deepEqual(setup.alerts, []);
+    assert.equal(setup.legacyControlRequests, 0, "an embedded caller is never a legacy front door");
     assert.ok(Array.isArray(setup.detected) && setup.detected.length > 0);
     for (const item of setup.detected) {
       assert.equal(typeof item.id, "string");

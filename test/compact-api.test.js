@@ -637,9 +637,11 @@ test("T9: setup summary and session_open carry exactly the bind-time facts", asy
   try {
     const full = await service.call("setup", {}, MAIN);
     const summary = await service.call("setup", { mode: "summary" }, MAIN);
+    // GOLDEN DIFF (1.7.0 W1): legacyControlRequests is appended, after the
+    // unchanged 1.4.0 prefix (see SETUP_KEYS in characterization.test.js).
     assert.deepEqual(Object.keys(summary), [
       "ok", "gatewayVersion", "gatewayApiVersion", "stateSchemaVersion", "responseProfiles",
-      "persistence", "alerts", "providers", "liveSessions"
+      "persistence", "alerts", "providers", "liveSessions", "legacyControlRequests"
     ]);
     assert.deepEqual(Object.keys(summary.persistence), ["healthy", "error"]);
     assert.equal(summary.liveSessions, 0);

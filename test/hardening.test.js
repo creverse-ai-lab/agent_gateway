@@ -7,6 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { AcpClient, acpRequestError } from "../src/acp-client.js";
 import { defaultProviderRegistryPath, providerRegistryReadPath } from "../src/acp-registry.js";
+import { SESSION_MARKER_ENV, withoutSessionMarkers } from "../src/caller.js";
 import { gatewayProtectedPaths } from "../src/config.js";
 import { ERROR_CODES } from "../src/errors.js";
 import { GatewayService } from "../src/gateway-service.js";
@@ -669,4 +670,68 @@ test("partial-enforcement alerts carry the exact scope a Main can rely on", () =
   assert.deepEqual(codex.scope, ["edit_inside_roots", "shell_write_inside_roots", "read_outside_roots", "read_protected"]);
   assert.deepEqual(partialPolicyEnforcement("codex", "auto_approve").scope, ["read_outside_roots", "read_protected"]);
   assert.equal(partialPolicyEnforcement("claude", "read_only"), null);
+});
+
+// ------------------------------------------------------------ worker identity
+
+// The daemon's env is whichever Main autostarted it. Before 1.7 every worker
+// (and every terminal a worker ran) inherited that Main's session id, so a worker
+// calling the Gateway looked exactly like the Main that happened to start it.
+test("W1: workers and their terminals never inherit the Main's session markers", async () => {
+  await withTemp("acp-worker-env-", async (directory) => {
+    const envLog = join(directory, "worker-env.json");
+    const codexHome = join(directory, "codex-home");
+    const inherited = {
+      CLAUDE_CODE_SESSION_ID: "main-claude-session",
+      CLAUDECODE: "1",
+      CLAUDE_CODE_ENTRYPOINT: "cli",
+      CODEX_THREAD_ID: "main-codex-thread",
+      GROK_SESSION_ID: "main-grok-session",
+      CODEX_HOME: codexHome
+    };
+    const namesIn = async (path) => new Set((await readFile(path, "utf8")).split("\n").map((line) => line.split("=")[0]));
+    await withEnv(inherited, async () => {
+      const service = new GatewayService({ createClient: permissionClientFactory({ ACP_MOCK_ENV_LOG: envLog }) });
+      try {
+        await service.init();
+        const { sessionId } = await service.call("session_open", { provider: "claude", cwd: directory, permissionPolicy: "auto_approve" }, context);
+        const worker = JSON.parse(await readFile(envLog, "utf8"));
+        for (const name of SESSION_MARKER_ENV) assert.equal(Object.hasOwn(worker, name), false, `worker inherited ${name}`);
+        assert.equal(worker.CODEX_HOME, codexHome, "config paths are not markers");
+        assert.equal(Object.hasOwn(worker, "ACP_GATEWAY_ROOT_ID"), false, "the existing scrub still holds");
+
+        const terminalEnv = join(directory, "terminal-env.txt");
+        const ran = await runPrompt(service, sessionId, { terminal: { command: "/bin/sh", args: ["-c", `env > "${terminalEnv}"`] } });
+        assert.equal(ran.result?.stopReason, "terminal-ok");
+        const terminal = await namesIn(terminalEnv);
+        for (const name of SESSION_MARKER_ENV) assert.equal(terminal.has(name), false, `terminal inherited ${name}`);
+        assert.equal(terminal.has("CODEX_HOME"), true);
+
+        // What the worker asks for itself is its own identity, not the Main's.
+        const ownEnv = join(directory, "terminal-own-env.txt");
+        const own = await runPrompt(service, sessionId, {
+          terminal: {
+            command: "/bin/sh",
+            args: ["-c", `printf %s "$CLAUDE_CODE_SESSION_ID" > "${ownEnv}"`],
+            env: [{ name: "CLAUDE_CODE_SESSION_ID", value: "worker-own-session" }]
+          }
+        });
+        assert.equal(own.result?.stopReason, "terminal-ok");
+        assert.equal(await readFile(ownEnv, "utf8"), "worker-own-session");
+      } finally {
+        await service.shutdown();
+      }
+    });
+  });
+});
+
+// The same helper builds the env of an autostarted daemon (socket-rpc.js).
+test("W1: the marker scrub is a copy that keeps config paths", () => {
+  const env = { PATH: "/bin", CODEX_HOME: "/c", CLAUDE_HOME: "/h", GROK_HOME: "/g", ...Object.fromEntries(SESSION_MARKER_ENV.map((name) => [name, "x"])) };
+  const scrubbed = withoutSessionMarkers(env);
+  assert.deepEqual(scrubbed, { PATH: "/bin", CODEX_HOME: "/c", CLAUDE_HOME: "/h", GROK_HOME: "/g" });
+  assert.equal(env.CLAUDE_CODE_SESSION_ID, "x", "a copy: the caller's env is untouched");
+  assert.deepEqual([...SESSION_MARKER_ENV].sort(), [
+    "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "GROK_SESSION_ID"
+  ]);
 });
