@@ -27,6 +27,13 @@ export const PUBLIC_CLIENT_EXPORTS = Object.freeze([
   "GatewayError",
   "GatewayRpcClient"
 ]);
+// How the runtime tree's production dependencies are installed. --omit=optional
+// drops the Claude Agent SDK's bundled Claude Code binary (about 245 MB, its
+// only optional dependency): the Gateway always runs the user's own CLI, and
+// tags before 1.7.1 still list the binary in their lockfile.
+export const RUNTIME_INSTALL_ARGS = Object.freeze([
+  "ci", "--omit=dev", "--omit=optional", "--ignore-scripts", "--os=darwin", "--cpu=arm64"
+]);
 export const REQUIRED_ALLOWED_ROOTS = Object.freeze([
   "gateway-client/",
   "node_modules/",

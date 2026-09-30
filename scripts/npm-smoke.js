@@ -28,6 +28,10 @@
 // serves this package exactly as npmjs would and passes every other request
 // through to registry.npmjs.org unchanged.
 //
+// The installed tree must hold no Claude Code binary (the Claude Agent SDK's
+// optional platform packages, which npm-shrinkwrap.json omits; see
+// scripts/omit-claude-binary.js) and must still load the Claude adapter.
+//
 // Needs the npm registry for the dependencies, so it is not part of `npm run ci`.
 
 import assert from "node:assert/strict";
@@ -42,6 +46,7 @@ import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { GATEWAY_VERSION } from "../src/version.js";
+import { findClaudePlatformPackages } from "./omit-claude-binary.js";
 
 const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const packageDocument = JSON.parse(await readFile(join(repositoryRoot, "package.json"), "utf8"));
@@ -282,6 +287,38 @@ async function assertShrinkwrappedTree(packageRoot) {
   step(`dependency tree matches npm-shrinkwrap.json (${matched} packages)`);
 }
 
+// Resolved through the installed package's own providers.js, as the daemon
+// does: the adapter entry the Claude Worker runs, the SDK it imports, and the
+// CLI it would be pointed at.
+const CLAUDE_PROBE = `
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
+const { providerConfig } = await import(pathToFileURL(process.argv[2]).href);
+const config = providerConfig("claude");
+const entry = config.args[0];
+const sdk = createRequire(entry).resolve("@anthropic-ai/claude-agent-sdk");
+await import(pathToFileURL(sdk).href);
+process.stdout.write(JSON.stringify({ entry, sdk, executable: config.env.CLAUDE_CODE_EXECUTABLE }));
+`;
+
+async function assertClaudeAdapter(env, packageRoot) {
+  const platformPackages = findClaudePlatformPackages(prefix);
+  assert.deepEqual(platformPackages, [], "the install must not include the Claude Agent SDK's bundled Claude Code binary");
+  const probePath = join(prefix, "claude-probe.mjs");
+  await writeFile(probePath, CLAUDE_PROBE);
+  const probe = JSON.parse(run(process.execPath, [probePath, join(packageRoot, "src", "providers.js")], { cwd: prefix, env }).stdout);
+  const installed = await realpath(prefix);
+  assert.ok(probe.entry.startsWith(`${installed}/`), `Claude adapter resolved outside the install: ${probe.entry}`);
+  assert.ok(probe.sdk.startsWith(`${installed}/`), `Claude Agent SDK resolved outside the install: ${probe.sdk}`);
+  assert.ok(!probe.executable.startsWith(`${installed}/`), `the Claude Worker must run the user's CLI, not ${probe.executable}`);
+  // --version loads the adapter's whole module graph (SDK included) and exits
+  // before any Claude CLI is needed.
+  const adapterVersion = run(process.execPath, [probe.entry, "--version"], { cwd: prefix, env }).stdout.trim();
+  const pinned = shrinkwrap.packages["node_modules/@agentclientprotocol/claude-agent-acp"].version;
+  assert.equal(adapterVersion, pinned, "installed Claude adapter version differs from the shrinkwrap");
+  step(`no Claude Code binary installed; Claude adapter ${adapterVersion} loads (${probe.entry.slice(installed.length + 1)})`);
+}
+
 function assertBins(env) {
   const binDirectory = join(prefix, "node_modules", ".bin");
   for (const name of Object.keys(packageDocument.bin)) {
@@ -403,6 +440,7 @@ try {
   await mkdir(home, { recursive: true });
   const env = isolatedEnv();
   assertBins(env);
+  await assertClaudeAdapter(env, packageRoot);
   await startDaemon(env);
   await setupThroughClient(env, packageRoot);
   step("passed");

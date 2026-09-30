@@ -16,6 +16,7 @@ import {
   readJson,
   sha256File
 } from "./runtime-release-lib.js";
+import { findClaudePlatformPackages } from "./omit-claude-binary.js";
 
 const arguments_ = process.argv.slice(2);
 
@@ -62,6 +63,12 @@ try {
     const root = file.path.split("/", 1)[0] + (file.path.includes("/") ? "/" : "");
     assert.ok(manifest.allowedRoots.includes(root), `unexpected runtime root: ${file.path}`);
   }
+  // The payload equals the manifest (checked above), so the tree answers for both.
+  assert.deepEqual(
+    findClaudePlatformPackages(runtimeRoot),
+    [],
+    "the runtime must not ship the Claude Agent SDK's bundled Claude Code binary"
+  );
 
   const consumer = join(temporary, "consumer");
   const modules = join(consumer, "node_modules");

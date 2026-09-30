@@ -3,6 +3,7 @@
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { validateMonitorConfig, validateSnapshot } from "./acp-upstream-monitor.js";
+import { omitClaudeBinaryFromShrinkwrap } from "./omit-claude-binary.js";
 
 const root = new URL("../", import.meta.url);
 
@@ -30,6 +31,9 @@ try {
   } else {
     const specs = updates.map((item) => `${item.packageName}@${item.after}`);
     await run("npm", ["install", "--save-exact", ...specs]);
+    // npm writes the new Claude Agent SDK's platform binaries back in.
+    const omitted = await omitClaudeBinaryFromShrinkwrap(new URL("npm-shrinkwrap.json", root));
+    if (omitted.length) process.stdout.write(`npm-shrinkwrap.json: omitted ${omitted.length} Claude platform binary references\n`);
     for (const update of updates) {
       process.stdout.write(`${update.agentId}: ${update.before ?? "missing"} -> ${update.after}\n`);
     }

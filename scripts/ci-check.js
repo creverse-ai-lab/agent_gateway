@@ -8,6 +8,7 @@ import { CRASH_POINTS } from "../src/state-store.js";
 import { GATEWAY_VERSION } from "../src/version.js";
 import { ACP_PROTOCOL_VERSION } from "../src/acp-version.js";
 import { compareSnapshots, validateMonitorConfig, validateSnapshot } from "./acp-upstream-monitor.js";
+import { claudePlatformBinaryReferences } from "./omit-claude-binary.js";
 
 const packageDocument = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 // npm-shrinkwrap.json, not package-lock.json: it ships inside the npm package,
@@ -30,6 +31,13 @@ assert.ok(packageDocument.files.includes("npm-shrinkwrap.json"), "the shrinkwrap
 assert.ok(
   !existsSync(new URL("../package-lock.json", import.meta.url)),
   "package-lock.json must not exist beside npm-shrinkwrap.json; npm would silently ignore it"
+);
+// npm installs a shrinkwrap's entries as written, whatever the platform and
+// --omit say, so a listed Claude Code binary reaches every user (see the script).
+assert.deepEqual(
+  claudePlatformBinaryReferences(lockDocument),
+  [],
+  "npm-shrinkwrap.json must not list the bundled Claude Code binaries; run node scripts/omit-claude-binary.js"
 );
 assert.deepEqual(
   packageDocument.exports,

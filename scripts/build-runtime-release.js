@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import {
   REQUIRED_ALLOWED_ROOTS,
   RUNTIME_ASSET_NAME,
+  RUNTIME_INSTALL_ARGS,
   RUNTIME_ROOT_NAME,
   RUNTIME_LOCKFILE_NAME,
   assertBuilderCommit,
@@ -91,7 +92,7 @@ try {
   await writeFile(packagePath, `${JSON.stringify(packageDocument, null, 2)}\n`);
   await writeFile(lockPath, `${JSON.stringify(lockDocument, null, 2)}\n`);
 
-  execFileSync("npm", ["ci", "--omit=dev", "--ignore-scripts", "--os=darwin", "--cpu=arm64"], {
+  execFileSync("npm", [...RUNTIME_INSTALL_ARGS], {
     cwd: runtimeRoot,
     stdio: "inherit",
     env: { ...process.env, npm_config_audit: "false", npm_config_fund: "false" }

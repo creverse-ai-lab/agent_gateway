@@ -1,13 +1,14 @@
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import { access } from "node:fs/promises";
-import { constants, readFileSync } from "node:fs";
+import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
 import { ERROR_CODES, GatewayError } from "./errors.js";
 import { readJsonFile, updateJsonFile } from "./atomic-json.js";
 import { providerRegistryReadPath, seedProviderRegistry } from "./acp-registry.js";
 
 const GROK_BIN = process.env.GROK_BIN || join(homedir(), ".grok/bin/grok");
+const CLAUDE_ADAPTER_ENTRY = "@agentclientprotocol/claude-agent-acp/dist/index.js";
 
 export const PROVIDERS = ["grok", "claude", "codex"];
 
@@ -22,7 +23,10 @@ export const PROVIDER_MANIFESTS = {
   claude: {
     id: "claude",
     displayName: "Claude Code",
-    agentCommand: process.env.CLAUDE_CODE_EXECUTABLE || join(homedir(), ".local/bin/claude"),
+    // Resolved on every read, so a CLI installed after the daemon started is seen.
+    get agentCommand() {
+      return claudeCodeExecutable();
+    },
     adapter: "@agentclientprotocol/claude-agent-acp",
     install: "npm install -g @agentclientprotocol/claude-agent-acp"
   },
@@ -81,14 +85,9 @@ export function providerConfig(provider, { model } = {}) {
     return {
       provider,
       command: process.execPath,
-      args: [
-        fileURLToPath(
-          import.meta.resolve("@agentclientprotocol/claude-agent-acp/dist/index.js")
-        )
-      ],
+      args: [fileURLToPath(import.meta.resolve(CLAUDE_ADAPTER_ENTRY))],
       env: {
-        CLAUDE_CODE_EXECUTABLE:
-          process.env.CLAUDE_CODE_EXECUTABLE || join(homedir(), ".local/bin/claude")
+        CLAUDE_CODE_EXECUTABLE: claudeCodeExecutable()
       },
       permissionPolicy: "ask",
       expectedModel: null,
@@ -116,15 +115,19 @@ export function providerConfig(provider, { model } = {}) {
 
 export async function detectProviders() {
   const builtins = await Promise.all(
-    Object.values(PROVIDER_MANIFESTS).map(async (manifest) => ({
-      ...manifest,
-      enabled: isProviderEnabled(manifest.id),
-      agentInstalled: await executableExists(manifest.agentCommand),
-      adapterInstalled:
-        manifest.adapter === "built-in" || manifest.id === "claude"
-          ? true
-          : await executableExists(manifest.adapter)
-    }))
+    Object.values(PROVIDER_MANIFESTS).map(async (source) => {
+      // Reads Claude's agentCommand getter once: the check and the report agree.
+      const manifest = { ...source };
+      return {
+        ...manifest,
+        enabled: isProviderEnabled(manifest.id),
+        agentInstalled: await executableExists(manifest.agentCommand),
+        adapterInstalled:
+          manifest.adapter === "built-in" || manifest.id === "claude"
+            ? true
+            : await executableExists(manifest.adapter)
+      };
+    })
   );
   const dynamic = await Promise.all(Object.values(configuredProviders()).map(async (definition) => ({
     id: definition.id,
@@ -180,25 +183,118 @@ function configuredProviders() {
 }
 
 async function executableExists(command) {
-  if (!command) return false;
-  if (command.includes("/")) {
+  for (const candidate of executableCandidates(command)) {
     try {
-      await access(command, constants.X_OK);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-  const paths = (process.env.PATH ?? "").split(":").filter(Boolean);
-  for (const directory of paths) {
-    try {
-      await access(join(directory, command), constants.X_OK);
+      await access(candidate, constants.X_OK);
       return true;
     } catch {
       // Continue searching PATH.
     }
   }
   return false;
+}
+
+// Where `command` may live: itself when it is a path, otherwise each PATH entry.
+function executableCandidates(command, pathValue = process.env.PATH) {
+  if (!command) return [];
+  if (command.includes("/")) return [command];
+  return (pathValue ?? "").split(":").filter(Boolean).map((directory) => join(directory, command));
+}
+
+function isExecutableFile(path) {
+  try {
+    accessSync(path, constants.X_OK);
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+// The native installer's location, and what every release before 1.7.1 used.
+export function legacyClaudeExecutable(home = homedir()) {
+  return join(home, ".local/bin/claude");
+}
+
+// The node_modules directories this package's own dependencies live in: its
+// nested one, and the one the Claude adapter actually resolves from (the same
+// directory for a global install, the prefix's for a hoisted one). The Claude
+// Agent SDK keeps a bundled Claude Code binary in there, and `npm exec`/`npm run`
+// put node_modules/.bin on PATH; neither may pass for the user's CLI.
+let ownRoots = null;
+export function ownDependencyRoots() {
+  if (ownRoots) return ownRoots;
+  const roots = new Set([fileURLToPath(new URL("../node_modules", import.meta.url))]);
+  try {
+    const entry = fileURLToPath(import.meta.resolve(CLAUDE_ADAPTER_ENTRY));
+    const marker = `${sep}node_modules${sep}@agentclientprotocol${sep}`;
+    const index = entry.lastIndexOf(marker);
+    if (index !== -1) roots.add(entry.slice(0, index + `${sep}node_modules`.length));
+  } catch {
+    // The adapter is not installed; the nested root still applies.
+  }
+  ownRoots = [...roots];
+  return ownRoots;
+}
+
+// A Claude Agent SDK platform package's own directory, in any node_modules.
+const BUNDLED_CLAUDE_BINARY = /(?:^|[\\/])node_modules[\\/]@anthropic-ai[\\/]claude-agent-sdk-[^\\/]+[\\/]/;
+
+function insideAny(path, roots) {
+  return roots.some((root) => {
+    const rest = relative(root, path);
+    return rest !== "" && rest !== ".." && !rest.startsWith(`..${sep}`) && !isAbsolute(rest);
+  });
+}
+
+// The Claude Code CLI the Claude Worker runs, and whether Claude counts as
+// installed. One answer serves both, in this order:
+// 1. CLAUDE_CODE_EXECUTABLE when set, as given (checked by the caller, as before);
+// 2. `claude` on PATH (Homebrew, npm global, the native installer, ...), never
+//    one inside this package's own node_modules;
+// 3. ~/.local/bin/claude when it exists, for a daemon started without it on PATH;
+// 4. null: not installed. The binary bundled with the Claude Agent SDK is never
+//    a fallback (from 1.7.1 the Gateway's installs no longer include it).
+export function resolveClaudeExecutable({
+  env = process.env,
+  home = homedir(),
+  isExecutable = isExecutableFile,
+  excludedRoots = ownDependencyRoots(),
+  realpath = realpathSync
+} = {}) {
+  // Whitespace only counts as unset; a set path is used even when missing.
+  const configured = env.CLAUDE_CODE_EXECUTABLE?.trim();
+  if (configured) return configured;
+  const real = (path) => {
+    try {
+      return realpath(path);
+    } catch {
+      return null;
+    }
+  };
+  // Both spellings of each root: a PATH entry or symlink may use either.
+  const roots = [...new Set([...excludedRoots, ...excludedRoots.map(real).filter(Boolean)])];
+  // Any project's bundled platform binary is refused too, e.g. through another
+  // project's node_modules/.bin shim.
+  const skip = (candidate) => {
+    const resolved = real(candidate) ?? candidate;
+    return insideAny(candidate, roots) || insideAny(resolved, roots)
+      || BUNDLED_CLAUDE_BINARY.test(candidate) || BUNDLED_CLAUDE_BINARY.test(resolved);
+  };
+  // Synchronous, unlike executableExists: providerConfig needs the answer inline.
+  // Relative PATH entries depend on the daemon's cwd, so they are ignored.
+  const onPath = executableCandidates("claude", env.PATH ?? "")
+    .find((candidate) => isAbsolute(candidate) && isExecutable(candidate) && !skip(candidate));
+  if (onPath) return onPath;
+  const legacy = legacyClaudeExecutable(home);
+  return isExecutable(legacy) ? legacy : null;
+}
+
+// What detection reports and the worker gets as CLAUDE_CODE_EXECUTABLE. When
+// nothing is found it is the legacy path, which is no usable CLI: detection says
+// not installed, and the adapter fails naming that path instead of falling back
+// to a bundled binary, exactly as before.
+function claudeCodeExecutable() {
+  return resolveClaudeExecutable() ?? legacyClaudeExecutable();
 }
 
 // Providers whose own tools can change the workspace without an ACP callback,
