@@ -119,7 +119,8 @@ const CHECK_UNDECIDED_CAVEATS = new Set(["provider_capabilities_unknown", "resto
 // restore in a row quarantines the session, and the third failed start in a
 // row marks the provider degraded in setup.
 const DEFAULT_MAX_CONSECUTIVE_RESTORE_FAILURES = 3;
-// Bounds the lastError a provider_degraded alert repeats from the start error.
+// Bounds the error text an alert repeats: provider_degraded's lastError, and the
+// persistence error in STATE_RESTORE_NOT_DURABLE.
 const PROVIDER_ALERT_ERROR_BYTES = 300;
 const CONTROL_SERVER_PATTERN = /(?:acp-gateway-control|acp-mcp-bridge|gateway-daemon|control-mcp)/i;
 // The calls that record a caller. One of them arriving over the control socket
@@ -1091,13 +1092,17 @@ export class GatewayService {
     const permissionPolicy = requirePermissionPolicy(
       args.permissionPolicy ?? existing?.permissionPolicy ?? "ask"
     );
+    const requested = args.method ?? "auto";
     let method;
     try {
-      method = restoreMethod(client.initResult, args.method ?? "auto");
+      method = restoreMethod(client.initResult, requested);
     } catch (error) {
-      // Refused against what the provider advertises, before the worker was
-      // asked anything: a request mistake, not the worker failing to come back.
-      if (attempt) attempt.refused = true;
+      // A method the caller named that the provider does not advertise is
+      // refused before the worker is asked anything: a request mistake, not the
+      // worker failing to come back. An automatic restore that finds no method
+      // at all is not a mistake anyone made: the session cannot come back on
+      // this provider, and that is a failed restore like any other.
+      if (attempt && (requested === "resume" || requested === "load")) attempt.refused = true;
       throw error;
     }
     if (attempt) {
@@ -1157,13 +1162,16 @@ export class GatewayService {
         // T0, like the failures that built the streak: they are synced in the
         // log, so the success that ends it is too, or a crash would bring the
         // streak (and a lifted quarantine) back. Nothing to clear, nothing written.
-        if (endedStreak) this.#appendSessionRegistered(existing, { durable: true });
+        // The worker is back either way; a write that did not hold is said
+        // alongside (additive, only then), never in place of the success.
+        const durability = endedStreak ? this.#appendSessionRegistered(existing, { durable: true }) : null;
         return {
           ok: true,
           ...this.#publicSession(existing),
           capabilities: configured.response,
           restoredWith: method,
-          ...this.bindTimeFacts(existing)
+          ...this.bindTimeFacts(existing),
+          ...(durability ? { durability } : {})
         };
       }
 
@@ -1363,9 +1371,10 @@ export class GatewayService {
   //
   // The attempt starts (restoring, session_restore_start) once restoreSession
   // knows the provider can take the request. A request refused before that
-  // (attempt.refused: a method the provider does not advertise) was never an
-  // attempt: it changes nothing on the record and counts nothing. Any other
-  // failure before that point (cwd gone, provider will not start) is the
+  // (attempt.refused: a method the caller named that the provider does not
+  // advertise) was never an attempt: it changes nothing on the record and
+  // counts nothing. Any other failure before that point (cwd gone, provider
+  // will not start, no restore method at all for an automatic restore) is the
   // worker failing to come back, so it starts the attempt late and fails it.
   // While the provider starts, the record is not yet restoring; _restoring is
   // what dedupes and what check reads in that window.
@@ -1400,7 +1409,10 @@ export class GatewayService {
         // what stop the next transparent restore, and the 50 ms snapshot above
         // is not durable. A crash that took them back would restart the
         // streak and hand a quarantined session to transparent recovery again.
-        this.#appendSessionRegistered(session, { durable: true });
+        // The worker's error is still what is returned; a write that did not
+        // hold rides along in its details.
+        const durability = this.#appendSessionRegistered(session, { durable: true, restore: "failed" });
+        if (durability) attachDurability(error, durability);
       }
       throw error;
     }
@@ -3509,22 +3521,41 @@ export class GatewayService {
   // That is also how a later session fact that must survive a crash (a restore
   // outcome) is journaled: no new record type, so a 1.7.0/1.7.1 reader applies it too.
   //
-  // durable (T0) fsyncs before returning. Its failure is recorded, not thrown:
-  // the caller is already returning a failure of its own, and replacing the
-  // worker's error with a persistence one would hide why the restore failed.
-  #appendSessionRegistered(session, { durable = false } = {}) {
-    if (!this.stateStore) return;
+  // durable (T0) fsyncs before returning. Its failure is not thrown: the
+  // restore it records already has an outcome (the worker came back, or its own
+  // error is being returned), and replacing that with a persistence error would
+  // misreport it. The failure is not swallowed either: persistence health says
+  // it, a setup alert keeps it after health recovers, and the durability fact
+  // returned here (null when the write held) goes on the restore's own answer.
+  #appendSessionRegistered(session, { durable = false, restore = null } = {}) {
+    if (!this.stateStore) return null;
     const checkpoint = this.store.checkpoints().find((record) => record.id === session.id);
-    if (!checkpoint) return;
+    if (!checkpoint) return null;
     if (!durable) {
       this.stateStore.append(WAL_TYPES.SESSION_REGISTERED, session.id, checkpoint);
-      return;
+      return null;
     }
     try {
       this.stateStore.appendDurable(WAL_TYPES.SESSION_REGISTERED, session.id, checkpoint);
       this.persistError = null;
+      return null;
     } catch (error) {
       this.persistError = error?.message ?? String(error);
+      const at = new Date(this.now()).toISOString();
+      const lost = restore === "failed"
+        ? "this failure would not be counted (nor any quarantine it caused)"
+        : "the session would come back with its previous restore failure count and quarantine";
+      this.recordStateAlert({
+        level: "warning",
+        code: "STATE_RESTORE_NOT_DURABLE",
+        sessionId: session.id,
+        at,
+        message: `The outcome of session ${session.id}'s ${restore === "failed" ? "failed " : ""}restore at ${at} `
+          + `could not be made durable (${utf8ByteHead(this.persistError, PROVIDER_ALERT_ERROR_BYTES)}). `
+          + `If the Gateway stops before its next successful state write, ${lost}. `
+          + "Check persistence in agent_acp_setup."
+      });
+      return { persisted: false, errorCode: ERROR_CODES.PERSISTENCE_UNHEALTHY };
     }
   }
 
@@ -3865,11 +3896,18 @@ export class GatewayService {
   flushPersist() {
     if (!this.persistDirty || !this.statePath) return this.persistChain;
     this.persistDirty = false;
+    let observed = null;
     this.persistChain = this.persistChain
       .catch(() => {})
-      .then(() => this.persist())
+      .then(() => {
+        observed = this.persistError;
+        return this.persist();
+      })
       .then(
-        () => { this.persistError = null; },
+        // A failure recorded while this write was in flight (a synced write
+        // that did not hold) is newer than the state this write captured, so
+        // this success does not answer it; the next write that does clears it.
+        () => { if (this.persistError === observed) this.persistError = null; },
         (error) => {
           this.persistError = error?.message ?? String(error);
           throw error;
@@ -4065,6 +4103,21 @@ function restoreMethod(initResult, requested) {
   if (canResume) return "resume";
   if (canLoad) return "load";
   throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "ACP agent does not support session restore");
+}
+
+// Adds the durability fact to a restore failure's details, keeping the error
+// itself (its class, code, message and any details it had), so the envelope
+// only gains a key. An error that cannot take it (not an object, frozen) is
+// returned unchanged: the setup alert and persistence health still say it.
+function attachDurability(error, durability) {
+  if (error == null || typeof error !== "object" || !Object.isExtensible(error)) return;
+  const details = error.details;
+  if (details !== undefined && (details === null || typeof details !== "object" || Array.isArray(details))) return;
+  try {
+    error.details = { ...(details ?? {}), durability };
+  } catch {
+    // A read-only details property: nothing more can be said on this error.
+  }
 }
 
 function alreadyRegistered(session) {

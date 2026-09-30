@@ -603,6 +603,109 @@ test("the failure that quarantines is on disk before it is returned: a crash rig
   }
 });
 
+// The three ways the synced checkpoint write can fail: the log append, its
+// fsync, and (without a WAL) the synced snapshot that stands in for both. A
+// failing disk fails the debounced snapshot too, so health cannot come back
+// until the fault is healed. Instance overrides: deleting them restores the
+// store's own methods.
+function failDurableWrites(stateStore, how) {
+  if (how === "append") stateStore.append = () => false;
+  if (how === "fsync") {
+    stateStore.barrier = () => { throw Object.assign(new Error("EIO: i/o error, fsync"), { code: "EIO" }); };
+  }
+  stateStore.writeSnapshot = () => {
+    throw Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" });
+  };
+  return () => {
+    for (const method of ["append", "barrier", "writeSnapshot"]) delete stateStore[method];
+  };
+}
+
+// 1.7.2 W21 (#3). The worker came back, so the restore succeeded; but the
+// synced write that makes the lifted quarantine survive a crash did not hold.
+// That is said, additively, on the response and in setup, never hidden and
+// never in place of the success. A failed restore's own write is the same.
+test("a lifted quarantine whose synced write fails still succeeds, and says so on the response and in setup", async () => {
+  for (const [mode, how] of [["wal", "append"], ["wal", "fsync"], ["snapshot", "snapshot"]]) {
+    const label = `${mode} ${how}`;
+    await withDirectory(async (directory) => {
+      const persistence = mode === "snapshot" ? { wal: false } : {};
+      const { service, clock, factory } = harness({ statePath: join(directory, "state.json"), artifactRoot: join(directory, "artifacts"), persistence });
+      try {
+        await service.init();
+        const notDurable = async () => {
+          const setup = await service.call("setup", { mode: "summary" }, MAIN);
+          return { healthy: setup.persistence.healthy, alerts: setup.alerts.filter((alert) => alert.code === "STATE_RESTORE_NOT_DURABLE") };
+        };
+        const durability = { persisted: false, errorCode: "PERSISTENCE_UNHEALTHY" };
+
+        // Held: a lift whose write is synced answers exactly as before.
+        const { session: healthy } = await open(service);
+        await quarantine(service, clock, factory, healthy);
+        factory.restoreError = null;
+        const plain = await explicitRestore(service, healthy);
+        assert.equal(Object.hasOwn(plain, "durability"), false, label);
+        assert.deepEqual(await notDurable(), { healthy: true, alerts: [] }, label);
+
+        // Did not hold: the success stands, and the gap is named.
+        const { session } = await open(service);
+        await quarantine(service, clock, factory, session);
+        factory.restoreError = null;
+        clock.now += 1_000;
+        const heal = failDurableWrites(service.stateStore, how);
+        const restored = await explicitRestore(service, session);
+        assert.equal(restored.ok, true, label);
+        assert.equal(restored.sessionId, session.id, label);
+        assert.deepEqual(restored.durability, durability, label);
+        assert.deepEqual(Object.keys(restored).at(-1), "durability", `${label}: additive, after every existing field`);
+        assert.deepEqual([session.status, session.restoreFailures, session.quarantined], ["idle", 0, null], label);
+        const reported = await notDurable();
+        assert.equal(reported.healthy, false, `${label}: persistence health says it`);
+        assert.equal(reported.alerts.length, 1, label);
+        const [alert] = reported.alerts;
+        assert.deepEqual({ ...alert, message: undefined }, {
+          level: "warning", code: "STATE_RESTORE_NOT_DURABLE", sessionId: session.id, at: iso(clock.now), message: undefined
+        }, label);
+        assert.match(alert.message, /could not be made durable/, label);
+        assert.match(alert.message, /previous restore failure count and quarantine/, label);
+        const full = await service.call("setup", {}, MAIN);
+        assert.deepEqual(full.alerts.filter((item) => item.code === "STATE_RESTORE_NOT_DURABLE"), [alert], label);
+        assert.equal(full.persistence.healthy, false, label);
+
+        // Health comes back with the next good write; the alert stays, because
+        // the gap it names was real until then.
+        heal();
+        service.schedulePersist();
+        await service.flushPersist();
+        assert.deepEqual(await notDurable(), { healthy: true, alerts: [alert] }, label);
+
+        // A failed restore keeps the worker's own error and gains the fact in its details.
+        const { session: failing } = await open(service);
+        await quarantine(service, clock, factory, failing, 2);
+        factory.restoreError = refused();
+        clock.now += 1_000;
+        const healAgain = failDurableWrites(service.stateStore, how);
+        await assert.rejects(explicitRestore(service, failing), (error) => {
+          assert.equal(error.code, ERROR_CODES.ACP_ERROR, label);
+          assert.equal(error.message, "Resource not found", label);
+          assert.deepEqual(error.details, { durability }, label);
+          return true;
+        });
+        assert.deepEqual(failing.quarantined, { at: iso(clock.now), failures: 3, lastErrorCode: "ACP_ERROR" }, label);
+        const after = await notDurable();
+        assert.equal(after.healthy, false, label);
+        assert.equal(after.alerts.length, 2, label);
+        assert.equal(after.alerts[1].sessionId, failing.id, label);
+        assert.match(after.alerts[1].message, /failed restore/, label);
+        assert.match(after.alerts[1].message, /would not be counted/, label);
+        healAgain();
+      } finally {
+        await service.shutdown().catch(() => {});
+      }
+    });
+  }
+});
+
 // 1.7.2 W15 (#5). Off blocks new registrations. A record this Main already
 // holds is not one: it may reconnect, explicitly as well as transparently, and
 // for a quarantined session the explicit restore is the only way back.
@@ -689,6 +792,64 @@ test("a restore method the provider does not advertise counts nothing, sends not
     assert.deepEqual(factory.restores, ["session/resume"]);
     assert.deepEqual([session.status, session.restoreFailures ?? 0, session.quarantined ?? null], ["idle", 0, null]);
     assert.deepEqual(session.lastRestore, { at: iso(EPOCH + 5_000), method: "resume", outcome: "resumed", errorCode: null });
+  } finally {
+    await service.shutdown().catch(() => {});
+  }
+});
+
+// 1.7.2 W21 (#2). The exemption above is for a method the caller named. An
+// automatic restore on a provider that advertises neither resume nor load was
+// not anyone's mistake: the session cannot come back there, and that failure
+// counts, is recorded and quarantines, as it did before 1.7.2.
+test("an automatic restore that finds no method is a failed restore and quarantines; only a named method is exempt", async () => {
+  const { service, clock, factory } = harness();
+  try {
+    factory.capabilities = { sessionCapabilities: { close: {} } };
+    const { session, worker } = await open(service);
+    worker.crash();
+    await until(() => session.status === "disconnected", "provider exit");
+    const restoreEvents = () => session.events.filter((event) => event.type.startsWith("session_restore"))
+      .map(({ type, method, outcome, errorCode }) => ({ type, ...(type === "session_restore_failed" ? { method, outcome, errorCode } : {}) }));
+
+    // Named, and not advertised: a request mistake. Nothing counts, nothing is recorded.
+    for (const method of ["resume", "load"]) {
+      clock.now += 1_000;
+      await assert.rejects(explicitRestore(service, session, { method }), (error) => {
+        assert.equal(error.code, ERROR_CODES.INVALID_ARGUMENT);
+        assert.match(error.message, new RegExp(`does not support session/${method}`));
+        return true;
+      });
+    }
+    assert.deepEqual([session.restoreFailures ?? 0, session.lastRestore ?? null, restoreEvents()], [0, null, []]);
+    assert.equal(session.status, "disconnected");
+
+    // Automatic: each one is a failed restore, up to the limit.
+    for (let failures = 1; failures <= 3; failures += 1) {
+      clock.now += 1_000;
+      await assert.rejects(service.call("config", { sessionId: session.id, action: "list" }, MAIN), (error) => {
+        assert.equal(error.code, ERROR_CODES.INVALID_ARGUMENT);
+        assert.match(error.message, /does not support session restore/);
+        return true;
+      });
+      assert.equal(session.restoreFailures, failures);
+      assert.equal(session.status, "unavailable");
+      assert.deepEqual(session.lastRestore, { at: iso(clock.now), method: null, outcome: "failed", errorCode: "INVALID_ARGUMENT" });
+    }
+    assert.deepEqual(session.quarantined, { at: iso(EPOCH + 5_000), failures: 3, lastErrorCode: "INVALID_ARGUMENT" });
+    assert.deepEqual(restoreEvents(), Array.from({ length: 3 }, () => [
+      { type: "session_restore_start" },
+      { type: "session_restore_failed", method: null, outcome: "failed", errorCode: "INVALID_ARGUMENT" }
+    ]).flat());
+    assert.deepEqual(factory.restores, [], "no restore request can reach a provider without one");
+
+    // Stopped: the next transparent restore fails fast without asking the provider.
+    const before = contacts(factory);
+    await assert.rejects(service.call("prompt", { sessionId: session.id, prompt: "go" }, MAIN), expectedQuarantineError(session));
+    assert.deepEqual(contacts(factory), before);
+    // Main's explicit restore without a method is automatic too, and counts.
+    clock.now += 1_000;
+    await assert.rejects(explicitRestore(service, session), /does not support session restore/);
+    assert.deepEqual(session.quarantined, { at: iso(EPOCH + 5_000), failures: 4, lastErrorCode: "INVALID_ARGUMENT" });
   } finally {
     await service.shutdown().catch(() => {});
   }

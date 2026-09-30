@@ -689,6 +689,55 @@ test("recover gives a degraded interrupted result back its interruption and next
   assert.deepEqual(bare.get("task-lost").result, { ...degraded, interruption });
 });
 
+// 1.7.2 W21 (#1): a not_started that 1.7.0/1.7.1 already wrote into a terminal
+// record is only as good as the marker behind it.
+test("recover turns a persisted not_started on an unmarked record into unknown, in the record and its envelope", () => {
+  const notStarted = { reason: "gateway_restarted", executionOutcome: "not_started", at: iso(50) };
+  const unknown = { ...notStarted, executionOutcome: "unknown" };
+  const stale = [{ action: "decide_rerun", note: "stale" }];
+  const rebuilt = [{ action: "decide_rerun", note: "rebuilt" }];
+  const envelope = { ok: false, sessionId: "session-1", interruption: notStarted, next: stale, result: { text: "" } };
+  const degraded = { preview: "{\"ok\":false,\"sess", resultDegraded: true };
+  const seen = [];
+  const { store } = makeStore();
+  store.recover([
+    persisted({ taskId: "task-envelope", status: "failed", interruption: notStarted, result: envelope }),
+    persisted({ taskId: "task-degraded", status: "failed", interruption: notStarted, result: degraded }),
+    persisted({ taskId: "task-bare", status: "cancelled", interruption: notStarted, result: null }),
+    // An envelope without a next (no gateway named one): the verdict alone is corrected, next is added.
+    persisted({ taskId: "task-no-next", status: "failed", interruption: notStarted, result: { ok: false, interruption: notStarted } }),
+    // Backed by the marker: kept, next untouched and not rebuilt.
+    persisted({ taskId: "task-marked", status: "failed", dispatchTracking: 1, interruption: notStarted, result: envelope }),
+    // Already unknown: nothing to correct.
+    persisted({ taskId: "task-unknown", status: "failed", interruption: unknown, result: { ...envelope, interruption: unknown } })
+  ], { next: (record, given) => { seen.push([record.taskId, given]); return rebuilt; } });
+
+  assert.deepEqual(store.get("task-envelope").interruption, unknown);
+  assert.deepEqual(store.get("task-envelope").result, { ...envelope, interruption: unknown, next: rebuilt });
+  assert.deepEqual(Object.keys(store.get("task-envelope").result), Object.keys(envelope), "key order kept");
+  assert.deepEqual(store.get("task-degraded").interruption, unknown);
+  assert.deepEqual(store.get("task-degraded").result, { ...degraded, interruption: unknown, next: rebuilt });
+  assert.deepEqual([store.get("task-bare").interruption, store.get("task-bare").result], [unknown, null]);
+  assert.deepEqual(store.get("task-no-next").result, { ok: false, interruption: unknown, next: rebuilt });
+  assert.deepEqual(store.get("task-marked").interruption, notStarted);
+  assert.deepEqual(store.get("task-marked").result, envelope);
+  assert.deepEqual(store.get("task-unknown").result, { ...envelope, interruption: unknown });
+  assert.deepEqual(seen, [["task-envelope", unknown], ["task-degraded", unknown], ["task-no-next", unknown]]);
+
+  // Idempotent: what was written back reads the same on the next restart.
+  const { store: again } = makeStore();
+  again.recover(store.toPersistedRecords(), { next: () => [{ action: "never" }] });
+  assert.deepEqual(again.get("task-envelope").result, store.get("task-envelope").result);
+  assert.deepEqual(again.get("task-marked").result, envelope);
+
+  // No gateway to name steps: the verdict is still corrected, and the next that
+  // was built for not_started goes with it rather than keep its promise.
+  const { store: bare } = makeStore();
+  bare.recover([persisted({ taskId: "task-envelope", status: "failed", interruption: notStarted, result: envelope })]);
+  const { next: _stale, ...withoutNext } = envelope;
+  assert.deepEqual(bare.get("task-envelope").result, { ...withoutNext, interruption: unknown });
+});
+
 test("recover keeps a null ttl as never-expires and repairs corrupt fields", () => {
   const { store, clock } = makeStore();
   store.recover([

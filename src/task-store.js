@@ -60,6 +60,32 @@ const isIsoDate = (value) => typeof value === "string" && Number.isFinite(Date.p
 const lostInterruption = (result) => result != null && typeof result === "object" && !Array.isArray(result)
   && result.resultDegraded === true && !Object.hasOwn(result, "interruption");
 
+const isNotStarted = (value) => value != null && typeof value === "object" && value.executionOutcome === "not_started";
+
+// 1.7.0 and 1.7.1 read a missing dispatch stamp as "never sent" on any record,
+// including 1.6.0 ones that could not carry a stamp, and wrote that verdict into
+// the record and into its result envelope. Only a record with the tracking
+// marker can back it, so on any other the persisted not_started is replaced by
+// unknown, in both places, and the envelope's next is rebuilt for the corrected
+// verdict (the diff offered, the re-run note changed) by the same callback the
+// restart conversion uses. Records with the marker keep their verdict.
+function distrustUntrackedVerdict(record, next) {
+  if (record.dispatchTracking === DISPATCH_TRACKING_VERSION) return;
+  if (isNotStarted(record.interruption)) {
+    record.interruption = { ...record.interruption, executionOutcome: "unknown" };
+  }
+  const envelope = record.result;
+  if (envelope == null || typeof envelope !== "object" || Array.isArray(envelope)) return;
+  if (!isNotStarted(envelope.interruption)) return;
+  const interruption = { ...envelope.interruption, executionOutcome: "unknown" };
+  const steps = typeof next === "function" ? next(record, interruption) : null;
+  // In place: the keys keep their order, so the envelope reads as it always did.
+  const corrected = { ...envelope, interruption };
+  if (steps) corrected.next = steps;
+  else delete corrected.next; // built for not_started, it would still promise a safe re-run
+  record.result = corrected;
+}
+
 // Links a Main declares when it creates a task (1.7.0): parentTaskId, the task
 // this one follows up, and inputTaskIds, the tasks whose results went into this
 // prompt. Declared, never inferred. Whether the ids name visible tasks is the
@@ -665,14 +691,18 @@ export class TaskStore {
         record.result = { ok: false, error: RESTART_MESSAGE, interruption, ...(steps ? { next: steps } : {}) };
         record.lastUpdatedAt = at;
         summary.restarted += 1;
-      } else if (record.interruption && lostInterruption(record.result)) {
-        // Replay could only bring this result back as its preview (the artifact
-        // behind it is gone), and the preview is an unparseable head, so the
-        // interruption and next the envelope carried are not in it. The
-        // interruption was persisted beside the result, not inside it; next is
-        // rebuilt from it the same way the restart conversion builds its own.
-        const steps = typeof next === "function" ? next(record, record.interruption) : null;
-        record.result = { ...record.result, interruption: record.interruption, ...(steps ? { next: steps } : {}) };
+      } else {
+        // First, so a degraded result below is rebuilt from the corrected verdict.
+        distrustUntrackedVerdict(record, next);
+        if (record.interruption && lostInterruption(record.result)) {
+          // Replay could only bring this result back as its preview (the artifact
+          // behind it is gone), and the preview is an unparseable head, so the
+          // interruption and next the envelope carried are not in it. The
+          // interruption was persisted beside the result, not inside it; next is
+          // rebuilt from it the same way the restart conversion builds its own.
+          const steps = typeof next === "function" ? next(record, record.interruption) : null;
+          record.result = { ...record.result, interruption: record.interruption, ...(steps ? { next: steps } : {}) };
+        }
       }
       // Budgets are not enforced here: recovery must never drop a durable handle.
       this.#tasks.set(record.taskId, record);

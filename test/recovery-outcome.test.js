@@ -418,6 +418,169 @@ test("1.6.0 tasks cut short by the upgrade restart are unknown and offer the dif
   });
 });
 
+// 1.7.2 W21 (#1). 1.7.0 and 1.7.1 read a missing stamp as "never sent" on every
+// record, so the 1.6.0 tasks their upgrade restart converted (and their own
+// tasks, which they did not mark) can carry a persisted not_started, in the
+// record and inside the result envelope. The state files below are what a
+// 1.7.1 daemon left behind: its snapshot, or its log alone. Only a record with
+// the tracking marker keeps that verdict.
+test("not_started verdicts 1.7.0/1.7.1 wrote on untracked tasks read as unknown after the upgrade, in the record and the envelope", async () => {
+  await withDirectory(async (directory) => {
+    await mkdir(join(directory, "state"));
+    const statePath = join(directory, "state", "state.json");
+    const paths = statePaths(statePath);
+    const project = join(directory, "project");
+    await mkdir(project);
+    await writeFile(join(project, "a.txt"), "a\n");
+    const workspace = await createSnapshot(project, join(directory, "workspaces"));
+    const at = iso(EPOCH - 120_000);
+    const at171 = iso(EPOCH - 60_000);
+    const session = (id, extra) => ({
+      id, provider: "claude", acpSessionId: `acp-${id}`, cwd: process.cwd(), title: null, permissionPolicy: "ask",
+      model: null, ownerRootId: MAIN.rootId, mcpServers: [], additionalDirectories: [], pinned: false,
+      status: "disconnected", statusReason: "daemon_restart", statusChangedAt: at171, createdAt: at, updatedAt: at171,
+      completedAt: null, orphanedAt: null, lastOwnerActivityAt: at, transientClearedAt: null, eventSequence: 3,
+      lastMessageSequence: -1, lastThoughtSequence: -1, eventsEvictedThrough: 2, turnId: "turn-1", stopReason: null,
+      thoughtCapture: null, generation: 1, lastRestore: null, restoreCapabilities: null, restoreFailures: 0,
+      quarantined: null, ...extra
+    });
+    const sessions = [
+      session("session-direct", {}),
+      session("session-snapshot", { cwd: workspace.path, workspace })
+    ];
+    // What 1.7.1 decided, with the next it built for that decision.
+    const verdict = (reason) => ({ reason, executionOutcome: "not_started", at: at171 });
+    const staleNext = (sessionId) => [
+      { action: "session_check", sessionId }, { action: "decide_rerun", note: NOT_STARTED_NOTE }
+    ];
+    const created = (taskId, sessionId, extra = {}) => ({
+      taskId, sessionId, ownerRootId: MAIN.rootId, turnId: null, status: "working", ttl: 3_600_000,
+      pollInterval: 1_000, createdAt: at, lastUpdatedAt: at, statusMessage: "Prompt accepted", origin: "prompt",
+      result: null, ...extra
+    });
+    // A 1.6.0 task its upgrade restart converted: the restart envelope (full result).
+    const restartedVerdict = verdict("gateway_restarted");
+    const restarted = {
+      created: created("task-restarted", "session-direct"),
+      final: {
+        status: "failed", statusMessage: RESTART_MESSAGE, lastUpdatedAt: at171, interruption: restartedVerdict,
+        result: { ok: false, error: RESTART_MESSAGE, interruption: restartedVerdict, next: staleNext("session-direct") }
+      }
+    };
+    // A 1.7.1 task (unmarked) cut short on a snapshot session: the terminal envelope (full result).
+    const orphanVerdict = verdict("orphan_cancelled");
+    const orphanEnvelope = {
+      ok: true, sessionId: "session-snapshot", turnId: "turn-1", taskId: "task-orphaned", status: "cancelled",
+      interruption: orphanVerdict, next: staleNext("session-snapshot"),
+      result: { text: "", stopReason: "cancelled" }
+    };
+    const orphaned = {
+      created: created("task-orphaned", "session-snapshot"),
+      final: {
+        status: "cancelled", statusMessage: "Cancelled after Main disconnect", lastUpdatedAt: at171,
+        interruption: orphanVerdict, result: orphanEnvelope
+      }
+    };
+    // Its result could only come back as the preview head (degraded result).
+    const degradedVerdict = verdict("provider_disconnected");
+    const preview = JSON.stringify({ ok: false, sessionId: "session-snapshot", turnId: "turn-1" }).slice(0, 40);
+    const degraded = {
+      created: created("task-degraded", "session-snapshot"),
+      final: {
+        status: "failed", statusMessage: "worker crashed", lastUpdatedAt: at171, interruption: degradedVerdict,
+        result: { preview, resultDegraded: true }
+      }
+    };
+    // Marked, never stamped: its not_started is backed, and stays.
+    const trackedVerdict = verdict("gateway_restarted");
+    const trackedResult = { ok: false, error: RESTART_MESSAGE, interruption: trackedVerdict, next: staleNext("session-snapshot") };
+    const tracked = {
+      created: created("task-tracked", "session-snapshot", { dispatchTracking: 1 }),
+      final: { status: "failed", statusMessage: RESTART_MESSAGE, lastUpdatedAt: at171, interruption: trackedVerdict, result: trackedResult }
+    };
+    const tasks = [restarted, orphaned, degraded, tracked];
+
+    const writeSnapshot = async () => {
+      const body = Buffer.from(JSON.stringify({
+        sessions, tasks: tasks.map((task) => ({ ...task.created, ...task.final })), inbox: []
+      }), "utf8");
+      const header = {
+        version: 5, gatewayApiVersion: 1, writerVersion: "1.7.1", writerPid: 4242, createdAt: at171, epoch: 1,
+        walSeq: 0, bodyBytes: body.length, bodySha256: createHash("sha256").update(body).digest("hex")
+      };
+      await writeFile(paths.snapshot, Buffer.concat([Buffer.from(`${JSON.stringify(header)}\n`), body, Buffer.from("\n")]));
+    };
+    const writeLog = async () => {
+      // The degraded one names an artifact that is gone, so replay falls back to its preview.
+      const committed = ({ final }, key) => key === "task-degraded"
+        ? {
+            status: final.status, statusMessage: final.statusMessage, lastUpdatedAt: final.lastUpdatedAt,
+            ref: { path: join(directory, "gone.json"), bytes: 99_999, sha256: "0".repeat(64) }, preview,
+            interruption: final.interruption
+          }
+        : { ...final };
+      const records = [
+        [WAL_TYPES.WAL_OPENED, "4242", { pid: 4242, writerVersion: "1.7.1", epoch: 0 }],
+        ...sessions.map((item) => [WAL_TYPES.SESSION_REGISTERED, item.id, item]),
+        ...tasks.flatMap((task) => [
+          [WAL_TYPES.TASK_CREATED, task.created.taskId, task.created],
+          [WAL_TYPES.TASK_RESULT_COMMITTED, task.created.taskId, committed(task, task.created.taskId)]
+        ])
+      ];
+      await writeFile(paths.wal, records.map(([type, key, payload], index) => encodeRecord({
+        v: 1, seq: index + 1, at: at171, type, key, payload
+      })).join(""));
+    };
+
+    const unknown = (value) => ({ ...value, executionOutcome: "unknown" });
+    const actedNext = (sessionId, diff) => [
+      { action: "session_check", sessionId },
+      ...(diff ? [{ action: "workspace_diff", sessionId }] : []),
+      { action: "decide_rerun", note: ACTED_NOTE }
+    ];
+    for (const source of ["snapshot", "wal"]) {
+      for (const path of [paths.snapshot, paths.wal, paths.rotating, statePath]) await rm(path, { force: true });
+      await (source === "snapshot" ? writeSnapshot() : writeLog());
+      // The second pass restarts from the snapshot the first recovery wrote.
+      for (const pass of ["upgrade", "again"]) {
+        const label = `${source} ${pass}`;
+        const { service, factory } = harness({ statePath, artifactRoot: join(directory, "artifacts") });
+        try {
+          await service.init();
+          const got = async (taskId) => (await service.call("task_get", { taskId }, MAIN)).interruption;
+          const result = (taskId) => service.call("task_result", { taskId }, MAIN);
+
+          assert.deepEqual(await got("task-restarted"), unknown(restartedVerdict), label);
+          assert.deepEqual(await result("task-restarted"), {
+            taskId: "task-restarted", ok: false, error: RESTART_MESSAGE,
+            interruption: unknown(restartedVerdict), next: actedNext("session-direct", false)
+          }, label);
+
+          // Only the verdict and the next built from it change; key order included.
+          assert.deepEqual(await got("task-orphaned"), unknown(orphanVerdict), label);
+          const orphanResult = await result("task-orphaned");
+          assert.deepEqual(Object.keys(orphanResult), Object.keys(orphanEnvelope), label);
+          assert.deepEqual(orphanResult, {
+            ...orphanEnvelope, interruption: unknown(orphanVerdict), next: actedNext("session-snapshot", true)
+          }, label);
+
+          assert.deepEqual(await got("task-degraded"), unknown(degradedVerdict), label);
+          assert.deepEqual(await result("task-degraded"), {
+            taskId: "task-degraded", preview, resultDegraded: true,
+            interruption: unknown(degradedVerdict), next: actedNext("session-snapshot", true)
+          }, label);
+
+          assert.deepEqual(await got("task-tracked"), trackedVerdict, label);
+          assert.deepEqual(await result("task-tracked"), { taskId: "task-tracked", ...trackedResult }, label);
+          assert.equal(factory.starts, 0, "nothing was re-run");
+        } finally {
+          await service.shutdown().catch(() => {});
+        }
+      }
+    }
+  });
+});
+
 test("a provider exit mid-turn reports provider_disconnected; the envelope keeps its fields and gains two", async () => {
   await withDirectory(async (directory) => {
     const statePath = join(directory, "state.json");
