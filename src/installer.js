@@ -524,19 +524,19 @@ function parseOnOff(value, option) {
   throw new Error(`${option} requires on or off`);
 }
 
-// No error out of an MCP registration carries the Control token, including
-// its literal value wherever a CLI echoed it.
+// No error out of an MCP registration carries a value of the identity env it
+// passes (the Control token and root id), including wherever a CLI echoed it.
 async function installMcp(spec, context) {
   try {
     await applyMcp(spec, context);
   } catch (error) {
-    throw new Error(redactText(error?.message ?? String(error), spec.secrets));
+    throw new Error(redactEnv(error?.message ?? String(error), spec.identityEnv));
   }
 }
 
 async function applyMcp(spec, { options, state, run, actions, warnings, claudeConfigPath }) {
   const key = `${spec.agent}:${spec.name}`;
-  const action = { type: "mcp", agent: spec.agent, name: spec.name, command: spec.command, args: redactArgs(spec.args) };
+  const action = { type: "mcp", agent: spec.agent, name: spec.name, command: spec.command, args: spec.shownArgs };
   actions.push(action);
 
   const inspected = await inspectEntry(spec, run, key, { dryRun: options.dryRun, claudeConfigPath });
@@ -593,8 +593,9 @@ async function applyMcp(spec, { options, state, run, actions, warnings, claudeCo
 // or the launch the install state records): a look-alike path is not enough
 // to be handed the Control token. Any other entry gets back its own env.
 async function registerMcp(spec, key, previous, run, recorded) {
-  if (previous) await requireSuccess(run, spec.command, spec.removeArgs, `remove existing ${key}`);
-  const failure = await attemptCommand(run, spec.command, spec.args, `install ${key}`);
+  const own = { env: spec.identityEnv };
+  if (previous) await requireSuccess(run, spec.command, spec.removeArgs, `remove existing ${key}`, own);
+  const failure = await attemptCommand(run, spec.command, spec.args, `install ${key}`, { ...own, shown: spec.shownArgs });
   if (!failure) return;
   if (!previous) throw failure;
   if (!previous.command || !previous.args || previous.exact === false) {
@@ -605,10 +606,9 @@ async function registerMcp(spec, key, previous, run, recorded) {
       && await samePath(previous.command, spec.launch.command)
       && await samePath(previous.args[0], spec.launch.args[0]));
   const env = { ...(previous.env ?? {}), ...(ours ? spec.identityEnv : {}) };
-  const hidden = Object.fromEntries(Object.keys(env).map((name) => [name, "<redacted>"]));
   const restoreFailure = await attemptCommand(run, spec.command, spec.addArgs(previous, env), `restore the previous ${key}`, {
-    shown: spec.addArgs(previous, hidden),
-    env
+    shown: spec.addArgs(previous, hiddenEnv(env)),
+    env: { ...spec.identityEnv, ...env }
   });
   const gap = restoreGap(previous);
   if (!restoreFailure) {
@@ -660,7 +660,7 @@ async function inspectWithCli(spec, run, key) {
   const result = await run(spec.command, spec.getArgs);
   const exists = inspectMcpExists(spec, result);
   if (!exists && spec.inspectMode !== "list-json" && !/no mcp server|not found|does not exist/i.test(`${result.stdout}\n${result.stderr}`)) {
-    throw commandError(spec.command, spec.getArgs, result, `inspect ${key}`);
+    throw commandError(spec.command, spec.getArgs, result, `inspect ${key}`, { env: spec.identityEnv });
   }
   return { exists, registered: exists ? registeredLaunch(spec, result) : null };
 }
@@ -840,9 +840,16 @@ function mcpSpec(agent, kind, identity) {
     : {};
   // addArgs registers any launch under this entry's name with the given env,
   // so a failed replacement can put the previous entry back as it was.
-  const secrets = isControl ? [identity.token] : [];
+  // shownArgs is the registration as actions and messages print it: every
+  // identity env value, not only the token, is <redacted>.
   const pairs = (flag, env) => Object.entries(env).flatMap(([name, value]) => [flag, `${name}=${value}`]);
-  const withAdd = (fields, addArgs) => ({ ...fields, identityEnv, secrets, addArgs, args: addArgs(launch, identityEnv) });
+  const withAdd = (fields, addArgs) => ({
+    ...fields,
+    identityEnv,
+    addArgs,
+    args: addArgs(launch, identityEnv),
+    shownArgs: addArgs(launch, hiddenEnv(identityEnv))
+  });
   if (agent === "codex") {
     return withAdd({
       agent, kind, name, command: "codex", launch,
@@ -874,7 +881,7 @@ function mcpSpec(agent, kind, identity) {
 
 function inspectMcpExists(spec, result) {
   if (spec.inspectMode !== "list-json") return result.code === 0;
-  if (result.code !== 0) throw commandError(spec.command, spec.getArgs, result, `inspect ${spec.agent}:${spec.name}`);
+  if (result.code !== 0) throw commandError(spec.command, spec.getArgs, result, `inspect ${spec.agent}:${spec.name}`, { env: spec.identityEnv });
   try {
     const parsed = JSON.parse(result.stdout);
     const servers = Array.isArray(parsed) ? parsed : parsed?.servers;
@@ -1168,9 +1175,9 @@ function preflight({ nodeVersion, platform }) {
   if (platform === "win32") throw new Error("The local Unix-socket Gateway installer currently supports macOS and Linux only");
 }
 
-async function requireSuccess(run, command, args, operation) {
+async function requireSuccess(run, command, args, operation, redaction) {
   const result = await run(command, args);
-  if (result.code !== 0) throw commandError(command, args, result, operation);
+  if (result.code !== 0) throw commandError(command, args, result, operation, redaction);
   return result;
 }
 
@@ -1205,6 +1212,11 @@ function redactText(text, secrets = [], keys = []) {
 function redactEnv(text, env = {}) {
   const values = Object.values(env).filter((value) => value.length >= MIN_ECHOED_SECRET_LENGTH);
   return redactText(text, values, Object.keys(env));
+}
+
+// An env with every value replaced, for printing the command that passes it.
+function hiddenEnv(env) {
+  return Object.fromEntries(Object.keys(env).map((name) => [name, "<redacted>"]));
 }
 
 export function runCommand(command, args) {

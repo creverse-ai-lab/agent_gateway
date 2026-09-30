@@ -729,8 +729,11 @@ test("installer registers Control and Guide MCPs for Grok and Auggie", async () 
     assert.ok(calls.some((call) => call[0] === "grok" && call.slice(1, 5).join(" ") === "mcp add --scope user"));
     assert.ok(calls.some((call) => call[0] === "auggie" && call[1] === "mcp" && call[2] === "add-json"));
     const state = JSON.parse(await readFile(statePath, "utf8"));
+    // Actions print every identity env value redacted, the root id as much as the token.
     assert.equal(JSON.stringify(result.actions).includes(state.identity.token), false);
-    assert.match(JSON.stringify(result.actions), /<redacted>/);
+    assert.equal(JSON.stringify(result.actions).includes(state.identity.rootId), false);
+    assert.match(JSON.stringify(result.actions), /ACP_GATEWAY_ROOT_ID=<redacted>/);
+    assert.match(JSON.stringify(result.actions), /\\"ACP_GATEWAY_ROOT_ID\\":\\"<redacted>\\"/);
     assert.ok(state.managedMcp["grok:agent-acp"]);
     assert.ok(state.managedMcp["grok:agent-acp-guide"]);
     assert.ok(state.managedMcp["auggie:agent-acp"]);
@@ -1051,6 +1054,12 @@ test("installer dry-run previews a stale entry without touching it or starting a
       dependencies
     ));
     assert.equal(rotated.actions.find((action) => action.type === "mcp").status, "would-replace");
+    // The dry run's planned command shows no identity value, whether stored or freshly rotated.
+    assert.deepEqual(rotated.actions.find((action) => action.type === "mcp").args, [
+      "mcp", "add", "--scope", "user", "--env", "ACP_GATEWAY_CONTROL_TOKEN=<redacted>", "--env", "ACP_GATEWAY_ROOT_ID=<redacted>",
+      "agent-acp", "--", NODE, gatewayScript("index.js")
+    ]);
+    assert.equal(JSON.stringify(result.actions).includes("main-test"), false);
 
     // An unreadable Claude config is reported, never worked around by asking the CLI.
     await writeFile(claudeConfigPath, "{ not json", "utf8");
@@ -1426,7 +1435,7 @@ test("installer restores the previous entry exactly when its replacement cannot 
   });
   const identityOf = async () => JSON.parse(await readFile(statePath, "utf8")).identity;
   const codexEnv = ["--env", `ACP_GATEWAY_CONTROL_TOKEN=${token}`, "--env", "ACP_GATEWAY_ROOT_ID=main-test"];
-  const redactedEnv = "--env ACP_GATEWAY_CONTROL_TOKEN=<redacted> --env ACP_GATEWAY_ROOT_ID=main-test";
+  const redactedEnv = "--env ACP_GATEWAY_CONTROL_TOKEN=<redacted> --env ACP_GATEWAY_ROOT_ID=<redacted>";
   const addFailure = `install codex:agent-acp failed (codex mcp add ${redactedEnv} agent-acp -- ${NODE} ${gatewayScript("index.js")}): config is locked`;
   const envPairs = (flag, env) => Object.entries(env).flatMap(([name, value]) => [flag, `${name}=${value}`]);
   const setting = "kept-exactly-as-it-was";
@@ -1585,7 +1594,8 @@ test("installer restores the previous entry exactly when its replacement cannot 
       : null;
     const echo = (command, args) => {
       const secret = args.find((arg) => arg.startsWith("ACP_GATEWAY_CONTROL_TOKEN=")).split("=")[1];
-      return `error: ${command} ${args.join(" ")}\n{"env":{"ACP_GATEWAY_CONTROL_TOKEN":"${secret}"}}\ntoken ${secret} was rejected`;
+      const root = args.find((arg) => arg.startsWith("ACP_GATEWAY_ROOT_ID=")).split("=")[1];
+      return `error: ${command} ${args.join(" ")}\n{"env":{"ACP_GATEWAY_CONTROL_TOKEN":"${secret}"}}\ntoken ${secret} was rejected for root ${root}`;
     };
     const claudeError = await withNode(() => runInstaller(
       parseInstallerArgs(["--rotate-token", "--target", "claude", "--skip-health-check"]),
@@ -1593,10 +1603,11 @@ test("installer restores the previous entry exactly when its replacement cannot 
     )).then(() => assert.fail("the claude replacement should fail"), (error) => error);
     const current = await identityOf();
     assert.equal(claudeError.message.includes(current.token), false);
+    assert.equal(claudeError.message.includes(current.rootId), false);
     assert.equal(claudeError.message.includes("old-secret-token"), false);
-    assert.match(claudeError.message, /^install claude:agent-acp failed \(claude mcp add --scope user agent-acp -e ACP_GATEWAY_CONTROL_TOKEN=<redacted> -e /);
+    assert.match(claudeError.message, /^install claude:agent-acp failed \(claude mcp add --scope user agent-acp -e ACP_GATEWAY_CONTROL_TOKEN=<redacted> -e ACP_GATEWAY_ROOT_ID=<redacted> -- /);
     assert.match(claudeError.message, /"ACP_GATEWAY_CONTROL_TOKEN":"<redacted>"/);
-    assert.match(claudeError.message, /token <redacted> was rejected; restore the previous claude:agent-acp failed \(claude mcp add /);
+    assert.match(claudeError.message, /token <redacted> was rejected for root <redacted>; restore the previous claude:agent-acp failed \(claude mcp add /);
     assert.match(claudeError.message, /claude:agent-acp is no longer registered \(it launched: /);
     assert.deepEqual(claudeRotateCalls.filter(isMutation).at(-1), [
       "claude", "mcp", "add", "--scope", "user", "agent-acp",
