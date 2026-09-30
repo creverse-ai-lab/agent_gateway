@@ -38,7 +38,8 @@ const MIN_ECHOED_SECRET_LENGTH = 8;
 const KEPT_ENTRY_WARNINGS = {
   unknown: "could not verify the registered path; rerun with --force to re-register it",
   foreign: "registered command is not one this installer wrote; rerun with --force to replace it",
-  "unverified-missing": "the registered script is missing and the install state does not record this installer writing that launch, so it cannot tell the entry is its own; rerun with --force to re-register it",
+  unrecorded: "the entry predates this installer's ownership records, so it cannot tell the entry is still its own and does not update it automatically; rerun with --force once to update it (later updates are automatic)",
+  customized: "its env is not the one this installer registered (a variable was added, removed or changed since), so it is left as it is; rerun with --force to re-register it without those changes",
   "keep-stale": "the registered path goes through a symlink to an older gateway; update it with the app that manages that link, or rerun with --force to re-register it",
   "keep-broken-link": "the registered path goes through a broken symlink; fix it with the app that manages it, or rerun with --force to re-register it",
   "keep-link-missing": "the registered path goes through a symlink to a missing script; fix it with the app that manages that link, or rerun with --force to re-register it"
@@ -547,6 +548,7 @@ async function applyMcp(spec, { options, state, run, actions, warnings, claudeCo
   }
   const { exists, registered } = inspected;
   const record = state?.managedMcp?.[key];
+  const recorded = recordedLaunch(record);
   if (exists && !record && !options.force) {
     throw new Error(`${key} already exists and is not managed by this installer; rerun with --force to replace it`);
   }
@@ -565,6 +567,15 @@ async function applyMcp(spec, { options, state, run, actions, warnings, claudeCo
       warnings.push(`${key}: could not read the entry fully enough to put it back if the update failed (${gap}); rerun with --force to re-register it`);
       return;
     }
+    // Only a recorded launch gets here (repointDecision), and it proves the
+    // command and args. The env is part of the entry too: a variable the user
+    // added (HTTP_PROXY, NODE_OPTIONS) or an identity value changed since
+    // would be lost to the replacement, so such an entry stays as it is.
+    if (!recorded || !ownEnv(registered.env, spec.identityEnv, recorded.envKeys)) {
+      action.status = "unchanged";
+      warnings.push(`${key}: ${KEPT_ENTRY_WARNINGS.customized}`);
+      return;
+    }
     action.status = options.dryRun ? "would-update" : "updated";
     action.previous = { command: registered.command, args: redactArgs(registered.args) };
     action.next = { command: spec.launch.command, args: redactArgs(spec.launch.args) };
@@ -572,7 +583,7 @@ async function applyMcp(spec, { options, state, run, actions, warnings, claudeCo
     action.status = exists ? "would-replace" : "would-install";
   }
   if (options.dryRun) return;
-  await registerMcp(spec, key, exists ? registered : null, run, recordedLaunch(record));
+  await registerMcp(spec, key, exists ? registered : null, run, { recorded, rotating: options.rotateToken });
   state.managedMcp ??= {};
   state.managedMcp[key] = {
     agent: spec.agent,
@@ -588,11 +599,13 @@ async function applyMcp(spec, { options, state, run, actions, warnings, claudeCo
 // Adds the entry, replacing `previous` when there is one. The CLIs have no
 // atomic replace, so a failed add after the remove puts the previous entry
 // back, with the command, args and env it had, rather than leave the agent
-// with no entry; the error reports both outcomes. The identity env is added
-// only to a launch this installer wrote (this install's own node and script,
-// or the launch the install state records): a look-alike path is not enough
-// to be handed the Control token. Any other entry gets back its own env.
-async function registerMcp(spec, key, previous, run, recorded) {
+// with no entry; the error reports both outcomes. The env goes back exactly
+// as it was, with one exception: after --rotate-token the install state
+// already holds the new identity, and a launch this installer wrote (this
+// install's own node and script, or the launch the install state records)
+// gets it over its own env, since the old one is being retired. A look-alike
+// path is not enough to be handed the Control token.
+async function registerMcp(spec, key, previous, run, { recorded, rotating }) {
   const own = { env: spec.identityEnv };
   if (previous) await requireSuccess(run, spec.command, spec.removeArgs, `remove existing ${key}`, own);
   const failure = await attemptCommand(run, spec.command, spec.args, `install ${key}`, { ...own, shown: spec.shownArgs });
@@ -601,11 +614,11 @@ async function registerMcp(spec, key, previous, run, recorded) {
   if (!previous.command || !previous.args || previous.exact === false) {
     throw new Error(`${failure.message}; the previous ${key} entry was removed and could not be restored because ${spec.agent} did not report its full launch command; re-add it or rerun the installer`);
   }
-  const ours = (recorded && sameLaunch(previous, recorded))
+  const rotated = rotating && ((recorded && sameLaunch(previous, recorded))
     || (previous.args.length === 1
       && await samePath(previous.command, spec.launch.command)
-      && await samePath(previous.args[0], spec.launch.args[0]));
-  const env = { ...(previous.env ?? {}), ...(ours ? spec.identityEnv : {}) };
+      && await samePath(previous.args[0], spec.launch.args[0])));
+  const env = { ...(previous.env ?? {}), ...(rotated ? spec.identityEnv : {}) };
   const restoreFailure = await attemptCommand(run, spec.command, spec.addArgs(previous, env), `restore the previous ${key}`, {
     shown: spec.addArgs(previous, hiddenEnv(env)),
     env: { ...spec.identityEnv, ...env }
@@ -967,9 +980,10 @@ function parseJson(text) {
 // since, with the same shape. So an entry moves only when it is provably
 // still this installer's and provably stale, and never to an older gateway.
 // Proof of ownership is the launch the state records this installer
-// registering. A record from before launches were recorded leaves only the
-// shape, so such an entry moves only off a script that is still there and
-// sits in a Gateway package.
+// registering (and, checked by applyMcp, the env it registered). A record
+// from before launches were recorded leaves only the shape, which a user's
+// own older Gateway install has too, so such an entry never moves on its own:
+// it stays, "unrecorded", until --force re-registers it and records it.
 async function repointDecision(registered, spec, record) {
   const { launch } = spec;
   if (!registered?.command || !registered.args) return "unknown";
@@ -988,9 +1002,7 @@ async function repointDecision(registered, spec, record) {
     if (!MISSING_PATH_CODES.has(error?.code)) return "unknown";
     if (!written) return "foreign";
     const decision = await missingScriptDecision(script);
-    // Without a record, a gone script is the one case nothing on disk can
-    // check: the user's own replacement that is not there looks the same.
-    return decision === "repoint" && !recorded ? "unverified-missing" : decision;
+    return decision === "repoint" && !recorded ? "unrecorded" : decision;
   }
   // A path through a symlink is a pointer someone else moves forward. When it
   // resolves to an older gateway the entry still stays, but says so: the
@@ -1000,11 +1012,13 @@ async function repointDecision(registered, spec, record) {
     const order = compareReleases(await gatewayVersionAt(dirname(resolved)), GATEWAY_VERSION);
     return order !== null && order < 0 ? "keep-stale" : "keep";
   }
+  // Stale, and moved only when the record proves it is this installer's. The
+  // package name only picks which warning an unrecorded entry gets.
   const owned = async () => {
     if (recorded) return "repoint";
     if (!written) return "foreign";
     const gateway = await isGatewayPackage(dirname(dirname(script)));
-    return gateway === null ? "unknown" : gateway ? "repoint" : "foreign";
+    return gateway === null ? "unknown" : gateway ? "unrecorded" : "foreign";
   };
   if (await samePath(script, launch.args[0])) {
     if (await samePath(registered.command, launch.command)) return "keep";
@@ -1016,14 +1030,29 @@ async function repointDecision(registered, spec, record) {
   return owned();
 }
 
-// The launch a managed record says this installer registered: undefined for a
-// record from before launches were recorded, null for one that is unreadable.
+// The launch a managed record says this installer registered, with the names
+// of the env it registered: undefined for a record from before launches were
+// recorded, null for one that is unreadable.
 function recordedLaunch(record) {
   if (record?.launch === undefined) return undefined;
-  const { command, args } = record.launch ?? {};
-  return typeof command === "string" && command && Array.isArray(args) && args.every((arg) => typeof arg === "string")
-    ? { command, args }
+  const { command, args, envKeys } = record.launch ?? {};
+  const strings = (list) => Array.isArray(list) && list.every((item) => typeof item === "string");
+  return typeof command === "string" && command && strings(args) && strings(envKeys)
+    ? { command, args, envKeys }
     : null;
+}
+
+// Whether an entry's env, as its CLI reports it, is still the one this
+// installer registered: exactly the recorded names, with this install's
+// current identity values (token, root id) wherever those appear. Any other
+// value is neither compared nor kept; an env not reported proves nothing.
+function ownEnv(env, identityEnv, envKeys) {
+  if (!env) return false;
+  const names = new Set(envKeys);
+  const registered = Object.keys(env);
+  return registered.length === names.size
+    && registered.every((name) => names.has(name))
+    && Object.entries(identityEnv).every(([name, value]) => !Object.hasOwn(env, name) || env[name] === value);
 }
 
 // Whether two launches are the same command and args, compared as normalized

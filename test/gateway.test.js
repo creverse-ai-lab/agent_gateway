@@ -1512,6 +1512,40 @@ test("Gateway surfaces persistence failures", async () => {
   }
 });
 
+test("an older write in flight never clears a newer persistence failure, even one with the same message", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-gateway-persist-generation-"));
+  const service = new GatewayService({ statePath: join(directory, "state.json"), gcIntervalMs: 0 });
+  const message = "ENOSPC: no space left on device, write";
+  try {
+    // Unhealthy already, then a background write starts and is held in flight.
+    service.persistError = message;
+    let started;
+    const inFlight = new Promise((resolve) => { started = resolve; });
+    let release;
+    service.persist = () => {
+      started();
+      return new Promise((resolve) => { release = resolve; });
+    };
+    service.persistDirty = true;
+    const older = service.flushPersist();
+    await inFlight;
+    // A newer failure, recorded while that write is in flight, repeats the message.
+    service.persistError = message;
+    release();
+    await older;
+    assert.equal(service.persistError, message);
+
+    // A write that starts after the failure answers it.
+    delete service.persist;
+    service.persistDirty = true;
+    await service.flushPersist();
+    assert.equal(service.persistError, null);
+  } finally {
+    await service.shutdown().catch(() => {});
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("Gateway recreates its state directory if it is removed while running", async () => {
   const directory = await mkdtemp(join(tmpdir(), "acp-gateway-state-recreate-"));
   const stateDirectory = join(directory, "state");

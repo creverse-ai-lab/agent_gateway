@@ -3878,6 +3878,22 @@ export class GatewayService {
     return true;
   }
 
+  // Persistence health: the last write failure's message, null while healthy.
+  // Every failure recorded, wherever it is recorded, also advances
+  // #persistFailures, so a write can tell a failure that arrived while it was
+  // in flight from the one it started under even when both say the same thing.
+  #persistError = null;
+  #persistFailures = 0;
+
+  get persistError() {
+    return this.#persistError;
+  }
+
+  set persistError(value) {
+    if (value != null) this.#persistFailures += 1;
+    this.#persistError = value;
+  }
+
   schedulePersist() {
     if (!this.statePath) return;
     this.persistDirty = true;
@@ -3896,18 +3912,19 @@ export class GatewayService {
   flushPersist() {
     if (!this.persistDirty || !this.statePath) return this.persistChain;
     this.persistDirty = false;
-    let observed = null;
+    let observed = 0;
     this.persistChain = this.persistChain
       .catch(() => {})
       .then(() => {
-        observed = this.persistError;
+        observed = this.#persistFailures;
         return this.persist();
       })
       .then(
         // A failure recorded while this write was in flight (a synced write
         // that did not hold) is newer than the state this write captured, so
-        // this success does not answer it; the next write that does clears it.
-        () => { if (this.persistError === observed) this.persistError = null; },
+        // this success does not answer it, whatever its message; the next
+        // write that does clears it.
+        () => { if (this.#persistFailures === observed) this.persistError = null; },
         (error) => {
           this.persistError = error?.message ?? String(error);
           throw error;
