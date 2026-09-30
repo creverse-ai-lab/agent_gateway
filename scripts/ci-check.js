@@ -9,11 +9,13 @@ import { GATEWAY_VERSION } from "../src/version.js";
 import { ACP_PROTOCOL_VERSION } from "../src/acp-version.js";
 import { compareSnapshots, validateMonitorConfig, validateSnapshot } from "./acp-upstream-monitor.js";
 import { claudePlatformBinaryReferences } from "./omit-claude-binary.js";
+import { PREPACK_SCRIPT, lockfileBundleProblems } from "./pack-release.js";
 
 const packageDocument = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
-// npm-shrinkwrap.json, not package-lock.json: it ships inside the npm package,
-// so `npm install -g acp-gateway-daemon` resolves exactly the tree CI tested.
-const lockDocument = JSON.parse(await readFile(new URL("../npm-shrinkwrap.json", import.meta.url), "utf8"));
+// package-lock.json again, not npm-shrinkwrap.json: npm 12 neither reads nor
+// writes a shrinkwrap, in a checkout or inside a published package. The npm
+// package pins its tree by bundling it instead (scripts/pack-release.js).
+const lockDocument = JSON.parse(await readFile(new URL("../package-lock.json", import.meta.url), "utf8"));
 const monitorConfig = JSON.parse(await readFile(new URL("../config/acp-monitor.json", import.meta.url), "utf8"));
 const upstreamSnapshot = JSON.parse(await readFile(new URL("../config/acp-upstream.snapshot.json", import.meta.url), "utf8"));
 
@@ -27,17 +29,25 @@ assert.equal(lockDocument.name, packageDocument.name, "lockfile and package name
 assert.equal(lockDocument.packages[""].name, packageDocument.name, "lockfile root package name must match");
 assert.equal(packageDocument.private, undefined, "the package is published; it must not be private");
 assert.equal(packageDocument.publishConfig?.access, "public", "the package must publish publicly");
-assert.ok(packageDocument.files.includes("npm-shrinkwrap.json"), "the shrinkwrap must ship in the package");
+assert.ok(!packageDocument.files.includes("npm-shrinkwrap.json"), "the package pins its tree by bundling it, not with a shrinkwrap");
 assert.ok(
-  !existsSync(new URL("../package-lock.json", import.meta.url)),
-  "package-lock.json must not exist beside npm-shrinkwrap.json; npm would silently ignore it"
+  !existsSync(new URL("../npm-shrinkwrap.json", import.meta.url)),
+  "npm-shrinkwrap.json must not exist: npm 12 ignores it, and npm 10 and 11 would prefer it to package-lock.json"
 );
-// npm installs a shrinkwrap's entries as written, whatever the platform and
-// --omit say, so a listed Claude Code binary reaches every user (see the script).
+// A listed Claude Code binary would be installed into every checkout by
+// `npm ci`, and bundled by a pack without --omit=optional (see the scripts).
 assert.deepEqual(
   claudePlatformBinaryReferences(lockDocument),
   [],
-  "npm-shrinkwrap.json must not list the bundled Claude Code binaries; run node scripts/omit-claude-binary.js"
+  "package-lock.json must not list the bundled Claude Code binaries; run node scripts/omit-claude-binary.js"
+);
+// Every production dependency is bundled, and the lockfile describes a tree
+// npm bundles in full and the same on every platform.
+assert.deepEqual(lockfileBundleProblems(packageDocument, lockDocument), [], "the locked production tree cannot be bundled as is");
+assert.equal(
+  packageDocument.scripts?.prepack,
+  PREPACK_SCRIPT,
+  "a plain npm pack or npm publish must refuse a node_modules that is not the locked production tree"
 );
 assert.deepEqual(
   packageDocument.exports,

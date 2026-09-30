@@ -63,8 +63,8 @@ const archivePath = join(outputDirectory, RUNTIME_ASSET_NAME);
 try {
   await mkdir(runtimeRoot, { recursive: true });
   const sourceArchive = join(temporary, "source.tar");
-  // Tags before 1.7.0 carry package-lock.json; from 1.7.0 the lockfile is
-  // npm-shrinkwrap.json (it ships in the npm package). The runtime layout is
+  // v1.7.0 and v1.7.1 carry npm-shrinkwrap.json (it shipped in the npm
+  // package); every other tag carries package-lock.json. The runtime layout is
   // unchanged either way: the app verifies gateway/package-lock.json, so the
   // tag's lockfile is always installed under that name.
   const lockfile = runtimeLockfilePlan((path) => sourceHasFile(sourceCommit, path));

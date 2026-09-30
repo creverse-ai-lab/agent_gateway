@@ -3,7 +3,7 @@
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { validateMonitorConfig, validateSnapshot } from "./acp-upstream-monitor.js";
-import { omitClaudeBinaryFromShrinkwrap } from "./omit-claude-binary.js";
+import { omitClaudeBinaryFromLockfile } from "./omit-claude-binary.js";
 
 const root = new URL("../", import.meta.url);
 
@@ -31,9 +31,13 @@ try {
   } else {
     const specs = updates.map((item) => `${item.packageName}@${item.after}`);
     await run("npm", ["install", "--save-exact", ...specs]);
-    // npm writes the new Claude Agent SDK's platform binaries back in.
-    const omitted = await omitClaudeBinaryFromShrinkwrap(new URL("npm-shrinkwrap.json", root));
-    if (omitted.length) process.stdout.write(`npm-shrinkwrap.json: omitted ${omitted.length} Claude platform binary references\n`);
+    // npm writes the new Claude Agent SDK's platform binaries back in, and
+    // installs this platform's one into node_modules.
+    const omitted = await omitClaudeBinaryFromLockfile(new URL("package-lock.json", root));
+    if (omitted.length) process.stdout.write(`package-lock.json: omitted ${omitted.length} Claude platform binary references\n`);
+    // Reinstall from the corrected lockfile, so node_modules is the tree
+    // scripts/pack-release.js bundles.
+    await run("npm", ["ci", "--omit=optional"]);
     for (const update of updates) {
       process.stdout.write(`${update.agentId}: ${update.before ?? "missing"} -> ${update.after}\n`);
     }

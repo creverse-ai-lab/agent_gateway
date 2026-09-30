@@ -6,14 +6,17 @@
 // CLAUDE_CODE_EXECUTABLE naming the user's own CLI (src/providers.js), and
 // claude-agent-acp resolves that variable before any bundled binary.
 //
-// npm installs a published package's npm-shrinkwrap.json exactly as written:
-// every package it lists, for every platform, even under --omit=optional
-// (measured with npm 10.9 and 11.19: all eight binaries, about 2.2 GB). So the
-// shrinkwrap lists none of them, and the SDK's entry does not name them as
-// optional dependencies either: with only the packages removed, `npm ci`
-// rejects the lockfile as out of sync with package.json.
+// So package-lock.json lists none of them, and the SDK's entry does not name
+// them as optional dependencies either: with only the packages removed,
+// `npm ci` rejects the lockfile as out of sync with package.json. `npm ci`
+// installs what the lockfile lists, so a source checkout gets no binary, and
+// neither does the npm package: it bundles the tree `npm ci --omit=optional`
+// installs (scripts/pack-release.js refuses a tree holding a platform package).
+// The same entries cost 1.7.0 all eight binaries (about 2.2 GB): npm 10 and 11
+// install a published npm-shrinkwrap.json as written, whatever the platform
+// and --omit say.
 //
-// Run this after anything that rewrites npm-shrinkwrap.json (npm install, the
+// Run this after anything that rewrites package-lock.json (npm install, the
 // dependency sync); scripts/ci-check.js fails until it has been run.
 
 import { readdirSync } from "node:fs";
@@ -94,7 +97,7 @@ export function findClaudePlatformPackages(root) {
   return found.sort();
 }
 
-export async function omitClaudeBinaryFromShrinkwrap(path) {
+export async function omitClaudeBinaryFromLockfile(path) {
   const document = JSON.parse(await readFile(path, "utf8"));
   const before = claudePlatformBinaryReferences(document);
   if (!before.length) return [];
@@ -106,9 +109,9 @@ export async function omitClaudeBinaryFromShrinkwrap(path) {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const path = resolve(process.argv[2] ?? fileURLToPath(new URL("../npm-shrinkwrap.json", import.meta.url)));
+  const path = resolve(process.argv[2] ?? fileURLToPath(new URL("../package-lock.json", import.meta.url)));
   try {
-    const removed = await omitClaudeBinaryFromShrinkwrap(path);
+    const removed = await omitClaudeBinaryFromLockfile(path);
     process.stdout.write(removed.length
       ? `omitted from ${path}:\n${removed.map((item) => `  ${item}`).join("\n")}\n`
       : `${path} already lists no Claude platform binary\n`);

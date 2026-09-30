@@ -222,6 +222,7 @@ test("verifier rejects --provenance so local files are not treated as attestatio
 });
 
 test("the tag's lockfile is archived as package-lock.json, shrinkwrap or not", async (t) => {
+  // v1.7.0 and v1.7.1 carry npm-shrinkwrap.json; earlier tags and v1.7.2 on, package-lock.json.
   const shrinkwrapTag = runtimeLockfilePlan((path) => ["package.json", "npm-shrinkwrap.json"].includes(path));
   assert.deepEqual(shrinkwrapTag, { source: "npm-shrinkwrap.json", target: "package-lock.json" });
   const olderTag = runtimeLockfilePlan((path) => ["package.json", "package-lock.json"].includes(path));

@@ -32,7 +32,7 @@ jobs:
         with:
           node-version: 22.18.0
           cache: npm
-          cache-dependency-path: npm-shrinkwrap.json
+          cache-dependency-path: package-lock.json
       - run: npm ci
       - name: Refuse existing immutable assets
         env:

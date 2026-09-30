@@ -7,7 +7,7 @@ import {
   claudePlatformBinaryReferences,
   findClaudePlatformPackages,
   isClaudePlatformPackage,
-  omitClaudeBinaryFromShrinkwrap,
+  omitClaudeBinaryFromLockfile,
   withoutClaudePlatformBinaries
 } from "../scripts/omit-claude-binary.js";
 import { RUNTIME_INSTALL_ARGS } from "../scripts/runtime-release-lib.js";
@@ -44,7 +44,7 @@ test("only the Claude Agent SDK's platform packages count as the bundled binary"
   assert.equal(isClaudePlatformPackage("claude-agent-sdk-darwin-arm64"), false);
 });
 
-test("the shrinkwrap loses the platform binaries and their optional names, nothing else", () => {
+test("the lockfile loses the platform binaries and their optional names, nothing else", () => {
   const before = lockfile();
   assert.equal(claudePlatformBinaryReferences(before).length, 4);
   const after = withoutClaudePlatformBinaries(before);
@@ -62,26 +62,26 @@ test("the shrinkwrap loses the platform binaries and their optional names, nothi
 test("a platform binary that is a required dependency is refused, not dropped", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "acp-omit-claude-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
-  const path = join(directory, "npm-shrinkwrap.json");
+  const path = join(directory, "package-lock.json");
   const document = lockfile();
   document.packages["node_modules/pinned"] = { dependencies: { "@anthropic-ai/claude-agent-sdk-darwin-arm64": "0.3.220" } };
   await writeFile(path, JSON.stringify(document));
-  await assert.rejects(omitClaudeBinaryFromShrinkwrap(path), /cannot omit a required Claude platform binary: node_modules\/pinned dependencies/);
+  await assert.rejects(omitClaudeBinaryFromLockfile(path), /cannot omit a required Claude platform binary: node_modules\/pinned dependencies/);
   assert.deepEqual(JSON.parse(await readFile(path, "utf8")), document, "nothing is written");
 
   delete document.packages["node_modules/pinned"];
   await writeFile(path, JSON.stringify(document));
-  assert.equal((await omitClaudeBinaryFromShrinkwrap(path)).length, 4);
+  assert.equal((await omitClaudeBinaryFromLockfile(path)).length, 4);
   const written = await readFile(path, "utf8");
   assert.ok(written.endsWith("}\n") && written.includes('\n  "packages": {'), "written like npm writes lockfiles");
-  assert.deepEqual(await omitClaudeBinaryFromShrinkwrap(path), [], "a second run changes nothing");
+  assert.deepEqual(await omitClaudeBinaryFromLockfile(path), [], "a second run changes nothing");
 });
 
-test("the committed shrinkwrap pins the SDK but none of its platform binaries", async () => {
-  const shrinkwrap = JSON.parse(await readFile(new URL("../npm-shrinkwrap.json", import.meta.url), "utf8"));
-  assert.deepEqual(claudePlatformBinaryReferences(shrinkwrap), []);
-  assert.match(shrinkwrap.packages[SDK]?.version ?? "", /^\d+\.\d+\.\d+/);
-  assert.ok(shrinkwrap.packages["node_modules/@agentclientprotocol/claude-agent-acp"]);
+test("the committed lockfile pins the SDK but none of its platform binaries", async () => {
+  const lockDocument = JSON.parse(await readFile(new URL("../package-lock.json", import.meta.url), "utf8"));
+  assert.deepEqual(claudePlatformBinaryReferences(lockDocument), []);
+  assert.match(lockDocument.packages[SDK]?.version ?? "", /^\d+\.\d+\.\d+/);
+  assert.ok(lockDocument.packages["node_modules/@agentclientprotocol/claude-agent-acp"]);
 });
 
 test("installed platform binaries are found hoisted or nested, the SDK itself is not", async (t) => {

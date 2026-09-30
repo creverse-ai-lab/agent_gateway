@@ -14,7 +14,8 @@ name: Publish npm
 #
 # Two jobs, because any process in a job with id-token: write can exchange a
 # GitHub OIDC token for an npm publish token. `verify` runs the dependency,
-# test and smoke code with contents: read only and packs the tarball.
+# test and smoke code with contents: read only and packs the tarball, which
+# carries the locked dependency tree (bundleDependencies).
 # `publish` holds id-token: write, runs no code from the repository or its
 # dependencies, and publishes exactly the tarball `verify` tested (npm runs no
 # lifecycle scripts when it publishes a tarball).
@@ -61,18 +62,32 @@ jobs:
             echo "Could not check the npm registry (HTTP $status)" >&2
             exit 1
           fi
-      - run: npm ci
+      # The package bundles node_modules as installed here, so install exactly
+      # the locked production tree, without optional packages (see
+      # scripts/pack-release.js).
+      - run: npm ci --omit=optional
       - run: npm run ci
       - run: npm run smoke:npm
+        env:
+          NPM_SMOKE_SHA256_FILE: ${{ runner.temp }}/npm-smoke.sha256
+      # Through scripts/pack-release.js only: it refuses a node_modules that is
+      # not the locked tree, packs with --ignore-scripts and checks the bundle
+      # in the tarball. Packing is reproducible, so this must be the tarball
+      # the smoke test installed, byte for byte.
       - name: Pack the tested package
         id: pack
         run: |
           directory="$RUNNER_TEMP/npm-package"
           tarball="acp-gateway-daemon-$VERSION.tgz"
           mkdir "$directory"
-          npm pack --ignore-scripts --pack-destination "$directory"
+          node scripts/pack-release.js --pack-destination "$directory"
           test -f "$directory/$tarball"
-          echo "sha256=$(sha256sum "$directory/$tarball" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          sha256="$(sha256sum "$directory/$tarball" | cut -d ' ' -f 1)"
+          if [ "$sha256" != "$(cat "$RUNNER_TEMP/npm-smoke.sha256")" ]; then
+            echo "The packed tarball differs from the one npm-smoke installed" >&2
+            exit 1
+          fi
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v7
         with:
           name: npm-package

@@ -44,10 +44,11 @@ export const REQUIRED_ALLOWED_ROOTS = Object.freeze([
   "runtime-manifest.json"
 ]);
 
-// Which lockfile a source commit carries: npm-shrinkwrap.json from 1.7.0 (it
-// ships in the npm package), package-lock.json before. `hasSourceFile(path)`
-// answers for the commit being released. The runtime root always receives it
-// as package-lock.json, the name the desktop app verifies.
+// Which lockfile a source commit carries: npm-shrinkwrap.json in v1.7.0 and
+// v1.7.1 (it shipped in the npm package), package-lock.json before and again
+// from v1.7.2 (npm 12 reads no shrinkwrap; the npm package bundles its tree).
+// `hasSourceFile(path)` answers for the commit being released. The runtime
+// root always receives it as package-lock.json, the name the desktop app verifies.
 export function runtimeLockfilePlan(hasSourceFile) {
   const source = hasSourceFile("npm-shrinkwrap.json") ? "npm-shrinkwrap.json" : RUNTIME_LOCKFILE_NAME;
   return { source, target: RUNTIME_LOCKFILE_NAME };

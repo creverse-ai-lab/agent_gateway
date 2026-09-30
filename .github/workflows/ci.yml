@@ -23,10 +23,11 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: npm-shrinkwrap.json
+          cache-dependency-path: package-lock.json
       - run: npm ci
       - run: npm run ci
-      # Packs the npm package, installs the tarball into a temporary prefix and
-      # runs the installed bins and daemon in an isolated HOME. Needs the npm
-      # registry for dependencies, so it stays out of `npm run ci`.
+      # Packs the npm package (scripts/pack-release.js), installs the tarball
+      # into a temporary prefix with npm 10, 11 and 12 each, and runs the
+      # installed bins and daemon in an isolated HOME. Needs the npm registry
+      # for the npm CLIs, so it stays out of `npm run ci`.
       - run: npm run smoke:npm

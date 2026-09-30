@@ -20,7 +20,6 @@
     "gateway-client/",
     "skills/",
     "docs/",
-    "npm-shrinkwrap.json",
     "README.md",
     "README.*.md",
     "CHANGELOG.md",
@@ -45,6 +44,7 @@
     "daemon": "node src/gateway-daemon.js",
     "guide": "node src/guide.js",
     "bootstrap": "node src/bootstrap.js",
+    "prepack": "node scripts/pack-release.js --prepack",
     "test": "sh -c 'export ACP_GATEWAY_DISABLE_DYNAMIC_PROVIDERS=1 ACP_GATEWAY_ARTIFACTS=\"$(mktemp -d)\"; node --test test/*.test.js; s=$?; rm -rf \"$ACP_GATEWAY_ARTIFACTS\"; exit $s'",
     "test:persistence:stress": "node scripts/stress-persistence.js",
     "bench:payload": "node scripts/bench-payload.js",
@@ -62,8 +62,14 @@
   },
   "dependencies": {
     "@agentclientprotocol/claude-agent-acp": "0.64.2",
+    "@anthropic-ai/sdk": "0.115.0",
     "@modelcontextprotocol/sdk": "1.30.0"
   },
+  "bundleDependencies": [
+    "@agentclientprotocol/claude-agent-acp",
+    "@anthropic-ai/sdk",
+    "@modelcontextprotocol/sdk"
+  ],
   "engines": {
     "node": ">=22"
   }
