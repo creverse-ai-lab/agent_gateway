@@ -30,10 +30,15 @@ const sourceDirectory = dirname(fileURLToPath(import.meta.url));
 const bundledSkillSource = join(dirname(sourceDirectory), "skills", DELEGATOR_SKILL_NAME);
 const NODE_EXECUTABLES = new Set(["node", "nodejs"]);
 const MISSING_PATH_CODES = new Set(["ENOENT", "ENOTDIR"]);
+// The npm names a Gateway install has had: acp-gateway until 1.7.0, then acp-gateway-daemon.
+const GATEWAY_PACKAGE_NAMES = new Set(["acp-gateway", "acp-gateway-daemon"]);
+// Captured env values at least this long are also redacted wherever a CLI echoes them.
+const MIN_ECHOED_SECRET_LENGTH = 8;
 // Why an existing managed entry was left as it is, keyed by repointDecision.
 const KEPT_ENTRY_WARNINGS = {
   unknown: "could not verify the registered path; rerun with --force to re-register it",
   foreign: "registered command is not one this installer wrote; rerun with --force to replace it",
+  "unverified-missing": "the registered script is missing and the install state does not record this installer writing that launch, so it cannot tell the entry is its own; rerun with --force to re-register it",
   "keep-stale": "the registered path goes through a symlink to an older gateway; update it with the app that manages that link, or rerun with --force to re-register it",
   "keep-broken-link": "the registered path goes through a broken symlink; fix it with the app that manages it, or rerun with --force to re-register it",
   "keep-link-missing": "the registered path goes through a symlink to a missing script; fix it with the app that manages that link, or rerun with --force to re-register it"
@@ -534,27 +539,30 @@ async function applyMcp(spec, { options, state, run, actions, warnings, claudeCo
   const action = { type: "mcp", agent: spec.agent, name: spec.name, command: spec.command, args: redactArgs(spec.args) };
   actions.push(action);
 
-  // A dry run inspects too, but never through a command that starts the
-  // server: `claude mcp get` health-checks the entry by launching it, and a
-  // launched front door can autostart a daemon. Codex `mcp get` and the Grok
-  // and Auggie lists only read configuration.
-  const inspected = options.dryRun && spec.agent === "claude"
-    ? await readClaudeEntry(claudeConfigPath, spec.name)
-    : await inspectWithCli(spec, run, key);
+  const inspected = await inspectEntry(spec, run, key, { dryRun: options.dryRun, claudeConfigPath });
   if (inspected.error) {
     action.status = "unknown";
     warnings.push(`${key}: ${inspected.error}; the dry run could not inspect it`);
     return;
   }
   const { exists, registered } = inspected;
-  if (exists && !state?.managedMcp?.[key] && !options.force) {
+  const record = state?.managedMcp?.[key];
+  if (exists && !record && !options.force) {
     throw new Error(`${key} already exists and is not managed by this installer; rerun with --force to replace it`);
   }
-  if (exists && state?.managedMcp?.[key] && !options.force && !options.rotateToken) {
-    const decision = await repointDecision(registered, spec);
+  if (exists && record && !options.force && !options.rotateToken) {
+    const decision = await repointDecision(registered, spec, record);
     if (decision !== "repoint") {
       action.status = "unchanged";
       if (KEPT_ENTRY_WARNINGS[decision]) warnings.push(`${key}: ${KEPT_ENTRY_WARNINGS[decision]}`);
+      return;
+    }
+    // Replacing means removing first, so an update nobody asked for goes
+    // ahead only when the entry could be put back as it was.
+    const gap = restoreGap(registered);
+    if (gap) {
+      action.status = "unchanged";
+      warnings.push(`${key}: could not read the entry fully enough to put it back if the update failed (${gap}); rerun with --force to re-register it`);
       return;
     }
     action.status = options.dryRun ? "would-update" : "updated";
@@ -564,17 +572,27 @@ async function applyMcp(spec, { options, state, run, actions, warnings, claudeCo
     action.status = exists ? "would-replace" : "would-install";
   }
   if (options.dryRun) return;
-  await registerMcp(spec, key, exists ? registered : null, run);
+  await registerMcp(spec, key, exists ? registered : null, run, recordedLaunch(record));
   state.managedMcp ??= {};
-  state.managedMcp[key] = { agent: spec.agent, name: spec.name, kind: spec.kind, installedAt: new Date().toISOString() };
+  state.managedMcp[key] = {
+    agent: spec.agent,
+    name: spec.name,
+    kind: spec.kind,
+    installedAt: new Date().toISOString(),
+    // What this installer registered, so a later run can tell the entry is
+    // still its own. The env is recorded by name only: its values are secrets.
+    launch: { command: spec.launch.command, args: [...spec.launch.args], envKeys: Object.keys(spec.identityEnv) }
+  };
 }
 
 // Adds the entry, replacing `previous` when there is one. The CLIs have no
-// atomic replace, so a failed add after the remove puts the previous launch
-// back rather than leave the agent with no entry, and the error reports both
-// outcomes. The identity env goes back only with this install's own node and
-// script: a look-alike path is not enough to be handed the Control token.
-async function registerMcp(spec, key, previous, run) {
+// atomic replace, so a failed add after the remove puts the previous entry
+// back, with the command, args and env it had, rather than leave the agent
+// with no entry; the error reports both outcomes. The identity env is added
+// only to a launch this installer wrote (this install's own node and script,
+// or the launch the install state records): a look-alike path is not enough
+// to be handed the Control token. Any other entry gets back its own env.
+async function registerMcp(spec, key, previous, run, recorded) {
   if (previous) await requireSuccess(run, spec.command, spec.removeArgs, `remove existing ${key}`);
   const failure = await attemptCommand(run, spec.command, spec.args, `install ${key}`);
   if (!failure) return;
@@ -582,28 +600,60 @@ async function registerMcp(spec, key, previous, run) {
   if (!previous.command || !previous.args || previous.exact === false) {
     throw new Error(`${failure.message}; the previous ${key} entry was removed and could not be restored because ${spec.agent} did not report its full launch command; re-add it or rerun the installer`);
   }
-  const ours = previous.args.length === 1
-    && await samePath(previous.command, spec.launch.command)
-    && await samePath(previous.args[0], spec.launch.args[0]);
-  const restoreFailure = await attemptCommand(run, spec.command, spec.addArgs(previous, ours), `restore the previous ${key}`);
+  const ours = (recorded && sameLaunch(previous, recorded))
+    || (previous.args.length === 1
+      && await samePath(previous.command, spec.launch.command)
+      && await samePath(previous.args[0], spec.launch.args[0]));
+  const env = { ...(previous.env ?? {}), ...(ours ? spec.identityEnv : {}) };
+  const hidden = Object.fromEntries(Object.keys(env).map((name) => [name, "<redacted>"]));
+  const restoreFailure = await attemptCommand(run, spec.command, spec.addArgs(previous, env), `restore the previous ${key}`, {
+    shown: spec.addArgs(previous, hidden),
+    env
+  });
+  const gap = restoreGap(previous);
   if (!restoreFailure) {
-    throw new Error(ours
-      ? `${failure.message}; the previous ${key} entry was restored`
-      : `${failure.message}; the previous ${key} entry was restored without its environment (its original env could not be read); re-add its env if it needs one`);
+    throw new Error(gap
+      ? `${failure.message}; the previous ${key} entry was restored, but not exactly (${gap}); re-add what it needs`
+      : `${failure.message}; the previous ${key} entry was restored`);
   }
   const launched = [previous.command, ...redactArgs(previous.args)].join(" ");
-  throw new Error(`${failure.message}; ${restoreFailure.message}; ${key} is no longer registered (it launched: ${launched}); re-add it or rerun the installer`);
+  const envNames = Object.keys(env).length ? `, with env ${Object.keys(env).join(", ")}` : "";
+  throw new Error(`${failure.message}; ${restoreFailure.message}; ${key} is no longer registered (it launched: ${launched}${envNames}); re-add it or rerun the installer`);
 }
 
-// The command's failure as an Error, or null when it succeeded.
-async function attemptCommand(run, command, args, operation) {
+// Why an inspected entry could not be added back exactly as it is, or null
+// when it could.
+function restoreGap(entry) {
+  if (!entry?.command || !entry.args || entry.exact === false) return "its full launch command was not reported";
+  return entry.gap ?? null;
+}
+
+// The command's failure as an Error, or null when it succeeded. `shown` is
+// what the message prints for the args; `env` names values to hide in
+// whatever the command printed.
+async function attemptCommand(run, command, args, operation, redaction) {
   let result;
   try {
     result = await run(command, args);
   } catch (error) {
-    return new Error(`${operation} failed (${command} ${redactArgs(args).join(" ")}): ${redactText(error?.message ?? String(error))}`);
+    const shown = redaction?.shown ?? redactArgs(args);
+    return new Error(`${operation} failed (${command} ${shown.join(" ")}): ${redactEnv(error?.message ?? String(error), redaction?.env)}`);
   }
-  return result.code === 0 ? null : commandError(command, args, result, operation);
+  return result.code === 0 ? null : commandError(command, args, result, operation, redaction);
+}
+
+// An entry's inspection: whether it exists and, when it does, what it
+// launches and with which env (registeredLaunch).
+async function inspectEntry(spec, run, key, { dryRun, claudeConfigPath }) {
+  if (spec.agent !== "claude") return inspectWithCli(spec, run, key);
+  // A dry run inspects too, but never through a command that starts the
+  // server: `claude mcp get` health-checks the entry by launching it, and a
+  // launched front door can autostart a daemon. Codex `mcp get` and the Grok
+  // and Auggie lists only read configuration.
+  if (dryRun) return readClaudeEntry(claudeConfigPath, spec.name);
+  const inspected = await inspectWithCli(spec, run, key);
+  if (!inspected.exists) return inspected;
+  return { exists: true, registered: await withClaudeConfig(inspected.registered, claudeConfigPath, spec.name) };
 }
 
 async function inspectWithCli(spec, run, key) {
@@ -627,7 +677,21 @@ async function readClaudeEntry(path, name) {
   const config = parseJson(text);
   if (!config || typeof config !== "object") return { error: `could not parse ${path}` };
   const entry = config.mcpServers?.[name];
-  return { exists: Boolean(entry), registered: entry ? launchFields(entry) : null };
+  return { exists: Boolean(entry), registered: entry ? entryLaunch(entry, "claude") : null };
+}
+
+// `claude mcp get` prints the args joined by spaces and the env as text. The
+// user-scope entry in Claude's config file holds both exactly, and is the one
+// the installer removes, so it stands in when it launches what the CLI
+// reported; otherwise the entry cannot be put back exactly.
+async function withClaudeConfig(reported, path, name) {
+  const file = await readClaudeEntry(path, name);
+  const entry = file.registered;
+  if (entry?.command && entry.args && reported.args
+    && entry.command === reported.command && entry.args.join(" ") === reported.args.join(" ")) {
+    return entry;
+  }
+  return { ...reported, env: null, gap: file.error ?? `the user-scope ${name} in ${path} is not the entry claude reported` };
 }
 
 async function installBundledSkill(agent, { source, destinationRoot, options, state, actions, warnings }) {
@@ -771,50 +835,41 @@ function mcpSpec(agent, kind, identity) {
   const serverArgs = [script];
   // What the host will launch, as opposed to the CLI call that registers it.
   const launch = { command: serverCommand, args: serverArgs };
-  // addArgs registers any launch under this entry's name, with the identity
-  // env unless withEnv is false, so a failed replacement can put the previous
-  // launch back.
+  const identityEnv = isControl
+    ? { ACP_GATEWAY_CONTROL_TOKEN: identity.token, ACP_GATEWAY_ROOT_ID: identity.rootId }
+    : {};
+  // addArgs registers any launch under this entry's name with the given env,
+  // so a failed replacement can put the previous entry back as it was.
   const secrets = isControl ? [identity.token] : [];
-  const withAdd = (fields, addArgs) => ({ ...fields, secrets, addArgs, args: addArgs(launch, true) });
+  const pairs = (flag, env) => Object.entries(env).flatMap(([name, value]) => [flag, `${name}=${value}`]);
+  const withAdd = (fields, addArgs) => ({ ...fields, identityEnv, secrets, addArgs, args: addArgs(launch, identityEnv) });
   if (agent === "codex") {
-    const envArgs = isControl
-      ? ["--env", `ACP_GATEWAY_CONTROL_TOKEN=${identity.token}`, "--env", `ACP_GATEWAY_ROOT_ID=${identity.rootId}`]
-      : [];
     return withAdd({
       agent, kind, name, command: "codex", launch,
       getArgs: ["mcp", "get", name, "--json"],
       removeArgs: ["mcp", "remove", name]
-    }, ({ command, args }, withEnv) => ["mcp", "add", ...(withEnv ? envArgs : []), name, "--", command, ...args]);
+    }, ({ command, args }, env) => ["mcp", "add", ...pairs("--env", env), name, "--", command, ...args]);
   }
   if (agent === "grok") {
-    const envArgs = isControl
-      ? ["--env", `ACP_GATEWAY_CONTROL_TOKEN=${identity.token}`, "--env", `ACP_GATEWAY_ROOT_ID=${identity.rootId}`]
-      : [];
     return withAdd({
       agent, kind, name, command: "grok", inspectMode: "list-json", launch,
       getArgs: ["mcp", "list", "--json"],
       removeArgs: ["mcp", "remove", name]
-    }, ({ command, args }, withEnv) => ["mcp", "add", "--scope", "user", ...(withEnv ? envArgs : []), name, "--", command, ...args]);
+    }, ({ command, args }, env) => ["mcp", "add", "--scope", "user", ...pairs("--env", env), name, "--", command, ...args]);
   }
   if (agent === "auggie") {
-    const env = isControl
-      ? { ACP_GATEWAY_CONTROL_TOKEN: identity.token, ACP_GATEWAY_ROOT_ID: identity.rootId }
-      : {};
     return withAdd({
       agent, kind, name, command: "auggie", inspectMode: "list-json", launch,
       getArgs: ["mcp", "list", "--json"],
       removeArgs: ["mcp", "remove", name]
-    }, ({ command, args }, withEnv) => ["mcp", "add-json", name, JSON.stringify({ type: "stdio", command, args, env: withEnv ? env : {} }), "--replace"]);
+    }, ({ command, args }, env) => ["mcp", "add-json", name, JSON.stringify({ type: "stdio", command, args, env }), "--replace"]);
   }
   if (agent !== "claude") throw new Error(`MCP registration is not supported for ${agent}`);
-  const envArgs = isControl
-    ? ["-e", `ACP_GATEWAY_CONTROL_TOKEN=${identity.token}`, "-e", `ACP_GATEWAY_ROOT_ID=${identity.rootId}`]
-    : [];
   return withAdd({
     agent, kind, name, command: "claude", launch,
     getArgs: ["mcp", "get", name],
     removeArgs: ["mcp", "remove", "--scope", "user", name]
-  }, ({ command, args }, withEnv) => ["mcp", "add", "--scope", "user", name, ...(withEnv ? envArgs : []), "--", command, ...args]);
+  }, ({ command, args }, env) => ["mcp", "add", "--scope", "user", name, ...pairs("-e", env), "--", command, ...args]);
 }
 
 function inspectMcpExists(spec, result) {
@@ -830,36 +885,64 @@ function inspectMcpExists(spec, result) {
   }
 }
 
-// The command and args an existing entry launches, read from the inspect
-// output; null fields mean that output does not say. Shapes, per CLI:
-//   codex  `mcp get --json`  {transport: {command, args, env}}
-//   grok   `mcp list --json` [{name, scope, command, args, env}]
-//   auggie `mcp list --json` {servers: [{name, source, transport: "stdio", command}]} (no args)
-//   claude `mcp get`         text lines "  Command: <cmd>" and "  Args: <args joined by spaces>"
+// What an existing entry launches and with which env, read from the inspect
+// output: {command, args, env, gap}. A null command or args means the output
+// does not say; a null env, or a gap, means the entry could not be added back
+// exactly as it is, and gap says why. Shapes, per CLI:
+//   codex  `mcp get --json`  {transport: {command, args, env (null for none), env_vars, cwd}}
+//   grok   `mcp list --json` [{name, scope, command, args, env, cwd}] (empty fields left out)
+//   auggie `mcp list --json` {servers: [{name, source, transport: "stdio", command}]} (no args, no env)
+//   claude `mcp get`         text lines "  Command: <cmd>" and "  Args: <args joined by spaces>";
+//                            the exact args and env come from its config file (withClaudeConfig)
 function registeredLaunch(spec, result) {
   if (spec.inspectMode === "list-json") {
     const parsed = parseJson(result.stdout);
     const servers = (Array.isArray(parsed) ? parsed : parsed?.servers ?? []).filter((item) => item?.name === spec.name);
     // A same-named project or registry entry can sit beside the user-scope one this installer adds.
-    return launchFields(servers.find((item) => item.scope === "user" || item.source === "user") ?? servers[0]);
+    return entryLaunch(servers.find((item) => item.scope === "user" || item.source === "user") ?? servers[0], spec.agent);
   }
-  if (spec.getArgs.includes("--json")) return launchFields(parseJson(result.stdout));
+  if (spec.getArgs.includes("--json")) return entryLaunch(parseJson(result.stdout), spec.agent);
   const command = /^[ \t]*Command:[ \t]*(.*?)[ \t]*$/m.exec(result.stdout)?.[1];
-  if (!command) return { command: null, args: null };
+  if (!command) return { command: null, args: null, env: null, gap: null };
   // Claude joins args with spaces, so the line is kept whole: the gateway
   // registers exactly one argument, and extra ones then read as a difference.
   // A line with spaces in it cannot be split back, so it is not re-added as is.
   const args = /^[ \t]*Args:[ \t]*(.*?)[ \t]*$/m.exec(result.stdout)?.[1];
-  return { command, args: args == null ? null : args ? [args] : [], exact: !/\s/.test(args ?? "") };
+  return {
+    command,
+    args: args == null ? null : args ? [args] : [],
+    exact: !/\s/.test(args ?? ""),
+    env: null,
+    gap: "claude mcp get does not print its env exactly"
+  };
 }
 
-function launchFields(entry) {
+function entryLaunch(entry, agent) {
   const holder = typeof entry?.command === "string"
     ? entry
     : entry?.transport && typeof entry.transport === "object" ? entry.transport : null;
   const command = typeof holder?.command === "string" && holder.command ? holder.command : null;
-  const args = Array.isArray(holder?.args) && holder.args.every((arg) => typeof arg === "string") ? holder.args : null;
-  return { command, args };
+  const args = Array.isArray(holder?.args) && holder.args.every((arg) => typeof arg === "string") ? [...holder.args] : null;
+  return { command, args, ...entryEnv(holder, agent) };
+}
+
+// The env an entry sets as its CLI reports it, and what else about the entry
+// that CLI's add command could not set again.
+function entryEnv(holder, agent) {
+  if (agent === "auggie") return { env: null, gap: "auggie mcp list does not report its args or env" };
+  if (!holder) return { env: null, gap: `${agent} did not report a command it launches` };
+  // Codex prints `env: null` for none; Grok and Claude's config leave an empty env out.
+  const env = holder.env === null || (holder.env === undefined && agent !== "codex") ? {} : holder.env;
+  if (!env || typeof env !== "object" || Array.isArray(env) || !Object.values(env).every((value) => typeof value === "string")) {
+    return { env: null, gap: `${agent} did not report its env` };
+  }
+  if (Object.values(env).some((value) => /^\*{3,}$/.test(value))) {
+    return { env: null, gap: `${agent} reported its env values masked` };
+  }
+  let gap = null;
+  if (Array.isArray(holder.env_vars) && holder.env_vars.length) gap = `it forwards env_vars, which ${agent} mcp add cannot set`;
+  else if (typeof holder.cwd === "string" && holder.cwd) gap = `it sets a cwd, which ${agent} mcp add cannot set`;
+  return { env: { ...env }, gap };
 }
 
 function parseJson(text) {
@@ -872,23 +955,35 @@ function parseJson(text) {
 
 // Whether a managed entry should launch this install instead: "repoint",
 // "keep", or a reason it stays that KEPT_ENTRY_WARNINGS explains. The install
-// state only says this installer once wrote the entry: the user or another
-// manager (AgenLynk's runtime/current) may have replaced it since. So an entry
-// moves only while it still has the shape this installer writes and is
-// provably stale, and never to an older gateway.
-async function repointDecision(registered, spec) {
+// state's key only says this installer once wrote an entry by that name: the
+// user or another manager (AgenLynk's runtime/current) may have replaced it
+// since, with the same shape. So an entry moves only when it is provably
+// still this installer's and provably stale, and never to an older gateway.
+// Proof of ownership is the launch the state records this installer
+// registering. A record from before launches were recorded leaves only the
+// shape, so such an entry moves only off a script that is still there and
+// sits in a Gateway package.
+async function repointDecision(registered, spec, record) {
   const { launch } = spec;
   if (!registered?.command || !registered.args) return "unknown";
+  const recorded = recordedLaunch(record);
+  if (recorded === null) return "unknown";
+  if (recorded && !sameLaunch(registered, recorded)) return "foreign";
   if (registered.args.length !== 1) return "foreign";
-  const [script] = registered.args;
-  const written = installerWrote(registered, spec);
+  const script = normalizedPath(registered.args[0]);
+  // Recorded: exactly what this installer registered. Otherwise only its shape, which anyone can copy.
+  const written = Boolean(recorded) || installerWrote(registered, spec);
   let resolved;
   try {
     resolved = await realpath(script);
   } catch (error) {
     // Only a path that is not there is stale; EACCES and the like say nothing.
     if (!MISSING_PATH_CODES.has(error?.code)) return "unknown";
-    return written ? await missingScriptDecision(script) : "foreign";
+    if (!written) return "foreign";
+    const decision = await missingScriptDecision(script);
+    // Without a record, a gone script is the one case nothing on disk can
+    // check: the user's own replacement that is not there looks the same.
+    return decision === "repoint" && !recorded ? "unverified-missing" : decision;
   }
   // A path through a symlink is a pointer someone else moves forward. When it
   // resolves to an older gateway the entry still stays, but says so: the
@@ -898,14 +993,54 @@ async function repointDecision(registered, spec) {
     const order = compareReleases(await gatewayVersionAt(dirname(resolved)), GATEWAY_VERSION);
     return order !== null && order < 0 ? "keep-stale" : "keep";
   }
+  const owned = async () => {
+    if (recorded) return "repoint";
+    if (!written) return "foreign";
+    const gateway = await isGatewayPackage(dirname(dirname(script)));
+    return gateway === null ? "unknown" : gateway ? "repoint" : "foreign";
+  };
   if (await samePath(script, launch.args[0])) {
     if (await samePath(registered.command, launch.command)) return "keep";
-    return written ? "repoint" : "foreign";
+    return owned();
   }
   const order = compareReleases(await gatewayVersionAt(dirname(script)), GATEWAY_VERSION);
   if (order === null) return "unknown";
   if (order >= 0) return "keep";
-  return written ? "repoint" : "foreign";
+  return owned();
+}
+
+// The launch a managed record says this installer registered: undefined for a
+// record from before launches were recorded, null for one that is unreadable.
+function recordedLaunch(record) {
+  if (record?.launch === undefined) return undefined;
+  const { command, args } = record.launch ?? {};
+  return typeof command === "string" && command && Array.isArray(args) && args.every((arg) => typeof arg === "string")
+    ? { command, args }
+    : null;
+}
+
+// Whether two launches are the same command and args, compared as normalized
+// paths where they are absolute.
+function sameLaunch(left, right) {
+  return normalizedPath(left.command) === normalizedPath(right.command)
+    && left.args.length === right.args.length
+    && left.args.every((arg, index) => normalizedPath(arg) === normalizedPath(right.args[index]));
+}
+
+function normalizedPath(value) {
+  return isAbsolute(value) ? normalize(value) : value;
+}
+
+// Whether a directory is the root of a Gateway install, by its package.json
+// name; null when that cannot be read for a reason other than its absence.
+async function isGatewayPackage(root) {
+  let text;
+  try {
+    text = await readFile(join(root, "package.json"), "utf8");
+  } catch (error) {
+    return MISSING_PATH_CODES.has(error?.code) ? false : null;
+  }
+  return GATEWAY_PACKAGE_NAMES.has(parseJson(text)?.name);
 }
 
 // Whether a launch has the shape this installer registers: a node executable
@@ -1039,9 +1174,9 @@ async function requireSuccess(run, command, args, operation) {
   return result;
 }
 
-function commandError(command, args, result, operation) {
-  const detail = redactText(String(result.stderr || result.stdout || "unknown error").trim());
-  return new Error(`${operation} failed (${command} ${redactArgs(args).join(" ")}): ${detail}`);
+function commandError(command, args, result, operation, redaction) {
+  const detail = redactEnv(String(result.stderr || result.stdout || "unknown error").trim(), redaction?.env);
+  return new Error(`${operation} failed (${command} ${(redaction?.shown ?? redactArgs(args)).join(" ")}): ${detail}`);
 }
 
 function redactArgs(args) {
@@ -1049,13 +1184,27 @@ function redactArgs(args) {
 }
 
 // Control token values out of text: the KEY=value, KEY: value and JSON
-// "KEY": "value" forms, and any known token value wherever it appears.
-function redactText(text, secrets = []) {
-  let redacted = String(text).replace(/(ACP_GATEWAY_CONTROL_TOKEN"?\s*[=:]\s*"?)[^\s"',}]+/g, "$1<redacted>");
-  for (const secret of secrets) {
-    if (secret) redacted = redacted.split(secret).join("<redacted>");
+// "KEY": "value" forms, for the token and any other named key, and any known
+// secret value wherever it appears.
+function redactText(text, secrets = [], keys = []) {
+  let redacted = String(text);
+  for (const key of new Set(["ACP_GATEWAY_CONTROL_TOKEN", ...keys])) {
+    const name = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    redacted = redacted.replace(new RegExp(`(${name}"?\\s*[=:]\\s*"?)[^\\s"',}]+`, "g"), "$1<redacted>");
+  }
+  // Longest first, so a secret that contains another is hidden whole.
+  for (const secret of secrets.filter(Boolean).sort((left, right) => right.length - left.length)) {
+    redacted = redacted.split(secret).join("<redacted>");
   }
   return redacted;
+}
+
+// Text a CLI printed while it was handed a captured env, with every value of
+// that env out of it: by key in the forms redactText knows, and as a bare
+// value wherever it is long enough to be told from ordinary words.
+function redactEnv(text, env = {}) {
+  const values = Object.values(env).filter((value) => value.length >= MIN_ECHOED_SECRET_LENGTH);
+  return redactText(text, values, Object.keys(env));
 }
 
 export function runCommand(command, args) {
