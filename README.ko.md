@@ -20,7 +20,7 @@ ACP Gateway는 사용자가 직접 대화하는 AI, 즉 **오케스트레이터*
 - ACP 세션과 provider 프로세스를 daemon이 계속 유지합니다.
 - MCP가 재시작되어도 Worker 세션을 복구할 수 있습니다.
 - 모델, 권한, 질문, 취소, 결과 수집을 오케스트레이터가 통제합니다.
-- Worker에는 Gateway 제어 권한을 전달하지 않습니다.
+- Gateway는 Worker 환경에서 자신의 토큰, socket, Main 식별자를 지웁니다. 다만 Gateway를 거치지 않고 파일을 읽는 Worker는 토큰을 찾아낼 수 있습니다. [권한 정책](#권한-정책)을 참고하세요.
 - 로컬 단일 사용자·단일 머신 사용을 기준으로 합니다.
 
 ## 빠른 시작
@@ -100,7 +100,7 @@ Grok 4.5에게 현재 설계의 보안 취약점을 red-team 검토시키고, pe
 | `ask` | 파일 변경이나 명령 실행 전에 오케스트레이터 승인 필요 |
 | `auto_approve` | 사용자가 허용한 세션 경계 안에서 자동 승인 |
 
-Control token, 오케스트레이터 식별자(Main ID)와 Gateway socket 경로는 ACP Worker 환경에서 제거됩니다. Worker 세션에 Control MCP를 다시 주입하는 것도 차단합니다.
+Control token, 오케스트레이터 식별자(Main ID)와 Gateway socket 경로는 ACP Worker 환경에서 제거되며, Worker 세션에 Control MCP를 다시 주입하는 것도 차단합니다. 그렇다고 모든 Worker가 토큰에 닿지 못하는 것은 아닙니다. 자기 도구로 Gateway를 거치지 않고 파일을 읽는 Worker(Codex는 `read_only`에서도 그렇게 읽는 것을 확인했습니다)는 프론트 도어의 MCP 설정에 저장된 Control token을 읽어 Main처럼 행동할 수 있습니다. 그러니 이런 Worker에게는 신뢰할 수 없는 자료(prompt injection이 숨어 있을 수 있는 저장소, 문서, 웹 페이지)를 맡기지 말고, 그런 작업에는 Gateway가 파일 읽기를 중개하거나 sandbox로 제한하는 provider를 쓰세요. 세션에서 Gateway가 강제하지 못하는 항목은 `permission_policy_partial` 경고에 나옵니다. 더 강한 격리는 이후 릴리스에서 제공할 예정입니다.
 
 ### 업데이트
 

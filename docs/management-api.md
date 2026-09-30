@@ -158,4 +158,4 @@ Required invariants and validation:
 | GC cannot remove active obligations or referenced artifacts | retention/resource/persistence tests |
 | Unrecoverable event history is explicit | replay completeness tests |
 
-Release builders require a v1.5.x tag (v1.5.0 through v1.5.2), v1.6.0, v1.7.0 or v1.7.1 plus an independently supplied reviewed source SHA; verifiers require the same SHA. Existing v1.4.0's historical pin is retained. New archives use the public client and engine from the same source commit. Checksums and local unsigned build records are not signed provenance; the separate release workflow attests and verifies before publishing without overwriting assets.
+Release builders require a v1.5.x tag (v1.5.0 through v1.5.2), v1.6.0, v1.7.0, v1.7.1 or v1.7.2 plus an independently supplied reviewed source SHA; verifiers require the same SHA. Existing v1.4.0's historical pin is retained. New archives use the public client and engine from the same source commit. Checksums and local unsigned build records are not signed provenance; the separate release workflow attests and verifies before publishing without overwriting assets.

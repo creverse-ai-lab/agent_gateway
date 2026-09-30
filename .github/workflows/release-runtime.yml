@@ -6,7 +6,7 @@ on:
       source_tag:
         description: Immutable Gateway source tag
         required: true
-        default: v1.7.1
+        default: v1.7.2
       source_commit:
         description: Reviewed full source SHA (must match source_tag)
         required: true

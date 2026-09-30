@@ -91,8 +91,8 @@ function comparePath(left, right) {
 }
 
 // 1.5.x and later tags carry no historical pin: the caller supplies the reviewed SHA.
-const REVIEWED_SOURCE_TAGS = new Set(["v1.5.0", "v1.5.1", "v1.5.2", "v1.6.0", "v1.7.0", "v1.7.1"]);
-const RUNTIME_VERSIONS = ["1.4.0", "1.5.0", "1.5.1", "1.5.2", "1.6.0", "1.7.0", "1.7.1"];
+const REVIEWED_SOURCE_TAGS = new Set(["v1.5.0", "v1.5.1", "v1.5.2", "v1.6.0", "v1.7.0", "v1.7.1", "v1.7.2"]);
+const RUNTIME_VERSIONS = ["1.4.0", "1.5.0", "1.5.1", "1.5.2", "1.6.0", "1.7.0", "1.7.1", "1.7.2"];
 
 export function pinnedSourceCommit(tag, expectedCommit) {
   const commit = PINNED_SOURCE_COMMITS[tag]

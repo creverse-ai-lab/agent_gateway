@@ -20,7 +20,7 @@ ACP Gateway is middleware that lets the AI you talk to directly — the **orches
 - The daemon keeps ACP sessions and provider processes alive.
 - Worker sessions can be recovered even when MCP restarts.
 - The orchestrator controls models, permissions, questions, cancellation, and result collection.
-- Gateway control authority is never passed to Workers.
+- The Gateway strips its token, socket and Main identity from Worker environments, but a Worker that reads files without going through the Gateway can still find the token; see [Permission policies](#permission-policies).
 - Designed for local, single-user, single-machine use.
 
 ## Quick start
@@ -100,7 +100,7 @@ Choose one of the following policies when you open a session.
 | `ask` | Orchestrator approval is required before changing files or running commands |
 | `auto_approve` | Automatic approval within the session boundary the user has allowed |
 
-The Control token, the orchestrator identifier (Main ID), and the Gateway socket path are removed from the ACP Worker's environment. Re-injecting the Control MCP into a Worker session is also blocked.
+The Control token, the orchestrator identifier (Main ID), and the Gateway socket path are removed from the ACP Worker's environment, and re-injecting the Control MCP into a Worker session is blocked. This does not keep the token from every Worker: a Worker whose own tools read files without going through the Gateway (measured with Codex, even under `read_only`) can read the Control token stored in the front door's MCP configuration and act as a Main. So do not give such a Worker untrusted content, such as repositories, documents or web pages that could carry a prompt injection; for that work, prefer a provider whose file reads the Gateway mediates or sandboxes. The `permission_policy_partial` alert lists what the Gateway cannot enforce for a session. Stronger isolation is planned for a later release.
 
 ### Updating
 

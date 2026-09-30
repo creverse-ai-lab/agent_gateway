@@ -20,7 +20,7 @@ ACP Gateway 是一个中间件：让你直接对话的 AI —— 即 **编排器
 - daemon 会持续维持 ACP 会话和 provider 进程。
 - 即使 MCP 重启，也能恢复 Worker 会话。
 - 模型、权限、提问、取消和结果收集均由编排器控制。
-- 不会把 Gateway 的控制权限传给 Worker。
+- Gateway 会从 Worker 的环境中移除自己的 token、socket 和 Main 标识；但不经过 Gateway 直接读取文件的 Worker 仍可能找到该 token，详见[权限策略](#权限策略)。
 - 以本地单用户、单机使用为前提。
 
 ## 快速开始
@@ -100,7 +100,7 @@ acp-gateway-bootstrap --install-all --refresh-registry
 | `ask` | 修改文件或执行命令之前，需要编排器批准 |
 | `auto_approve` | 在用户允许的会话边界内自动批准 |
 
-Control token、编排器标识符（Main ID）和 Gateway socket 路径都会从 ACP Worker 的环境中移除。同时也会阻止向 Worker 会话重新注入 Control MCP。
+Control token、编排器标识符（Main ID）和 Gateway socket 路径都会从 ACP Worker 的环境中移除，同时也会阻止向 Worker 会话重新注入 Control MCP。但这并不能让所有 Worker 都拿不到 token：用自身工具读取文件、不经过 Gateway 的 Worker（实测 Codex 即使在 `read_only` 下也会这样读取）可以读到保存在 front door 的 MCP 配置中的 Control token，并以 Main 的身份操作。因此，不要把不可信的内容（可能藏有提示词注入的仓库、文档或网页）交给这类 Worker；这类工作请优先使用由 Gateway 中转文件读取或用沙箱加以限制的 provider。Gateway 在某个会话中无法强制执行的项目，会列在 `permission_policy_partial` 警告中。更强的隔离计划在后续版本中提供。
 
 ### 更新
 

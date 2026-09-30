@@ -1,6 +1,6 @@
 {
   "name": "acp-gateway-daemon",
-  "version": "1.7.1",
+  "version": "1.7.2",
   "description": "Persistent local ACP gateway with Main-only control and worker-safe guidance.",
   "license": "Apache-2.0",
   "repository": {

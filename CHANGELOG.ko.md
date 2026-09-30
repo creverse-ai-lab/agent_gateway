@@ -2,6 +2,34 @@
 
 **한국어** | [English](CHANGELOG.md)
 
+## v1.7.2 변경 사항
+
+1.7.0에서 도입한 복구 관련 사실이 업그레이드와 장애 뒤에도 정확하게 유지되도록 고치고, installer가 자신이 쓰지 않은 MCP 항목을 다시 등록하지 않게 하며, npm 게시를 trusted publishing으로 바꾸고, README에서 Worker와 Gateway 제어 권한에 대해 설명한 내용을 바로잡는 패치 릴리스입니다. API major **1**과 state schema **5**는 유지되며, 새 공개 필드·설정·오류 코드는 없습니다.
+
+- **중단 결과 판정(1.7.0 버그):**
+  - 1.7.0과 1.7.1은 dispatch 기록이 없는 중단 작업을 모두 `executionOutcome: "not_started"`로 보고했습니다. v1.6.0은 이 기록을 남기지 않았기 때문에, 업그레이드 재시작으로 끊긴 v1.6.0 작업이 `not_started`로 보고됐습니다. Worker가 이미 prompt를 받아 움직였을 수도 있는데 다시 실행해도 안전하다고 알린 셈입니다.
+  - 이제 작업에 dispatch 추적 표시를 내부적으로 남깁니다(API로는 나오지 않음). 중단 판정이 `not_started`가 되는 것은 이 표시가 있으면서 dispatch 기록이 없는 작업뿐입니다. 그 밖의 작업은 1.7.2 이전에 만든 작업을 포함해 모두 `unknown`으로 판정하며, snapshot 세션이라면 `next`에 `workspace_diff`가 들어갑니다. 1.7.0이나 1.7.1이 이미 기록한 중단 판정은 그대로 남으므로, v1.6.0에서 업그레이드할 때 진행 중이던 작업에 `not_started`가 적혀 있다면 `unknown`으로 읽으세요.
+  - 중단된 작업의 결과를 replay가 미리보기로만 되살릴 수 있는 경우(artifact가 사라진 경우)에도 결과에 `interruption`과 `next`가 다시 붙습니다. 1.7.0이나 1.7.1이 이 둘 없이 저장해 둔 결과도 1.7.2가 읽어 들일 때 바로잡습니다.
+- **복구 실패와 격리가 장애 뒤에도 유지됨:**
+  - 복구에 실패하면 세션의 실패 횟수, 격리 상태, `lastRestore`를 WAL에 쓰고 fsync한 뒤에 오류를 돌려줍니다. 실패 연속을 끝내거나 격리를 푸는 복구 성공도 마찬가지입니다. 예전에는 이 값들이 이후의 상태 snapshot에서야 디스크에 기록됐기 때문에, 세션을 격리한 실패 직후에 장애가 나면 격리가 풀리거나, 복구 성공으로 풀린 격리가 되살아날 수 있었습니다.
+  - provider가 광고하지 않은 복구 방법을 요청하면 아무 일도 일어나기 전에 거부합니다. 복구 이벤트도, 상태 변경도, 실패 횟수 증가도 없습니다. 예전에는 세션이 `restoring`을 거치고 복구 실패로 세어졌습니다.
+  - 명시적 `agent_acp_session_restore`는 그 세션에서 진행 중인 유일한 복구입니다. 그동안 (예컨대 prompt 때문에) 시작된 자동 복구는 이 복구에 합류하고, 자동 복구 도중에 들어온 명시적 복구는 그 결과를 기다린 뒤 다시 판단합니다. 그래서 Worker가 복구 요청을 두 번 받는 일이 없습니다.
+  - provider를 끄면(`set_enabled`, `enabled: false`) 관리 API 계약에 적힌 대로 새 등록만 막습니다. 이 Main이 가진 등록 세션은 Off 상태에서도 `agent_acp_session_restore`로 복구할 수 있으며, 격리된 세션에는 이것이 유일한 복구 경로입니다. 아직 등록되지 않은 세션은 provider가 꺼져 있는 동안 여전히 복구할 수 없습니다.
+- **installer와 MCP 항목:**
+  - `--update`와 `--install-all`은 관리 중인 `agent-acp`·`agent-acp-guide` 항목이 installer가 쓰는 형태를 유지하고 있을 때만 다시 등록합니다. 그 형태란 절대 경로의 node 실행 파일이 Gateway의 `src/index.js`(Control) 또는 `src/guide.js`(Guide)를 가리키는 정규화된 절대 경로 하나를 실행하는 것입니다. 설치 상태가 알려 주는 것은 installer가 한때 그 항목을 썼다는 사실뿐이라, 이후에 사용자나 다른 앱이 바꿨다면 경고와 함께 그대로 두고, `--force`를 주면 교체합니다. 예전에는 스크립트가 사라진 관리 항목을 무조건 다시 등록했습니다.
+  - 경로가 symlink를 거치는 항목은 링크가 끊겼거나 스크립트가 없는 곳을 가리켜도 경고만 남기고 그대로 둡니다. 그 링크를 관리하는 앱이 고칠 일입니다. 확인할 수 없는 경로(예: `EACCES`)는 사라진 것으로 간주하지 않고 unknown으로 보고한 뒤 그대로 둡니다.
+  - agent CLI에는 원자적인 교체 명령이 없습니다. 기존 항목을 지운 뒤 새 항목 추가에 실패하면 installer가 이전 항목을 다시 추가하고, 그 사실을 오류에 적습니다. Control token과 Main ID는 이전 항목이 이 설치본의 node와 스크립트를 실행하던 경우에만 함께 되돌리고, 그 밖의 경우에는 환경 변수 없이 복구했다고 오류에 밝힙니다.
+  - installer 오류에는 Control token이 나오지 않습니다. agent CLI가 출력에 그 값을 그대로 찍은 경우도 가립니다.
+- **trusted publishing으로 npm 게시:**
+  - `Publish npm` workflow는 npm trusted publishing(OIDC)으로 게시합니다. 저장소에 npm 토큰을 두지 않고 workflow도 토큰을 쓰지 않으며, 토큰으로 대신 게시하는 경로도 없습니다. 1.7.0은 secret `NPM_TOKEN`을 썼습니다.
+  - workflow는 릴리스 태그 `refs/tags/v<version>`에서 실행해야 하며, checkout한 커밋이 태그의 커밋이자 실행을 요청한 커밋이어야 합니다. 그래서 실행 후 태그를 옮기면 거부됩니다(`scripts/check-npm-release.js`).
+  - 첫 번째 job은 게시 권한 없이 `npm ci`, `npm run ci`, `npm run smoke:npm`을 실행하고 tarball을 만듭니다. GitHub OIDC 토큰을 요청할 수 있는 유일한 job인 두 번째 job은 저장소 코드를 실행하지 않고, tarball의 checksum과 이름·버전을 확인한 뒤 바로 그 tarball을 npm 11로 provenance와 함께 게시합니다. npm 쪽 설정은 [운영 가이드](docs/operations.ko.md#npm-배포-maintainer용)에 있습니다.
+- **Control MCP의 `agent_acp_run` attach:** Control MCP를 통한 attach(`{taskId}`)는 이제 호출자가 보낸 인자를 Gateway에 그대로 전달합니다. 그래서 `prompt`·`sessionId`·`parentTaskId`·`inputTaskIds`를 함께 보낸 attach는 socket으로 호출할 때와 같이 `INVALID_ARGUMENT`로 실패합니다. 예전에는 프론트 도어가 이 인자를 버리고, 보내지 않은 것처럼 attach했습니다.
+- **문서 정정(보안):** README는 Worker에 Gateway 제어 권한을 전달하지 않는다고 설명했습니다. Gateway는 Worker 환경에서 자신의 토큰, socket, Main 식별자를 지우지만, 자기 도구로 Gateway를 거치지 않고 파일을 읽는 Worker(Codex는 `read_only`에서도 그렇게 읽는 것을 확인했습니다)는 프론트 도어의 MCP 설정에 저장된 Control token을 읽어 Main처럼 행동할 수 있습니다. README와 운영 가이드에 이 사실을 적고, 이런 Worker에게 신뢰할 수 없는 자료를 맡기지 말라고 안내했습니다. 1.7.2에서 이 동작 자체는 바뀌지 않으며, 더 강한 격리를 계획하고 있습니다.
+- **테스트:** Gateway가 종료 중일 때의 실패는 복구 실패로 세지 않는다는 것, 명시적 복구가 snapshot 세션을 복사해 온 원본 디렉터리로도 지정할 수 있다는 것, 작업을 취소해도 확인한 것으로 표시되지 않는다는 것을 새 테스트로 고정했습니다.
+- **호환성:** API, state, 설정, 응답 형태는 바뀌지 않았습니다. 기본·compact poll 응답과 일반 작업·run의 조회 응답·결과 envelope는 바이트 단위까지 같습니다. 바뀐 것은 다음과 같습니다. 1.7.2 이전에 만든 작업은 앞으로 중단되면 `unknown`으로 판정합니다(1.7.0·1.7.1은 `not_started`로 판정할 수 있었습니다). 시작용 인자를 함께 보낸 attach는 조용히 인자가 잘리는 대신 실패합니다. 광고되지 않은 복구 방법은 더 이상 실패로 세지 않습니다. provider가 꺼져 있어도 Main이 자기 세션을 복구할 수 있습니다. 1.7.2가 쓴 state는 1.7.0과 1.7.1에서도 읽을 수 있습니다. 복구 결과는 기존 `session.registered` 레코드로 기록하고, 새 WAL 레코드 유형은 없으며, 이전 daemon은 작업에 새로 붙은 표시를 무시합니다.
+- **업그레이드:** npm 설치본은 `npm install -g acp-gateway-daemon@latest`를 실행한 뒤 `acp-gateway-bootstrap --update`를 실행하세요. daemon 재시작까지 해 줍니다. 소스 checkout은 `acp-gateway-bootstrap --update`로 업데이트하고, 앱이 관리하는 runtime은 그 앱이 업데이트합니다. 그다음 호스트 세션을 다시 연결해야 호스트가 attach 수정이 들어간 새 Control MCP 프론트 도어를 띄웁니다. `--update`가 MCP 항목을 그대로 두었다고 경고하면 그 항목이 무엇을 실행하는지 확인하고, 다시 등록하려면 `--force`를 쓰세요.
+
 ## v1.7.1 변경 사항
 
 npm 설치 크기를 바로잡는 패치 릴리스입니다. npm에서 `acp-gateway-daemon@1.7.0`을 설치하면 모든 플랫폼용 Claude Code 바이너리를 2GB 넘게 내려받으며, `--omit=optional`로도 막을 수 없습니다. 1.7.1은 약 49MB만 설치합니다. 또한 Claude Worker가 PATH에 있는 Claude CLI도 찾습니다. API major **1**과 state schema **5**는 유지되며, 새 필드·설정·오류 코드는 없습니다.
@@ -170,12 +198,12 @@ acp-gateway-admin shutdown_if_idle
 
 `expectedRevision`은 예시의 0을 복사하지 말고 직전 조회값을 사용하세요. 설정은 안전 종료 후 새 daemon 시작에 적용됩니다. 재시작·runtime 교체를 수행하는 소비자는 자동 재연결 client를 먼저 닫고, 선택한 runtime으로 새 daemon을 시작한 뒤 setup의 실행본 식별과 적용값을 확인해야 합니다.
 
-### 1.5.x·1.6.0·1.7.0·1.7.1 runtime 빌드
+### 1.5.x·1.6.0·1.7.0·1.7.1·1.7.2 runtime 빌드
 
-1.5.x(`v1.5.0`~`v1.5.2`), `v1.6.0`, `v1.7.0`, `v1.7.1` builder는 tag와 별도로 검토한 전체 source SHA를 요구합니다. tag가 해당 SHA와 다르면 빌드와 검증을 거부하며, 새 runtime의 엔진과 public client는 모두 같은 source commit에서 추출합니다. 기존 1.4.0 태그의 고정 SHA 검증은 유지합니다.
+1.5.x(`v1.5.0`~`v1.5.2`), `v1.6.0`, `v1.7.0`, `v1.7.1`, `v1.7.2` builder는 tag와 별도로 검토한 전체 source SHA를 요구합니다. tag가 해당 SHA와 다르면 빌드와 검증을 거부하며, 새 runtime의 엔진과 public client는 모두 같은 source commit에서 추출합니다. 기존 1.4.0 태그의 고정 SHA 검증은 유지합니다.
 
 ```bash
-npm run release:runtime -- --source-tag v1.7.1 --source-commit FULL_REVIEWED_SOURCE_SHA --output-dir dist
+npm run release:runtime -- --source-tag v1.7.2 --source-commit FULL_REVIEWED_SOURCE_SHA --output-dir dist
 npm run release:verify -- --source-commit FULL_REVIEWED_SOURCE_SHA \
   --archive dist/acp-gateway-runtime-darwin-arm64.tar.gz \
   --sha256 dist/acp-gateway-runtime-darwin-arm64.tar.gz.sha256 \

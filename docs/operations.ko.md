@@ -60,7 +60,7 @@ acp-gateway-bootstrap --update-skill    # 2. skill 갱신 (수정본이면 --for
 3. **호스트 재연결** — Claude Code는 `/mcp reconnect` 또는 새 세션, Codex·Grok·Auggie는 새 세션을 시작합니다.
 4. **검증** — tool 목록에 `agent_acp_run`이 있고, `agent_acp_setup` 응답에 `staleFrontDoor`가 없으면 정상입니다.
 
-`staleFrontDoor`는 프론트 도어(호스트에 등록된 MCP 프로세스)의 버전과 실행 중인 daemon 버전이 다를 때 `agent_acp_setup`·`agent_acp_session_open` 응답에 붙는 알림으로, `frontDoorVersion`·`gatewayVersion`·필요한 조치(`action`)와, 두 버전의 순서를 정할 수 있으면 `reason`을 담고 있습니다. `reason: "front_door_older"`이거나 `reason`이 없으면 3번을 수행하세요. `reason: "gateway_older"`이면 daemon 쪽이 오래된 것이라 재연결해도 같은 daemon에 다시 붙을 뿐입니다. 한가할 때 `acp-gateway-admin shutdown_if_idle`로 daemon을 재시작하면(작업이 진행 중이면 거부하므로 나중에 다시 시도) 다음 `agent-acp` 호출이 프론트 도어 버전으로 daemon을 띄웁니다. `acp-gateway-bootstrap --update`는 스크립트가 사라졌거나 더 오래된 Gateway를 고정 경로로 가리키는 관리 중인 `agent-acp` 항목을 현재 설치본을 가리키도록 다시 등록합니다. 다른 앱이 관리하는 symlink를 거치는 항목은 그대로 두고, 더 오래된 Gateway로 이어지면 경고만 남깁니다.
+`staleFrontDoor`는 프론트 도어(호스트에 등록된 MCP 프로세스)의 버전과 실행 중인 daemon 버전이 다를 때 `agent_acp_setup`·`agent_acp_session_open` 응답에 붙는 알림으로, `frontDoorVersion`·`gatewayVersion`·필요한 조치(`action`)와, 두 버전의 순서를 정할 수 있으면 `reason`을 담고 있습니다. `reason: "front_door_older"`이거나 `reason`이 없으면 3번을 수행하세요. `reason: "gateway_older"`이면 daemon 쪽이 오래된 것이라 재연결해도 같은 daemon에 다시 붙을 뿐입니다. 한가할 때 `acp-gateway-admin shutdown_if_idle`로 daemon을 재시작하면(작업이 진행 중이면 거부하므로 나중에 다시 시도) 다음 `agent-acp` 호출이 프론트 도어 버전으로 daemon을 띄웁니다. `acp-gateway-bootstrap --update`는 스크립트가 사라졌거나 더 오래된 Gateway를 고정 경로로 가리키는 관리 중인 `agent-acp` 항목을 현재 설치본을 가리키도록 다시 등록합니다. 단, 그 항목이 installer가 쓰는 형태(node 실행 파일이 Gateway의 `src/index.js`를 실행)를 유지하고 있을 때만 그렇게 하며, 다른 누군가가 바꾼 항목은 경고와 함께 그대로 두고 `--force`로 다시 등록할 수 있습니다. 다른 앱이 관리하는 symlink를 거치는 항목도 그대로 두고, 더 오래된 Gateway로 이어지거나 링크가 끊겼거나 그 뒤에 스크립트가 없으면 경고만 남깁니다.
 
 ### 주요 installer 옵션
 
@@ -89,7 +89,7 @@ Control token과 오케스트레이터 식별자(Main ID)는 `~/.acp-gateway/ins
 
 Skill은 Codex `~/.codex/skills`, Claude `~/.claude/skills`, Grok `~/.grok/skills`, Auggie `~/.augment/skills`에 설치합니다. 별도 경로가 알려지지 않은 registry provider는 공용 `~/.agents/skills`를 사용합니다. 같은 공용 경로를 사용하는 provider가 여러 개면 skill 파일은 한 번만 복사하고 installer 상태에는 각 provider를 모두 기록합니다.
 
-Control·Guide MCP 등록은 Codex, Claude, Grok, Auggie를 지원합니다. 기본 `--install-all`에서 Control은 사용자가 프론트 도어로 선택한 Codex·Claude·Grok 중 하나에만 등록되고, Guide와 skill은 발견된 지원 agent 전체에 설치됩니다. `--target`은 고급 수동 대상 지정 용도로 유지됩니다. Control MCP는 Gateway 전체 제어 권한이 있으므로 신뢰하는 로컬 agent에만 설치하세요.
+Control·Guide MCP 등록은 Codex, Claude, Grok, Auggie를 지원합니다. 기본 `--install-all`에서 Control은 사용자가 프론트 도어로 선택한 Codex·Claude·Grok 중 하나에만 등록되고, Guide와 skill은 발견된 지원 agent 전체에 설치됩니다. `--target`은 고급 수동 대상 지정 용도로 유지됩니다. Control MCP는 Gateway 전체 제어 권한이 있으므로 신뢰하는 로컬 agent에만 설치하세요. 이 토큰은 그 agent의 MCP 설정에 저장되므로, 자기 도구로 Gateway를 거치지 않고 파일을 읽는 Worker(Codex는 `read_only`에서도 그렇게 읽는 것을 확인했습니다)가 읽어서 Main처럼 행동할 수 있습니다. 이런 Worker에게 신뢰할 수 없는 자료를 맡기기 전에 [권한 정책](../README.ko.md#권한-정책)을 확인하세요.
 
 공식 registry 원본은 `https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json`이며 `~/.acp-gateway/registry.json`에 24시간 캐시합니다. 발견된 provider 실행 정의는 `~/.acp-gateway/providers.json`에 저장됩니다. `npx`·`uvx` 배포는 registry에 고정된 버전을 설치하고, binary 배포는 이미 설치된 실행 파일을 사용합니다. registry에 등록되지 않은 임의의 AI는 ACP 실행 계약을 안전하게 추론할 수 없으므로 자동 등록하지 않습니다.
 
@@ -136,13 +136,14 @@ Dependabot 설정은 GitHub의 기본 브랜치에 존재해야 활성화되며,
 
 Gateway는 npm에 `acp-gateway-daemon`으로 게시합니다(명령 이름은 그대로 `acp-gateway-*`). 릴리스 버전이 `package.json`, `npm-shrinkwrap.json`, `src/version.js`의 `GATEWAY_VERSION`, 두 변경 이력의 최신 제목에 모두 반영된 commit만 게시하세요. 이 값들이 서로 맞는지는 `npm run ci`가 검사합니다. npm 버전은 바꿀 수 없습니다. 한 번 게시한 버전 번호는 unpublish한 뒤에도 다시 쓸 수 없으므로, 잘못 게시했다면 새 버전을 내는 수밖에 없습니다.
 
-- **GitHub Actions(기본 경로):** 릴리스 태그에서 `Publish npm` workflow(`.github/workflows/publish-npm.yml`, 수동 `workflow_dispatch`)를 입력 `version`과 함께 실행합니다. 예: `gh workflow run publish-npm.yml --ref v1.7.1 -f version=1.7.1`. workflow는 입력 버전이 `package.json` 버전·`GATEWAY_VERSION`과 같은지, 패키지 이름이 `acp-gateway-daemon`인지 확인하고, npm에 이미 있는 버전이면 거부합니다. 이어서 `npm ci`, `npm run ci`, `npm run smoke:npm`을 모두 통과해야 `npm publish --provenance --access public`을 실행합니다.
-  - 저장소 secret `NPM_TOKEN`이 필요합니다. 이 패키지에 publish 권한이 있고 2FA 코드를 묻지 않는 npm granular access token을 넣으세요. CI 작업은 2FA 입력에 답할 수 없습니다.
-  - npm은 공개 GitHub 저장소에서 온 provenance만 받으므로, 저장소가 비공개인 동안에는 이 workflow로 게시할 수 없습니다.
+- **GitHub Actions(기본 경로):** 릴리스 태그를 push한 뒤, 그 태그에서 `Publish npm` workflow(`.github/workflows/publish-npm.yml`, 수동 `workflow_dispatch`)를 입력 `version`과 함께 실행합니다. 예: `gh workflow run publish-npm.yml --ref v1.7.2 -f version=1.7.2`. 실행이 `refs/tags/v<version>`에서 시작되지 않았거나, 입력 버전이 `package.json` 버전·`GATEWAY_VERSION`과 다르거나, 패키지 이름이 `acp-gateway-daemon`이 아니거나, checkout한 커밋이 태그의 커밋과 다르면(실행 후 태그를 옮긴 경우 포함) 실패합니다. npm에 이미 있는 버전은 거부하고, 게시 권한이 없는 job에서 `npm ci`, `npm run ci`, `npm run smoke:npm`을 통과한 뒤 tarball을 만듭니다. GitHub OIDC 토큰을 요청할 수 있는 유일한 job인 두 번째 job은 저장소 코드를 실행하지 않고, 검증된 그 tarball만 npm 11로 게시합니다(`npm publish --provenance --access public`).
+  - 게시는 npm trusted publishing(OIDC)을 사용하며, 저장소에 npm 토큰을 두지 않고 workflow도 토큰을 쓰지 않습니다. npmjs.com의 `acp-gateway-daemon` → Settings → Trusted Publisher에 GitHub Actions를 organization `creverse-ai-lab`, repository `agent_gateway`, workflow filename `publish-npm.yml`, environment 비움으로 등록하고, allowed actions에 `npm publish`를 포함해야 합니다. 2026-09-03 이후 만든 설정은 `npm publish`를 따로 체크하지 않으면 `npm stage publish`만 허용하는데, 이 workflow는 `npm publish`를 실행합니다. 각 항목은 대소문자를 구분하고 저장할 때 npm이 검증하지 않으므로, 값이 틀리면 게시 job의 실패(예: `ENEEDAUTH`, `E404`)로만 드러납니다. workflow 파일 이름을 바꾸면 이 설정을 고칠 때까지 게시할 수 없습니다.
+  - trusted publishing이 동작하면 Settings → Publishing access를 "Require two-factor authentication and disallow tokens"로 바꾸세요. trusted publishing은 계속 동작하고, 유출된 토큰으로는 더 이상 게시할 수 없습니다.
+  - npm은 공개 GitHub 저장소에서만 provenance를 붙이고 trusted publishing은 GitHub-hosted runner에서만 동작하므로, 저장소가 비공개인 동안에는 이 workflow로 게시할 수 없습니다.
 - **로컬 게시:** 릴리스 태그를 깨끗하게 checkout한 상태에서 검사를 돌리고, 로그인한 뒤 게시합니다. 이 경로로 게시하면 provenance가 붙지 않습니다.
 
 ```bash
-git clone --branch v1.7.1 https://github.com/creverse-ai-lab/agent_gateway.git
+git clone --branch v1.7.2 https://github.com/creverse-ai-lab/agent_gateway.git
 cd agent_gateway
 npm ci
 npm run ci
@@ -181,14 +182,14 @@ v1.3.0부터 poll 기본값이 절약형입니다. 턴이 진행 중일 때 `res
 v1.7.0부터 Gateway는 맡긴 작업이 어디까지 왔는지 알려 주므로 오케스트레이터가 짐작할 필요가 없습니다. 어느 것도 대신 취소하거나 다시 실행하지 않습니다.
 
 - **상태 이유와 멈춤 힌트** — 세션 `get`/`list`에 `statusReason`·`statusChangedAt`·`lastWorkerActivityAt`이 나오고, 실행 중인 턴이 `stallHintMs` 동안 아무것도 보내지 않으면 `stallSuspected`가 붙습니다. `setup`은 `sessions_stall_suspected` 경고를 띄웁니다.
-- **중단** — Gateway가 끊은 작업에는 `interruption: {reason, executionOutcome, at}`이 붙고(`executionOutcome`은 `not_started` 또는 `unknown`), 결과에 `next` 단계가 담깁니다. `agent_acp_session {action: "check"}`는 provider를 띄우지 않고 세션이 `restorable`·`restorable_with_caveats`·`not_restorable`·`unknown` 중 어디에 해당하는지 알려 줍니다.
+- **중단** — Gateway가 끊은 작업에는 `interruption: {reason, executionOutcome, at}`이 붙고(`executionOutcome`은 `not_started` 또는 `unknown`), 결과에 `next` 단계가 담깁니다. v1.7.2부터 `not_started` 판정은 v1.7.2 이후에 만든 작업에만 나올 수 있고, 그 이전에 만든 작업은 이후에 중단되면 `unknown`입니다. `agent_acp_session {action: "check"}`는 provider를 띄우지 않고 세션이 `restorable`·`restorable_with_caveats`·`not_restorable`·`unknown` 중 어디에 해당하는지 알려 줍니다.
 - **attention** — `agent_acp_inbox {action: "attention"}`은 `needsMain`(대기 중 요청, `attentionStaleMs`가 지나면 `stale`)과 `updates`(작업을 시작한 Main에게 결과가 아직 닿지 않은 종료 작업)를 돌려줍니다. `{action: "ack", taskIds}`는 지정한 작업을 확인한 것으로 표시합니다.
 - **scope** — `agent_acp_session {action: "list"}`와 `task_list`에 `scope: "mine"`을 주면 호출한 Main의 기록만 남깁니다. 호출자 정보를 보내지 않는 프론트 도어(1.6 이전)는 `INVALID_ARGUMENT`를 받습니다.
-- **격리** — 복구가 `maxConsecutiveRestoreFailures`번 연달아 실패하면 `prompt`·`task_prompt`·`run`·`config`는 provider에 연락하지 않고 `SESSION_QUARANTINED`로 실패합니다. `check`, `agent_acp_session_restore`(이 Main의 기존 기록을 그 자리에서 복구하며, 성공하면 격리가 풀림), `agent_acp_session_open`은 계속 쓸 수 있습니다.
+- **격리** — 복구가 `maxConsecutiveRestoreFailures`번 연달아 실패하면 `prompt`·`task_prompt`·`run`·`config`는 provider에 연락하지 않고 `SESSION_QUARANTINED`로 실패합니다. `check`, `agent_acp_session_restore`(이 Main의 기존 기록을 그 자리에서 복구하며, provider가 꺼져 있어도 쓸 수 있고, 성공하면 격리가 풀림), `agent_acp_session_open`은 계속 쓸 수 있습니다.
 
 ### 내구성과 복구
 
-Task 생성과 결과 확정은 응답을 반환하기 전에 WAL에 append + fsync합니다. 즉 Main이 받은 Task 핸들은 daemon이 죽어도 남아 있고, 재시작 후 미완 Task는 `failed`(재시작 메시지)로 확정됩니다. v1.7.0부터는 `interruption`도 함께 붙습니다(아래 참고). 나머지 전이(permission·질문 기록, 세션 등록/종료, 상태 변경)는 5ms group commit입니다. macOS에서 Node는 `F_FULLFSYNC`를 노출하지 않으므로 `fsync(2)`만 사용합니다 — 프로세스 비정상 종료는 완전히 보호되고, 전원 손실은 group commit 창(기본 5ms)만 노출됩니다.
+Task 생성과 결과 확정은 응답을 반환하기 전에 WAL에 append + fsync합니다. 즉 Main이 받은 Task 핸들은 daemon이 죽어도 남아 있고, 재시작 후 미완 Task는 `failed`(재시작 메시지)로 확정됩니다. v1.7.0부터는 `interruption`도 함께 붙습니다(아래 참고). 나머지 전이(permission·질문 기록, 세션 등록/종료, 상태 변경)는 5ms group commit입니다. v1.7.2부터는 세션 복구 실패(실패 횟수, 격리, `lastRestore`)와 실패 연속을 끝내는 복구 성공도 응답을 반환하기 전에 fsync하므로, 장애가 나도 격리가 풀리거나 복구 성공으로 풀린 격리가 되살아나지 않습니다. macOS에서 Node는 `F_FULLFSYNC`를 노출하지 않으므로 `fsync(2)`만 사용합니다 — 프로세스 비정상 종료는 완전히 보호되고, 전원 손실은 group commit 창(기본 5ms)만 노출됩니다.
 
 상태 파일이 손상되면 daemon은 **빈 상태로 조용히 시작하지 않고** 중단합니다. 이때 `~/.acp-gateway/state.recovery-required`에 이유를 기록하고 exit 78로 종료하며, Control MCP 연결 실패 메시지에 그 내용이 표면화됩니다. 복구는 명시적으로 선택합니다.
 

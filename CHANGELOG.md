@@ -2,6 +2,34 @@
 
 [한국어](CHANGELOG.ko.md) | **English**
 
+## v1.7.2
+
+This patch release makes the recovery facts that 1.7.0 introduced hold across upgrades and crashes, stops the installer from repointing MCP entries it did not write, publishes to npm with trusted publishing, and corrects what the READMEs said about Workers and Gateway control. API major **1** and state schema **5** are unchanged, and there are no new public fields, settings or error codes.
+
+- **Interruption outcome (a 1.7.0 bug):**
+  - 1.7.0 and 1.7.1 reported `executionOutcome: "not_started"` for any interrupted task without a dispatch stamp. v1.6.0 never wrote that stamp, so a v1.6.0 task cut short by the upgrade restart was reported `not_started`, suggesting a safe re-run of a prompt the Worker may already have acted on.
+  - Tasks now carry an internal dispatch-tracking marker, never returned by the API. An interruption is judged `not_started` only for a task that has the marker and no stamp. Any other task, including every task created before 1.7.2, is judged `unknown`, and for a snapshot session its `next` includes `workspace_diff`. Interruptions that 1.7.0 or 1.7.1 already recorded keep their verdict, so read `not_started` on a task that was in flight during an upgrade from v1.6.0 as `unknown`.
+  - When replay can bring back only the preview of an interrupted task's result (its artifact is gone), the result again carries `interruption` and `next`. Results that 1.7.0 or 1.7.1 already saved without them are repaired when 1.7.2 loads them.
+- **Restore failures and quarantine survive a crash:**
+  - A failed restore writes the session's failure count, quarantine and `lastRestore` to the WAL and fsyncs before the error is returned, and so does a successful restore that ends a failure streak or lifts a quarantine. Before, these reached disk only with a later state snapshot, so a crash right after the failure that quarantined a session could undo the quarantine, or bring back one that a success had lifted.
+  - A restore method the provider does not advertise is refused before anything happens: no restore events, no status change and no failure counted. Before, it put the session through `restoring` and counted as a failed restore.
+  - An explicit `agent_acp_session_restore` is the session's only restore in flight. A transparent restore started meanwhile (by a prompt, for example) joins it, and an explicit restore that arrives during a transparent one waits for it and then decides again, so the Worker never receives two restore requests.
+  - Turning a provider off (`set_enabled` with `enabled: false`) blocks only new registrations, as the Management API contract says. `agent_acp_session_restore` of this Main's own registered record works under Off, which for a quarantined session is the only way back. A session that is not registered yet still cannot be restored while its provider is off.
+- **Installer and MCP entries:**
+  - `--update` and `--install-all` repoint a managed `agent-acp` or `agent-acp-guide` entry only while it still has the shape the installer writes: an absolute node executable running one normalized absolute path to a Gateway's `src/index.js` (Control) or `src/guide.js` (Guide). The install state only says the installer once wrote the entry; if the user or another app has replaced it since, it is kept with a warning, and `--force` replaces it. Before, a managed entry whose script was missing was always re-registered.
+  - An entry whose path goes through a symlink is kept with a warning when the link is broken or leads somewhere without the script, for the app that manages the link to fix. A path that cannot be checked (for example `EACCES`) is reported as unknown and kept, instead of being treated as missing.
+  - The agent CLIs have no atomic replace. When the add fails after the old entry was removed, the installer adds the previous entry back and says so in the error. The Control token and Main ID go back with it only when the previous entry launched this install's own node and script; otherwise it is restored without environment variables, and the error says that too.
+  - Installer errors never show the Control token, including where an agent CLI echoed it in its output.
+- **npm publishing with trusted publishing:**
+  - The `Publish npm` workflow publishes with npm trusted publishing (OIDC). No npm token is stored in the repository or used by the workflow, and there is no token fallback; 1.7.0 used the `NPM_TOKEN` secret.
+  - It must be dispatched on the release tag `refs/tags/v<version>`, and the checked-out commit must be the tag's commit and the commit the run was dispatched for, so a tag moved after the dispatch is refused (`scripts/check-npm-release.js`).
+  - One job runs `npm ci`, `npm run ci` and `npm run smoke:npm` and packs the tarball without the right to publish. A second job, the only one that can request a GitHub OIDC token, runs no repository code, checks the tarball's checksum, name and version, and publishes exactly that tarball with npm 11 and provenance. The npm-side settings are in the [Operations guide](docs/operations.md#publishing-to-npm-maintainers).
+- **Control MCP `agent_acp_run` attach:** An attach (`{taskId}`) through the Control MCP now forwards the caller's arguments to the Gateway, so an attach that also names `prompt`, `sessionId`, `parentTaskId` or `inputTaskIds` fails with `INVALID_ARGUMENT`, as it already did over the socket. Before, the front door dropped those arguments and attached as if they had not been sent.
+- **Documentation correction (security):** The READMEs said that Gateway control is never passed to Workers. The Gateway strips its token, socket and Main identity from Worker environments, but a Worker whose own tools read files without going through the Gateway (measured with Codex, even under `read_only`) can read the Control token stored in the front door's MCP configuration and act as a Main. The READMEs and the Operations guide now say so and advise against giving such a Worker untrusted content. 1.7.2 does not change this behavior; stronger isolation is planned.
+- **Tests:** New tests pin that failures while the Gateway is draining do not count as restore failures, that an explicit restore can name a snapshot session by the directory it was copied from, and that cancelling a task does not mark it seen.
+- **Compatibility:** No API, state, setting or response-shape changes. Default and compact poll responses, and the task reads and result envelopes of ordinary tasks and runs, are byte-identical. What changes: a task created before 1.7.2 that is interrupted from now on is judged `unknown` where 1.7.0 or 1.7.1 could have said `not_started`; an attach with start-only arguments now fails instead of being quietly trimmed; an unadvertised restore method no longer counts as a failure; and a Main can restore its own record while the provider is off. State written by 1.7.2 stays readable by 1.7.0 and 1.7.1: restore outcomes are journaled as the existing `session.registered` record, there is no new WAL record type, and an older daemon ignores the new task marker.
+- **Upgrade:** For an npm install, run `npm install -g acp-gateway-daemon@latest`, then `acp-gateway-bootstrap --update`, which also restarts the daemon. A source checkout updates with `acp-gateway-bootstrap --update`, and an app-managed runtime through its app. Then reconnect host sessions so the host starts the new Control MCP front door, which carries the attach fix. If `--update` now warns that it kept an MCP entry, check what that entry launches; `--force` re-registers it.
+
 ## v1.7.1
 
 This patch release fixes the size of the npm install. Installing `acp-gateway-daemon@1.7.0` from npm downloads the Claude Code binary for every platform, more than 2 GB, and `--omit=optional` does not prevent it; 1.7.1 installs about 49 MB. The Claude Worker now also finds a Claude CLI on PATH. API major **1** and state schema **5** are unchanged, and there are no new fields, settings or error codes.
@@ -170,12 +198,12 @@ acp-gateway-admin shutdown_if_idle
 
 Do not copy the 0 in the example for `expectedRevision`; use the value from the immediately preceding read. Settings are applied when a new daemon starts after a safe shutdown. A consumer that performs a restart or runtime replacement must first close its auto-reconnecting client, start a new daemon with the chosen runtime, and then check the runtime identification and applied values in setup.
 
-### 1.5.x, 1.6.0, 1.7.0 and 1.7.1 runtime builds
+### 1.5.x, 1.6.0, 1.7.0, 1.7.1 and 1.7.2 runtime builds
 
-The builders for 1.5.x (`v1.5.0` through `v1.5.2`), `v1.6.0`, `v1.7.0` and `v1.7.1` require the full source SHA that was reviewed separately from the tag. If the tag differs from that SHA, the build and verification are rejected, and the engine and public client of the new runtime are both extracted from the same source commit. The fixed-SHA verification for the existing 1.4.0 tag is retained.
+The builders for 1.5.x (`v1.5.0` through `v1.5.2`), `v1.6.0`, `v1.7.0`, `v1.7.1` and `v1.7.2` require the full source SHA that was reviewed separately from the tag. If the tag differs from that SHA, the build and verification are rejected, and the engine and public client of the new runtime are both extracted from the same source commit. The fixed-SHA verification for the existing 1.4.0 tag is retained.
 
 ```bash
-npm run release:runtime -- --source-tag v1.7.1 --source-commit FULL_REVIEWED_SOURCE_SHA --output-dir dist
+npm run release:runtime -- --source-tag v1.7.2 --source-commit FULL_REVIEWED_SOURCE_SHA --output-dir dist
 npm run release:verify -- --source-commit FULL_REVIEWED_SOURCE_SHA \
   --archive dist/acp-gateway-runtime-darwin-arm64.tar.gz \
   --sha256 dist/acp-gateway-runtime-darwin-arm64.tar.gz.sha256 \
