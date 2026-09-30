@@ -1,45 +1,56 @@
 name: Publish npm
 
+# Publishes acp-gateway-daemon to npm with trusted publishing (OIDC): no npm
+# token is stored or used. npmjs.com trusts this workflow by file name
+# (acp-gateway-daemon → Settings → Trusted Publisher: creverse-ai-lab /
+# agent_gateway / publish-npm.yml, environment empty), so renaming this file
+# stops publishing until that setting is changed to match. The publisher's
+# allowed actions must include `npm publish`: a configuration created after
+# 2026-09-03 allows only `npm stage publish` unless that box is ticked, and
+# this workflow runs `npm publish`.
+#
+# Run it on the release tag:
+#   gh workflow run publish-npm.yml --ref v1.7.2 -f version=1.7.2
+#
+# Two jobs, because any process in a job with id-token: write can exchange a
+# GitHub OIDC token for an npm publish token. `verify` runs the dependency,
+# test and smoke code with contents: read only and packs the tarball.
+# `publish` holds id-token: write, runs no code from the repository or its
+# dependencies, and publishes exactly the tarball `verify` tested (npm runs no
+# lifecycle scripts when it publishes a tarball).
+
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: Gateway version to publish (must equal package.json and GATEWAY_VERSION, e.g. 1.7.1)
+        description: Gateway version to publish (must equal package.json and GATEWAY_VERSION, e.g. 1.7.2); run it on the tag v<version>
         required: true
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
-  publish:
+  verify:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       VERSION: ${{ inputs.version }}
+    outputs:
+      sha256: ${{ steps.pack.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v7
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
-          cache: npm
-          cache-dependency-path: npm-shrinkwrap.json
-      - name: Check the requested version
-        run: |
-          node --input-type=module -e '
-            import { readFileSync } from "node:fs";
-            import { GATEWAY_VERSION } from "./src/version.js";
-            const pkg = JSON.parse(readFileSync("package.json", "utf8"));
-            const wanted = process.env.VERSION;
-            const problems = [];
-            if (!/^\d+\.\d+\.\d+$/.test(wanted)) problems.push(`input version ${wanted} is not X.Y.Z`);
-            if (pkg.name !== "acp-gateway-daemon") problems.push(`package name is ${pkg.name}`);
-            if (pkg.version !== wanted) problems.push(`package.json version ${pkg.version} != ${wanted}`);
-            if (GATEWAY_VERSION !== wanted) problems.push(`GATEWAY_VERSION ${GATEWAY_VERSION} != ${wanted}`);
-            if (problems.length) { console.error(problems.join("\n")); process.exit(1); }
-            console.log(`publishing ${pkg.name}@${wanted} from ${process.env.GITHUB_SHA}`);
-          '
+          # npm's trusted-publishing guide: no dependency cache in release builds.
+          package-manager-cache: false
+      # The run must be on refs/tags/v<version>, the version must equal
+      # package.json and GATEWAY_VERSION, and the checkout must be the tag's
+      # commit (see the script).
+      - name: Check the release tag and version
+        run: node scripts/check-npm-release.js
       - name: Refuse a version that is already on npm
         run: |
           status="$(curl -sS -o /dev/null -w '%{http_code}' "https://registry.npmjs.org/acp-gateway-daemon/$VERSION")"
@@ -53,7 +64,89 @@ jobs:
       - run: npm ci
       - run: npm run ci
       - run: npm run smoke:npm
-      - name: Publish with provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --provenance --access public
+      - name: Pack the tested package
+        id: pack
+        run: |
+          directory="$RUNNER_TEMP/npm-package"
+          tarball="acp-gateway-daemon-$VERSION.tgz"
+          mkdir "$directory"
+          npm pack --ignore-scripts --pack-destination "$directory"
+          test -f "$directory/$tarball"
+          echo "sha256=$(sha256sum "$directory/$tarball" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: npm-package
+          path: ${{ runner.temp }}/npm-package/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: verify
+    # Trusted publishing works only on GitHub-hosted runners.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ inputs.version }}
+      SHA256: ${{ needs.verify.outputs.sha256 }}
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          package-manager-cache: false
+      # Trusted publishing needs npm >= 11.5.1 and Node >= 22.14.0; Node 22
+      # ships npm 10. Pinned to the npm release whose OIDC code was reviewed.
+      - name: Install npm 11
+        run: npm install -g npm@11.20.0
+      - name: Check Node and npm for trusted publishing
+        run: |
+          # shellcheck disable=SC2016 # JavaScript template literals, not shell
+          node -e '
+            const atLeast = (version, minimum) => {
+              const parts = version.split(".").map(Number);
+              for (let index = 0; index < 3; index += 1) {
+                if (parts[index] !== minimum[index]) return parts[index] > minimum[index];
+              }
+              return true;
+            };
+            const npmVersion = process.argv[1];
+            const problems = [];
+            if (!atLeast(process.versions.node, [22, 14, 0])) problems.push(`Node ${process.versions.node} is older than 22.14.0`);
+            if (!atLeast(npmVersion, [11, 5, 1])) problems.push(`npm ${npmVersion} is older than 11.5.1`);
+            for (const problem of problems) console.error(`::error title=Trusted publishing needs Node 22.14+ and npm 11.5.1+::${problem}`);
+            if (problems.length) process.exit(1);
+            console.log(`Node ${process.versions.node}, npm ${npmVersion}`);
+          ' "$(npm --version)"
+      - uses: actions/download-artifact@v8
+        with:
+          name: npm-package
+          path: ${{ runner.temp }}/npm-package
+      - name: Check the tarball is the one verify tested
+        run: |
+          cd "$RUNNER_TEMP/npm-package"
+          tarball="acp-gateway-daemon-$VERSION.tgz"
+          echo "$SHA256  $tarball" | sha256sum --check --strict -
+          # shellcheck disable=SC2016 # JavaScript template literals, not shell
+          tar -xzOf "$tarball" package/package.json | node -e '
+            const pkg = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+            if (pkg.name !== "acp-gateway-daemon" || pkg.version !== process.env.VERSION) {
+              console.error(`the tarball holds ${pkg.name}@${pkg.version}, not acp-gateway-daemon@${process.env.VERSION}`);
+              process.exit(1);
+            }
+          '
+      # OIDC only: no NODE_AUTH_TOKEN, no registry-url .npmrc, so npm has no
+      # token to fall back to. --provenance is explicit so a publish without
+      # provenance fails instead of going out silently (npm enables it by
+      # itself only when its own visibility checks succeed).
+      - name: Publish with trusted publishing
+        run: |
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error title=No OIDC token::This job cannot request a GitHub OIDC token; it needs permissions: id-token: write." >&2
+            exit 1
+          fi
+          if ! npm publish "$RUNNER_TEMP/npm-package/acp-gateway-daemon-$VERSION.tgz" --provenance --access public; then
+            echo "::error title=npm publish failed::This workflow publishes only with npm trusted publishing (OIDC); there is no token fallback. If npm reported ENEEDAUTH, E401, E403 or E404, check on npmjs.com: acp-gateway-daemon → Settings → Trusted Publisher → GitHub Actions must be organization creverse-ai-lab, repository agent_gateway, workflow publish-npm.yml, environment empty (case-sensitive), and its allowed actions must include npm publish (a configuration created after 2026-09-03 allows only npm stage publish by default). Then run the workflow again." >&2
+            exit 1
+          fi
