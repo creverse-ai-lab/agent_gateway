@@ -55,6 +55,11 @@ function sanitizeCaller(value) {
 
 const isIsoDate = (value) => typeof value === "string" && Number.isFinite(Date.parse(value));
 
+// A result recovery degraded to a preview (state-store marks it resultDegraded)
+// that does not say how its task was cut short.
+const lostInterruption = (result) => result != null && typeof result === "object" && !Array.isArray(result)
+  && result.resultDegraded === true && !Object.hasOwn(result, "interruption");
+
 // Links a Main declares when it creates a task (1.7.0): parentTaskId, the task
 // this one follows up, and inputTaskIds, the tasks whose results went into this
 // prompt. Declared, never inferred. Whether the ids name visible tasks is the
@@ -660,6 +665,14 @@ export class TaskStore {
         record.result = { ok: false, error: RESTART_MESSAGE, interruption, ...(steps ? { next: steps } : {}) };
         record.lastUpdatedAt = at;
         summary.restarted += 1;
+      } else if (record.interruption && lostInterruption(record.result)) {
+        // Replay could only bring this result back as its preview (the artifact
+        // behind it is gone), and the preview is an unparseable head, so the
+        // interruption and next the envelope carried are not in it. The
+        // interruption was persisted beside the result, not inside it; next is
+        // rebuilt from it the same way the restart conversion builds its own.
+        const steps = typeof next === "function" ? next(record, record.interruption) : null;
+        record.result = { ...record.result, interruption: record.interruption, ...(steps ? { next: steps } : {}) };
       }
       // Budgets are not enforced here: recovery must never drop a durable handle.
       this.#tasks.set(record.taskId, record);

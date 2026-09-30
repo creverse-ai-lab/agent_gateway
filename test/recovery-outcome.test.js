@@ -482,6 +482,78 @@ test("a provider exit mid-turn reports provider_disconnected; the envelope keeps
   });
 });
 
+test("an interrupted result that replay can only bring back as a preview still carries interruption and next", async () => {
+  await withDirectory(async (directory) => {
+    const statePath = join(directory, "state.json");
+    const paths = statePaths(statePath);
+    const artifactRoot = join(directory, "artifacts");
+    let taskId;
+    let sessionId;
+    let wal;
+    const before = harness({ statePath, artifactRoot });
+    try {
+      await before.service.init();
+      const { session, worker } = await open(before.service);
+      sessionId = session.id;
+      taskId = (await before.service.call("run", { sessionId, prompt: "go", waitMs: 0 }, MAIN)).taskId;
+      // Far past the 4 KB inline limit, so the log holds a ref plus a preview head.
+      worker.handlers.get(session.acpSessionId)({
+        sessionUpdate: "agent_message_chunk", content: { type: "text", text: "x".repeat(16_384) }
+      });
+      await until(() => session.resultText.length === 16_384, "result text");
+      before.clock.now += 1_000;
+      worker.crash();
+      await until(terminal(before.service, taskId), "task terminal");
+      await before.service.flushPersist();
+      wal = await readFile(paths.wal);
+    } finally {
+      await before.service.shutdown();
+    }
+
+    const committed = wal.toString("utf8").split("\n").filter(Boolean)
+      .map((line) => decodeRecord(Buffer.from(line, "utf8")))
+      .find((record) => record.type === WAL_TYPES.TASK_RESULT_COMMITTED && record.key === taskId);
+    assert.equal(committed.payload.result, undefined, "oversized: not inlined");
+    const original = JSON.parse(await readFile(committed.payload.ref.path, "utf8"));
+    const interruption = { reason: "provider_disconnected", executionOutcome: "unknown", at: iso(EPOCH + 1_000) };
+    assert.deepEqual(original.interruption, interruption);
+    assert.deepEqual(original.next, [{ action: "session_check", sessionId }, { action: "decide_rerun", note: ACTED_NOTE }]);
+    // Persisted beside the result, not only inside the artifact that is about to go.
+    assert.deepEqual(committed.payload.interruption, interruption);
+    assert.throws(() => JSON.parse(committed.payload.preview), "the preview is an unparseable head");
+
+    // The log alone, with the artifact it names gone.
+    await writeFile(paths.wal, wal, { mode: 0o600 });
+    await rm(paths.snapshot, { force: true });
+    await rm(committed.payload.ref.path);
+    // The second pass restarts from the snapshot the first recovery wrote.
+    for (const source of ["wal", "snapshot"]) {
+      const after = harness({ statePath, artifactRoot });
+      after.clock.now = EPOCH + 9_000;
+      try {
+        await after.service.init();
+        const got = await after.service.call("task_get", { taskId }, MAIN);
+        assert.equal(got.status, "failed", source);
+        assert.deepEqual(got.interruption, interruption, source);
+        const [listed] = (await after.service.call("task_list", {}, MAIN)).tasks;
+        assert.deepEqual(listed.interruption, interruption, source);
+
+        const result = await after.service.call("task_result", { taskId }, MAIN);
+        assert.deepEqual(Object.keys(result), ["taskId", "preview", "resultDegraded", "interruption", "next"], source);
+        assert.equal(result.resultDegraded, true, source);
+        assert.equal(result.preview, committed.payload.preview, source);
+        assert.deepEqual(result.interruption, original.interruption, source);
+        assert.deepEqual(result.next, original.next, source);
+        // agent_acp_run attach ends at the same envelope.
+        assert.deepEqual(await after.service.call("run", { taskId }, MAIN), result, source);
+        assert.equal(after.factory.starts, 0, "nothing was re-run");
+      } finally {
+        await after.service.shutdown().catch(() => {});
+      }
+    }
+  });
+});
+
 test("one provider exit reads the same whichever of turn failure and exit notice lands first", async () => {
   const outcomes = [];
   for (const order of ["exit_first", "turn_failure_first"]) {

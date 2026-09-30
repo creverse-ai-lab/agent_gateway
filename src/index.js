@@ -144,6 +144,11 @@ async function runTool(args, extra, caller) {
   const requested = Number(args.waitMs ?? RUN_DEFAULT_WAIT_MS);
   const waitMs = Math.min(RUN_MAX_WAIT_MS, Number.isFinite(requested) ? Math.max(0, requested) : RUN_DEFAULT_WAIT_MS);
   let taskId = typeof args.taskId === "string" ? args.taskId : null;
+  // An explicit attach sends everything the caller sent, so the gateway refuses
+  // start-only arguments (prompt, sessionId, links) exactly as it does over the
+  // socket instead of this process dropping them unseen. The attach that follows
+  // a start is ours, and names only the handle.
+  const attachArgs = taskId ? { ...args } : {};
   if (!taskId) {
     const admitted = await rpc.call("run", { ...args, waitMs: 0 }, 30_000, { caller });
     taskId = typeof admitted.taskId === "string" ? admitted.taskId : null;
@@ -156,7 +161,7 @@ async function runTool(args, extra, caller) {
   const envelope = await raceAbort(
     rpc.call(
       "run",
-      { taskId, waitMs },
+      { ...attachArgs, taskId, waitMs },
       Math.max(30_000, waitMs + 5_000),
       { signal: waitController.signal, caller }
     ),

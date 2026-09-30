@@ -240,6 +240,47 @@ test("run, task_result and a terminal poll mark seen for the creator only, and d
   }
 });
 
+test("a cancel is not a delivery: the cancelled task stays an unseen update until its result reaches its Main", async () => {
+  const { service, clock } = harness();
+  try {
+    const { session, worker } = await open(service);
+
+    // agent_acp_cancel: the worker ends the turn as cancelled.
+    const viaSession = await start(service, session, A);
+    await service.call("cancel", { sessionId: session.id }, A);
+    worker.turns.at(-1).resolve({ stopReason: "cancelled" });
+    await until(() => service.taskStore.find(viaSession)?.status === "cancelled", "session cancel end");
+    assert.equal(seenAt(service, viaSession), null);
+    assert.deepEqual(await updateIds(service, A), [viaSession]);
+    // A second cancel of the finished session delivers nothing either.
+    await service.call("cancel", { sessionId: session.id }, A);
+    assert.equal(seenAt(service, viaSession), null);
+
+    // task_cancel (MCP tasks/cancel): commits the cancelled envelope at once and
+    // answers with the task record, not the result.
+    clock.now += 1_000;
+    const viaTask = await start(service, session, A);
+    const cancelled = await service.call("task_cancel", { taskId: viaTask }, A);
+    assert.equal(cancelled.status, "cancelled");
+    assert.equal(Object.hasOwn(cancelled, "result"), false);
+    assert.equal(seenAt(service, viaTask), null);
+    assert.deepEqual(await updateIds(service, A), [viaSession, viaTask]);
+    worker.turns.at(-1).resolve({ stopReason: "cancelled" });
+    await until(() => session.status !== "cancelling" && session.status !== "running", "worker turn end");
+    assert.equal(seenAt(service, viaTask), null, "the late turn end delivers nothing");
+
+    // The real deliveries.
+    clock.now += 1_000;
+    assert.equal((await service.call("run", { taskId: viaSession }, A)).status, "cancelled");
+    assert.equal(seenAt(service, viaSession), iso(EPOCH + 2_000));
+    await service.call("task_result", { taskId: viaTask }, A);
+    assert.equal(seenAt(service, viaTask), iso(EPOCH + 2_000));
+    assert.deepEqual(await updateIds(service, A), []);
+  } finally {
+    await service.shutdown().catch(() => {});
+  }
+});
+
 test("two Mains on one root keep their own updates", async () => {
   const { service, clock } = harness();
   try {

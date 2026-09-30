@@ -663,6 +663,32 @@ test("recover claims not_started only for a record whose dispatch was tracked an
   assert.equal(store.get(unsent.taskId).dispatchTracking, 1);
 });
 
+test("recover gives a degraded interrupted result back its interruption and next, and touches nothing else", () => {
+  const interruption = { reason: "provider_disconnected", executionOutcome: "unknown", at: iso(50) };
+  const degraded = { preview: "{\"ok\":false,\"sessionId\":\"session-1\",\"turnId\":\"tu", resultDegraded: true };
+  const steps = [{ action: "decide_rerun", note: "n" }];
+  const seen = [];
+  const { store } = makeStore();
+  store.recover([
+    // What a replay with the artifact gone yields, or a 1.7.1 recovery already wrote to its snapshot.
+    persisted({ taskId: "task-lost", status: "failed", interruption, result: degraded }),
+    // An ordinary task's degraded result has nothing to add.
+    persisted({ taskId: "task-plain", status: "completed", result: degraded }),
+    // Already carries them (a full envelope, or a rebuilt one read back): unchanged.
+    persisted({ taskId: "task-full", status: "failed", interruption, result: { ok: false, interruption, next: [] } })
+  ], { next: (record, given) => { seen.push([record.taskId, given]); return steps; } });
+  assert.deepEqual(store.get("task-lost").result, { ...degraded, interruption, next: steps });
+  assert.deepEqual(store.get("task-lost").interruption, interruption);
+  assert.deepEqual(store.get("task-plain").result, degraded);
+  assert.deepEqual(store.get("task-full").result, { ok: false, interruption, next: [] });
+  assert.deepEqual(seen, [["task-lost", interruption]]);
+
+  // No gateway to name steps: the interruption alone still comes back.
+  const { store: bare } = makeStore();
+  bare.recover([persisted({ taskId: "task-lost", status: "failed", interruption, result: degraded })]);
+  assert.deepEqual(bare.get("task-lost").result, { ...degraded, interruption });
+});
+
 test("recover keeps a null ttl as never-expires and repairs corrupt fields", () => {
   const { store, clock } = makeStore();
   store.recover([

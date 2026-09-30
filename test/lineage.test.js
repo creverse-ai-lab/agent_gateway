@@ -12,10 +12,15 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { isSameCaller, isTaskCreator } from "../src/attention.js";
 import { GatewayService } from "../src/gateway-service.js";
+import { GatewayRpcClient } from "../src/socket-rpc.js";
 import { statePaths } from "../src/state-store.js";
 import { requireTaskLinks, TaskStore } from "../src/task-store.js";
+import { startDaemon, writeMockProviders } from "./helpers/daemon-harness.js";
 
 const ROOT = "main-root";
 const EPOCH = Date.parse("2026-01-01T00:00:00.000Z");
@@ -234,6 +239,78 @@ test("links must name tasks this root can see; a refused link starts nothing", a
     assert.equal((await service.call("task_get", { taskId: valid }, A)).parentTaskId, mine);
   } finally {
     await service.shutdown().catch(() => {});
+  }
+});
+
+test("through the real front door, an explicit attach is refused start-only arguments instead of dropping them", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-lineage-frontdoor-"));
+  let daemon = null;
+  let mcpClient = null;
+  let rpc = null;
+  try {
+    const providers = await writeMockProviders(directory, { permissionPolicy: "read_only" });
+    daemon = await startDaemon({ directory, env: providers });
+    mcpClient = new Client({ name: "w16-lineage", version: "1.0.0" });
+    await mcpClient.connect(new StdioClientTransport({
+      command: process.execPath,
+      args: [fileURLToPath(new URL("../src/index.js", import.meta.url))],
+      stderr: "pipe",
+      env: {
+        ...process.env,
+        ACP_GATEWAY_SOCKET: daemon.socketPath,
+        ACP_GATEWAY_CONTROL_TOKEN: daemon.token,
+        ACP_GATEWAY_ROOT_ID: daemon.rootId,
+        ...providers
+      }
+    }));
+    rpc = new GatewayRpcClient({
+      socketPath: daemon.socketPath, token: daemon.token, rootId: daemon.rootId, statePath: daemon.statePath, autoStart: false
+    });
+    const run = (args) => mcpClient.callTool({ name: "agent_acp_run", arguments: args });
+    const taskCount = async () => (await rpc.call("task_list", {}, 30_000)).tasks.length;
+
+    const opened = await mcpClient.callTool({
+      name: "agent_acp_session_open",
+      arguments: { provider: "mock", cwd: directory, permissionPolicy: "read_only" }
+    });
+    const sessionId = opened.structuredContent.sessionId;
+    const first = await run({ sessionId, prompt: "narrated-result", waitMs: 20_000 });
+    assert.equal(first.isError, false);
+    const firstId = first.structuredContent.taskId;
+
+    // A linked start still records its links.
+    const linked = await run({ sessionId, prompt: "narrated-result", parentTaskId: firstId, inputTaskIds: [firstId], waitMs: 20_000 });
+    assert.equal(linked.isError, false);
+    assert.equal(linked.structuredContent.result.text, "FINAL ANSWER");
+    const linkedId = linked.structuredContent.taskId;
+    const recorded = await rpc.call("task_get", { taskId: linkedId }, 30_000);
+    assert.deepEqual([recorded.parentTaskId, recorded.inputTaskIds], [firstId, [firstId]]);
+
+    // Links (and a prompt) on an attach reach the gateway, which refuses them
+    // as it does over the socket. Nothing is started or relinked.
+    const tasksBefore = await taskCount();
+    for (const extra of [{ parentTaskId: firstId }, { inputTaskIds: [firstId] }, { prompt: "narrated-result" }]) {
+      const refused = await run({ taskId: linkedId, ...extra });
+      assert.equal(refused.isError, true, JSON.stringify(extra));
+      assert.equal(refused.structuredContent.ok, false);
+      assert.equal(refused.structuredContent.errorCode, "INVALID_ARGUMENT", JSON.stringify(extra));
+      await assert.rejects(rpc.call("run", { taskId: linkedId, ...extra }, 30_000),
+        (error) => error.code === "INVALID_ARGUMENT" && error.message === refused.structuredContent.error,
+        "the same refusal the socket gives");
+    }
+    assert.equal(await taskCount(), tasksBefore, "nothing was started");
+    assert.deepEqual(await rpc.call("task_get", { taskId: linkedId }, 30_000), recorded);
+
+    // A plain attach is unchanged: the terminal envelope, as delivered by the start.
+    const attached = await run({ taskId: linkedId });
+    assert.equal(attached.isError, false);
+    assert.deepEqual(attached.structuredContent, linked.structuredContent);
+    assert.deepEqual((await run({ taskId: linkedId, waitMs: 0 })).structuredContent, linked.structuredContent);
+  } finally {
+    rpc?.close();
+    await mcpClient?.close().catch(() => {});
+    await daemon?.stop().catch(() => {});
+    await rm(directory, { recursive: true, force: true });
   }
 });
 
