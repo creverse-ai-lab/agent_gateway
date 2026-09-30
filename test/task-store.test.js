@@ -46,6 +46,9 @@ test("exported terminal statuses match the gateway wire contract", () => {
 // than derived because after a restart there is nothing left to derive it from,
 // and it defaults to "prompt" both for a caller that omits it and for a snapshot
 // written before the field existed.
+// GOLDEN DIFF (1.7.2 W15): the store record also grows the internal
+// `dispatchTracking: 1` marker, the evidence that makes a missing dispatch stamp
+// mean not_started. Additive; it never reaches the wire (publicTask allowlists).
 test("create returns the legacy task record shape plus its origin", () => {
   const { store } = makeStore();
   const task = store.create({ sessionId: "session-1", ownerRootId: "rootA", turnId: "turn-1" });
@@ -61,8 +64,10 @@ test("create returns the legacy task record shape plus its origin", () => {
     "lastUpdatedAt",
     "statusMessage",
     "origin",
+    "dispatchTracking",
     "result"
   ]);
+  assert.equal(task.dispatchTracking, 1);
   assert.equal(task.origin, "prompt");
   assert.match(task.taskId, /^task-[0-9a-f-]{36}$/);
   assert.equal(task.status, "working");
@@ -604,9 +609,11 @@ test("recover converts in-flight records with the legacy restart message", () =>
     assert.equal(record.status, "failed");
     assert.equal(record.statusMessage, "Gateway restarted before this task completed");
     // GOLDEN DIFF (1.7.0 W4): the legacy result keeps its exact wording and
-    // gains what is known about the worker. These records were never stamped as
-    // dispatched, so the worker cannot have acted on them. Additive.
-    const interruption = { reason: "gateway_restarted", executionOutcome: "not_started", at: iso(5_000) };
+    // gains what is known about the worker. Additive.
+    // GOLDEN DIFF (1.7.2 W15): these fixtures carry no dispatchTracking marker
+    // (the shape 1.6.0 wrote, which never stamped a dispatch), so the missing
+    // stamp proves nothing and the outcome is unknown, not not_started.
+    const interruption = { reason: "gateway_restarted", executionOutcome: "unknown", at: iso(5_000) };
     assert.deepEqual(record.interruption, interruption);
     assert.deepEqual(record.result, { ok: false, error: "Gateway restarted before this task completed", interruption });
     assert.equal(record.lastUpdatedAt, iso(5_000), "only failed conversions bump lastUpdatedAt");
@@ -623,6 +630,37 @@ test("recover converts in-flight records with the legacy restart message", () =>
   assert.throws(() => store.get("task-5"), assertCode("UNKNOWN_TASK"), "expired terminal records are dropped");
   assert.throws(() => store.get("task-6"), assertCode("UNKNOWN_TASK"));
   assert.throws(() => store.recover("nope"), assertCode("INVALID_ARGUMENT"));
+});
+
+test("recover claims not_started only for a record whose dispatch was tracked and never stamped", () => {
+  // Written by this store: marked at create, persisted, recovered by the next one.
+  const { store: writer } = makeStore();
+  const unsent = writer.create({ sessionId: "session-1", ownerRootId: "rootA" });
+  const sent = writer.create({ sessionId: "session-1", ownerRootId: "rootA" });
+  writer.markPromptDispatched(sent.taskId, iso(1));
+  const records = writer.toPersistedRecords();
+  assert.ok(records.every((record) => record.dispatchTracking === 1));
+
+  const { store, clock } = makeStore();
+  clock.t = 5_000;
+  store.recover([
+    ...records,
+    // 1.6.0 shape: no marker and no stamp, in both in-flight states.
+    persisted({ taskId: "task-legacy-working", status: "working" }),
+    persisted({ taskId: "task-legacy-input", status: "input_required" }),
+    // Anything but the exact marker proves nothing either.
+    persisted({ taskId: "task-bad-marker", dispatchTracking: "1" }),
+    persisted({ taskId: "task-future-marker", dispatchTracking: 2 })
+  ]);
+  const outcome = (taskId) => store.get(taskId).interruption.executionOutcome;
+  assert.equal(outcome(unsent.taskId), "not_started");
+  assert.equal(outcome(sent.taskId), "unknown");
+  for (const taskId of ["task-legacy-working", "task-legacy-input", "task-bad-marker", "task-future-marker"]) {
+    assert.equal(outcome(taskId), "unknown", taskId);
+    assert.equal(Object.hasOwn(store.get(taskId), "dispatchTracking"), false, taskId);
+  }
+  // The marker survives the round trip, so a second restart decides the same way.
+  assert.equal(store.get(unsent.taskId).dispatchTracking, 1);
 });
 
 test("recover keeps a null ttl as never-expires and repairs corrupt fields", () => {

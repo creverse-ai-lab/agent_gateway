@@ -4,6 +4,7 @@
 // silently opens a fresh session. Every case drives an in-process fake worker
 // on an injected clock.
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -12,8 +13,9 @@ import test from "node:test";
 import { isReadOnlyCall } from "../src/access.js";
 import { ERROR_CODES, GatewayError } from "../src/errors.js";
 import { CHECK_CAVEATS, GatewayService } from "../src/gateway-service.js";
-import { decodeRecord, statePaths, WAL_TYPES } from "../src/state-store.js";
+import { decodeRecord, encodeRecord, statePaths, WAL_TYPES } from "../src/state-store.js";
 import { EXECUTION_OUTCOMES, INTERRUPTION_REASONS } from "../src/task-store.js";
+import { createSnapshot } from "../src/workspace.js";
 
 const MAIN = { rootId: "main-a" };
 const EPOCH = Date.parse("2026-01-01T00:00:00.000Z");
@@ -304,6 +306,12 @@ test("a restart before the prompt reached the worker reports not_started, and of
     await writeFile(paths.wal, wal, { mode: 0o600 });
     await rm(paths.snapshot, { force: true });
 
+    // What makes the missing stamp mean "never sent": the record says, durably,
+    // that its dispatch was tracked.
+    const created = wal.toString("utf8").split("\n").filter(Boolean).map((line) => decodeRecord(Buffer.from(line, "utf8")))
+      .find((record) => record.type === WAL_TYPES.TASK_CREATED && record.key === taskId);
+    assert.equal(created.payload.dispatchTracking, 1);
+
     const after = harness({ statePath, workspaceRoot, artifactRoot: join(directory, "artifacts") });
     after.clock.now = EPOCH + 7_000;
     try {
@@ -318,6 +326,94 @@ test("a restart before the prompt reached the worker reports not_started, and of
       ]);
     } finally {
       await after.service.shutdown().catch(() => {});
+    }
+  });
+});
+
+// 1.6.0 never stamped a dispatch, so on its records a missing stamp proves
+// nothing. The state files below carry exactly the keys 1.6.0 wrote: its
+// session checkpoint, its task record, its status-change payload.
+test("1.6.0 tasks cut short by the upgrade restart are unknown and offer the diff, from the snapshot and from the log", async () => {
+  await withDirectory(async (directory) => {
+    await mkdir(join(directory, "state"));
+    const statePath = join(directory, "state", "state.json");
+    const paths = statePaths(statePath);
+    const project = join(directory, "project");
+    await mkdir(project);
+    await writeFile(join(project, "a.txt"), "a\n");
+    const workspace = await createSnapshot(project, join(directory, "workspaces"));
+    const at = iso(EPOCH - 60_000);
+    const session160 = (id, extra) => ({
+      id, provider: "claude", acpSessionId: `acp-${id}`, cwd: process.cwd(), title: null, permissionPolicy: "ask",
+      model: null, ownerRootId: MAIN.rootId, mcpServers: [], additionalDirectories: [], pinned: false,
+      status: "running", createdAt: at, updatedAt: at, completedAt: null, orphanedAt: null, lastOwnerActivityAt: at,
+      transientClearedAt: null, eventSequence: 3, lastMessageSequence: -1, lastThoughtSequence: -1,
+      eventsEvictedThrough: -1, turnId: "turn-1", stopReason: null, thoughtCapture: null, ...extra
+    });
+    const sessions = [
+      session160("session-direct", {}),
+      session160("session-snapshot", { cwd: workspace.path, status: "waiting_permission", workspace })
+    ];
+    const created160 = (taskId, sessionId) => ({
+      taskId, sessionId, ownerRootId: MAIN.rootId, turnId: null, status: "working", ttl: 3_600_000,
+      pollInterval: 1_000, createdAt: at, lastUpdatedAt: at, statusMessage: "Prompt accepted", origin: "prompt", result: null
+    });
+    const status160 = (status, statusMessage) => ({ status, statusMessage, lastUpdatedAt: at, turnId: "turn-1" });
+    const running = status160("working", "Prompt running");
+    const waiting = status160("input_required", "Waiting for Main permission");
+    const snapshotTasks = [
+      { ...created160("task-working", "session-direct"), ...running },
+      { ...created160("task-input", "session-snapshot"), ...waiting }
+    ];
+    const walRecords = [
+      [WAL_TYPES.WAL_OPENED, "4242", { pid: 4242, writerVersion: "1.6.0", epoch: 0 }],
+      ...sessions.map((session) => [WAL_TYPES.SESSION_REGISTERED, session.id, session]),
+      [WAL_TYPES.TASK_CREATED, "task-working", created160("task-working", "session-direct")],
+      [WAL_TYPES.TASK_STATUS_CHANGED, "task-working", running],
+      [WAL_TYPES.TASK_CREATED, "task-input", created160("task-input", "session-snapshot")],
+      [WAL_TYPES.TASK_STATUS_CHANGED, "task-input", running],
+      [WAL_TYPES.TASK_STATUS_CHANGED, "task-input", waiting]
+    ];
+
+    for (const source of ["snapshot", "wal"]) {
+      for (const path of [paths.snapshot, paths.wal, paths.rotating, statePath]) await rm(path, { force: true });
+      if (source === "snapshot") {
+        const body = Buffer.from(JSON.stringify({ sessions, tasks: snapshotTasks, inbox: [] }), "utf8");
+        const header = {
+          version: 5, gatewayApiVersion: 1, writerVersion: "1.6.0", writerPid: 4242, createdAt: at, epoch: 0,
+          walSeq: 0, bodyBytes: body.length, bodySha256: createHash("sha256").update(body).digest("hex")
+        };
+        await writeFile(paths.snapshot, Buffer.concat([Buffer.from(`${JSON.stringify(header)}\n`), body, Buffer.from("\n")]));
+      } else {
+        const lines = walRecords.map(([type, key, payload], index) => encodeRecord({ v: 1, seq: index + 1, at, type, key, payload }));
+        await writeFile(paths.wal, lines.join(""));
+      }
+
+      const { service, factory } = harness({ statePath, artifactRoot: join(directory, "artifacts") });
+      try {
+        await service.init();
+        const interruption = { reason: "gateway_restarted", executionOutcome: "unknown", at: iso(EPOCH) };
+        for (const taskId of ["task-working", "task-input"]) {
+          const got = await service.call("task_get", { taskId }, MAIN);
+          assert.equal(got.status, "failed", `${source} ${taskId}`);
+          assert.deepEqual(got.interruption, interruption, `${source} ${taskId}`);
+        }
+        const direct = await service.call("task_result", { taskId: "task-working" }, MAIN);
+        assert.deepEqual([direct.error, direct.interruption], [RESTART_MESSAGE, interruption], source);
+        assert.deepEqual(direct.next, [
+          { action: "session_check", sessionId: "session-direct" },
+          { action: "decide_rerun", note: ACTED_NOTE }
+        ], source);
+        // The worker may have changed its copy before the restart: the diff is offered.
+        assert.deepEqual((await service.call("task_result", { taskId: "task-input" }, MAIN)).next, [
+          { action: "session_check", sessionId: "session-snapshot" },
+          { action: "workspace_diff", sessionId: "session-snapshot" },
+          { action: "decide_rerun", note: ACTED_NOTE }
+        ], source);
+        assert.equal(factory.starts, 0, "nothing was re-run");
+      } finally {
+        await service.shutdown().catch(() => {});
+      }
     }
   });
 });

@@ -25,8 +25,16 @@ const DEFAULT_STATUS_MESSAGE = "Prompt accepted";
 export const INTERRUPTION_REASONS = Object.freeze(["gateway_restarted", "provider_disconnected", "orphan_cancelled"]);
 export const EXECUTION_OUTCOMES = Object.freeze(["not_started", "unknown"]);
 
+// Set on every record at create (1.7.2) and persisted with it: the positive
+// evidence that this record's dispatch was tracked, so that a missing
+// promptDispatchedAt stamp means "never sent". A record without it (written by
+// 1.6.0, which never stamped, or by any writer that did not mark it) proves
+// nothing either way, so it can only ever be unknown.
+export const DISPATCH_TRACKING_VERSION = 1;
+
 export function taskInterruption(reason, record, at) {
-  return { reason, executionOutcome: record?.promptDispatchedAt ? "unknown" : "not_started", at };
+  const tracked = record?.dispatchTracking === DISPATCH_TRACKING_VERSION;
+  return { reason, executionOutcome: tracked && !record.promptDispatchedAt ? "not_started" : "unknown", at };
 }
 
 function sanitizeInterruption(value) {
@@ -311,6 +319,8 @@ export class TaskStore {
       ...(origin === "run" && idempotencyKey && typeof requestDigest === "string" ? { requestDigest } : {}),
       ...(recordedCaller ? { caller: recordedCaller } : {}),
       ...recordedLinks,
+      // Internal, never on the wire (publicTask is an allowlist). See taskInterruption.
+      dispatchTracking: DISPATCH_TRACKING_VERSION,
       result: null
     };
     this.#tasks.set(record.taskId, record);
@@ -443,7 +453,8 @@ export class TaskStore {
   }
 
   // Provenance like turnId: the moment the Gateway handed the prompt to the
-  // worker. Set once; its absence is what makes an interruption not_started.
+  // worker. Set once; its absence on a record with dispatchTracking is what
+  // makes an interruption not_started.
   markPromptDispatched(taskId, at, options = {}) {
     if (typeof at !== "string" || !Number.isFinite(Date.parse(at))) {
       throw taskError("INVALID_ARGUMENT", "promptDispatchedAt must be an ISO date string");
@@ -753,6 +764,9 @@ export class TaskStore {
       ...(interruption ? { interruption } : {}),
       ...(caller ? { caller } : {}),
       ...links,
+      // Kept only when it is exactly the marker: anything else (absent on a
+      // 1.6.0 record, or unreadable) must not let a missing stamp read as not_started.
+      ...(raw.dispatchTracking === DISPATCH_TRACKING_VERSION ? { dispatchTracking: DISPATCH_TRACKING_VERSION } : {}),
       // Only a terminal record can have been delivered.
       ...(TERMINAL_TASK_STATUSES.has(status) && isIsoDate(raw.seenAt) ? { seenAt: raw.seenAt } : {}),
       result: raw.result ?? null

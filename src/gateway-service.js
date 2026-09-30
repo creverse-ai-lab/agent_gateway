@@ -1013,8 +1013,11 @@ export class GatewayService {
   // but Main asked for it, so a quarantine does not stop it. The record's own
   // cwd, MCP servers and directories are what its worker was opened with; the
   // call may change what a restore records (model, policy, method, capture, pin).
+  //
+  // No provider enablement check: Off blocks new registrations, and this is
+  // not one. An already registered session may reconnect under Off, exactly as
+  // a transparent restore does, and for a quarantined one this is the only way back.
   async #restoreKnown(session, args, context) {
-    assertProviderEnabled(session.provider);
     // Argument mistakes are refused here, before the attempt, so they never
     // count as the worker failing to come back. A snapshot session may be named
     // by its copy (its cwd) or by the directory it was copied from.
@@ -1029,29 +1032,46 @@ export class GatewayService {
       );
     }
     // Synchronous from here to the reservation, like #admitTurn.
-    if (!this.#needsRestore(session)) {
-      throw new GatewayError(
-        ERROR_CODES.INVALID_ARGUMENT,
-        `ACP session is already registered as ${session.id}`,
-        { sessionId: session.id, acpSessionId: session.acpSessionId }
-      );
-    }
+    if (!this.#needsRestore(session)) throw alreadyRegistered(session);
     if (session._reserved || ACTIVE_STATUSES.has(session.status)) {
       throw new GatewayError(ERROR_CODES.SESSION_ACTIVE, `Session ${session.id} is still active`);
     }
     this.#reserve(session, "restore");
     try {
       return await this.#queueFor(session).run("session_restore", async () => {
-        if (CLOSED_STATUSES.has(session.status) || !this.store.get(session.id)) {
-          throw new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`);
+        const assertOpen = () => {
+          if (CLOSED_STATUSES.has(session.status) || !this.store.get(session.id)) {
+            throw new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`);
+          }
+        };
+        assertOpen();
+        // A caller outside the mailbox (ensureConnected is public) may have
+        // started a restore while this command waited for it. Join it rather
+        // than send the worker a second one, then decide again from its outcome.
+        if (session._restoring) {
+          await session._restoring.catch(() => {});
+          assertOpen();
+          if (!this.#needsRestore(session)) throw alreadyRegistered(session);
         }
-        return this.#restoreLocked(session, context, {
+        const restore = this.#restoreLocked(session, context, {
           model: args.model,
           permissionPolicy: args.permissionPolicy,
           method: args.method,
           thoughtCapture: args.thoughtCapture,
           pinned: args.pinned
         });
+        // The same one-restore-per-session guard ensureConnected keeps, so a
+        // transparent restore asked for meanwhile joins this one. Set only here,
+        // inside the command: a queued command that joined it while this one was
+        // still waiting for the mailbox would wait on itself.
+        const joined = restore.then(() => session);
+        joined.catch(() => {}); // a joiner is optional; its absence is not an unhandled rejection
+        session._restoring = joined;
+        try {
+          return await restore;
+        } finally {
+          if (session._restoring === joined) session._restoring = null;
+        }
       });
     } finally {
       this.#release(session, "restore");
@@ -1071,8 +1091,21 @@ export class GatewayService {
     const permissionPolicy = requirePermissionPolicy(
       args.permissionPolicy ?? existing?.permissionPolicy ?? "ask"
     );
-    const method = restoreMethod(client.initResult, args.method ?? "auto");
-    if (attempt) attempt.method = method;
+    let method;
+    try {
+      method = restoreMethod(client.initResult, args.method ?? "auto");
+    } catch (error) {
+      // Refused against what the provider advertises, before the worker was
+      // asked anything: a request mistake, not the worker failing to come back.
+      if (attempt) attempt.refused = true;
+      throw error;
+    }
+    if (attempt) {
+      attempt.method = method;
+      // The attempt starts here, once the request is known to be one the
+      // provider can take, so a refused one leaves no trace on the record.
+      attempt.start();
+    }
     const restored = await client.sessionRestore({
       method: `session/${method}`,
       sessionId: acpSessionId,
@@ -1116,10 +1149,15 @@ export class GatewayService {
         existing.lastRestore = restoreRecord(this.now(), method);
         existing.restoreCapabilities = restoreCapabilitiesOf(client.initResult);
         // Any success ends the streak, and with it a quarantine.
+        const endedStreak = (existing.restoreFailures ?? 0) > 0 || existing.quarantined != null;
         existing.restoreFailures = 0;
         existing.quarantined = null;
         client.onSessionUpdate(acpSessionId, (update) => this.handleUpdate(existing, update));
         this.store.push(existing, { type: "session_restored", method, outcome: existing.lastRestore.outcome });
+        // T0, like the failures that built the streak: they are synced in the
+        // log, so the success that ends it is too, or a crash would bring the
+        // streak (and a lifted quarantine) back. Nothing to clear, nothing written.
+        if (endedStreak) this.#appendSessionRegistered(existing, { durable: true });
         return {
           ok: true,
           ...this.#publicSession(existing),
@@ -1322,17 +1360,35 @@ export class GatewayService {
   // Every attempt, transparent (ensureConnected) or explicit (#restoreKnown),
   // runs here, so every failure is counted once; the success path in
   // restoreSession resets the count.
+  //
+  // The attempt starts (restoring, session_restore_start) once restoreSession
+  // knows the provider can take the request. A request refused before that
+  // (attempt.refused: a method the provider does not advertise) was never an
+  // attempt: it changes nothing on the record and counts nothing. Any other
+  // failure before that point (cwd gone, provider will not start) is the
+  // worker failing to come back, so it starts the attempt late and fails it.
+  // While the provider starts, the record is not yet restoring; _restoring is
+  // what dedupes and what check reads in that window.
   async #restoreLocked(session, context, args = {}) {
-    this.#setStatus(session, "restoring", "session_restore_start");
-    this.store.push(session, { type: "session_restore_start" });
-    const attempt = { method: null };
+    const attempt = {
+      method: null,
+      refused: false,
+      started: false,
+      start: () => {
+        if (attempt.started) return;
+        attempt.started = true;
+        this.#setStatus(session, "restoring", "session_restore_start");
+        this.store.push(session, { type: "session_restore_start" });
+      }
+    };
     try {
       return await this.sessionRestore(args, context, session, attempt);
     } catch (error) {
       // The record can be gone (closed, retention) by the time the resume
       // fails. Reporting a restore failure on it would push an event for a
       // session Main has already been told is finished.
-      if (this.store.get(session.id) && !CLOSED_STATUSES.has(session.status)) {
+      if (!(attempt.refused && !attempt.started) && this.store.get(session.id) && !CLOSED_STATUSES.has(session.status)) {
+        attempt.start();
         this.#setStatus(session, "unavailable", "session_restore_failed");
         session.error = error?.message ?? String(error);
         session.lastRestore = restoreRecord(this.now(), attempt.method, error);
@@ -1340,6 +1396,11 @@ export class GatewayService {
         this.#countRestoreFailure(session, error);
         const { method, outcome, errorCode } = session.lastRestore;
         this.store.push(session, { type: "session_restore_failed", text: session.error, method, outcome, errorCode });
+        // T0, before the failure is returned: the count and a quarantine are
+        // what stop the next transparent restore, and the 50 ms snapshot above
+        // is not durable. A crash that took them back would restart the
+        // streak and hand a quarantined session to transparent recovery again.
+        this.#appendSessionRegistered(session, { durable: true });
       }
       throw error;
     }
@@ -2593,7 +2654,8 @@ export class GatewayService {
     if (session.client?.alive && !RESTORE_REQUIRED_STATUSES.has(session.status) && session.status !== "restoring") {
       return verdict(caveats.length ? "restorable_with_caveats" : "restorable", "live");
     }
-    if (session.status === "restoring") caveats.push("restore_in_progress");
+    // _restoring covers the provider start that precedes the restoring status.
+    if (session.status === "restoring" || session._restoring) caveats.push("restore_in_progress");
     if (!session.acpSessionId) caveats.push("acp_session_id_missing");
     const detected = (await this.providerDetector()).find((item) => item.id === session.provider);
     if (!detected?.agentInstalled || !detected?.adapterInstalled) caveats.push("provider_not_installed");
@@ -3443,10 +3505,27 @@ export class GatewayService {
     });
   }
 
-  #appendSessionRegistered(session) {
+  // The record's whole checkpoint, which replay puts in place of what it had.
+  // That is also how a later session fact that must survive a crash (a restore
+  // outcome) is journaled: no new record type, so a 1.7.0/1.7.1 reader applies it too.
+  //
+  // durable (T0) fsyncs before returning. Its failure is recorded, not thrown:
+  // the caller is already returning a failure of its own, and replacing the
+  // worker's error with a persistence one would hide why the restore failed.
+  #appendSessionRegistered(session, { durable = false } = {}) {
     if (!this.stateStore) return;
     const checkpoint = this.store.checkpoints().find((record) => record.id === session.id);
-    if (checkpoint) this.stateStore.append(WAL_TYPES.SESSION_REGISTERED, session.id, checkpoint);
+    if (!checkpoint) return;
+    if (!durable) {
+      this.stateStore.append(WAL_TYPES.SESSION_REGISTERED, session.id, checkpoint);
+      return;
+    }
+    try {
+      this.stateStore.appendDurable(WAL_TYPES.SESSION_REGISTERED, session.id, checkpoint);
+      this.persistError = null;
+    } catch (error) {
+      this.persistError = error?.message ?? String(error);
+    }
   }
 
   touchOwnerActivity(args, context) {
@@ -3986,6 +4065,14 @@ function restoreMethod(initResult, requested) {
   if (canResume) return "resume";
   if (canLoad) return "load";
   throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "ACP agent does not support session restore");
+}
+
+function alreadyRegistered(session) {
+  return new GatewayError(
+    ERROR_CODES.INVALID_ARGUMENT,
+    `ACP session is already registered as ${session.id}`,
+    { sessionId: session.id, acpSessionId: session.acpSessionId }
+  );
 }
 
 function canRestoreSession(initResult) {
