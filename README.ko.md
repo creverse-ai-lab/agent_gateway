@@ -34,12 +34,12 @@ Node.js 22 이상과 macOS 또는 Linux가 필요합니다.
 npm으로 Gateway를 설치한 뒤, bootstrap으로 이 컴퓨터의 agent에 연결합니다.
 
 ```bash
-npm install -g acp-gateway-daemon --omit=optional
+npm install -g acp-gateway-daemon
 acp-gateway-bootstrap --install-all --refresh-registry --dry-run
 acp-gateway-bootstrap --install-all --refresh-registry
 ```
 
-`--omit=optional`을 붙이면 의존성에 딸려 오는 약 245MB짜리 Claude Code 바이너리를 받지 않습니다. Gateway는 이 바이너리를 쓰지 않고, Claude Worker는 이미 설치된 Claude CLI를 사용합니다.
+Claude Worker는 이미 설치된 Claude CLI를 사용하며, `CLAUDE_CODE_EXECUTABLE`이 비어 있지 않으면 그 경로를, 아니면 daemon의 PATH 중 절대 경로 디렉터리에서 처음 찾은 `claude`(Gateway 자신의 의존성 안에 있는 것과 Claude Agent SDK에 딸린 바이너리는 제외)를, 그것도 없으면 `~/.local/bin/claude`를 쓰고, 모두 없으면 Claude를 설치되지 않은 것으로 보고합니다.
 
 마지막 두 명령 중 첫 번째는 설치 계획만 확인하는 dry-run이고, 두 번째가 실제 설치입니다. `--install-all`은 ACP 공식 registry가 지정한 `npx`·`uvx` 패키지를 전역으로 설치하거나 갱신할 수 있으므로 dry-run 결과에서 대상과 버전을 먼저 확인하세요. Registry manifest는 ACP가 관리하지만 실제 package와 binary는 각 공급자의 배포처에서 내려받습니다. 설치가 내 환경에서 무엇을 바꾸는지는 [설치가 내 환경에 바꾸는 것](#설치가-내-환경에-바꾸는-것)에 정리했습니다.
 
@@ -109,7 +109,7 @@ Control token, 오케스트레이터 식별자(Main ID)와 Gateway socket 경로
 **npm으로 설치한 경우** — 새 버전을 설치한 다음, 등록 정보를 갱신하고 daemon을 다시 시작합니다.
 
 ```bash
-npm install -g acp-gateway-daemon@latest --omit=optional
+npm install -g acp-gateway-daemon@latest
 acp-gateway-bootstrap --update
 ```
 

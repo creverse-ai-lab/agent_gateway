@@ -34,12 +34,12 @@ ACP Gateway 是一个中间件：让你直接对话的 AI —— 即 **编排器
 先用 npm 安装 Gateway，再用 bootstrap 把它接入本机的各个 agent：
 
 ```bash
-npm install -g acp-gateway-daemon --omit=optional
+npm install -g acp-gateway-daemon
 acp-gateway-bootstrap --install-all --refresh-registry --dry-run
 acp-gateway-bootstrap --install-all --refresh-registry
 ```
 
-`--omit=optional` 会跳过依赖中附带的一个约 245 MB 的 Claude Code 二进制文件。Gateway 并不会用到它，Claude Worker 使用的是你已经安装的 Claude CLI。
+Claude Worker 使用你已经安装的 Claude CLI：`CLAUDE_CODE_EXECUTABLE` 不为空时用它指定的路径，否则用 daemon 的 PATH 中绝对路径目录里找到的第一个 `claude`（跳过 Gateway 自身依赖中的副本以及 Claude Agent SDK 附带的二进制文件），再没有则用 `~/.local/bin/claude`；都找不到时，Claude 会被报告为未安装。
 
 最后两条命令中，第一条是只确认安装计划的 dry-run，第二条才是真正的安装。`--install-all` 可能会全局安装或更新 ACP 官方 registry 所指定的 `npx`、`uvx` 包，因此请先在 dry-run 的输出中确认目标和版本。Registry manifest 由 ACP 维护，但实际的包和二进制文件是从各提供方的分发渠道下载的。安装会对你的机器做哪些改动，见[安装会对你的机器做哪些改动](#安装会对你的机器做哪些改动)。
 
@@ -109,7 +109,7 @@ Control token、编排器标识符（Main ID）和 Gateway socket 路径都会�
 **通过 npm 安装** — 先安装新版本，再刷新注册信息并重启 daemon：
 
 ```bash
-npm install -g acp-gateway-daemon@latest --omit=optional
+npm install -g acp-gateway-daemon@latest
 acp-gateway-bootstrap --update
 ```
 

@@ -27,11 +27,13 @@ In a source checkout, `--update` fetches the upstream commit, installs and tests
 `--update` first works out how this Gateway was installed, from where its package sits. Only a source checkout (a directory with `.git`) is pulled and verified as described above. For an npm install (a package inside `node_modules`), `--update` runs neither Git nor npm: it checks the `latest` version of `acp-gateway-daemon` on the npm registry, reports `npm install -g acp-gateway-daemon@latest` when a newer release exists, and then goes straight on to the dry-run plan, the registry, adapter and MCP refresh, and the daemon restart. Install the new release first, then run `--update`:
 
 ```bash
-npm install -g acp-gateway-daemon@latest --omit=optional
+npm install -g acp-gateway-daemon@latest
 acp-gateway-bootstrap --update
 ```
 
 An app-managed runtime (under `~/.acp-gateway/runtime/versions/`) reports `managed`: its app replaces the Gateway, and `--update` only refreshes this install's registrations.
+
+The Claude Worker runs a Claude CLI you have installed, found in this order: `CLAUDE_CODE_EXECUTABLE` if it is not blank; otherwise the first executable `claude` in an absolute directory on the daemon's PATH, skipping copies inside the Gateway's own dependencies and any binary bundled with the Claude Agent SDK; otherwise `~/.local/bin/claude`. If none exists, Claude is reported as not installed. From 1.7.1, neither the npm package nor the GitHub runtime release includes the Claude Code binary that the Claude Agent SDK bundles.
 
 To protect a user-modified `agent-delegator`, the skill is installed only on the first `--install-all` and is not touched by `--update`. `--install-skill` is also meant for first installation, so it does not automatically overwrite a copy that the installer already manages. To protect local source changes, the update aborts if the Git working tree is not clean, so commit or stash your changes first. The `npm link` that connects directly to the source does not need to be repeated after the first installation.
 
@@ -134,13 +136,13 @@ The Dependabot configuration must exist on GitHub's default branch to be activat
 
 The Gateway is published to npm as `acp-gateway-daemon` (the command names stay `acp-gateway-*`). Publish only a commit whose release version is already in `package.json`, `npm-shrinkwrap.json`, `GATEWAY_VERSION` in `src/version.js` and the newest heading of both changelogs; `npm run ci` checks that they agree. npm versions are immutable: a published version number can never be reused, even after an unpublish, so a mistake is fixed only by a new version.
 
-- **GitHub Actions (the usual path):** Run the `Publish npm` workflow (`.github/workflows/publish-npm.yml`, manual `workflow_dispatch`) from the release tag with the input `version`, for example `gh workflow run publish-npm.yml --ref v1.7.0 -f version=1.7.0`. It checks that the input equals the `package.json` version and `GATEWAY_VERSION` and that the package name is `acp-gateway-daemon`, refuses a version that is already on npm, runs `npm ci`, `npm run ci` and `npm run smoke:npm`, and only then runs `npm publish --provenance --access public`.
+- **GitHub Actions (the usual path):** Run the `Publish npm` workflow (`.github/workflows/publish-npm.yml`, manual `workflow_dispatch`) from the release tag with the input `version`, for example `gh workflow run publish-npm.yml --ref v1.7.1 -f version=1.7.1`. It checks that the input equals the `package.json` version and `GATEWAY_VERSION` and that the package name is `acp-gateway-daemon`, refuses a version that is already on npm, runs `npm ci`, `npm run ci` and `npm run smoke:npm`, and only then runs `npm publish --provenance --access public`.
   - It needs the repository secret `NPM_TOKEN`: an npm granular access token with publish rights to the package that does not ask for a 2FA code, since a CI job cannot answer one.
   - npm accepts provenance only from a public GitHub repository, so the workflow cannot publish while the repository is private.
 - **Local publish:** From a clean checkout of the release tag, run the checks, log in and publish. This path publishes without provenance.
 
 ```bash
-git clone --branch v1.7.0 https://github.com/creverse-ai-lab/agent_gateway.git
+git clone --branch v1.7.1 https://github.com/creverse-ai-lab/agent_gateway.git
 cd agent_gateway
 npm ci
 npm run ci

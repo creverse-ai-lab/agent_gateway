@@ -1,4 +1,4 @@
-export const GATEWAY_VERSION = "1.7.0";
+export const GATEWAY_VERSION = "1.7.1";
 // Control-plane API contract version. Bump only on a breaking change to a
 // control response shape or method set, never for additive fields.
 export const GATEWAY_API_VERSION = 1;

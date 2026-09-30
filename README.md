@@ -34,12 +34,12 @@ Node.js 22 or later, and macOS or Linux.
 Install the Gateway from npm, then let the bootstrap set it up for the agents on your machine:
 
 ```bash
-npm install -g acp-gateway-daemon --omit=optional
+npm install -g acp-gateway-daemon
 acp-gateway-bootstrap --install-all --refresh-registry --dry-run
 acp-gateway-bootstrap --install-all --refresh-registry
 ```
 
-`--omit=optional` skips a bundled Claude Code binary of about 245 MB that the Gateway never uses: the Claude Worker runs the Claude CLI you have installed.
+The Claude Worker runs the Claude CLI you have installed: the one `CLAUDE_CODE_EXECUTABLE` names if it is not blank, otherwise the first `claude` in an absolute directory on the daemon's PATH (skipping copies inside the Gateway's own dependencies and any binary bundled with the Claude Agent SDK), otherwise `~/.local/bin/claude`; if none is found, Claude is reported as not installed.
 
 Of the last two commands, the first is a dry-run that only shows the installation plan, and the second performs the actual installation. `--install-all` can install or update, globally, the `npx` and `uvx` packages named by the official ACP registry, so check the targets and versions in the dry-run output first. The registry manifest is maintained by ACP, but the actual packages and binaries are downloaded from each vendor's distribution site. What the installation changes on your machine is listed in [What installation changes on your machine](#what-installation-changes-on-your-machine).
 
@@ -109,7 +109,7 @@ How you update depends on how the Gateway was installed.
 **npm install** — install the new release, then refresh the registrations and restart the daemon:
 
 ```bash
-npm install -g acp-gateway-daemon@latest --omit=optional
+npm install -g acp-gateway-daemon@latest
 acp-gateway-bootstrap --update
 ```
 

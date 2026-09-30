@@ -2,6 +2,22 @@
 
 **한국어** | [English](CHANGELOG.md)
 
+## v1.7.1 변경 사항
+
+npm 설치 크기를 바로잡는 패치 릴리스입니다. npm에서 `acp-gateway-daemon@1.7.0`을 설치하면 모든 플랫폼용 Claude Code 바이너리를 2GB 넘게 내려받으며, `--omit=optional`로도 막을 수 없습니다. 1.7.1은 약 49MB만 설치합니다. 또한 Claude Worker가 PATH에 있는 Claude CLI도 찾습니다. API major **1**과 state schema **5**는 유지되며, 새 필드·설정·오류 코드는 없습니다.
+
+- **npm 설치 크기(1.7.0 버그):** Claude adapter가 의존하는 Claude Agent SDK는 Claude Code CLI를 플랫폼마다 하나씩 optional native 패키지(`@anthropic-ai/claude-agent-sdk-<platform>`, 각 약 245MB)로 배포합니다. 1.7.0의 `npm-shrinkwrap.json`에는 이 여덟 개가 모두 들어 있었고, npm은 게시된 패키지의 shrinkwrap을 OS·CPU·`--omit=optional`과 상관없이 적힌 그대로 설치합니다. 그래서 1.7.0을 npm으로 설치하면 여덟 개를 모두 받았고, 1.7.0 README가 안내한 `npm install -g acp-gateway-daemon --omit=optional`도 효과가 없었습니다. Gateway는 이 바이너리를 실행하지 않습니다.
+  - 수정: shrinkwrap에서 이 패키지들을 빼고, SDK 항목의 optional 의존성 목록에서도 지웠습니다. 이제 `npm install -g acp-gateway-daemon`은 옵션 없이 약 49MB를 설치합니다.
+  - maintainer용: shrinkwrap을 다시 쓰는 작업(`npm install` 등) 뒤에는 `node scripts/omit-claude-binary.js`로 다시 빼야 합니다. `npm run monitor:sync-dependencies`는 이 작업을 직접 실행합니다.
+- **runtime 릴리스 크기 축소:** GitHub runtime 릴리스도 의존성을 `--omit=optional`로 설치하므로 archive에 Claude Code 바이너리가 더는 들어가지 않습니다. 크기는 약 80MB에서 약 6.6MB로 줄었습니다. 패키지 이름(`acp-gateway`), `package-lock.json`, 공개 client는 그대로입니다.
+- **Claude CLI 찾는 순서:** Claude Worker는 다음 순서로 찾은 Claude CLI를 실행합니다. `CLAUDE_CODE_EXECUTABLE`이 비어 있지 않으면 그 경로, 아니면 daemon의 PATH 중 절대 경로 디렉터리에서 처음 찾은 실행 가능한 `claude`(Gateway 자신의 의존성 안에 있는 것과 Claude Agent SDK에 딸린 바이너리는 제외), 그것도 없으면 `~/.local/bin/claude`입니다. provider 감지와 Worker는 같은 결과를 씁니다.
+  - 1.7.1 이전의 기본 Claude provider는 `CLAUDE_CODE_EXECUTABLE`이 없으면 늘 `~/.local/bin/claude`를 썼기 때문에, 패키지 관리자로 설치한 CLI처럼 다른 곳에 있는 CLI는 쓰지 않았습니다.
+  - `~/.local/bin/claude`가 있으면서 PATH에서 그보다 앞에 다른 `claude`가 있으면, 이제 Worker는 PATH 쪽을 실행합니다. `CLAUDE_CODE_EXECUTABLE`이 여전히 가장 우선하므로, 특정 CLI를 계속 쓰려면 이 값을 지정하세요.
+  - 아무것도 찾지 못하면 Claude는 설치되지 않은 것으로 보고되며, Worker가 SDK에 딸린 바이너리로 대신 실행하는 일은 없습니다.
+- **CI 검사:** `scripts/ci-check.js`(`npm run ci`에 포함)는 `npm-shrinkwrap.json`이 Claude 플랫폼 바이너리를 포함하거나 이름으로 가리키면 실패합니다. `npm run smoke:npm`은 설치된 패키지에 바이너리가 하나도 없는지, 그리고 그 안의 Claude adapter가 정상적으로 로드되면서 설치본 밖의 CLI를 가리키는지 확인합니다. `release:verify`는 바이너리가 든 runtime archive를 거부합니다.
+- **호환성:** API, state, 설정, 응답 형태는 바뀌지 않았습니다. 동작이 바뀐 곳은 `CLAUDE_CODE_EXECUTABLE`이 없을 때 어느 Claude CLI를 실행하는지(위 항목) 하나뿐입니다.
+- **업그레이드:** npm 설치본은 `npm install -g acp-gateway-daemon@latest`를 실행한 뒤 `acp-gateway-bootstrap --update`를 실행하세요. daemon 재시작까지 해 줍니다. npm의 `acp-gateway-daemon@1.7.0`은 deprecated 처리됐으니 설치하지 마세요. 소스 checkout은 `acp-gateway-bootstrap --update`로 업데이트하고, 앱이 관리하는 runtime은 그 앱이 업데이트합니다.
+
 ## v1.7.0 변경 사항
 
 세션과 작업이 누구의 것인지, 왜 지금 상태에 있는지, 재시작이나 장애로 무엇을 모르게 되었는지를 Main이 Gateway 응답만 보고 알 수 있게 하는 릴리스입니다. v1.6.0에서는 Codex 프로세스 하나에 속한 여러 thread가 모두 한 Main으로 보였고, Worker는 daemon을 띄운 Main의 신원을 그대로 물려받았습니다. 작업이 중간에 끊기면 Worker가 이미 prompt를 받아 움직였는지도 Main이 알 수 없었습니다. API major **1**과 state schema **5**는 유지되며, 새 필드·action·설정·오류 코드는 모두 additive입니다. npm에 `acp-gateway-daemon`으로 게시하는 첫 릴리스이기도 합니다.
@@ -154,12 +170,12 @@ acp-gateway-admin shutdown_if_idle
 
 `expectedRevision`은 예시의 0을 복사하지 말고 직전 조회값을 사용하세요. 설정은 안전 종료 후 새 daemon 시작에 적용됩니다. 재시작·runtime 교체를 수행하는 소비자는 자동 재연결 client를 먼저 닫고, 선택한 runtime으로 새 daemon을 시작한 뒤 setup의 실행본 식별과 적용값을 확인해야 합니다.
 
-### 1.5.x·1.6.0·1.7.0 runtime 빌드
+### 1.5.x·1.6.0·1.7.0·1.7.1 runtime 빌드
 
-1.5.x(`v1.5.0`~`v1.5.2`), `v1.6.0`, `v1.7.0` builder는 tag와 별도로 검토한 전체 source SHA를 요구합니다. tag가 해당 SHA와 다르면 빌드와 검증을 거부하며, 새 runtime의 엔진과 public client는 모두 같은 source commit에서 추출합니다. 기존 1.4.0 태그의 고정 SHA 검증은 유지합니다.
+1.5.x(`v1.5.0`~`v1.5.2`), `v1.6.0`, `v1.7.0`, `v1.7.1` builder는 tag와 별도로 검토한 전체 source SHA를 요구합니다. tag가 해당 SHA와 다르면 빌드와 검증을 거부하며, 새 runtime의 엔진과 public client는 모두 같은 source commit에서 추출합니다. 기존 1.4.0 태그의 고정 SHA 검증은 유지합니다.
 
 ```bash
-npm run release:runtime -- --source-tag v1.7.0 --source-commit FULL_REVIEWED_SOURCE_SHA --output-dir dist
+npm run release:runtime -- --source-tag v1.7.1 --source-commit FULL_REVIEWED_SOURCE_SHA --output-dir dist
 npm run release:verify -- --source-commit FULL_REVIEWED_SOURCE_SHA \
   --archive dist/acp-gateway-runtime-darwin-arm64.tar.gz \
   --sha256 dist/acp-gateway-runtime-darwin-arm64.tar.gz.sha256 \

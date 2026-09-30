@@ -2,6 +2,22 @@
 
 [한국어](CHANGELOG.ko.md) | **English**
 
+## v1.7.1
+
+This patch release fixes the size of the npm install. Installing `acp-gateway-daemon@1.7.0` from npm downloads the Claude Code binary for every platform, more than 2 GB, and `--omit=optional` does not prevent it; 1.7.1 installs about 49 MB. The Claude Worker now also finds a Claude CLI on PATH. API major **1** and state schema **5** are unchanged, and there are no new fields, settings or error codes.
+
+- **npm install size (a 1.7.0 bug):** The Claude Agent SDK, which the Claude adapter depends on, ships the Claude Code CLI as one optional native package per platform (`@anthropic-ai/claude-agent-sdk-<platform>`, about 245 MB each). The 1.7.0 `npm-shrinkwrap.json` listed all eight, and npm installs a published package's shrinkwrap as written, regardless of the operating system, the CPU or `--omit=optional`. So every npm install of 1.7.0 downloaded all eight, and the `npm install -g acp-gateway-daemon --omit=optional` advice in the 1.7.0 README had no effect. The Gateway never runs these binaries.
+  - Fix: The shrinkwrap no longer lists them, nor names them among the SDK's optional dependencies. `npm install -g acp-gateway-daemon` installs about 49 MB, with no flag.
+  - Maintainers: After anything that rewrites the shrinkwrap (such as `npm install`), `node scripts/omit-claude-binary.js` removes them again; `npm run monitor:sync-dependencies` runs it itself.
+- **Smaller runtime release:** The GitHub runtime release installs its dependencies with `--omit=optional`, so the archive no longer carries the Claude Code binary: about 6.6 MB instead of about 80 MB. Its package name (`acp-gateway`), `package-lock.json` and public client are unchanged.
+- **Claude CLI resolution:** The Claude Worker runs the Claude CLI found in this order: `CLAUDE_CODE_EXECUTABLE` if it is not blank; otherwise the first executable `claude` in an absolute directory on the daemon's PATH, skipping the Gateway's own dependencies and any binary bundled with the Claude Agent SDK; otherwise `~/.local/bin/claude`. Provider detection and the Worker use the same answer.
+  - Before 1.7.1 the built-in Claude provider used `CLAUDE_CODE_EXECUTABLE` or else always `~/.local/bin/claude`, so it did not use a CLI installed elsewhere, such as one installed by a package manager.
+  - If you have both `~/.local/bin/claude` and another `claude` earlier on PATH, the Worker now runs the PATH one. `CLAUDE_CODE_EXECUTABLE` still wins; set it to keep a specific CLI.
+  - When none is found, Claude is reported as not installed, and the Worker never falls back to a binary bundled with the SDK.
+- **CI guards:** `scripts/ci-check.js` (part of `npm run ci`) fails when `npm-shrinkwrap.json` lists or names a Claude platform binary. `npm run smoke:npm` asserts that the installed package contains none and that its Claude adapter still loads while pointing at a CLI outside the install. `release:verify` rejects a runtime archive that contains one.
+- **Compatibility:** No API, state, setting or response shape changes. The only behavior change is which Claude CLI runs when `CLAUDE_CODE_EXECUTABLE` is not set (above).
+- **Upgrade:** For an npm install, run `npm install -g acp-gateway-daemon@latest`, then `acp-gateway-bootstrap --update`, which also restarts the daemon. `acp-gateway-daemon@1.7.0` is deprecated on npm; do not install it. A source checkout updates with `acp-gateway-bootstrap --update`, and an app-managed runtime through its app.
+
 ## v1.7.0
 
 This release lets Main tell from Gateway responses alone whose work a session or task is, why it is in its current state, and what a restart or crash left unknown. In v1.6.0 every thread of one Codex process still looked like a single Main, a Worker inherited the identity of the Main that had started the daemon, and after an interruption Main could not tell whether the Worker had already acted on the prompt. API major **1** and state schema **5** are unchanged, and all new fields, actions, settings and error codes are additive. It is also the first release published to npm, as `acp-gateway-daemon`.
@@ -154,12 +170,12 @@ acp-gateway-admin shutdown_if_idle
 
 Do not copy the 0 in the example for `expectedRevision`; use the value from the immediately preceding read. Settings are applied when a new daemon starts after a safe shutdown. A consumer that performs a restart or runtime replacement must first close its auto-reconnecting client, start a new daemon with the chosen runtime, and then check the runtime identification and applied values in setup.
 
-### 1.5.x, 1.6.0 and 1.7.0 runtime builds
+### 1.5.x, 1.6.0, 1.7.0 and 1.7.1 runtime builds
 
-The builders for 1.5.x (`v1.5.0` through `v1.5.2`), `v1.6.0` and `v1.7.0` require the full source SHA that was reviewed separately from the tag. If the tag differs from that SHA, the build and verification are rejected, and the engine and public client of the new runtime are both extracted from the same source commit. The fixed-SHA verification for the existing 1.4.0 tag is retained.
+The builders for 1.5.x (`v1.5.0` through `v1.5.2`), `v1.6.0`, `v1.7.0` and `v1.7.1` require the full source SHA that was reviewed separately from the tag. If the tag differs from that SHA, the build and verification are rejected, and the engine and public client of the new runtime are both extracted from the same source commit. The fixed-SHA verification for the existing 1.4.0 tag is retained.
 
 ```bash
-npm run release:runtime -- --source-tag v1.7.0 --source-commit FULL_REVIEWED_SOURCE_SHA --output-dir dist
+npm run release:runtime -- --source-tag v1.7.1 --source-commit FULL_REVIEWED_SOURCE_SHA --output-dir dist
 npm run release:verify -- --source-commit FULL_REVIEWED_SOURCE_SHA \
   --archive dist/acp-gateway-runtime-darwin-arm64.tar.gz \
   --sha256 dist/acp-gateway-runtime-darwin-arm64.tar.gz.sha256 \

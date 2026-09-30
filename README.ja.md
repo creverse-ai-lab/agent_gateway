@@ -34,12 +34,12 @@ Node.js 22 以上と、macOS または Linux が必要です。
 npm で Gateway をインストールしてから、bootstrap でこのマシンのエージェントに組み込みます。
 
 ```bash
-npm install -g acp-gateway-daemon --omit=optional
+npm install -g acp-gateway-daemon
 acp-gateway-bootstrap --install-all --refresh-registry --dry-run
 acp-gateway-bootstrap --install-all --refresh-registry
 ```
 
-`--omit=optional` を付けると、依存パッケージに同梱された約 245 MB の Claude Code バイナリをダウンロードせずに済みます。Gateway はこのバイナリを使わず、Claude Worker はインストール済みの Claude CLI を使います。
+Claude Worker はインストール済みの Claude CLI を使い、`CLAUDE_CODE_EXECUTABLE` が空でなければそのパスを、なければ daemon の PATH のうち絶対パスのディレクトリで最初に見つかった `claude` (Gateway 自身の依存パッケージ内のものと、Claude Agent SDK に同梱されたバイナリは除く) を、それもなければ `~/.local/bin/claude` を使い、どれもなければ Claude は未インストールと報告されます。
 
 最後の 2 つのコマンドのうち、1 つ目はインストール計画だけを確認する dry-run で、2 つ目が実際のインストールです。`--install-all` は ACP 公式レジストリが指定する `npx`・`uvx` パッケージをグローバルにインストールまたは更新することがあるため、まず dry-run の結果で対象とバージョンを確認してください。レジストリの manifest は ACP が管理していますが、実際のパッケージとバイナリは各提供元の配布元からダウンロードされます。インストールがマシンに加える変更は、[インストールがマシンに加える変更](#インストールがマシンに加える変更)にまとめています。
 
@@ -109,7 +109,7 @@ Control token、オーケストレーターの識別子 (Main ID)、Gateway の�
 **npm でインストールした場合** — 新しいリリースをインストールしてから、登録情報を更新して daemon を再起動します。
 
 ```bash
-npm install -g acp-gateway-daemon@latest --omit=optional
+npm install -g acp-gateway-daemon@latest
 acp-gateway-bootstrap --update
 ```
 

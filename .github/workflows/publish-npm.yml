@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Gateway version to publish (must equal package.json and GATEWAY_VERSION, e.g. 1.7.0)
+        description: Gateway version to publish (must equal package.json and GATEWAY_VERSION, e.g. 1.7.1)
         required: true
 
 permissions:

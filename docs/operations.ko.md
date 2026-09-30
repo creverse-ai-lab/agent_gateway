@@ -27,11 +27,13 @@ acp-gateway-bootstrap --update
 `--update`는 먼저 패키지가 놓인 위치를 보고 Gateway가 어떻게 설치됐는지 판단합니다. 위처럼 pull과 검증을 하는 것은 소스 checkout(`.git`이 있는 디렉터리)뿐입니다. npm 설치본(`node_modules` 안의 패키지)에서는 Git도 npm도 실행하지 않습니다. npm registry에서 `acp-gateway-daemon`의 `latest` 버전을 확인해 새 버전이 있으면 `npm install -g acp-gateway-daemon@latest`를 안내하고, 곧바로 dry-run 계획, registry·adapter·MCP 갱신, daemon 재시작으로 넘어갑니다. 그러니 새 버전을 먼저 설치한 뒤 `--update`를 실행하세요.
 
 ```bash
-npm install -g acp-gateway-daemon@latest --omit=optional
+npm install -g acp-gateway-daemon@latest
 acp-gateway-bootstrap --update
 ```
 
 앱이 관리하는 runtime(`~/.acp-gateway/runtime/versions/` 아래)은 `managed`로 보고합니다. Gateway 교체는 그 앱이 맡고, `--update`는 이 설치본의 등록 정보만 갱신합니다.
+
+Claude Worker는 사용자가 설치한 Claude CLI를 실행하며, 다음 순서로 찾습니다. `CLAUDE_CODE_EXECUTABLE`이 비어 있지 않으면 그 경로, 아니면 daemon의 PATH 중 절대 경로 디렉터리에서 처음 찾은 실행 가능한 `claude`(Gateway 자신의 의존성 안에 있는 것과 Claude Agent SDK에 딸린 바이너리는 제외), 그것도 없으면 `~/.local/bin/claude`입니다. 셋 다 없으면 Claude는 설치되지 않은 것으로 보고됩니다. 1.7.1부터는 npm 패키지와 GitHub runtime 릴리스 모두 Claude Agent SDK에 딸린 Claude Code 바이너리를 포함하지 않습니다.
 
 사용자가 수정한 `agent-delegator`를 보호하기 위해 skill은 최초 `--install-all`에서만 설치하며 `--update`에서는 건드리지 않습니다. `--install-skill`도 최초 설치용이므로 이미 installer가 관리하는 복사본을 자동으로 덮어쓰지 않습니다. 로컬 소스 변경을 보호하기 위해 Git 작업 트리가 깨끗하지 않으면 update를 중단하므로 먼저 변경 사항을 commit하거나 stash해야 합니다. 소스와 직접 연결되는 `npm link`는 최초 설치 후 다시 할 필요가 없습니다.
 
@@ -134,13 +136,13 @@ Dependabot 설정은 GitHub의 기본 브랜치에 존재해야 활성화되며,
 
 Gateway는 npm에 `acp-gateway-daemon`으로 게시합니다(명령 이름은 그대로 `acp-gateway-*`). 릴리스 버전이 `package.json`, `npm-shrinkwrap.json`, `src/version.js`의 `GATEWAY_VERSION`, 두 변경 이력의 최신 제목에 모두 반영된 commit만 게시하세요. 이 값들이 서로 맞는지는 `npm run ci`가 검사합니다. npm 버전은 바꿀 수 없습니다. 한 번 게시한 버전 번호는 unpublish한 뒤에도 다시 쓸 수 없으므로, 잘못 게시했다면 새 버전을 내는 수밖에 없습니다.
 
-- **GitHub Actions(기본 경로):** 릴리스 태그에서 `Publish npm` workflow(`.github/workflows/publish-npm.yml`, 수동 `workflow_dispatch`)를 입력 `version`과 함께 실행합니다. 예: `gh workflow run publish-npm.yml --ref v1.7.0 -f version=1.7.0`. workflow는 입력 버전이 `package.json` 버전·`GATEWAY_VERSION`과 같은지, 패키지 이름이 `acp-gateway-daemon`인지 확인하고, npm에 이미 있는 버전이면 거부합니다. 이어서 `npm ci`, `npm run ci`, `npm run smoke:npm`을 모두 통과해야 `npm publish --provenance --access public`을 실행합니다.
+- **GitHub Actions(기본 경로):** 릴리스 태그에서 `Publish npm` workflow(`.github/workflows/publish-npm.yml`, 수동 `workflow_dispatch`)를 입력 `version`과 함께 실행합니다. 예: `gh workflow run publish-npm.yml --ref v1.7.1 -f version=1.7.1`. workflow는 입력 버전이 `package.json` 버전·`GATEWAY_VERSION`과 같은지, 패키지 이름이 `acp-gateway-daemon`인지 확인하고, npm에 이미 있는 버전이면 거부합니다. 이어서 `npm ci`, `npm run ci`, `npm run smoke:npm`을 모두 통과해야 `npm publish --provenance --access public`을 실행합니다.
   - 저장소 secret `NPM_TOKEN`이 필요합니다. 이 패키지에 publish 권한이 있고 2FA 코드를 묻지 않는 npm granular access token을 넣으세요. CI 작업은 2FA 입력에 답할 수 없습니다.
   - npm은 공개 GitHub 저장소에서 온 provenance만 받으므로, 저장소가 비공개인 동안에는 이 workflow로 게시할 수 없습니다.
 - **로컬 게시:** 릴리스 태그를 깨끗하게 checkout한 상태에서 검사를 돌리고, 로그인한 뒤 게시합니다. 이 경로로 게시하면 provenance가 붙지 않습니다.
 
 ```bash
-git clone --branch v1.7.0 https://github.com/creverse-ai-lab/agent_gateway.git
+git clone --branch v1.7.1 https://github.com/creverse-ai-lab/agent_gateway.git
 cd agent_gateway
 npm ci
 npm run ci
