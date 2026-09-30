@@ -2,7 +2,11 @@
 
 **English** | [한국어](README.ko.md) | [日本語](README.ja.md) | [简体中文](README.zh-CN.md)
 
+[![npm version](https://img.shields.io/npm/v/acp-gateway-daemon.svg)](https://www.npmjs.com/package/acp-gateway-daemon) [![CI](https://github.com/creverse-ai-lab/agent_gateway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/creverse-ai-lab/agent_gateway/actions/workflows/ci.yml?query=branch%3Amain) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 **Let the coding agent you already use delegate work to Claude Code, Codex, and Grok on demand — over MCP + ACP, with persistent sessions, interactive approvals, and no predefined workflows.**
+
+ACP Gateway is a local daemon and Model Context Protocol (MCP) server: whichever of Claude Code, Codex, or Grok you talk to uses it to delegate work to the others, and to any other installed agent listed in the official Agent Client Protocol (ACP) registry.
 
 Do you use more than one AI agent?
 
@@ -22,6 +26,15 @@ ACP Gateway is middleware that lets the AI you talk to directly — the **orches
 - The orchestrator controls models, permissions, questions, cancellation, and result collection.
 - The Gateway strips its token, socket and Main identity from Worker environments, but a Worker that reads files without going through the Gateway can still find the token; see [Permission policies](#permission-policies).
 - Designed for local, single-user, single-machine use.
+
+## Use cases
+
+- **One conversation, several agents** — From Claude Code, have Codex implement a change and Grok review it, without leaving the conversation or switching terminals.
+- **Follow-ups in the same session** — Send feedback to the Worker that did the work instead of starting over. If its session was unloaded while idle, the next prompt reconnects it on providers that support resume or load.
+- **Approvals from your main agent** — Under the `ask` policy, a Worker's permission requests and questions come to the agent you talk to, which approves, denies or answers them, or checks with you first.
+- **Results after a reconnect** — After your host reconnects or the Gateway restarts, `agent_acp_inbox {action: "attention"}` lists what is still waiting on you and the finished results you have not collected.
+- **Reviews that cannot touch your tree** — Open a reviewer with `workspace: "snapshot"` so it works in a private copy of the repository, then read its changes as a patch with `workspace_diff` and apply only what you want.
+- **Why a session stopped** — Each session records the reason for its status, and `agent_acp_session {action: "check"}` tells you, without starting anything, whether it can come back.
 
 ## Quick start
 

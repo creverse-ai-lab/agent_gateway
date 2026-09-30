@@ -2,7 +2,11 @@
 
 **한국어** | [English](README.md) | [日本語](README.ja.md) | [简体中文](README.zh-CN.md)
 
+[![npm version](https://img.shields.io/npm/v/acp-gateway-daemon.svg)](https://www.npmjs.com/package/acp-gateway-daemon) [![CI](https://github.com/creverse-ai-lab/agent_gateway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/creverse-ai-lab/agent_gateway/actions/workflows/ci.yml?query=branch%3Amain) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 **지금 쓰는 코딩 에이전트가 필요할 때 Claude Code, Codex, Grok에게 일을 나눠 맡길 수 있게 해주는 로컬 관제실 — MCP + ACP 기반으로 세션이 유지되고, 권한 요청은 대화로 승인하며, 미리 정해 둔 워크플로도 필요 없습니다.**
+
+ACP Gateway는 로컬에서 돌아가는 daemon이자 MCP(Model Context Protocol) 서버입니다. Claude Code, Codex, Grok 중 지금 대화하는 에이전트가 이 서버를 통해 나머지 에이전트에게 일을 맡길 수 있고, ACP(Agent Client Protocol) 공식 registry에 있는 다른 에이전트도 설치되어 있다면 똑같이 쓸 수 있습니다.
 
 혹시 여러 AI 에이전트를 쓰고 계신가요?
 
@@ -22,6 +26,15 @@ ACP Gateway는 사용자가 직접 대화하는 AI, 즉 **오케스트레이터*
 - 모델, 권한, 질문, 취소, 결과 수집을 오케스트레이터가 통제합니다.
 - Gateway는 Worker 환경에서 자신의 토큰, socket, Main 식별자를 지웁니다. 다만 Gateway를 거치지 않고 파일을 읽는 Worker는 토큰을 찾아낼 수 있습니다. [권한 정책](#권한-정책)을 참고하세요.
 - 로컬 단일 사용자·단일 머신 사용을 기준으로 합니다.
+
+## 활용 사례
+
+- **대화 하나로 여러 에이전트를** — Claude Code와 대화하면서 Codex에게는 구현을, Grok에게는 리뷰를 맡깁니다. 대화를 벗어나거나 터미널을 오갈 필요가 없습니다.
+- **같은 세션에 이어서 요청** — 작업을 한 Worker에게 처음부터 다시 설명하지 않고 피드백을 이어서 보냅니다. 한동안 쓰지 않아 unload된 세션도, resume이나 load를 지원하는 provider라면 다음 prompt를 보낼 때 자동으로 다시 연결됩니다.
+- **권한 요청은 메인 에이전트가 처리** — `ask` 정책에서는 Worker의 권한 요청과 질문이 지금 대화하는 에이전트로 옵니다. 에이전트가 승인·거부하거나 답하고, 필요하면 사용자에게 먼저 물어봅니다.
+- **다시 연결한 뒤에도 결과 확인** — 호스트를 다시 연결했거나 Gateway가 재시작된 뒤에도 `agent_acp_inbox {action: "attention"}`으로 아직 처리를 기다리는 것과 받지 못한 완료 결과를 확인할 수 있습니다.
+- **원본을 건드리지 않는 리뷰** — `workspace: "snapshot"`으로 리뷰어 세션을 열면 저장소의 개인 복사본에서 작업합니다. 바뀐 내용은 `workspace_diff`로 patch를 받아 필요한 것만 반영하면 됩니다.
+- **세션이 멈춘 이유 확인** — 세션마다 지금 상태가 된 이유를 기록하고, `agent_acp_session {action: "check"}`는 아무것도 띄우지 않고 세션을 되살릴 수 있는지 알려 줍니다.
 
 ## 빠른 시작
 

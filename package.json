@@ -1,7 +1,24 @@
 {
   "name": "acp-gateway-daemon",
   "version": "1.7.2",
-  "description": "Persistent local ACP gateway with Main-only control and worker-safe guidance.",
+  "description": "Let your coding agent delegate work to Claude Code, Codex and Grok: a local MCP server and Agent Client Protocol (ACP) gateway with persistent sessions, approvals and crash-safe recovery.",
+  "keywords": [
+    "acp",
+    "agent-client-protocol",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "claude-code",
+    "codex-cli",
+    "grok",
+    "multi-agent",
+    "agent-orchestration",
+    "ai-agents",
+    "coding-agent",
+    "ai-coding",
+    "delegation",
+    "developer-tools"
+  ],
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

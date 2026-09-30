@@ -1,0 +1,18 @@
+# ACP Gateway
+
+> ACP Gateway is a local daemon and Model Context Protocol (MCP) server that lets the coding agent you talk to (Claude Code, Codex or Grok) delegate work to other agents on the same machine over the Agent Client Protocol (ACP). It keeps Worker sessions alive between prompts, relays each Worker's permission requests and questions back to the orchestrating agent, and after a reconnect or a Gateway restart reports where delegated work stands. It is published on npm as `acp-gateway-daemon` and licensed under Apache-2.0.
+
+- What it is: the agent you talk to (the orchestrator, called `Main` in the code) controls Workers through MCP tools; the Gateway runs each Worker over ACP. Claude Code, Codex and Grok are built-in Workers, and other installed agents listed in the official ACP registry are discovered automatically.
+- Scope: local, single-user, single-machine. Requires Node.js 22 or later on macOS or Linux. Remote agents are not supported.
+- Install: `npm install -g acp-gateway-daemon`, then `acp-gateway-bootstrap --install-all --refresh-registry --dry-run` to review the plan and `acp-gateway-bootstrap --install-all --refresh-registry` to apply it. The Control MCP `agent-acp` is registered with one front door (`--front-door codex|claude|grok`); the read-only Guide MCP `agent-acp-guide` and the `agent-delegator` skill go to every discovered agent.
+- Permission policies: `read_only`, `ask` (the orchestrator approves file changes and commands) and `auto_approve`.
+- Key tools: `agent_acp_setup` (providers and health), `agent_acp_session_open` (open a Worker session), `agent_acp_config` (model, mode, reasoning level), `agent_acp_prompt` and `agent_acp_run` (send work, or send and wait), `agent_acp_poll` (status and results), `agent_acp_permission` and `agent_acp_answer` (reply to a Worker), `agent_acp_inbox` (pending requests; `attention` lists what needs the orchestrator and uncollected results), `agent_acp_session` (list, get, check, close, `workspace_diff`), `agent_acp_session_restore`, `agent_acp_cancel`.
+
+## Docs
+
+- [README](https://github.com/creverse-ai-lab/agent_gateway/blob/main/README.md): overview, use cases, install, permission policies, how it works, what installation changes
+- [README (Korean)](https://github.com/creverse-ai-lab/agent_gateway/blob/main/README.ko.md): the same README in Korean
+- [Operations guide](https://github.com/creverse-ai-lab/agent_gateway/blob/main/docs/operations.md): installer options, updating, host reconnection, Worker parameters, session and data management, durability and recovery
+- [Management API contract](https://github.com/creverse-ai-lab/agent_gateway/blob/main/docs/management-api.md): engine settings, provider policy, snapshot workspaces, safe shutdown, the public client (`acp-gateway-daemon/client`)
+- [Changelog](https://github.com/creverse-ai-lab/agent_gateway/blob/main/CHANGELOG.md): changes by version
+- [npm package](https://www.npmjs.com/package/acp-gateway-daemon): `acp-gateway-daemon` releases

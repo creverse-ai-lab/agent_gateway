@@ -2,7 +2,11 @@
 
 [English](README.md) | [한국어](README.ko.md) | [日本語](README.ja.md) | **简体中文**
 
+[![npm version](https://img.shields.io/npm/v/acp-gateway-daemon.svg)](https://www.npmjs.com/package/acp-gateway-daemon) [![CI](https://github.com/creverse-ai-lab/agent_gateway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/creverse-ai-lab/agent_gateway/actions/workflows/ci.yml?query=branch%3Amain) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 **让你正在使用的编码 agent 按需把工作委派给 Claude Code、Codex 和 Grok —— 基于 MCP + ACP，会话持久保持，权限请求可以在对话中交互式审批，无需预先定义任何工作流。**
+
+ACP Gateway 是一个在本地运行的 daemon，也是一个 MCP（Model Context Protocol）服务器：你正在对话的 Claude Code、Codex 或 Grok 可以通过它把工作委派给其余的 agent，也可以委派给本机已安装、并列在 ACP（Agent Client Protocol）官方 registry 中的其他 agent。
 
 你是否同时在用多个 AI agent？
 
@@ -22,6 +26,15 @@ ACP Gateway 是一个中间件：让你直接对话的 AI —— 即 **编排器
 - 模型、权限、提问、取消和结果收集均由编排器控制。
 - Gateway 会从 Worker 的环境中移除自己的 token、socket 和 Main 标识；但不经过 Gateway 直接读取文件的 Worker 仍可能找到该 token，详见[权限策略](#权限策略)。
 - 以本地单用户、单机使用为前提。
+
+## 使用场景
+
+- **一个对话，多个 agent** — 在与 Claude Code 的对话中，让 Codex 实现改动、让 Grok 做 review，无需离开对话，也不用来回切换终端。
+- **在同一个会话中继续跟进** — 直接向完成工作的 Worker 发送反馈，不必从头交代。闲置后被 unload 的会话，只要 provider 支持 resume 或 load，下次发送 prompt 时就会自动重新连接。
+- **由主 agent 处理权限请求** — 在 `ask` 策略下，Worker 的权限请求和提问会发给你正在对话的 agent，由它批准、拒绝或回答，必要时先来问你。
+- **重新连接后照样取回结果** — 宿主重新连接或 Gateway 重启之后，`agent_acp_inbox {action: "attention"}` 仍会列出等你处理的事项，以及你还没取回的已完成结果。
+- **不碰原始代码的 review** — 用 `workspace: "snapshot"` 打开 reviewer 会话，它会在仓库的私有副本中工作；再用 `workspace_diff` 以 patch 形式取回改动，只应用你需要的部分。
+- **弄清会话为何停下** — 每个会话都会记录它处于当前状态的原因；`agent_acp_session {action: "check"}` 不启动任何进程，就能告诉你会话能否恢复。
 
 ## 快速开始
 
