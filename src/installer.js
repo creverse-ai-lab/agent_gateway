@@ -1,9 +1,9 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { accessSync, constants } from "node:fs";
-import { access, chmod, cp, lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { access, chmod, cp, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, normalize, parse, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { detectProviders } from "./providers.js";
 import {
@@ -28,6 +28,16 @@ const FRONT_DOOR_TARGETS = new Set(["codex", "claude", "grok"]);
 const SUPPORTED_TARGETS = new Set(MCP_TARGETS);
 const sourceDirectory = dirname(fileURLToPath(import.meta.url));
 const bundledSkillSource = join(dirname(sourceDirectory), "skills", DELEGATOR_SKILL_NAME);
+const NODE_EXECUTABLES = new Set(["node", "nodejs"]);
+const MISSING_PATH_CODES = new Set(["ENOENT", "ENOTDIR"]);
+// Why an existing managed entry was left as it is, keyed by repointDecision.
+const KEPT_ENTRY_WARNINGS = {
+  unknown: "could not verify the registered path; rerun with --force to re-register it",
+  foreign: "registered command is not one this installer wrote; rerun with --force to replace it",
+  "keep-stale": "the registered path goes through a symlink to an older gateway; update it with the app that manages that link, or rerun with --force to re-register it",
+  "keep-broken-link": "the registered path goes through a broken symlink; fix it with the app that manages it, or rerun with --force to re-register it",
+  "keep-link-missing": "the registered path goes through a symlink to a missing script; fix it with the app that manages that link, or rerun with --force to re-register it"
+};
 
 export function defaultInstallStatePath() {
   return process.env.ACP_GATEWAY_INSTALL_STATE || join(homedir(), ".acp-gateway", "install.json");
@@ -509,7 +519,17 @@ function parseOnOff(value, option) {
   throw new Error(`${option} requires on or off`);
 }
 
-async function installMcp(spec, { options, state, run, actions, warnings, claudeConfigPath }) {
+// No error out of an MCP registration carries the Control token, including
+// its literal value wherever a CLI echoed it.
+async function installMcp(spec, context) {
+  try {
+    await applyMcp(spec, context);
+  } catch (error) {
+    throw new Error(redactText(error?.message ?? String(error), spec.secrets));
+  }
+}
+
+async function applyMcp(spec, { options, state, run, actions, warnings, claudeConfigPath }) {
   const key = `${spec.agent}:${spec.name}`;
   const action = { type: "mcp", agent: spec.agent, name: spec.name, command: spec.command, args: redactArgs(spec.args) };
   actions.push(action);
@@ -531,13 +551,10 @@ async function installMcp(spec, { options, state, run, actions, warnings, claude
     throw new Error(`${key} already exists and is not managed by this installer; rerun with --force to replace it`);
   }
   if (exists && state?.managedMcp?.[key] && !options.force && !options.rotateToken) {
-    const decision = await repointDecision(registered, spec.launch);
+    const decision = await repointDecision(registered, spec);
     if (decision !== "repoint") {
       action.status = "unchanged";
-      if (decision === "unknown") warnings.push(`${key}: could not verify the registered path; rerun with --force to re-register it`);
-      if (decision === "keep-stale") {
-        warnings.push(`${key}: the registered path goes through a symlink to an older gateway; update it with the app that manages that link, or rerun with --force to re-register it`);
-      }
+      if (KEPT_ENTRY_WARNINGS[decision]) warnings.push(`${key}: ${KEPT_ENTRY_WARNINGS[decision]}`);
       return;
     }
     action.status = options.dryRun ? "would-update" : "updated";
@@ -547,10 +564,46 @@ async function installMcp(spec, { options, state, run, actions, warnings, claude
     action.status = exists ? "would-replace" : "would-install";
   }
   if (options.dryRun) return;
-  if (exists) await requireSuccess(run, spec.command, spec.removeArgs, `remove existing ${key}`);
-  await requireSuccess(run, spec.command, spec.args, `install ${key}`);
+  await registerMcp(spec, key, exists ? registered : null, run);
   state.managedMcp ??= {};
   state.managedMcp[key] = { agent: spec.agent, name: spec.name, kind: spec.kind, installedAt: new Date().toISOString() };
+}
+
+// Adds the entry, replacing `previous` when there is one. The CLIs have no
+// atomic replace, so a failed add after the remove puts the previous launch
+// back rather than leave the agent with no entry, and the error reports both
+// outcomes. The identity env goes back only with this install's own node and
+// script: a look-alike path is not enough to be handed the Control token.
+async function registerMcp(spec, key, previous, run) {
+  if (previous) await requireSuccess(run, spec.command, spec.removeArgs, `remove existing ${key}`);
+  const failure = await attemptCommand(run, spec.command, spec.args, `install ${key}`);
+  if (!failure) return;
+  if (!previous) throw failure;
+  if (!previous.command || !previous.args || previous.exact === false) {
+    throw new Error(`${failure.message}; the previous ${key} entry was removed and could not be restored because ${spec.agent} did not report its full launch command; re-add it or rerun the installer`);
+  }
+  const ours = previous.args.length === 1
+    && await samePath(previous.command, spec.launch.command)
+    && await samePath(previous.args[0], spec.launch.args[0]);
+  const restoreFailure = await attemptCommand(run, spec.command, spec.addArgs(previous, ours), `restore the previous ${key}`);
+  if (!restoreFailure) {
+    throw new Error(ours
+      ? `${failure.message}; the previous ${key} entry was restored`
+      : `${failure.message}; the previous ${key} entry was restored without its environment (its original env could not be read); re-add its env if it needs one`);
+  }
+  const launched = [previous.command, ...redactArgs(previous.args)].join(" ");
+  throw new Error(`${failure.message}; ${restoreFailure.message}; ${key} is no longer registered (it launched: ${launched}); re-add it or rerun the installer`);
+}
+
+// The command's failure as an Error, or null when it succeeded.
+async function attemptCommand(run, command, args, operation) {
+  let result;
+  try {
+    result = await run(command, args);
+  } catch (error) {
+    return new Error(`${operation} failed (${command} ${redactArgs(args).join(" ")}): ${redactText(error?.message ?? String(error))}`);
+  }
+  return result.code === 0 ? null : commandError(command, args, result, operation);
 }
 
 async function inspectWithCli(spec, run, key) {
@@ -718,50 +771,50 @@ function mcpSpec(agent, kind, identity) {
   const serverArgs = [script];
   // What the host will launch, as opposed to the CLI call that registers it.
   const launch = { command: serverCommand, args: serverArgs };
+  // addArgs registers any launch under this entry's name, with the identity
+  // env unless withEnv is false, so a failed replacement can put the previous
+  // launch back.
+  const secrets = isControl ? [identity.token] : [];
+  const withAdd = (fields, addArgs) => ({ ...fields, secrets, addArgs, args: addArgs(launch, true) });
   if (agent === "codex") {
     const envArgs = isControl
       ? ["--env", `ACP_GATEWAY_CONTROL_TOKEN=${identity.token}`, "--env", `ACP_GATEWAY_ROOT_ID=${identity.rootId}`]
       : [];
-    return {
+    return withAdd({
       agent, kind, name, command: "codex", launch,
       getArgs: ["mcp", "get", name, "--json"],
-      removeArgs: ["mcp", "remove", name],
-      args: ["mcp", "add", ...envArgs, name, "--", serverCommand, ...serverArgs]
-    };
+      removeArgs: ["mcp", "remove", name]
+    }, ({ command, args }, withEnv) => ["mcp", "add", ...(withEnv ? envArgs : []), name, "--", command, ...args]);
   }
   if (agent === "grok") {
     const envArgs = isControl
       ? ["--env", `ACP_GATEWAY_CONTROL_TOKEN=${identity.token}`, "--env", `ACP_GATEWAY_ROOT_ID=${identity.rootId}`]
       : [];
-    return {
+    return withAdd({
       agent, kind, name, command: "grok", inspectMode: "list-json", launch,
       getArgs: ["mcp", "list", "--json"],
-      removeArgs: ["mcp", "remove", name],
-      args: ["mcp", "add", "--scope", "user", ...envArgs, name, "--", serverCommand, ...serverArgs]
-    };
+      removeArgs: ["mcp", "remove", name]
+    }, ({ command, args }, withEnv) => ["mcp", "add", "--scope", "user", ...(withEnv ? envArgs : []), name, "--", command, ...args]);
   }
   if (agent === "auggie") {
     const env = isControl
       ? { ACP_GATEWAY_CONTROL_TOKEN: identity.token, ACP_GATEWAY_ROOT_ID: identity.rootId }
       : {};
-    const config = { type: "stdio", command: serverCommand, args: serverArgs, env };
-    return {
+    return withAdd({
       agent, kind, name, command: "auggie", inspectMode: "list-json", launch,
       getArgs: ["mcp", "list", "--json"],
-      removeArgs: ["mcp", "remove", name],
-      args: ["mcp", "add-json", name, JSON.stringify(config), "--replace"]
-    };
+      removeArgs: ["mcp", "remove", name]
+    }, ({ command, args }, withEnv) => ["mcp", "add-json", name, JSON.stringify({ type: "stdio", command, args, env: withEnv ? env : {} }), "--replace"]);
   }
   if (agent !== "claude") throw new Error(`MCP registration is not supported for ${agent}`);
   const envArgs = isControl
     ? ["-e", `ACP_GATEWAY_CONTROL_TOKEN=${identity.token}`, "-e", `ACP_GATEWAY_ROOT_ID=${identity.rootId}`]
     : [];
-  return {
+  return withAdd({
     agent, kind, name, command: "claude", launch,
     getArgs: ["mcp", "get", name],
-    removeArgs: ["mcp", "remove", "--scope", "user", name],
-    args: ["mcp", "add", "--scope", "user", name, ...envArgs, "--", serverCommand, ...serverArgs]
-  };
+    removeArgs: ["mcp", "remove", "--scope", "user", name]
+  }, ({ command, args }, withEnv) => ["mcp", "add", "--scope", "user", name, ...(withEnv ? envArgs : []), "--", command, ...args]);
 }
 
 function inspectMcpExists(spec, result) {
@@ -795,8 +848,9 @@ function registeredLaunch(spec, result) {
   if (!command) return { command: null, args: null };
   // Claude joins args with spaces, so the line is kept whole: the gateway
   // registers exactly one argument, and extra ones then read as a difference.
+  // A line with spaces in it cannot be split back, so it is not re-added as is.
   const args = /^[ \t]*Args:[ \t]*(.*?)[ \t]*$/m.exec(result.stdout)?.[1];
-  return { command, args: args == null ? null : args ? [args] : [] };
+  return { command, args: args == null ? null : args ? [args] : [], exact: !/\s/.test(args ?? "") };
 }
 
 function launchFields(entry) {
@@ -817,18 +871,24 @@ function parseJson(text) {
 }
 
 // Whether a managed entry should launch this install instead: "repoint",
-// "keep", "keep-stale" (a pointer to an older gateway, kept with a warning), or
-// "unknown" when the inspect output does not say. Another manager
-// (AgenLynk's runtime/current) may own the registered path, so only an entry
-// that is provably stale moves, and never to an older gateway.
-async function repointDecision(registered, launch) {
-  const script = registered?.args?.length === 1 ? registered.args[0] : null;
-  if (!registered?.command || !script) return "unknown";
+// "keep", or a reason it stays that KEPT_ENTRY_WARNINGS explains. The install
+// state only says this installer once wrote the entry: the user or another
+// manager (AgenLynk's runtime/current) may have replaced it since. So an entry
+// moves only while it still has the shape this installer writes and is
+// provably stale, and never to an older gateway.
+async function repointDecision(registered, spec) {
+  const { launch } = spec;
+  if (!registered?.command || !registered.args) return "unknown";
+  if (registered.args.length !== 1) return "foreign";
+  const [script] = registered.args;
+  const written = installerWrote(registered, spec);
   let resolved;
   try {
     resolved = await realpath(script);
-  } catch {
-    return "repoint";
+  } catch (error) {
+    // Only a path that is not there is stale; EACCES and the like say nothing.
+    if (!MISSING_PATH_CODES.has(error?.code)) return "unknown";
+    return written ? await missingScriptDecision(script) : "foreign";
   }
   // A path through a symlink is a pointer someone else moves forward. When it
   // resolves to an older gateway the entry still stays, but says so: the
@@ -839,11 +899,53 @@ async function repointDecision(registered, launch) {
     return order !== null && order < 0 ? "keep-stale" : "keep";
   }
   if (await samePath(script, launch.args[0])) {
-    return await samePath(registered.command, launch.command) ? "keep" : "repoint";
+    if (await samePath(registered.command, launch.command)) return "keep";
+    return written ? "repoint" : "foreign";
   }
   const order = compareReleases(await gatewayVersionAt(dirname(script)), GATEWAY_VERSION);
   if (order === null) return "unknown";
-  return order < 0 ? "repoint" : "keep";
+  if (order >= 0) return "keep";
+  return written ? "repoint" : "foreign";
+}
+
+// Whether a launch has the shape this installer registers: a node executable
+// running exactly one normalized absolute path to a gateway's src/index.js
+// (Control) or src/guide.js (Guide).
+function installerWrote({ command, args: [script] }, { launch }) {
+  const node = command === launch.command || (isAbsolute(command) && NODE_EXECUTABLES.has(basename(command)));
+  return node
+    && isAbsolute(script)
+    && normalize(script) === script
+    && basename(script) === basename(launch.args[0])
+    && basename(dirname(script)) === "src";
+}
+
+// Why an installer-shaped script path no longer resolves. A fixed path that
+// is simply gone (a deleted checkout, a removed node version) is stale:
+// "repoint". A symlink on the way is a pointer whatever manages it will fix:
+// "keep-broken-link" when it dangles, "keep-link-missing" when it leads
+// somewhere without the script.
+async function missingScriptDecision(script) {
+  const { root } = parse(script);
+  let path = root;
+  let linked = false;
+  for (const part of script.slice(root.length).split(sep)) {
+    path = join(path, part);
+    try {
+      if (!(await lstat(path)).isSymbolicLink()) continue;
+    } catch (error) {
+      if (!MISSING_PATH_CODES.has(error?.code)) return "unknown";
+      return linked ? "keep-link-missing" : "repoint";
+    }
+    try {
+      await stat(path);
+    } catch (error) {
+      return MISSING_PATH_CODES.has(error?.code) || error?.code === "ELOOP" ? "keep-broken-link" : "unknown";
+    }
+    linked = true;
+  }
+  // Every component is there: the script appeared after realpath looked.
+  return "unknown";
 }
 
 // The GATEWAY_VERSION of the install a script belongs to, read as text: the
@@ -938,14 +1040,22 @@ async function requireSuccess(run, command, args, operation) {
 }
 
 function commandError(command, args, result, operation) {
-  const detail = String(result.stderr || result.stdout || "unknown error").trim();
+  const detail = redactText(String(result.stderr || result.stdout || "unknown error").trim());
   return new Error(`${operation} failed (${command} ${redactArgs(args).join(" ")}): ${detail}`);
 }
 
 function redactArgs(args) {
-  return args.map((arg) => String(arg)
-    .replace(/^(ACP_GATEWAY_CONTROL_TOKEN=).+$/, "$1<redacted>")
-    .replace(/("ACP_GATEWAY_CONTROL_TOKEN"\s*:\s*")[^"]+("\s*[,}])/g, "$1<redacted>$2"));
+  return args.map((arg) => redactText(arg));
+}
+
+// Control token values out of text: the KEY=value, KEY: value and JSON
+// "KEY": "value" forms, and any known token value wherever it appears.
+function redactText(text, secrets = []) {
+  let redacted = String(text).replace(/(ACP_GATEWAY_CONTROL_TOKEN"?\s*[=:]\s*"?)[^\s"',}]+/g, "$1<redacted>");
+  for (const secret of secrets) {
+    if (secret) redacted = redacted.split(secret).join("<redacted>");
+  }
+  return redacted;
 }
 
 export function runCommand(command, args) {
