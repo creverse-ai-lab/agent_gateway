@@ -31,9 +31,9 @@ const gatewayScript = (name) => fileURLToPath(new URL(`../src/${name}`, import.m
 
 // Pins the node command the installer registers, so a fake inspect output can
 // describe the entry this install would add.
-async function withNode(run) {
+async function withNode(run, node = NODE) {
   const saved = process.env.ACP_GATEWAY_NODE;
-  process.env.ACP_GATEWAY_NODE = NODE;
+  process.env.ACP_GATEWAY_NODE = node;
   try {
     return await run();
   } finally {
@@ -165,10 +165,16 @@ const heldToken = (key, { retired = false, tightened = null } = {}) => {
 
 // The agent CLIs as a fake that keeps what each add registered, so a later run
 // inspects what an earlier one wrote: codex and grok, through inspectAnswers.
-function rememberingClis(initial) {
+// failAdds[cli] adds of that CLI fail first, leaving its entries as they are.
+function rememberingClis(initial, { failAdds = {} } = {}) {
   const entries = structuredClone(initial);
+  const failing = { ...failAdds };
   const answer = (command, args) => {
     if (!["codex", "grok"].includes(command)) return null;
+    if (args[1] === "add" && failing[command] > 0) {
+      failing[command] -= 1;
+      return { code: 1, stdout: "", stderr: "config is locked" };
+    }
     if (args[1] === "add") {
       const at = args.indexOf("--");
       const env = Object.fromEntries(args.filter((_, index) => args[index - 1] === "--env")
@@ -1733,7 +1739,8 @@ test("installer restores the previous entry exactly when its replacement cannot 
 
     // A token rotation shares the path: this install's own launch, still holding the identity
     // it was registered with, moves to an identity-free entry in place. When that fails, it goes
-    // back exactly as it was, with the retired identity: no argv ever carries the new one.
+    // back exactly as it was, with the identity it had, and install.json keeps that identity
+    // too: the rotation is not committed, so the entry and the running daemon still agree.
     await writeManagedState(statePath, [["grok", "agent-acp", "control", recordedControl(NODE, gatewayScript("index.js"))], ["claude", "agent-acp", "control"]]);
     const rotateCalls = [];
     const grokAnswer = inspectAnswers({ grok: { "agent-acp": { command: NODE, args: [gatewayScript("index.js")], env: identityEnv } } });
@@ -1744,15 +1751,15 @@ test("installer restores the previous entry exactly when its replacement cannot 
       )),
       /: config is locked; the previous grok:agent-acp entry was restored$/
     );
-    const rotated = await identityOf();
-    assert.notEqual(rotated.token, token);
+    assert.deepEqual(await identityOf(), { token, rootId: "main-test" });
     assert.deepEqual(rotateCalls.filter(isMutation), [
       ["grok", "mcp", "remove", "agent-acp"],
       ["grok", "mcp", "add", "--scope", "user", ...ownEnv, "agent-acp", "--", NODE, gatewayScript("index.js")],
       ["grok", "mcp", "add", "--scope", "user", ...envPairs("--env", identityEnv), "agent-acp", "--", NODE, gatewayScript("index.js")]
     ]);
-    assert.equal(JSON.stringify(rotateCalls).includes(rotated.token), false);
-    assert.equal(JSON.stringify(rotateCalls).includes(rotated.rootId), false);
+    // The one token any argv carried is the one the entry had: never the new one.
+    const tokensOnArgv = rotateCalls.flat().filter((arg) => arg.startsWith("ACP_GATEWAY_CONTROL_TOKEN="));
+    assert.deepEqual(tokensOnArgv, [`ACP_GATEWAY_CONTROL_TOKEN=${token}`]);
 
     // --force over someone else's command, or a look-alike of this installer's: each goes
     // back with the env it had, and never with the Control identity it did not have.
@@ -1767,13 +1774,13 @@ test("installer restores the previous entry exactly when its replacement cannot 
         withNode(() => runInstaller(force, dependencies(foreignCalls, inspectAnswers({ grok: { "agent-acp": previous } }), ["config is locked"]))),
         (error) => {
           assert.match(error.message, /: config is locked; the previous grok:agent-acp entry was restored$/);
-          assert.equal(error.message.includes(rotated.token), false);
+          assert.equal(error.message.includes(token), false);
           return true;
         }
       );
       const restore = foreignCalls.filter(isMutation).at(-1);
       assert.deepEqual(restore, ["grok", "mcp", "add", "--scope", "user", ...envPairs("--env", previous.env), "agent-acp", "--", previous.command, ...previous.args]);
-      assert.equal(restore.includes(`ACP_GATEWAY_CONTROL_TOKEN=${rotated.token}`), false);
+      assert.equal(restore.includes(`ACP_GATEWAY_CONTROL_TOKEN=${token}`), false);
       assert.equal(restore.some((arg) => arg.startsWith("ACP_GATEWAY_ROOT_ID=")), false);
       assert.equal(foreignCalls.filter(isMutation).length, 3);
     }
@@ -2112,6 +2119,146 @@ test("W5: --rotate-token re-registers nothing that reads install.json, and warns
       heldToken("codex:agent-acp", { retired: true, tightened: configs.codex })
     ]);
     assert.equal(await modeOf(configs.codex), 0o600);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+// ------------------------------------------- install.json always says what is live
+
+test("W5: each entry is recorded as soon as it is rewritten, so a later failure cannot strand it", async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "acp-installer-record-at-once-")));
+  const statePath = join(directory, "install.json");
+  const nextNode = "/opt/test/next/bin/node";
+  try {
+    const older = await gatewayTree(directory, "runtime/versions/1.4.0-older", "1.4.0");
+    // Two front doors registered by 1.7.2 with the identity in their env: Codex on an older install.
+    await writeManagedState(statePath, [
+      ["codex", "agent-acp", "control", recordedControl(NODE, join(older, "index.js"))],
+      ["grok", "agent-acp", "control", recordedControl(NODE, gatewayScript("index.js"))]
+    ]);
+    // Grok refuses its first add: its replacement fails after Codex's went through.
+    const clis = rememberingClis({
+      codex: { "agent-acp": { command: NODE, args: [join(older, "index.js")], env: identityEnv } },
+      grok: { "agent-acp": { command: NODE, args: [gatewayScript("index.js")], env: identityEnv } }
+    }, { failAdds: { grok: 1 } });
+    const options = parseInstallerArgs(["--install-control", "--target", "codex", "--target", "grok", "--skip-health-check"]);
+    await assert.rejects(
+      withNode(() => runInstaller(options, updateDependencies(statePath, directory, clis, []))),
+      /: config is locked; the previous grok:agent-acp entry was restored$/
+    );
+    // install.json says what each CLI holds now: Codex moved here without its identity, Grok as it was.
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    assert.deepEqual(clis.entries.codex["agent-acp"], { command: NODE, args: [gatewayScript("index.js")], env: installStateEnv(statePath) });
+    assert.deepEqual(state.managedMcp["codex:agent-acp"].launch, identityFreeControl(NODE, gatewayScript("index.js")));
+    assert.deepEqual(clis.entries.grok["agent-acp"], { command: NODE, args: [gatewayScript("index.js")], env: identityEnv });
+    assert.deepEqual(state.managedMcp["grok:agent-acp"].launch, recordedControl(NODE, gatewayScript("index.js")));
+
+    // The next run, under another node, proves both its own: both move to that node, and Grok
+    // gives up its identity too.
+    const calls = [];
+    const next = await withNode(() => runInstaller(options, updateDependencies(statePath, directory, clis, calls)), nextNode);
+    assert.deepEqual(statusOf(next), { "codex:agent-acp": "updated", "grok:agent-acp": "updated" });
+    assert.deepEqual(calls.filter((call) => call[2] === "add"), [
+      ["codex", "mcp", "add", "--env", `ACP_GATEWAY_INSTALL_STATE=${statePath}`, "agent-acp", "--", nextNode, gatewayScript("index.js")],
+      ["grok", "mcp", "add", "--scope", "user", "--env", `ACP_GATEWAY_INSTALL_STATE=${statePath}`, "agent-acp", "--", nextNode, gatewayScript("index.js")]
+    ]);
+    assert.deepEqual(next.warnings, [rotateAdvice(1)]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("W5: a rotation cut short keeps the identity the live entries share, and a retry completes it", async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "acp-installer-rotate-retry-")));
+  const statePath = join(directory, "install.json");
+  const retired = { token: identityEnv.ACP_GATEWAY_CONTROL_TOKEN, rootId: identityEnv.ACP_GATEWAY_ROOT_ID };
+  const identityIn = (state) => ({ token: state.identity.token, rootId: state.identity.rootId });
+  try {
+    // Two front doors this installer registered with the identity in their env, both on this install.
+    await writeManagedState(statePath, [
+      ["codex", "agent-acp", "control", recordedControl(NODE, gatewayScript("index.js"))],
+      ["grok", "agent-acp", "control", recordedControl(NODE, gatewayScript("index.js"))]
+    ]);
+    const clis = rememberingClis({
+      codex: { "agent-acp": { command: NODE, args: [gatewayScript("index.js")], env: identityEnv } },
+      grok: { "agent-acp": { command: NODE, args: [gatewayScript("index.js")], env: identityEnv } }
+    }, { failAdds: { grok: 1 } });
+    const rotate = parseInstallerArgs(["--rotate-token", "--skip-health-check"]);
+    await assert.rejects(
+      withNode(() => runInstaller(rotate, updateDependencies(statePath, directory, clis, []))),
+      /: config is locked; the previous grok:agent-acp entry was restored$/
+    );
+    // Codex now reads install.json and Grok still holds the identity in its env. install.json keeps
+    // that same identity, the one the running daemon accepts, so both front doors keep working.
+    let state = JSON.parse(await readFile(statePath, "utf8"));
+    assert.deepEqual(identityIn(state), retired);
+    assert.deepEqual(clis.entries.codex["agent-acp"].env, installStateEnv(statePath));
+    assert.deepEqual(state.managedMcp["codex:agent-acp"].launch, identityFreeControl(NODE, gatewayScript("index.js")));
+    assert.deepEqual(clis.entries.grok["agent-acp"].env, identityEnv);
+    assert.deepEqual(state.managedMcp["grok:agent-acp"].launch, recordedControl(NODE, gatewayScript("index.js")));
+
+    // A retry still knows Grok as its own, moves it, and commits the new identity.
+    const calls = [];
+    const retried = await withNode(() => runInstaller(rotate, updateDependencies(statePath, directory, clis, calls)));
+    assert.deepEqual(statusOf(retried), { "codex:agent-acp": "unchanged", "grok:agent-acp": "updated" });
+    assert.deepEqual(retried.warnings, []);
+    state = JSON.parse(await readFile(statePath, "utf8"));
+    assert.notEqual(state.identity.token, retired.token);
+    assert.notEqual(state.identity.rootId, retired.rootId);
+    assert.equal(JSON.stringify(calls).includes(state.identity.token), false);
+    assert.deepEqual(clis.entries.grok["agent-acp"].env, installStateEnv(statePath));
+    assert.deepEqual(state.managedMcp["grok:agent-acp"].launch, identityFreeControl(NODE, gatewayScript("index.js")));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("W5: a record a cut-short run left behind still proves an entry that only lost its identity, never a customized one", async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "acp-installer-self-heal-")));
+  const statePath = join(directory, "install.json");
+  const customized = (key) => `${key}: its env is not the one this installer registered (a variable was added, removed or changed since), so it is left as it is; rerun with --force to re-register it without those changes`;
+  try {
+    const older = await gatewayTree(directory, "runtime/versions/1.4.0-older", "1.4.0");
+    const launch = { command: NODE, args: [join(older, "index.js")] };
+    // What a 1.7.2 registration recorded: the launch, with the identity in its env.
+    const stale = recordedControl(launch.command, launch.args[0]);
+    const run = (targets, entries, calls) => withNode(() => runInstaller(
+      parseInstallerArgs(["--install-control", ...targets.flatMap((target) => ["--target", target]), "--skip-health-check"]),
+      updateDependencies(statePath, directory, rememberingClis(entries), calls)
+    ));
+
+    // Both lost the identity in place, by a run killed before it recorded them: the records
+    // still name the identity. Codex carries this installer's install-state variable, Grok,
+    // registered from the default path, nothing. Both are still its own, and move when stale.
+    await writeManagedState(statePath, [["codex", "agent-acp", "control", stale], ["grok", "agent-acp", "control", stale]]);
+    const healed = await run(["codex", "grok"], {
+      codex: { "agent-acp": { ...launch, env: installStateEnv(statePath) } },
+      grok: { "agent-acp": { ...launch, env: {} } }
+    }, []);
+    assert.deepEqual(statusOf(healed), { "codex:agent-acp": "updated", "grok:agent-acp": "updated" });
+    assert.deepEqual(healed.warnings, []);
+    const records = JSON.parse(await readFile(statePath, "utf8")).managedMcp;
+    assert.deepEqual(records["codex:agent-acp"].launch, identityFreeControl(NODE, gatewayScript("index.js")));
+    assert.deepEqual(records["grok:agent-acp"].launch, identityFreeControl(NODE, gatewayScript("index.js")));
+
+    // Any other difference is the user's, and such an entry is left as it is: a variable
+    // added, a value changed, a recorded variable removed.
+    await writeManagedState(statePath, [["codex", "agent-acp", "control", stale], ["grok", "agent-acp", "control", stale]]);
+    const changedCalls = [];
+    const changed = await run(["codex", "grok"], {
+      codex: { "agent-acp": { ...launch, env: { HTTP_PROXY: "http://proxy.internal:3128" } } },
+      grok: { "agent-acp": { ...launch, env: { ACP_GATEWAY_INSTALL_STATE: join(directory, "elsewhere.json") } } }
+    }, changedCalls);
+    assert.deepEqual(statusOf(changed), { "codex:agent-acp": "unchanged", "grok:agent-acp": "unchanged" });
+    assert.deepEqual(changed.warnings, [customized("codex:agent-acp"), customized("grok:agent-acp")]);
+    assert.deepEqual(changedCalls.filter(isMutation), []);
+
+    await writeManagedState(statePath, [["codex", "agent-acp", "control", identityFreeControl(launch.command, launch.args[0])]]);
+    const removedCalls = [];
+    const removed = await run(["codex"], { codex: { "agent-acp": { ...launch, env: {} } } }, removedCalls);
+    assert.deepEqual(removed.warnings, [customized("codex:agent-acp")]);
+    assert.deepEqual(removedCalls.filter(isMutation), []);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

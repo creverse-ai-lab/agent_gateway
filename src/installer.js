@@ -368,16 +368,28 @@ export async function runInstaller(options, dependencies = {}) {
     }
   }
   if (options.installControl) {
+    // A first identity is written before any entry is registered: an
+    // identity-free entry reads it from this file. A rotated one replaces the
+    // previous only once every entry is recorded as this run left it (after
+    // the loop below), so a run cut short leaves install.json with the
+    // identity the running daemon and every entry still share, and a retry
+    // still recognizes the entries that kept it in their env.
+    const rotating = Boolean(identity) && options.rotateToken;
     if (!identity || options.rotateToken) identity = createIdentity();
-    state.identity = identity;
+    if (!rotating) state.identity = identity;
     state.managedMcp ??= {};
     state.updatedAt = new Date().toISOString();
     if (!options.dryRun) await writeInstallState(statePath, state);
   }
 
   const installedSkillDestinations = new Map();
-  // migrated counts the entries whose Control token this run took out of an agent config.
-  const mcpContext = { options, state, run, actions, warnings, claudeConfigPath, agentConfigPaths, migrated: 0 };
+  // migrated counts the entries whose Control token this run took out of an
+  // agent config; persist records an entry the moment it is rewritten.
+  const mcpContext = {
+    options, state, run, actions, warnings, claudeConfigPath, agentConfigPaths,
+    migrated: 0,
+    persist: () => writeInstallState(statePath, state)
+  };
   const specOptions = { registeredIdentity, statePath };
   for (const target of new Set([...controlTargets, ...guideTargets, ...skillTargets])) {
     const provider = providers.find((item) => item.id === target);
@@ -435,6 +447,8 @@ export async function runInstaller(options, dependencies = {}) {
       warnings.push(`${target} is not installed; skill installation skipped`);
     }
   }
+  // Every entry is recorded as it is now: a rotated identity may take over.
+  if (options.installControl) state.identity = identity;
   // Rotating is the user's call, not the migration's: an app such as AgenLynk
   // keeps the identity it read, and a new token would lock it out.
   if (mcpContext.migrated && !options.rotateToken) {
@@ -621,6 +635,10 @@ async function applyMcp(spec, context) {
     // recognized as this installer's later.
     launch: { command: launch.command, args: [...launch.args], envKeys: Object.keys(spec.env) }
   };
+  // Written now, not at the end of the run: the entry is live as it is, and
+  // a later one failing must not leave install.json describing the entry
+  // this one replaced.
+  await context.persist();
 }
 
 // What an update does with an existing entry this installer manages: {launch}
@@ -653,7 +671,8 @@ async function updateDecision(registered, spec, record) {
   // env is part of the entry too: a variable the user added (HTTP_PROXY,
   // NODE_OPTIONS) or an identity value changed since would be lost to the
   // replacement, so such an entry stays as it is.
-  if (!recorded || !ownEnv(registered.env, { ...spec.registeredIdentityEnv, ...spec.env }, recorded.envKeys)) {
+  const ownValues = { ...spec.registeredIdentityEnv, ...spec.env };
+  if (!recorded || !ownEnv(registered.env, { envKeys: recorded.envKeys, ownValues, installEnv: spec.env })) {
     return { kept: "customized" };
   }
   return { launch };
@@ -1145,20 +1164,25 @@ function recordedLaunch(record) {
 }
 
 // Whether an entry's env, as its CLI reports it, is still the one this
-// installer registered: exactly the recorded names, with the values this
-// installer gives them (the identity it registered before 1.8.0, the install
-// state path since) wherever those appear. A Control identity it holds no
-// value for is not its own. Any other value is neither compared nor kept; an
-// env not reported proves nothing.
-function ownEnv(env, ownValues, envKeys) {
+// installer registered: the recorded names, with the values this installer
+// gives them wherever it knows them (the identity it registered before
+// 1.8.0, and installEnv, the env it registers now). Two differences from the
+// record are the installer's own doing and keep the entry its own: a Control
+// identity variable gone, and a variable of installEnv there with exactly its
+// value. Each rewrite is recorded at once, but a run killed in between would
+// otherwise strand an entry it just moved off the identity. Any other
+// difference, a variable added, removed or changed, is the user's, and such
+// an entry is never rewritten on its own. A Control identity this installer
+// holds no value for is not its own; an env not reported proves nothing.
+function ownEnv(env, { envKeys, ownValues, installEnv }) {
   if (!env) return false;
-  const names = new Set(envKeys);
-  const registered = Object.keys(env);
-  return registered.length === names.size
-    && registered.every((name) => names.has(name))
-    && registered.every((name) => Object.hasOwn(ownValues, name)
-      ? env[name] === ownValues[name]
-      : !CONTROL_IDENTITY_ENV.includes(name));
+  const recorded = new Set(envKeys);
+  if (envKeys.some((name) => !Object.hasOwn(env, name) && !CONTROL_IDENTITY_ENV.includes(name))) return false;
+  return Object.keys(env).every((name) => {
+    if (!recorded.has(name) && !Object.hasOwn(installEnv, name)) return false;
+    if (Object.hasOwn(ownValues, name)) return env[name] === ownValues[name];
+    return !CONTROL_IDENTITY_ENV.includes(name);
+  });
 }
 
 // Whether two launches are the same command and args, compared as normalized
