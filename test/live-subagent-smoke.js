@@ -10,10 +10,17 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { GatewayRpcClient } from "../src/socket-rpc.js";
 
 const directory = await mkdtemp(join(tmpdir(), "acp-gateway-subagent-smoke-"));
+// The Gateway protects the directory its state lives in, and a Claude worker is
+// denied Read of everything under a protected path, so the workspace has to be
+// a sibling of that directory and never inside it. The socket stays in
+// `directory`: only the socket file itself is protected, and a deeper path gets
+// close to the unix socket path limit (104 bytes on macOS).
+const gatewayDirectory = join(directory, "gateway");
 const workspace = join(directory, "workspace");
 const socketPath = join(directory, "gateway.sock");
-const statePath = join(directory, "state.json");
+const statePath = join(gatewayDirectory, "state.json");
 const token = "subagent-smoke-control-token-at-least-24-characters";
+await mkdir(gatewayDirectory, { mode: 0o700 });
 await mkdir(workspace);
 await writeFile(join(workspace, "task.txt"), "alpha=17\nbeta=25\n", "utf8");
 
