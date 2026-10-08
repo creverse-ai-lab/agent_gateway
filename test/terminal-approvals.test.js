@@ -194,17 +194,19 @@ test("W4: Main's inbox shows the operation, in full and in the summary", async (
 
 // ------------------------------------------------------------------ W4: binding
 
-test("W4: approving an execute request lets a genuinely-equivalent command through once, wrapped in a non-login shell or not", async () => {
+test("W4: approving an execute request lets the same command through once, string or argv", async () => {
   await withTemp("acp-w4-bind-", (directory) => withClient({ cwd: directory, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
     // [what the permission request named, the terminal/create argv that follows].
-    // Each pair runs exactly `echo bound`: a bare argv, or a non-login shell whose
-    // -c script is only plain words tokenizes to that same argv. A login shell or
-    // a script with shell syntax is NOT equivalent — those are the next test.
+    // The grant matches only the SAME command shape, compared argv word for word:
+    // a plain command-line string tokenizes to the argv it names, and an argv
+    // matches the identical argv. A different shape (a literal argv vs a shell
+    // script that happens to run the same thing, or a login shell) is NOT the
+    // same command and is re-asked — that is the next test.
     const cases = [
       ["echo bound", ["echo", "bound"]],
-      ["echo   bound", ["sh", "-c", "echo bound"]],
-      ["sh -c \"echo bound\"", ["/bin/bash", "-c", "echo  bound"]],
-      [["sh", "-c", "echo bound"], ["echo", "bound"]]
+      [["echo", "bound"], ["echo", "bound"]],
+      ["sh -c \"echo bound\"", ["sh", "-c", "echo bound"]],
+      [["sh", "-c", "echo bound"], ["sh", "-c", "echo bound"]]
     ];
     for (const [approved, argv] of cases) {
       const before = requests.length;
@@ -231,6 +233,10 @@ test("F1: a literal argv, a shell-metacharacter script and a login shell are dis
       // The literal args "a;" and "./x" are printed, not run; sh -c would run ./x.
       [["echo", "a; ./x"], { command: "sh", args: ["-c", "echo a; ./x"] }],
       [["echo", "$(./x)"], { command: "sh", args: ["-c", "echo $(./x)"] }],
+      // A newline in the script runs a second command; a literal argv never does.
+      [["echo", "a"], { command: "sh", args: ["-c", "echo a\nrm -rf x"] }],
+      // A quoted-literal script word is not the same word as the bare script.
+      [["sh", "-c", "'echo a; ./x'"], { command: "sh", args: ["-c", "echo a; ./x"] }],
       // A plain command must not be spent as a login shell.
       ["echo hi", { command: "bash", args: ["-lc", "echo hi"] }],
       [["echo", "hi"], { command: "zsh", args: ["-l", "-c", "echo hi"] }]

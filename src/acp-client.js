@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { realpathSync, statSync } from "node:fs";
 import { readlink, realpath } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { BoundedUtf8Text, readTextHead, readTextLines } from "./bounded-utf8.js";
 import { workerEnv } from "./caller.js";
@@ -1448,59 +1448,54 @@ function namesGatewayDirectory(text) {
 }
 
 // An approval and the terminal/create that spends it are compared as commands.
-// A command normalizes to a comparable form: a literal argv (what spawn runs
-// directly), or a shell script with whether it is a login shell. A non-login
-// shell whose `-c` script is only plain words is equal to the literal argv of
-// those words, because the shell would exec exactly them (`echo bound` ≡
-// `sh -c echo bound`). A script with any shell syntax — operators, quotes,
-// $expansion, globs, assignments — or a login shell (which sources profiles
-// first) keeps shell:true, so it is spent only by the same shell request, never
-// by a bare argv, and vice versa: approving the literal `["echo","a; ./x"]`
-// (which spawn does not interpret) does not authorize `sh -c "echo a; ./x"`.
-const SHELLS = new Set(["sh", "bash", "zsh", "dash"]);
-const SCRIPT_FLAG = /^-(?:c|lc|cl)$/;
-const LOGIN_FLAG = /^(?:-l|--login)$/;
-// A shell command *line* string (not an argv): a shell by name, an optional
-// login flag, a `-c` flag, then the script. Captures the login flag and script.
-const SHELL_LINE = /^(?:\S*\/)?(?:sh|bash|zsh|dash)(?:\s+(-l|--login))?\s+(-c|-lc|-cl)\s+(.+)$/;
-// A `-c` script a shell would tokenize into exactly a plain argv: unquoted words
-// of safe characters only. Anything else is more than its words.
-const PLAIN_WORD = /^[A-Za-z0-9_@%+,:./-]+$/;
+// A command is its argv, compared word for word (sameCommand): a literal argv, a
+// `sh -c` script, and a login shell are different arrays and never authorize one
+// another, so approving `["echo","a; ./x"]` (which spawn runs verbatim) does not
+// cover `["sh","-c","echo a; ./x"]`, and the same shell request is spent only by
+// the identical one. The Gateway never tries to prove a script equals an argv —
+// a different shape is simply re-asked. A bare command-line *string* (some
+// providers' execute request) is tokenized to an argv only when it is plain
+// words; a line carrying any shell syntax stays opaque and matches nothing, so
+// it can never stand in for a tokenized command.
+// Shell syntax that makes a line more than its plain words: an operator,
+// redirection, expansion, command substitution, glob, brace/tilde, assignment,
+// an escape, or a newline/tab. A space is omitted on purpose — it separates
+// words.
+const SHELL_META = /[;&|<>()$`\\*?[\]{}~=\n\r\t]/;
 
-function isSimpleScript(text) {
-  const words = collapse(text).split(" ");
-  return words[0] !== "" && words.every((word) => PLAIN_WORD.test(word));
-}
-
-// The comparable form of an argv.
+// The comparable form of an argv: its exact words, and a flat text used ONLY to
+// scan which env names the command interpolates (never for equality).
 function commandForm(argv) {
   const words = argv.map(String);
-  if (SHELLS.has(basename(words[0] ?? ""))) {
-    if (words.length === 3 && SCRIPT_FLAG.test(words[1])) return scriptForm(words[2], words[1].includes("l"));
-    if (words.length === 4 && LOGIN_FLAG.test(words[1]) && words[2] === "-c") return scriptForm(words[3], true);
-  }
-  return { shell: false, login: false, text: collapse(words.join(" ")) };
+  return { argv: words, text: words.join(" ") };
 }
 
-// The comparable form of a `-c` script: a simple non-login script becomes the
-// literal argv of its words; anything else stays a (login-)shell form.
-function scriptForm(script, login) {
-  const text = collapse(unquoted(script));
-  if (!login && isSimpleScript(text)) return { shell: false, login: false, text };
-  return { shell: true, login, text };
-}
-
-// The comparable form of a shell command *line* string: a `sh -c SCRIPT`
-// invocation unwraps to that script's form (login-aware); anything else is the
-// line itself, run as a command.
+// The comparable form of a bare command-line string: tokenized to an argv when
+// it is plain quoted words, so a string approval and a later argv terminal
+// compare; otherwise opaque (argv null), an array no request can equal.
 function shellCommand(text) {
-  const match = SHELL_LINE.exec(collapse(text));
-  if (match) return scriptForm(unquoted(match[3]), Boolean(match[1]) || match[2].includes("l"));
-  return scriptForm(collapse(text), false);
+  const tokens = tokenizePlainLine(text);
+  return tokens ? { argv: tokens, text: tokens.join(" ") } : { argv: null, text: String(text) };
 }
 
+// A command line split into argv, or null when it carries shell syntax an argv
+// cannot faithfully stand for. Plain words, each optionally single- or
+// double-quoted, separated by blanks.
+function tokenizePlainLine(text) {
+  const line = String(text);
+  if (SHELL_META.test(line)) return null;
+  const tokens = [];
+  const pattern = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  let match;
+  while ((match = pattern.exec(line)) !== null) tokens.push(match[1] ?? match[2] ?? match[3]);
+  return tokens.length ? tokens : null;
+}
+
+// Two commands match only when both are argvs of equal length and equal words;
+// an opaque line (argv null) matches nothing.
 function sameCommand(a, b) {
-  return a.shell === b.shell && a.login === b.login && a.text === b.text;
+  if (!a.argv || !b.argv || a.argv.length !== b.argv.length) return false;
+  return a.argv.every((word, index) => word === b.argv[index]);
 }
 
 // Indirect (`${!NAME}`) or arithmetic (`$((...))` / `$[...]`) expansion reads a
@@ -1508,17 +1503,6 @@ function sameCommand(a, b) {
 // command that uses it — such a command is asked about every time.
 function usesDynamicExpansion(text) {
   return /\$\{!/.test(text) || /\$\(\(/.test(text) || /\$\[/.test(text);
-}
-
-function unquoted(text) {
-  const quote = text[0];
-  const whole = (quote === "'" || quote === "\"") && text.length >= 2 && text.at(-1) === quote
-    && !text.slice(1, -1).includes(quote);
-  return whole ? text.slice(1, -1) : text;
-}
-
-function collapse(text) {
-  return String(text).replace(/\s+/g, " ").trim();
 }
 
 // The command an execute permission request names, in comparable form, or null
