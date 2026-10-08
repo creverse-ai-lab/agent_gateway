@@ -1395,9 +1395,11 @@ const COMMAND_KILL_GRACE_MS = 2_000;
 // Agent CLIs, and npm and uv installing adapters (their packages' lifecycle
 // scripts run too): none of them gets the Control token, the socket or a
 // session marker, whether the installer runs from a shell or in the daemon.
-// A command past timeoutMs, or one whose signal aborts, is killed and rejects
-// with code COMMAND_TIMEOUT or COMMAND_ABORTED. The child stays in the
-// installer's process group, so Ctrl-C at a terminal still reaches it.
+// A command still running past timeoutMs, or when its signal aborts, is killed
+// and rejects with code COMMAND_TIMEOUT or COMMAND_ABORTED. One that has already
+// exited on its own by then resolves with its own status and output, even while
+// a grandchild still holds its pipes. The child stays in the installer's
+// process group, so Ctrl-C at a terminal still reaches it.
 export function runCommand(command, args, {
   timeoutMs = COMMAND_TIMEOUT_MS,
   maxOutputBytes = COMMAND_OUTPUT_BYTES,
@@ -1416,30 +1418,47 @@ export function runCommand(command, args, {
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => stdout.append(chunk));
     child.stderr.on("data", (chunk) => stderr.append(chunk));
+    // stopped: the error for a command this call killed while it still ran.
+    // exitStatus: how the command exited, killed or on its own.
     let stopped = null;
-    let exited = false;
+    let exitStatus = null;
+    let settled = false;
     let killTimer = null;
     const settle = () => {
+      settled = true;
       clearTimeout(deadline);
       clearTimeout(killTimer);
       signal?.removeEventListener("abort", onAbort);
     };
-    // A stopped command is done once it has exited. Waiting for "close" as well
-    // would wait on any grandchild still holding its pipes, such as a lifecycle
-    // script npm started, which is the very hang the deadline is for.
-    const finishStopped = () => {
+    const finish = (code) => {
       settle();
+      const truncated = stdout.omittedBytes > 0 || stderr.omittedBytes > 0;
+      resolve({ code: code ?? 1, stdout: stdout.text(), stderr: stderr.text(), ...(truncated ? { outputTruncated: true } : {}) });
+    };
+    // Once the command has exited, waiting for "close" as well would wait on any
+    // grandchild still holding its pipes, such as a lifecycle script npm
+    // started, which is the very hang the deadline is for. Whatever ends the
+    // wait after the exit drops the pipes and settles at once.
+    const dropPipes = () => {
       child.stdout.destroy();
       child.stderr.destroy();
+    };
+    const finishStopped = () => {
+      settle();
+      dropPipes();
       reject(stopped);
     };
     const stop = (error) => {
-      if (stopped) return;
-      stopped = error;
-      if (exited) {
-        finishStopped();
+      if (stopped || settled) return;
+      if (exitStatus) {
+        // It finished on its own and only its pipes are still open (a
+        // grandchild holds them, or "close" is a turn away): there is nothing
+        // left to stop, and the status it exited with stands.
+        dropPipes();
+        finish(exitStatus.code);
         return;
       }
+      stopped = error;
       child.kill("SIGTERM");
       killTimer = setTimeout(() => child.kill("SIGKILL"), COMMAND_KILL_GRACE_MS);
       killTimer.unref?.();
@@ -1456,18 +1475,14 @@ export function runCommand(command, args, {
       settle();
       reject(error);
     });
-    child.once("exit", () => {
-      exited = true;
+    child.once("exit", (code, exitSignal) => {
+      exitStatus = { code, signal: exitSignal };
+      // stopped is only ever set while the command still ran, so a command
+      // this call killed is reported as stopped, whatever status it exited with.
       if (stopped) finishStopped();
     });
     child.once("close", (code) => {
-      settle();
-      if (stopped) {
-        reject(stopped);
-        return;
-      }
-      const truncated = stdout.omittedBytes > 0 || stderr.omittedBytes > 0;
-      resolve({ code: code ?? 1, stdout: stdout.text(), stderr: stderr.text(), ...(truncated ? { outputTruncated: true } : {}) });
+      if (!settled) finish(code);
     });
   });
 }

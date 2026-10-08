@@ -17,7 +17,7 @@ import { ArtifactStore } from "../src/artifacts.js";
 import { BoundedUtf8Text } from "../src/bounded-utf8.js";
 import { ERROR_CODES } from "../src/errors.js";
 import { GatewayService } from "../src/gateway-service.js";
-import { runCommand } from "../src/installer.js";
+import { parseInstallerArgs, runCommand, runInstaller } from "../src/installer.js";
 import { GatewaySettings } from "../src/settings.js";
 import { decodeRecord, statePaths } from "../src/state-store.js";
 
@@ -59,6 +59,15 @@ function processGone(pid) {
   } catch (error) {
     return error.code === "ESRCH";
   }
+}
+
+// The pid a test child wrote to path, or null if it has not written one yet.
+// The file exists a moment before the pid is in it, so waiting on existsSync
+// alone could kill the child first and leave an empty file to read.
+async function pidIn(path) {
+  if (!existsSync(path)) return null;
+  const pid = Number(await readFile(path, "utf8"));
+  return Number.isInteger(pid) && pid > 1 ? pid : null;
 }
 
 // ------------------------------------------------------------- P3: text tails
@@ -293,7 +302,7 @@ test("an aborted installer command is killed, and one aborted before it starts n
       ["-e", `require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); ${HANG}`],
       { signal: controller.signal }
     );
-    await until(() => existsSync(pidFile), "the command to start");
+    await until(async () => (await pidIn(pidFile)) !== null, "the command to start");
     controller.abort(new Error("the Gateway is shutting down"));
     await assert.rejects(running, (error) => error.code === "COMMAND_ABORTED" && /shutting down/.test(error.message));
     assert.equal(processGone(Number(await readFile(pidFile, "utf8"))), true);
@@ -305,6 +314,69 @@ test("an aborted installer command is killed, and one aborted before it starts n
     );
     await delay(200);
     assert.equal(existsSync(marker), false, "nothing was spawned");
+  });
+});
+
+// npm finishing an install on its own while a process its lifecycle script
+// started lives on, holding npm's pipes: the child prints, then exits 0, and
+// the grandchild keeps stdout and stderr open, so "close" never comes.
+function exitsLeavingGrandchild(directory) {
+  const childPid = join(directory, "child");
+  const grandchildPid = join(directory, "grandchild");
+  const script = [
+    "const { spawn } = require('node:child_process');",
+    "const { writeFileSync } = require('node:fs');",
+    `const grandchild = spawn(process.execPath, ['-e', ${JSON.stringify(HANG)}], { stdio: ['ignore', 'inherit', 'inherit'] });`,
+    "grandchild.unref();",
+    `writeFileSync(${JSON.stringify(grandchildPid)}, String(grandchild.pid));`,
+    "process.stdout.write('added 1 package');",
+    "process.stderr.write('npm warn deprecated');",
+    `writeFileSync(${JSON.stringify(childPid)}, String(process.pid));`
+  ].join("\n");
+  return { script, childPid, grandchildPid };
+}
+
+async function killGrandchild(path) {
+  const pid = await pidIn(path);
+  if (pid && !processGone(pid)) process.kill(pid, "SIGKILL");
+}
+
+test("a command that exited 0 on its own resolves with its status and output when the deadline comes while a grandchild holds its pipes", async () => {
+  await withDirectory("late-deadline", async (directory) => {
+    const { script, grandchildPid } = exitsLeavingGrandchild(directory);
+    try {
+      const started = Date.now();
+      // Long enough for the child to start, print and exit well before it.
+      const result = await runCommand(process.execPath, ["-e", script], { timeoutMs: 2_000 });
+      assert.deepEqual(result, { code: 0, stdout: "added 1 package", stderr: "npm warn deprecated" }, "not COMMAND_TIMEOUT");
+      assert.ok(Date.now() - started < 6_000, "the deadline, not the grandchild, ended the wait");
+      const grandchild = await pidIn(grandchildPid);
+      assert.ok(grandchild && !processGone(grandchild), "the grandchild still holds the pipes: \"close\" never came");
+    } finally {
+      await killGrandchild(grandchildPid);
+    }
+  });
+});
+
+test("an abort after a command exited 0 on its own resolves with its status and output, not as aborted", async () => {
+  await withDirectory("late-abort", async (directory) => {
+    const { script, childPid, grandchildPid } = exitsLeavingGrandchild(directory);
+    const controller = new AbortController();
+    try {
+      const running = runCommand(process.execPath, ["-e", script], { signal: controller.signal });
+      // Gone means reaped, and Node emits "exit" as it reaps: runCommand has seen
+      // the exit by the time this holds.
+      await until(async () => {
+        const pid = await pidIn(childPid);
+        return pid !== null && processGone(pid);
+      }, "the command to exit");
+      controller.abort(new Error("the Gateway is shutting down"));
+      assert.deepEqual(await running, { code: 0, stdout: "added 1 package", stderr: "npm warn deprecated" }, "not COMMAND_ABORTED");
+      const grandchild = await pidIn(grandchildPid);
+      assert.ok(grandchild && !processGone(grandchild), "the grandchild still holds the pipes: \"close\" never came");
+    } finally {
+      await killGrandchild(grandchildPid);
+    }
   });
 });
 
@@ -324,6 +396,46 @@ test("installer command output keeps its head and tail and says how much it drop
 
   const small = await runCommand(process.execPath, ["-e", "process.stdout.write('ok')"]);
   assert.deepEqual(small, { code: 0, stdout: "ok", stderr: "" }, "output within the bound is returned as it was");
+});
+
+test("an npm list cut at the output bound fails agent discovery with a warning instead of reporting nothing installed", async () => {
+  await withDirectory("npm-list", async (directory) => {
+    // What `npm list --global --depth=0 --json` prints for a global tree of
+    // count packages, captured under a bound made small for the test.
+    const npmList = (count) => runCommand(process.execPath, ["-e", [
+      `const dependencies = Object.fromEntries(Array.from({ length: ${count} }, (_, index) => ["package-" + index, { version: "1.0.0" }]));`,
+      "process.stdout.write(JSON.stringify({ dependencies }, null, 2));"
+    ].join("\n")], { maxOutputBytes: 64 * 1024 });
+    const calls = [];
+    const discovered = [];
+    const discover = (count) => runInstaller(parseInstallerArgs(["--discover-agents"]), {
+      statePath: join(directory, "install.json"),
+      providerRegistryPath: join(directory, "providers.json"),
+      runtime: { nodeVersion: "22.0.0", platform: "darwin", arch: "arm64" },
+      detectProviders: async () => [],
+      registryLoader: async () => ({ registry: { version: "1.0.0", agents: [] }, source: "network", stale: false }),
+      registryDiscover: async (_registry, { installedPackages }) => {
+        discovered.push([...installedPackages]);
+        return [];
+      },
+      runCommand: async (command, args) => {
+        calls.push([command, ...args].join(" "));
+        return npmList(count);
+      }
+    });
+
+    const cut = await discover(5_000);
+    assert.deepEqual(calls, ["npm list --global --depth=0 --json"]);
+    assert.deepEqual(discovered, [], "discovery never ran on an empty package set");
+    assert.match(cut.registry.error, /^Cannot discover ACP registry agents: npm list --global printed more than the installer captures/);
+    assert.deepEqual(cut.warnings, [cut.registry.error]);
+    assert.deepEqual(cut.registry.configured, []);
+
+    const whole = await discover(3);
+    assert.equal(whole.registry.error, undefined);
+    assert.deepEqual(whole.warnings, []);
+    assert.deepEqual(discovered, [["package-0", "package-1", "package-2"]], "a list within the bound is still read");
+  });
 });
 
 const registry = {
@@ -354,7 +466,7 @@ test("aborting an adapter update kills the install it is running and records why
     const pidFile = join(directory, "pid");
     const manager = hangingUpdates(pidFile);
     const refreshing = manager.refresh();
-    await until(() => existsSync(pidFile), "the install to start");
+    await until(async () => (await pidIn(pidFile)) !== null, "the install to start");
     manager.abort(new Error("the Gateway is shutting down"));
     const state = await refreshing;
     assert.equal(state.status, "error");
@@ -376,7 +488,7 @@ test("shutdown waits a bounded time for an adapter update, aborts it, then stops
       agentUpdateStopMs: 200
     });
     await service.init();
-    await until(() => existsSync(pidFile), "the update to start its install");
+    await until(async () => (await pidIn(pidFile)) !== null, "the update to start its install");
     const started = Date.now();
     const report = await service.shutdown();
     assert.ok(Date.now() - started < 5_000, "a hung install no longer holds shutdown");

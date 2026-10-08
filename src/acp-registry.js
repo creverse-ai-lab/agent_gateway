@@ -253,9 +253,20 @@ export async function mergeProviderDefinitions(path, definitions) {
 }
 
 export async function installedGlobalNpmPackages(run) {
+  let result;
   try {
-    const result = await run("npm", ["list", "--global", "--depth=0", "--json"]);
-    if (result.code !== 0 && !result.stdout) return new Set();
+    result = await run("npm", ["list", "--global", "--depth=0", "--json"]);
+  } catch {
+    return new Set();
+  }
+  if (result.code !== 0 && !result.stdout) return new Set();
+  // Past its capture bound the installer keeps the head and the tail of the
+  // output around a marker, which is no JSON. Read as "nothing installed", that
+  // would hide every global package from discovery, so discovery fails instead.
+  if (result.outputTruncated) {
+    throw new Error("Cannot discover ACP registry agents: npm list --global printed more than the installer captures, so the globally installed npm packages are unknown");
+  }
+  try {
     return new Set(Object.keys(JSON.parse(result.stdout).dependencies ?? {}));
   } catch {
     return new Set();
