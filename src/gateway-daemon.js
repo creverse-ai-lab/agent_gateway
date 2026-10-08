@@ -20,7 +20,7 @@ import { listenPrivately } from "./private-socket.js";
 import { createSocketSender } from "./socket-flow.js";
 import { processIsAlive, statePaths } from "./state-store.js";
 import { GATEWAY_VERSION } from "./version.js";
-import { callerVerdicts } from "./worker-tree.js";
+import { callerVerdicts, workerControlDeniedMessage } from "./worker-tree.js";
 
 // A start that dies before it serves is invisible: autostart spawns this
 // process with stdout and stderr ignored, so the only thing a Main ever sees is
@@ -148,10 +148,11 @@ const server = createServer((socket) => {
             // on the same lookup, in order.
             const verdict = callerVerdict(caller?.pid);
             if (verdict) {
-              if (await verdict.denied) {
+              const deniedReason = await verdict.denied;
+              if (deniedReason) {
                 throw new GatewayError(
                   ERROR_CODES.WORKER_CONTROL_DENIED,
-                  `Control access denied: caller process ${verdict.pid} runs inside a Gateway worker`
+                  workerControlDeniedMessage(deniedReason, verdict.pid)
                 );
               }
               // While it waited the connection may have closed, and its close

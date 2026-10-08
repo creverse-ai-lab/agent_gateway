@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { link, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -204,6 +204,57 @@ test("a hard link to a protected file is refused for reads and writes, and an or
     } finally {
       await handle.close();
     }
+  });
+});
+
+// Review: the inode scan swallowed every stat/readdir error, so a protected file
+// it could not see was treated as absent and the open was allowed — a hard link
+// to the token became readable while its directory was briefly unlistable.
+test("the inode check fails closed when a protected path faults, and skips one that is absent", async () => {
+  await withLayout(async ({ root, secret, options }) => {
+    // A protected path the Gateway cannot stat (here it runs through a file, so
+    // ENOTDIR, standing in for EACCES or EIO) could be hiding the token: the open
+    // is refused rather than waved through on a swallowed error.
+    const faulting = join(secret, "within");
+    for (const write of [false, true]) {
+      await assert.rejects(
+        openWorkerFile(join(root, "a.txt"), { ...options, write, protectedPaths: [faulting] }),
+        /Cannot verify a path is not Gateway-protected/
+      );
+    }
+    // A protected path that is simply absent (ENOENT) protects nothing: the same
+    // open is allowed, so a missing settings or state directory does not refuse reads.
+    const handle = await openWorkerFile(join(root, "a.txt"), { ...options, protectedPaths: [join(root, "gone")] });
+    try {
+      assert.equal(await readAll(handle), "inside\nsecond line");
+    } finally {
+      await handle.close();
+    }
+    assert.equal(await readFile(secret, "utf8"), TOKEN);
+  });
+});
+
+test("the inode check fails closed when a protected directory cannot be listed", {
+  skip: typeof process.getuid === "function" && process.getuid() === 0
+}, async () => {
+  await withLayout(async ({ root, guarded, secret, options }) => {
+    // Mode 000: the directory cannot be listed, so the token it holds cannot be
+    // ruled out and even an ordinary in-root open is refused.
+    await chmod(guarded, 0o000);
+    try {
+      await assert.rejects(openWorkerFile(join(root, "a.txt"), options), /Cannot list a Gateway-protected directory/);
+      await assert.rejects(openWorkerFile(join(root, "a.txt"), { ...options, write: true }), /Cannot list a Gateway-protected directory/);
+    } finally {
+      await chmod(guarded, 0o700);
+    }
+    // Listable again: ordinary in-root files read, and the token is untouched.
+    const handle = await openWorkerFile(join(root, "a.txt"), options);
+    try {
+      assert.equal(await readAll(handle), "inside\nsecond line");
+    } finally {
+      await handle.close();
+    }
+    assert.equal(await readFile(secret, "utf8"), TOKEN);
   });
 });
 

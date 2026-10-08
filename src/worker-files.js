@@ -157,21 +157,41 @@ async function verifyOpened(handle, requested, path, { roots, protectedPaths, pl
  * comparing regular files is enough, and the walk stays one level deep: those
  * files sit directly in the directory, and recursing would stat the snapshot and
  * workspace trees on every read. Resolved per call, so a file recreated with a
- * new inode is never matched by a stale one.
+ * new inode is never matched by a stale one. Fails closed: a protected path,
+ * directory, or child the Gateway cannot stat or list could be the file the
+ * descriptor holds under a mode or a fault that hides it, so it throws rather
+ * than wave the open through. Only a path that is genuinely absent (ENOENT)
+ * protects nothing and is skipped.
  */
 async function descriptorIsProtected(opened, protectedPaths) {
   const sameFile = (info) => info?.isFile() && info.dev === opened.dev && info.ino === opened.ino;
+  // stat, treating "not there" as nothing to protect and anything else — a denied
+  // or faulting protected path — as a file that cannot be ruled out: fail closed.
+  const statOrRefuse = async (path) => {
+    try {
+      return await stat(path, { bigint: true });
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      throw new Error(`Cannot verify a path is not Gateway-protected: ${path}`, { cause: error });
+    }
+  };
   for (const base of protectedPaths) {
-    const info = await stat(base, { bigint: true }).catch(() => null);
+    const info = await statOrRefuse(base);
     if (sameFile(info)) return true;
     if (!info?.isDirectory()) continue;
-    const entries = await readdir(base, { withFileTypes: true }).catch(() => []);
+    let entries;
+    try {
+      entries = await readdir(base, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw new Error(`Cannot list a Gateway-protected directory: ${base}`, { cause: error });
+    }
     for (const entry of entries) {
       // A dirent of a known other kind is skipped without a stat; an unknown one
       // (some filesystems leave the type out) is settled by the stat.
       if (entry.isDirectory() || entry.isSymbolicLink() || entry.isSocket()
         || entry.isBlockDevice() || entry.isCharacterDevice() || entry.isFIFO()) continue;
-      if (sameFile(await stat(join(base, entry.name), { bigint: true }).catch(() => null))) return true;
+      if (sameFile(await statOrRefuse(join(base, entry.name)))) return true;
     }
   }
   return false;

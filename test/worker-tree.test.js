@@ -13,7 +13,8 @@ import { readNdjson } from "../src/ndjson.js";
 import { GatewayRpcClient } from "../src/socket-rpc.js";
 import {
   callerVerdicts, canReadAncestry, daemonLockPid, findAncestor, MAX_ANCESTRY_DEPTH, readProcessInfo, runsGatewayDaemon,
-  runsUnder, WORKER_TREE_EXIT_CODE, workerTreeReason
+  runsUnder, WORKER_CALLER_ANCESTRY_UNVERIFIABLE, WORKER_CALLER_UNDER_DAEMON, WORKER_TREE_EXIT_CODE,
+  workerControlDeniedMessage, workerTreeReason
 } from "../src/worker-tree.js";
 import { startDaemon } from "./helpers/daemon-harness.js";
 import { withTemp } from "./helpers/scratch.js";
@@ -140,7 +141,7 @@ test("W1: pid 1 is the top of every chain, never the daemon, even when the lock 
     assert.equal(await findAncestor(1, { pids: [1], readProcess: () => assert.fail("pid 1 is never read") }), null);
     // The daemon's side: everything runs under it, so ancestry refuses nobody.
     assert.equal(await runsUnder(100, 1, { readProcess }), false);
-    assert.equal(await callerVerdicts({ daemonPid: 1, readProcess })(100).denied, false);
+    assert.equal(await callerVerdicts({ daemonPid: 1, readProcess })(100).denied, null);
     // There the marker alone tells its workers apart.
     assert.equal(await workerTreeReason({ env: { [GATEWAY_WORKER_ENV]: "1" }, ppid: 100, socketPath, readProcess }), "ACP_GATEWAY_WORKER=1 is set");
   });
@@ -241,12 +242,24 @@ test("F6: an unreadable ancestry fails closed at the front door and the daemon, 
       await workerTreeReason({ env: {}, ppid: 100, socketPath: "/nonexistent/gateway.sock", readProcess }),
       /process ancestry cannot be read/
     );
-    assert.equal(await callerVerdicts({ daemonPid: 40, readProcess })(100).denied, true, "the daemon refuses the caller pid");
+    // Refused as unverifiable, not mislabelled a worker that runs under the daemon.
+    assert.equal(await callerVerdicts({ daemonPid: 40, readProcess })(100).denied, WORKER_CALLER_ANCESTRY_UNVERIFIABLE);
   }
   // The marker decides before any lookup, unreadable chain or not.
   assert.equal(
     await workerTreeReason({ env: { [GATEWAY_WORKER_ENV]: "1" }, ppid: 100, socketPath: "/nonexistent/gateway.sock", readProcess: () => assert.fail("the marker decides first") }),
     "ACP_GATEWAY_WORKER=1 is set"
+  );
+});
+
+test("F6: the daemon denial reason words the unverifiable host apart from a worker", () => {
+  assert.equal(
+    workerControlDeniedMessage(WORKER_CALLER_UNDER_DAEMON, 4242),
+    "Control access denied: caller process 4242 runs inside a Gateway worker"
+  );
+  assert.equal(
+    workerControlDeniedMessage(WORKER_CALLER_ANCESTRY_UNVERIFIABLE, 4242),
+    "Control access denied: caller process 4242 ancestry cannot be verified on this host"
   );
 });
 
@@ -256,7 +269,7 @@ test("F6: a readable chain with no daemon is allowed, and a no-caller request is
   // host healthy and the caller merely outside it.
   const { readProcess } = processTable({ 100: [90, "/bin/zsh"], 90: [1, "/sbin/launchd"], 40: [1, "node /x/gateway-daemon.js"] });
   assert.equal(await workerTreeReason({ env: {}, ppid: 100, socketPath: "/nonexistent/gateway.sock", readProcess }), null);
-  assert.equal(await callerVerdicts({ daemonPid: 40, readProcess })(100).denied, false);
+  assert.equal(await callerVerdicts({ daemonPid: 40, readProcess })(100).denied, null);
   // A management request names no caller: a fresh connection asked for none has
   // no verdict and is never looked up.
   assert.equal(callerVerdicts({ daemonPid: 40, readProcess })(undefined), null);
@@ -273,7 +286,7 @@ test("F6: where no host can read ancestry at all (no /proc, no ps), an unreadabl
     await workerTreeReason({ env: {}, ppid: 100, socketPath: "/nonexistent/gateway.sock", readProcess: unreadable, ancestrySupported: false }),
     null
   );
-  assert.equal(await callerVerdicts({ daemonPid: 40, readProcess: unreadable, ancestrySupported: false })(100).denied, false);
+  assert.equal(await callerVerdicts({ daemonPid: 40, readProcess: unreadable, ancestrySupported: false })(100).denied, null);
 });
 
 test("W1: the daemon lock yields a pid only when it holds one", async () => {
@@ -294,7 +307,7 @@ test("W1: a connection's caller is looked up once per pid, and a pid-less reques
   assert.equal(verdictFor(1), null, "pid 1 is no caller");
   const first = verdictFor(100);
   assert.equal(first.pid, 100);
-  assert.equal(await first.denied, true);
+  assert.equal(await first.denied, WORKER_CALLER_UNDER_DAEMON);
   assert.equal(verdictFor(100), first);
   assert.equal(verdictFor(null), first);
   assert.deepEqual(reads, [100, 50, 45], "one lookup while the pid stays the same");
@@ -302,14 +315,14 @@ test("W1: a connection's caller is looked up once per pid, and a pid-less reques
   // under the daemon: a denial is not kept for the connection.
   const second = verdictFor(300);
   assert.notEqual(second, first);
-  assert.equal(await second.denied, false);
+  assert.equal(await second.denied, null);
   // 300 is read and found not under the daemon; then (F6) the daemon reads its
   // own live pid once to confirm the host can place callers at all, so 300 is a
   // caller outside it rather than one it cannot read.
   assert.deepEqual(reads, [100, 50, 45, 300, 40]);
   // The daemon itself as the caller's agent CLI: under the daemon by the walk, so
   // it is refused before any probe (the reader is never called).
-  assert.equal(await callerVerdicts({ daemonPid: 40, readProcess: () => assert.fail() })(40).denied, true);
+  assert.equal(await callerVerdicts({ daemonPid: 40, readProcess: () => assert.fail() })(40).denied, WORKER_CALLER_UNDER_DAEMON);
 });
 
 test("W1: the process reader reads this platform's processes", { skip: !unix }, async () => {

@@ -205,17 +205,30 @@ export async function runsUnder(pid, daemonPid, { readProcess = readProcessInfo,
   return (await findAncestor(pid, { pids: [daemonPid], readProcess, maxDepth })) !== null;
 }
 
+// Why callerVerdicts refuses a caller: it runs under the daemon, so it is a
+// worker's; or this process cannot read ancestry on the host and so cannot place
+// it, which is refused as unverifiable rather than mislabelled a worker.
+export const WORKER_CALLER_UNDER_DAEMON = "under_daemon";
+export const WORKER_CALLER_ANCESTRY_UNVERIFIABLE = "ancestry_unverifiable";
+
+/** The WORKER_CONTROL_DENIED message for a callerVerdicts refusal reason. */
+export function workerControlDeniedMessage(reason, pid) {
+  return reason === WORKER_CALLER_ANCESTRY_UNVERIFIABLE
+    ? `Control access denied: caller process ${pid} ancestry cannot be verified on this host`
+    : `Control access denied: caller process ${pid} runs inside a Gateway worker`;
+}
+
 /**
  * One control connection's verdict on its caller. Called with each request's
  * caller pid, it returns null while the connection has named none, else
- * {pid, denied}: denied a promise of whether that pid is a worker's — it runs
- * under the daemon, or the host cannot read process ancestry at all and so cannot
- * place it, which fails closed the same way the front door does. The verdict is
- * computed for the first pid and reused while the pid stays the same, which it
- * does for a front door, so a connection pays for one lookup; a request that
- * names another pid gets a lookup, and a verdict, of its own. A request with no
- * pid gets the connection's latest verdict, so it waits behind a lookup in flight
- * instead of overtaking the requests before it.
+ * {pid, denied}: denied a promise of the reason that pid is refused — it runs
+ * under the daemon (a worker's), or the host cannot read ancestry and so cannot
+ * place it — or null when it is allowed. The verdict is computed for the first
+ * pid and reused while the pid stays the same, which it does for a front door, so
+ * a connection pays for one lookup; a request that names another pid gets a
+ * lookup, and a verdict, of its own. A request with no pid gets the connection's
+ * latest verdict, so it waits behind a lookup in flight instead of overtaking the
+ * requests before it.
  */
 export function callerVerdicts({ daemonPid = process.pid, ancestrySupported = canReadAncestry(), ...options } = {}) {
   let verdict = null;
@@ -227,21 +240,21 @@ export function callerVerdicts({ daemonPid = process.pid, ancestrySupported = ca
   };
 }
 
-// Whether a caller pid is a worker's. Under the daemon is the clear case. The
-// walk not placing it there is not: unlike the front door, which walks from its
-// own live parent, the daemon walks from a caller pid it does not control, and
-// that pid may simply be gone — no worker. So a broken host is told from a gone
-// pid by reading a process known to be alive, the daemon itself: a read that
-// fails there means the host cannot place any caller and fails closed; one that
-// succeeds means the caller really runs outside the daemon. Windows, which can
-// read no ancestry (ancestrySupported false), stays marker-only.
+// The reason a caller pid is refused, or null. Under the daemon is the clear
+// case. The walk not placing it there is not: unlike the front door, which walks
+// from its own live parent, the daemon walks from a caller pid it does not
+// control, and that pid may simply be gone — no worker. So a broken host is told
+// from a gone pid by reading a process known to be alive, the daemon itself: a
+// read that fails there means the host cannot place any caller (unverifiable);
+// one that succeeds means the caller really runs outside the daemon. Windows,
+// which can read no ancestry (ancestrySupported false), stays marker-only.
 async function callerDenied(pid, daemonPid, ancestrySupported, options) {
-  if (await runsUnder(pid, daemonPid, options)) return true;
-  if (!ancestrySupported) return false;
+  if (await runsUnder(pid, daemonPid, options)) return WORKER_CALLER_UNDER_DAEMON;
+  if (!ancestrySupported) return null;
   const readProcess = options.readProcess ?? readProcessInfo;
   try {
-    return (await readProcess(daemonPid)) === null;
+    return (await readProcess(daemonPid)) === null ? WORKER_CALLER_ANCESTRY_UNVERIFIABLE : null;
   } catch {
-    return true;
+    return WORKER_CALLER_ANCESTRY_UNVERIFIABLE;
   }
 }
