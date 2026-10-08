@@ -221,6 +221,9 @@ export class GatewayService {
     // Canonical paths no worker may read or write (Control token, settings,
     // state, socket). Injectable so tests can point them at a temp directory.
     protectedPaths = null,
+    // The OS sandbox Gateway terminals run in (terminal-sandbox.js): left out,
+    // each client uses what this OS offers; null, none. Injectable for tests.
+    terminalSandbox = undefined,
     // Where workspace=snapshot copies live. Never under a protected path.
     workspaceRoot = defaultWorkspaceRoot(),
     // Every live snapshot copy together, checked at session_open (workspace.js).
@@ -263,6 +266,7 @@ export class GatewayService {
     this.settings = settings;
     this.protectedPaths = protectedPaths
       ?? gatewayProtectedPaths(statePath ? { statePath } : {});
+    this.terminalSandbox = terminalSandbox;
     this.draining = false;
     this.inflightMutations = 0;
     this.pendingSessions = new Map();
@@ -3297,11 +3301,15 @@ export class GatewayService {
       maxTerminalsPerSession: this.resourceLimits.maxTerminalsPerSession,
       maxPendingRequestsPerSession: this.resourceLimits.maxPendingRequestsPerSession,
       maxInboxItemBytes: this.resourceLimits.maxInboxItemBytes,
+      // A write or terminal waiting for Main is pending input like a
+      // permission request, and shares its per-session byte budget.
+      maxPendingInputBytesPerSession: this.resourceLimits.maxPendingInboxBytesPerSession,
       maxFrameBytes: this.resourceLimits.maxFrameBytes,
       maxFileReadBytes: this.resourceLimits.maxFileReadBytes,
       maxTerminalOutputBytes: this.resourceLimits.maxTerminalOutputBytes,
       writeTimeoutMs: this.resourceLimits.writeTimeoutMs,
       protectedPaths: this.protectedPaths,
+      terminalSandbox: this.terminalSandbox,
       onExit: (error) => {
         const text = error?.message ?? String(error);
         // Through each session's mailbox: a close already in flight has to finish

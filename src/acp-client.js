@@ -1,16 +1,17 @@
 import { spawn } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { realpath } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { BoundedUtf8Text, readTextHead, readTextLines } from "./bounded-utf8.js";
 import { workerEnv } from "./caller.js";
 import { ERROR_CODES, GatewayError } from "./errors.js";
 import { readNdjson } from "./ndjson.js";
 import { LANE_HIGH, LANE_NORMAL, NdjsonChannel } from "./ndjson-channel.js";
+import { detectTerminalSandbox } from "./terminal-sandbox.js";
 import { GATEWAY_VERSION } from "./version.js";
 import { ACP_PROTOCOL_VERSION } from "./acp-version.js";
-import { isWithin, openWorkerFile } from "./worker-files.js";
+import { isWithin, openWorkerFile, requireWorkerPath, workerFilePathSync } from "./worker-files.js";
 
 export const PERMISSION_POLICIES = ["ask", "read_only", "auto_approve"];
 const READ_ONLY_TOOL_KINDS = new Set(["read", "search", "think", "fetch"]);
@@ -35,6 +36,14 @@ const CLIENT_REQUEST_PREFIXES = ["fs/", "terminal/"];
 // HIGH lane's derived share is an eighth of this number. What actually ends a child
 // that has stopped reading its stdin is the no-progress deadline, not a byte cap.
 const CHILD_STDIN_QUEUE_BYTES = 128 * 1024 * 1024;
+// How long a process the Gateway ends gets after SIGTERM before SIGKILL, and
+// how long it then gets to be gone before a stop() stops waiting for it.
+const KILL_GRACE_MS = 2_000;
+// Approvals that wait for their operation, per session. Main has to click each
+// one, so this only bounds what a long turn whose worker never consumes them
+// (Codex runs its own commands) keeps; the oldest goes first, and a dropped one
+// only means Main is asked again.
+const MAX_GRANTS_PER_SESSION = 64;
 
 // Lane C has no droppable traffic. Responses to agent-initiated requests and
 // cancels are HIGH because the agent is blocked on them, so a dropped frame is a
@@ -52,6 +61,11 @@ export class AcpClient {
     this.maxTerminalsPerSession = options.maxTerminalsPerSession ?? 16;
     this.maxPendingRequestsPerSession = options.maxPendingRequestsPerSession ?? 64;
     this.maxInboxItemBytes = options.maxInboxItemBytes ?? 64 * 1024;
+    // The per-session byte budget of what waits for Main. A write or terminal
+    // waiting for approval holds its whole payload (a write can carry most of a
+    // 32 MiB frame), so it counts against this the way the inbox counts the
+    // permission requests it holds (maxPendingInboxBytesPerSession).
+    this.maxPendingInputBytesPerSession = options.maxPendingInputBytesPerSession ?? 512 * 1024;
     this.maxFrameBytes = options.maxFrameBytes ?? 32 * 1024 * 1024;
     this.maxFileReadBytes = options.maxFileReadBytes ?? 500_000;
     // The clamp that has always been here as a literal, now named. Same default,
@@ -60,6 +74,12 @@ export class AcpClient {
     this.maxQueueBytes = options.maxQueueBytes ?? CHILD_STDIN_QUEUE_BYTES;
     // Canonical paths no session may touch, even when a root contains them.
     this.protectedPaths = [...(options.protectedPaths ?? [])];
+    // What keeps a Gateway terminal off the protected paths besides the string
+    // checks (terminal-sandbox.js): left out, whatever this OS offers; null,
+    // none. Without one, auto_approve no longer starts terminals on its own.
+    this.terminalSandbox = options.terminalSandbox === undefined ? detectTerminalSandbox() : options.terminalSandbox;
+    // SIGTERM to SIGKILL for the provider and terminals. Injectable for tests.
+    this.killGraceMs = options.killGraceMs ?? KILL_GRACE_MS;
     this.writeTimeoutMs = options.writeTimeoutMs;
     this.proc = null;
     this.rl = null;
@@ -70,6 +90,8 @@ export class AcpClient {
     this.pendingPermissions = new Map();
     this.pendingElicitations = new Map();
     this.pendingOperations = new Map();
+    // sessionId -> approvals Main gave a worker's execute or edit request, each
+    // bound to the command or the files it named, until the turn ends.
     this.sessionOperationGrants = new Map();
     this.sessionHandlers = new Map();
     this.sessionRoots = new Map();
@@ -180,9 +202,17 @@ export class AcpClient {
     const channel = this.channel;
     this.channel = null;
     await channel?.close({ flushMs: 250 });
-    this.proc?.stdin?.end();
-    this.proc?.kill("SIGTERM");
-    for (const terminal of this.terminals.values()) terminal.child.kill("SIGTERM");
+    // SIGTERM, then SIGKILL after the grace, and each one waited for (bounded):
+    // a provider or a terminal that ignores SIGTERM, or what a terminal started
+    // in its process group, must not outlive the stop that unloads them. The
+    // references are dropped only after that wait, so the SIGKILL still has a
+    // process to reach. The provider usually exits on the stdin EOF first.
+    const proc = this.proc;
+    proc?.stdin?.end();
+    await Promise.all([
+      proc ? endProvider(proc, this.killGraceMs) : null,
+      ...[...this.terminals.values()].map((terminal) => endTerminal(terminal, this.killGraceMs))
+    ]);
     this.terminals.clear();
     this.proc = null;
     this.initResult = null;
@@ -349,10 +379,12 @@ export class AcpClient {
       throw new Error(`Invalid permission option: ${optionId}`);
     }
     this.pendingPermissions.delete(rpcId);
-    if (!READ_ONLY_TOOL_KINDS.has(pending.params.toolCall?.kind) && optionId && (pending.params.options ?? []).some(
+    // Approving an execute or edit request lets the worker carry out that
+    // request through the Gateway: the command it named, or the files.
+    if (pending.params.grant && optionId && (pending.params.options ?? []).some(
       (option) => option.optionId === optionId && /^allow_/.test(option.kind ?? "")
     )) {
-      this.#addOperationGrant(pending.params.sessionId, grantKindForTool(pending.params.toolCall?.kind));
+      this.#addOperationGrant(pending.params.sessionId, pending.params.grant);
     }
     const outcome = optionId
       ? { outcome: "selected", optionId }
@@ -431,7 +463,9 @@ export class AcpClient {
           const retained = {
             sessionId: params.sessionId,
             toolCall: { kind: params.toolCall?.kind },
-            options: (params.options ?? []).map((option) => ({ optionId: option.optionId, kind: option.kind }))
+            options: (params.options ?? []).map((option) => ({ optionId: option.optionId, kind: option.kind })),
+            // Taken now, from what Main is shown, not from a later request.
+            grant: this.#grantFor(params)
           };
           this.pendingPermissions.set(id, { rpcId: id, params: retained });
           try {
@@ -556,9 +590,7 @@ export class AcpClient {
     const roots = this.sessionRoots.get(params.sessionId) ?? [];
     // A shell command names its files inside a string. It cannot be parsed
     // reliably, but naming a protected path in any spelling is enough to refuse.
-    const command = commandText(params.toolCall?.rawInput);
-    if (mentionsProtectedPath(command, this.protectedPaths)
-      || commandPathsHitProtected(command, roots[0], this.protectedPaths)) return "protected";
+    if (this.#namesProtectedPath(commandText(params.toolCall?.rawInput), roots[0])) return "protected";
     let outside = false;
     for (const requested of requestedPaths(params.toolCall)) {
       const path = canonicalizePhysical(isAbsolute(requested) ? requested : `${roots[0] ?? ""}/${requested}`);
@@ -566,6 +598,34 @@ export class AcpClient {
       if (!roots.some((root) => isWithin(root, path))) outside = true;
     }
     return outside ? "outside" : "inside";
+  }
+
+  // The string checks on a command line, best effort: a protected path in any
+  // spelling the shell would expand, a word that resolves into one from cwd,
+  // and any .acp-gateway path segment. Nothing to find when nothing is protected.
+  #namesProtectedPath(command, cwd) {
+    if (!command || !this.protectedPaths.length) return false;
+    return mentionsProtectedPath(command, this.protectedPaths)
+      || commandPathsHitProtected(command, cwd, this.protectedPaths)
+      || namesGatewayDirectory(command);
+  }
+
+  // The approval a worker's execute or edit permission request would become:
+  // the command it names, or the files, in the form a later terminal/create or
+  // fs/write_text_file is compared in. Null when it names none, and then
+  // approving it lets nothing through on its own.
+  #grantFor(params) {
+    const kind = grantKindForTool(params.toolCall?.kind);
+    if (kind === "terminal") {
+      const command = approvedCommand(params.toolCall?.rawInput);
+      return command ? { kind, command } : null;
+    }
+    if (kind === "write") {
+      const root = this.sessionRoots.get(params.sessionId)?.[0] ?? "";
+      const paths = new Set(requestedPaths(params.toolCall).map((path) => grantPath(isAbsolute(path) ? path : join(root, path))));
+      return paths.size ? { kind, paths } : null;
+    }
+    return null;
   }
 
   // Truncate, never refuse: the ACP contract has no way to say "too large", and a
@@ -618,27 +678,59 @@ export class AcpClient {
     }
   }
 
-  async #createTerminal(params) {
+  // A terminal/create, checked: cwd inside the roots, a command, args that are
+  // strings, and no word that names a protected path. Before Main is asked, so
+  // Main is never shown a request that cannot run or that names a protected
+  // path, and again when the terminal starts, which can be long after.
+  #terminalRequest(params) {
     const roots = this.sessionRoots.get(params.sessionId) ?? [];
-    const cwd = await realpath(resolve(params.cwd ?? roots[0] ?? process.cwd()));
+    const cwd = realpathSync(resolve(params.cwd ?? roots[0] ?? process.cwd()));
     if (!roots.some((root) => isWithin(root, cwd))) throw new Error(`Terminal cwd is outside ACP session roots: ${cwd}`);
     if (typeof params.command !== "string" || !params.command) throw new Error("Terminal command is required");
-    const commandLine = [params.command, ...(params.args ?? [])].join(" ");
-    if (mentionsProtectedPath(commandLine, this.protectedPaths) || commandPathsHitProtected(commandLine, cwd, this.protectedPaths)) {
+    const args = params.args ?? [];
+    if (!Array.isArray(args) || args.some((arg) => typeof arg !== "string")) {
+      throw new Error("Terminal args must be an array of strings");
+    }
+    const env = params.env ?? [];
+    if (!Array.isArray(env) || env.some((entry) => typeof entry?.name !== "string")) {
+      throw new Error("Terminal env must be an array of {name, value}");
+    }
+    if (this.#namesProtectedPath([params.command, ...args].join(" "), cwd)) {
       throw new Error("Terminal command names a path protected by the Gateway");
     }
+    return { cwd, command: params.command, args, env };
+  }
+
+  // The sandbox a terminal of this client runs in, or null: none is needed when
+  // nothing is protected, and one that cannot apply a profile here is none.
+  async #terminalSandboxReady() {
+    if (!this.protectedPaths.length || !this.terminalSandbox) return null;
+    try {
+      return (await (this.terminalSandbox.ready?.() ?? true)) ? this.terminalSandbox : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async #createTerminal(params) {
+    const request = this.#terminalRequest(params);
+    // Before the limit check, which has to stay in one turn with the insert.
+    const sandbox = await this.#terminalSandboxReady();
+    // A stop() that began meanwhile would not wait for this terminal.
+    if (!this.alive) throw new Error("ACP client stopped");
     const activeForSession = [...this.terminals.values()].filter((item) => item.sessionId === params.sessionId).length;
     if (activeForSession >= this.maxTerminalsPerSession) {
       throw new Error(`ACP session terminal limit exceeded: ${this.maxTerminalsPerSession}`);
     }
     const terminalId = `terminal-${this.nextId++}`;
     const limit = Math.min(Math.max(Number(params.outputByteLimit ?? 1_000_000), 1), this.maxTerminalOutputBytes);
+    const launch = sandbox ? sandbox.wrap(request.command, request.args, this.protectedPaths) : request;
     // Same scrub and marker as the worker's own env. What the worker asks for
     // explicitly is its own identity, not the Main's, and is kept; the marker
     // is not the worker's to remove.
-    const child = spawn(params.command, params.args ?? [], {
-      cwd,
-      env: workerEnv(Object.fromEntries((params.env ?? []).map(({ name, value }) => [name, value]))),
+    const child = spawn(launch.command, launch.args, {
+      cwd: request.cwd,
+      env: workerEnv(Object.fromEntries(request.env.map(({ name, value }) => [name, value]))),
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32"
     });
@@ -705,7 +797,7 @@ export class AcpClient {
 
   #releaseTerminal(params) {
     const terminal = this.#terminal(params.sessionId, params.terminalId);
-    if (!terminal.exitStatus) terminateChild(terminal);
+    if (!terminal.exitStatus) terminateChild(terminal, this.killGraceMs);
     this.terminals.delete(params.terminalId);
     return {};
   }
@@ -741,15 +833,20 @@ export class AcpClient {
   async #runProtectedOperation(id, method, params, run) {
     const policy = this.sessionPolicies.get(params.sessionId) ?? this.permissionPolicy;
     if (policy === "read_only") throw new Error("Session permission policy is read_only");
-    if (policy === "auto_approve") {
+    // Checked before anything is decided: what cannot run is refused here and
+    // never reaches Main, and what can is described the way Main will see it.
+    const operation = method === "fs/write_text_file"
+      ? this.#writeOperation(id, params)
+      : this.#terminalOperation(id, params);
+    // auto_approve runs a write, and a terminal the OS keeps off the protected
+    // paths (or when nothing is protected). Without that, all that stands
+    // between a terminal and install.json is its command line, which a shell
+    // can always hide behind cd, a variable or a script, so Main sees it first.
+    if (policy === "auto_approve" && (operation.kind === "write" || await this.#terminalConfined())) {
       this.#respond(id, await run() ?? {});
       return;
     }
-    const operationKind = method === "fs/write_text_file" ? "write" : "terminal";
-    const sessionGrants = this.sessionOperationGrants.get(params.sessionId);
-    const grants = sessionGrants?.get(operationKind) ?? 0;
-    if (grants > 0) {
-      sessionGrants.set(operationKind, grants - 1);
+    if (this.#consumeGrant(params.sessionId, operation)) {
       this.#respond(id, await run() ?? {});
       return;
     }
@@ -758,40 +855,118 @@ export class AcpClient {
       { optionId: "reject-once", name: "Reject", kind: "reject_once" }
     ];
     this.#requirePendingInputCapacity(params.sessionId);
+    this.#requirePendingOperationBytes(params.sessionId, operation.bytes);
     await new Promise((done) => {
       this.pendingOperations.set(id, {
         sessionId: params.sessionId,
-        operationKind,
+        operationKind: operation.kind,
+        bytes: operation.bytes,
         options,
         run,
         resolve: (result) => { this.#respond(id, result ?? {}); done(); },
         reject: (error) => { this.#respondError(id, -32001, error.message); done(); }
       });
-      this.sessionHandlers.get(params.sessionId)?.({
-        sessionUpdate: "permission_request",
-        requestId: id,
-        toolCall: { toolCallId: `client-${id}`, title: method, kind: method === "fs/write_text_file" ? "edit" : "execute" },
-        options
-      });
+      try {
+        this.sessionHandlers.get(params.sessionId)?.({
+          sessionUpdate: "permission_request",
+          requestId: id,
+          toolCall: operation.toolCall,
+          options
+        });
+      } catch (error) {
+        this.pendingOperations.delete(id);
+        throw error;
+      }
     });
+  }
+
+  // A fs/write_text_file as Main is asked about it: the file, resolved the way
+  // the write will resolve it, and the size. Refused now when the write could
+  // not happen anyway (outside the roots, protected, no such directory).
+  #writeOperation(id, params) {
+    if (typeof params.path !== "string" || !params.path) throw new Error("Write path is required");
+    const path = requireWorkerPath(workerFilePathSync(params.path, { allowMissing: true }), {
+      roots: this.sessionRoots.get(params.sessionId) ?? [],
+      protectedPaths: this.protectedPaths
+    });
+    const bytes = Buffer.byteLength(String(params.content ?? ""), "utf8");
+    return {
+      kind: "write",
+      path,
+      // What waiting for Main holds: the content, and the path.
+      bytes: bytes + Buffer.byteLength(path),
+      toolCall: {
+        toolCallId: `client-${id}`,
+        title: `Write ${displayText(path)} (${bytes} ${bytes === 1 ? "byte" : "bytes"})`,
+        kind: "edit",
+        locations: [{ path }],
+        rawInput: { path, bytes }
+      }
+    };
+  }
+
+  // A terminal/create as Main is asked about it: the command, its args, the
+  // working directory and the names of the env vars it sets, never their
+  // values, which can be a credential the worker passes along.
+  #terminalOperation(id, params) {
+    const request = this.#terminalRequest(params);
+    return {
+      kind: "terminal",
+      command: argvCommand([request.command, ...request.args]),
+      // What waiting for Main holds: the whole request, env values included.
+      bytes: Buffer.byteLength(JSON.stringify({ command: request.command, args: request.args, cwd: request.cwd, env: request.env })),
+      toolCall: {
+        toolCallId: `client-${id}`,
+        title: `Run: ${displayText(displayCommand(request.command, request.args), TITLE_COMMAND_CHARS)}`,
+        kind: "execute",
+        rawInput: {
+          command: request.command,
+          args: request.args,
+          cwd: request.cwd,
+          env: request.env.map((entry) => entry.name)
+        }
+      }
+    };
+  }
+
+  // Whether a terminal of this client is kept off the protected paths by more
+  // than its command line: by the OS sandbox, or because nothing is protected.
+  async #terminalConfined() {
+    return !this.protectedPaths.length || (await this.#terminalSandboxReady()) !== null;
   }
 
   #closeSessionTerminals(sessionId) {
     for (const [terminalId, terminal] of this.terminals) {
       if (terminal.sessionId !== sessionId) continue;
-      if (!terminal.exitStatus) terminateChild(terminal);
+      if (!terminal.exitStatus) terminateChild(terminal, this.killGraceMs);
       this.terminals.delete(terminalId);
     }
   }
 
-  #addOperationGrant(sessionId, operationKind) {
-    if (!operationKind) return;
+  #addOperationGrant(sessionId, grant) {
     let grants = this.sessionOperationGrants.get(sessionId);
     if (!grants) {
-      grants = new Map();
+      grants = [];
       this.sessionOperationGrants.set(sessionId, grants);
     }
-    grants.set(operationKind, (grants.get(operationKind) ?? 0) + 1);
+    grants.push(grant);
+    if (grants.length > MAX_GRANTS_PER_SESSION) grants.shift();
+  }
+
+  // Spends the approval that covers this operation, if one does: a terminal
+  // whose command is the approved one, a write to an approved file. Each
+  // approved file once, the command once. Anything else is asked about anew.
+  #consumeGrant(sessionId, operation) {
+    const grants = this.sessionOperationGrants.get(sessionId);
+    const index = grants?.findIndex((grant) => grant.kind === operation.kind && (operation.kind === "write"
+      ? grant.paths.has(operation.path)
+      : grant.command === operation.command)) ?? -1;
+    if (index === -1) return false;
+    const grant = grants[index];
+    if (operation.kind === "write" && grant.paths.size > 1) grant.paths.delete(operation.path);
+    else grants.splice(index, 1);
+    if (!grants.length) this.sessionOperationGrants.delete(sessionId);
+    return true;
   }
 
   #requirePendingInputCapacity(sessionId) {
@@ -805,6 +980,19 @@ export class AcpClient {
     const bytes = Buffer.byteLength(JSON.stringify(params ?? null));
     if (bytes > this.maxInboxItemBytes) {
       throw new Error(`ACP pending input payload exceeds ${this.maxInboxItemBytes} bytes`);
+    }
+  }
+
+  // What the session's operations waiting for Main hold, with this one. An
+  // operation's bytes are released when it leaves pendingOperations, however
+  // it ends.
+  #requirePendingOperationBytes(sessionId, bytes) {
+    let held = 0;
+    for (const operation of this.pendingOperations.values()) {
+      if (operation.sessionId === sessionId) held += operation.bytes;
+    }
+    if (held + bytes > this.maxPendingInputBytesPerSession) {
+      throw new Error(`ACP session pending input byte budget exceeded (${held + bytes}/${this.maxPendingInputBytesPerSession})`);
     }
   }
 
@@ -859,7 +1047,7 @@ export class AcpClient {
     this.pendingOperations.clear();
     this.sessionOperationGrants.clear();
     for (const terminal of this.terminals.values()) {
-      if (!terminal.exitStatus) terminateChild(terminal);
+      if (!terminal.exitStatus) terminateChild(terminal, this.killGraceMs);
     }
     this.terminals.clear();
     this.proc = null;
@@ -873,6 +1061,8 @@ function grantKindForTool(toolKind) {
   return null;
 }
 
+// A terminal is detached, so it leads a process group of its own, and a signal
+// to the group reaches what the command started as well.
 function killChild(child, signal) {
   try {
     if (process.platform !== "win32" && child.pid) process.kill(-child.pid, signal);
@@ -882,12 +1072,80 @@ function killChild(child, signal) {
   }
 }
 
-function terminateChild(terminal) {
-  killChild(terminal.child, "SIGTERM");
+// Whether anything of a terminal's process group is still there, the command
+// or something it started, also after the command itself exited. A group id
+// is not reused while the group has a member, so within the grace after a
+// SIGTERM to it, a group that answers is this one.
+function groupAlive(child) {
+  if (!child.pid) return false;
+  if (process.platform === "win32") return !exited(child);
+  try {
+    process.kill(-child.pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+// SIGTERM to the terminal's group now, SIGKILL to whatever of it is left after
+// the grace. Never throws: it runs on teardown paths and from a timer.
+function terminateChild(terminal, graceMs = KILL_GRACE_MS) {
+  quietly(() => killChild(terminal.child, "SIGTERM"));
   const timer = setTimeout(() => {
-    if (!terminal.exitStatus) killChild(terminal.child, "SIGKILL");
-  }, 2_000);
+    if (groupAlive(terminal.child)) quietly(() => killChild(terminal.child, "SIGKILL"));
+  }, graceMs);
   timer.unref();
+}
+
+// stop(): a terminal through terminateChild, then waited for until its group is
+// gone, at most a second grace after the SIGKILL. Polled, because the command
+// may exit while what it started has not. Only one whose output is still open,
+// like every other teardown: a terminal that exited and closed it long ago may
+// have left a group id that is free again, and could by now be anyone's.
+async function endTerminal(terminal, graceMs) {
+  if (terminal.exitStatus) return;
+  terminateChild(terminal, graceMs);
+  const deadline = Date.now() + graceMs * 2;
+  while (groupAlive(terminal.child) && Date.now() < deadline) {
+    await new Promise((done) => setTimeout(done, 25));
+  }
+}
+
+// stop(): the provider is not detached, so it has no process group of its own
+// and the signals go to it alone, the same SIGTERM, grace, SIGKILL.
+async function endProvider(child, graceMs) {
+  if (!child.pid || exited(child)) return;
+  quietly(() => child.kill("SIGTERM"));
+  if (await exitWithin(child, graceMs)) return;
+  quietly(() => child.kill("SIGKILL"));
+  await exitWithin(child, graceMs);
+}
+
+function exited(child) {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+function exitWithin(child, ms) {
+  if (exited(child)) return Promise.resolve(true);
+  return new Promise((done) => {
+    const onExit = () => {
+      clearTimeout(timer);
+      done(true);
+    };
+    const timer = setTimeout(() => {
+      child.off("exit", onExit);
+      done(false);
+    }, ms);
+    child.once("exit", onExit);
+  });
+}
+
+function quietly(action) {
+  try {
+    action();
+  } catch {
+    // Already gone, or not ours to signal: nothing more a teardown can do.
+  }
 }
 
 // The message keeps its historical "ACP error <code>: <message>" text. What is new
@@ -974,7 +1232,8 @@ function canonicalizePhysical(path) {
 // Path-looking words of a command line, resolved physically against the working
 // directory: catches "cat link/../.acp-gateway/install.json" where the literal
 // never names the protected directory. Best effort, like any shell parsing; the
-// literal check above and the Grok/Claude sandbox rules are the other layers.
+// literal check above, the .acp-gateway segment check, the Grok/Claude sandbox
+// rules and the terminal sandbox (terminal-sandbox.js) are the other layers.
 function commandPathsHitProtected(text, cwd, protectedPaths) {
   if (!text || !protectedPaths.length) return false;
   const words = String(text).replace(/["'\\]/g, "").split(/[\s;|&()<>=]+/);
@@ -990,7 +1249,102 @@ function commandText(input) {
   if (!input || typeof input !== "object") return "";
   const command = input.command ?? input.cmd;
   if (Array.isArray(command)) return command.join(" ");
-  return typeof command === "string" ? command : "";
+  if (typeof command !== "string") return "";
+  return Array.isArray(input.args) ? [command, ...input.args].join(" ") : command;
+}
+
+// The directory that holds the Control token. A command word with a path
+// segment of this name counts as protected wherever it points: in
+// `cd ~ && cat .acp-gateway/install.json` the path resolves against a cwd the
+// checks never see.
+const GATEWAY_DIRECTORY = ".acp-gateway";
+
+function namesGatewayDirectory(text) {
+  return String(text).replace(/["'\\]/g, "").split(/[\s;|&()<>=`{},:]+/)
+    .some((word) => word.split("/").includes(GATEWAY_DIRECTORY));
+}
+
+// An approval and the terminal/create that spends it are compared as commands:
+// whitespace collapsed, and a shell given one script (`bash -lc X`, `sh -c X`,
+// `zsh -c X`, `bash -l -c X`) counts as that script. An argv unwraps only in
+// exactly that shape, because a word after the script becomes the script's $0
+// instead of an argument.
+const SHELLS = new Set(["sh", "bash", "zsh", "dash"]);
+const SCRIPT_FLAG = /^-(?:c|lc|cl)$/;
+const LOGIN_FLAG = /^(?:-l|--login)$/;
+const SHELL_LINE = /^(?:\S*\/)?(?:sh|bash|zsh|dash)(?: (?:-l|--login))? -(?:c|lc|cl) (.+)$/;
+
+function argvCommand(argv) {
+  const words = argv.map(String);
+  if (SHELLS.has(basename(words[0] ?? ""))) {
+    if (words.length === 3 && SCRIPT_FLAG.test(words[1])) return shellCommand(words[2]);
+    if (words.length === 4 && LOGIN_FLAG.test(words[1]) && words[2] === "-c") return shellCommand(words[3]);
+  }
+  return collapse(words.join(" "));
+}
+
+// A command line as text: the same, and a wrapper's quotes around its script
+// come off with it, a few levels deep.
+function shellCommand(text) {
+  let command = collapse(text);
+  for (let depth = 0; depth < 3; depth += 1) {
+    const script = SHELL_LINE.exec(command)?.[1];
+    if (script == null) break;
+    command = collapse(unquoted(script));
+  }
+  return command;
+}
+
+function unquoted(text) {
+  const quote = text[0];
+  const whole = (quote === "'" || quote === "\"") && text.length >= 2 && text.at(-1) === quote
+    && !text.slice(1, -1).includes(quote);
+  return whole ? text.slice(1, -1) : text;
+}
+
+function collapse(text) {
+  return String(text).replace(/\s+/g, " ").trim();
+}
+
+// The command an execute permission request names, in that form: an array
+// (Codex) or a command with args is an argv, a string a command line.
+function approvedCommand(input) {
+  if (!input || typeof input !== "object") return "";
+  const command = input.command ?? input.cmd;
+  if (Array.isArray(command)) return argvCommand(command);
+  if (typeof command !== "string") return "";
+  return Array.isArray(input.args) ? argvCommand([command, ...input.args]) : shellCommand(command);
+}
+
+// The file a path names, resolved the way fs/write_text_file resolves it, so an
+// approved path and a later write compare as files. One that does not resolve
+// stays as written: a write to it fails on its own.
+function grantPath(path) {
+  try {
+    return workerFilePathSync(path, { allowMissing: true });
+  } catch {
+    return resolve(path);
+  }
+}
+
+// What Main reads in a pending terminal's title: argv as a shell would spell
+// it, a word with spaces or shell syntax single-quoted, so `sh -c 'cat "$T"'`
+// reads as the three words it is. The exact values are in rawInput.
+const TITLE_COMMAND_CHARS = 200;
+
+function displayCommand(command, args) {
+  return [command, ...args]
+    .map((word) => /^[\w@%+=:,./-]+$/.test(word) ? word : `'${word.replace(/'/g, "'\\''")}'`)
+    .join(" ");
+}
+
+// A title stays one line: control characters escaped, and cut at maxChars.
+function displayText(text, maxChars = Infinity) {
+  const line = String(text).replace(/[\u0000-\u001f\u007f]/g, (character) => (
+    character === "\n" ? "\\n" : character === "\t" ? "\\t" : `\\x${character.charCodeAt(0).toString(16).padStart(2, "0")}`
+  ));
+  const characters = [...line];
+  return characters.length > maxChars ? `${characters.slice(0, maxChars - 1).join("")}…` : line;
 }
 
 // Every spelling a shell would expand to a protected path: the canonical path,

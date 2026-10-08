@@ -1,4 +1,4 @@
-import { constants } from "node:fs";
+import { constants, realpathSync } from "node:fs";
 import { open, readlink, realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
@@ -23,6 +23,13 @@ export function isWithin(root, path) {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
+/** path (canonical) when it is inside one of roots and under none of protectedPaths; throws otherwise. */
+export function requireWorkerPath(path, { roots, protectedPaths }) {
+  if (!roots.some((root) => isWithin(root, path))) throw new Error(`Path is outside ACP session roots: ${path}`);
+  if (protectedPaths.some((item) => isWithin(item, path))) throw new Error(`Path is protected by the Gateway: ${path}`);
+  return path;
+}
+
 // The canonical path of requestedPath when it is inside one of roots and under
 // none of protectedPaths; throws otherwise. With allowMissing a file that does
 // not exist yet resolves through its parent.
@@ -35,9 +42,24 @@ async function checkedPath(requestedPath, { roots, protectedPaths, allowMissing 
     if (!allowMissing || error?.code !== "ENOENT") throw error;
     path = join(await realpath(dirname(requested)), basename(requested));
   }
-  if (!roots.some((root) => isWithin(root, path))) throw new Error(`Path is outside ACP session roots: ${path}`);
-  if (protectedPaths.some((item) => isWithin(item, path))) throw new Error(`Path is protected by the Gateway: ${path}`);
-  return path;
+  return requireWorkerPath(path, { roots, protectedPaths });
+}
+
+/**
+ * The file openWorkerFile would act on for requestedPath, resolved the same way
+ * as checkedPath (no root or protected check), synchronously: what an approval
+ * is bound to and what a pending write is shown as must be decided before the
+ * request is registered, without an I/O turn in which a later request could
+ * overtake it. Throws like checkedPath when the path cannot be resolved.
+ */
+export function workerFilePathSync(requestedPath, { allowMissing = false } = {}) {
+  const requested = resolve(requestedPath);
+  try {
+    return realpathSync(requested);
+  } catch (error) {
+    if (!allowMissing || error?.code !== "ENOENT") throw error;
+    return join(realpathSync(dirname(requested)), basename(requested));
+  }
 }
 
 /**

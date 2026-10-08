@@ -18,6 +18,7 @@ import { GatewayRpcClient } from "../src/socket-rpc.js";
 import { runSourceCommand } from "../src/source-update.js";
 import { createSnapshot, removeSnapshot, snapshotDiff } from "../src/workspace.js";
 import { startDaemon } from "./helpers/daemon-harness.js";
+import { terminalSandboxOrStandIn } from "./helpers/terminal-sandbox.js";
 
 // v1.5.2 hardening: every case below reproduces a defect found by running the
 // Gateway against real Claude, Codex and Grok workers (docs/live-usecases.md).
@@ -180,7 +181,11 @@ test("Grok review: commands naming a protected path are refused, in permission r
     await mkdir(guarded, { recursive: true });
     await writeFile(join(guarded, "install.json"), "{}");
     await withEnv({ HOME: home }, async () => {
-      const service = new GatewayService({ createClient: permissionClientFactory(), protectedPaths: [guarded] });
+      const service = new GatewayService({
+        createClient: permissionClientFactory(),
+        protectedPaths: [guarded],
+        terminalSandbox: terminalSandboxOrStandIn
+      });
       try {
         await service.init();
         const { sessionId } = await service.call("session_open", { provider: "claude", cwd: directory, permissionPolicy: "auto_approve" }, context);
@@ -694,7 +699,10 @@ test("W1: workers and their terminals never inherit the Main's session markers",
     };
     const namesIn = async (path) => new Set((await readFile(path, "utf8")).split("\n").map((line) => line.split("=")[0]));
     await withEnv(inherited, async () => {
-      const service = new GatewayService({ createClient: permissionClientFactory({ ACP_MOCK_ENV_LOG: envLog }) });
+      const service = new GatewayService({
+        createClient: permissionClientFactory({ ACP_MOCK_ENV_LOG: envLog }),
+        terminalSandbox: terminalSandboxOrStandIn
+      });
       try {
         await service.init();
         const { sessionId } = await service.call("session_open", { provider: "claude", cwd: directory, permissionPolicy: "auto_approve" }, context);
@@ -734,7 +742,10 @@ test("W1: workers and their terminals never inherit the Main's session markers",
 test("W1: workers and their terminals carry the worker marker, which a worker cannot drop", async () => {
   await withTemp("acp-worker-marker-", async (directory) => {
     const envLog = join(directory, "worker-env.json");
-    const service = new GatewayService({ createClient: permissionClientFactory({ ACP_MOCK_ENV_LOG: envLog }) });
+    const service = new GatewayService({
+      createClient: permissionClientFactory({ ACP_MOCK_ENV_LOG: envLog }),
+      terminalSandbox: terminalSandboxOrStandIn
+    });
     try {
       await service.init();
       const { sessionId } = await service.call("session_open", { provider: "claude", cwd: directory, permissionPolicy: "auto_approve" }, context);

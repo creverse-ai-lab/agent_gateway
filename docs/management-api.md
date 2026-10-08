@@ -75,15 +75,26 @@ Since 1.5.2, automatic decisions also depend on paths:
 - When several offered options share the chosen kind, a refusal prefers the one that lets the worker continue (for example Codex `decline` over `cancel`).
 
 Commands are checked as well:
-- A permission request's `rawInput.command` and a `terminal/create` command line are refused under every policy when they name a protected path. That covers the literal path and its `~`, `$HOME`, `${HOME}` and quoted spellings, plus any path-looking word that resolves physically into one, such as `link/../.acp-gateway`.
-- Other commands keep the policy's normal treatment. `auto_approve` trusts commands inside the roots, because a shell command's file access cannot be verified from its text.
+- A permission request's `rawInput.command` and a `terminal/create` command line are refused under every policy when they name a protected path. That covers the literal path and its `~`, `$HOME`, `${HOME}` and quoted spellings, plus any path-looking word that resolves physically into one, such as `link/../.acp-gateway`. Since 1.8.0 it also covers any word with a `.acp-gateway` path segment, relative or absolute, such as `.acp-gateway/install.json` after a `cd ~`; a search pattern spelled that way is refused too.
+- Other commands keep the policy's normal treatment. `auto_approve` trusts commands inside the roots, because a shell command's file access cannot be verified from its text. These checks are best effort: a variable, a glob or a script the Worker wrote can always hide a path, which is why Gateway terminals also run in a sandbox (below).
+
+Since 1.8.0 a terminal the Gateway opens for a Worker (`terminal/create`) is kept off the protected paths by the OS, because the daemon starts it outside any provider sandbox:
+- On macOS it runs under `/usr/bin/sandbox-exec` with a profile that allows everything except reading, writing or connecting to the protected paths: a directory with everything under it, a file or the socket by name, each by its real path. The terminal's pid, process group, exit status, output and `terminal/kill` are the command's own. Setuid programs such as `ps` and `top` cannot start inside the sandbox.
+- Where no sandbox is available (Linux and other platforms, or a `sandbox-exec` that cannot apply a profile, as inside another sandbox), `auto_approve` no longer starts terminals on its own: each `terminal/create` becomes a normal pending permission request with its full command. Writes stay automatic.
+
+Since 1.8.0 a `fs/write_text_file` or `terminal/create` waiting for Main names the operation, and an approval covers only what it named:
+- The pending request's `toolCall` (`toolCallId: "client-<requestId>"`) is, for a terminal, `kind:"execute"`, `title:"Run: <command line>"` (one line, cut at 200 characters) and `rawInput: {command, args, cwd, env}`, where `env` lists the variable names and never their values; for a write, `kind:"edit"`, `title:"Write <path> (<n> bytes)"`, `locations: [{path}]` and `rawInput: {path, bytes}`, without the content. A write or terminal that could not run anyway (outside the roots, protected, a cwd outside the roots) is refused before Main is asked.
+- Main approving (`allow_*`) a Worker's `execute` request lets the next `terminal/create` with that command through. The commands compare with whitespace collapsed, and a `sh -c X`, `bash -c X`, `bash -lc X` or `zsh -c X` wrapper counts as `X`. The approved command is `rawInput.command` or `cmd`, a string or an argv, with `rawInput.args` when given.
+- Approving an `edit`, `delete` or `move` request lets one `fs/write_text_file` through to each file it named (`locations[].path`, `rawInput.path`/`file_path`/`notebook_path`, resolved like the write).
+- Anything else, and a second run, is asked about anew with the full operation. Approvals end with the turn. Before 1.8.0 any approval let one write or terminal of the same kind through, whatever it was.
+- A write or terminal waiting for Main counts its payload (the content; the command, args, cwd and env) against the session's pending-input byte budget, `maxPendingInboxBytesPerSession` (512 KiB). One that does not fit is refused with a JSON-RPC error to the Worker, and the bytes are released when it is answered or cancelled.
 
 Claude sessions receive `_meta.claudeCode.options.disallowedTools` on `session/new` and on every restore. `read_only` adds `Bash`, `Edit`, `Write`, `MultiEdit` and `NotebookEdit`, and every policy adds path rules for the protected paths.
 
 The Grok process is started with its cwd in a Gateway-owned directory (`ACP_GATEWAY_GROK_SANDBOX_DIR`, default `~/.cache/acp-gateway/grok-sandbox`) holding `.grok/sandbox.toml`, and with `GROK_SANDBOX=acp-gateway`:
 - The profile extends Grok's `workspace` profile and denies every protected path to the whole process, through Seatbelt on macOS and Landlock on Linux.
 - It covers Grok's in-process tools such as grep, which never reach ACP.
-- Edits and terminals go through ACP and are unaffected.
+- Edits and terminals go through ACP and are unaffected by it; Grok's shell commands run in Gateway terminals, under the terminal sandbox above.
 
 `permission_policy_partial` carries `scope`, the list of things the engine cannot enforce for that provider and policy: `edit_inside_roots`, `shell_write_inside_roots`, `read_outside_roots`, `read_protected`.
 - Codex under `read_only`/`ask` has all four; under `auto_approve` it has the two read scopes.

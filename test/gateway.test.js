@@ -9,6 +9,7 @@ import { AcpClient } from "../src/acp-client.js";
 import { GatewayService, sanitizeWorkerMcpServers } from "../src/gateway-service.js";
 import { statePaths } from "../src/state-store.js";
 import { readSnapshotBody } from "./helpers/state-files.js";
+import { terminalSandboxOrStandIn } from "./helpers/terminal-sandbox.js";
 
 const mockAgent = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 const capabilityAgent = fileURLToPath(new URL("./mock-capability-agent.js", import.meta.url));
@@ -1073,7 +1074,7 @@ test("Gateway cancels active sessions after the disconnected owner grace period"
   let clock = Date.now();
   const makeClient = (_provider, options) =>
     new AcpClient({ provider: "mock", command: process.execPath, args: [capabilityAgent], permissionPolicy: "auto_approve" }, options);
-  const service = new GatewayService({ createClient: makeClient, gcIntervalMs: 0, orphanGraceMs: 10, now: () => clock });
+  const service = new GatewayService({ createClient: makeClient, gcIntervalMs: 0, orphanGraceMs: 10, now: () => clock, terminalSandbox: terminalSandboxOrStandIn });
   try {
     service.attachRoot("main-a");
     const opened = await service.call("session_open", { provider: "claude", cwd: process.cwd(), permissionPolicy: "auto_approve" }, { rootId: "main-a" });
@@ -1100,7 +1101,7 @@ test("a worker that cannot be told about a cancel is still sealed and finalized"
   let clock = Date.now();
   const makeClient = (_provider, options) =>
     new AcpClient({ provider: "mock", command: process.execPath, args: [capabilityAgent], permissionPolicy: "auto_approve" }, options);
-  const service = new GatewayService({ createClient: makeClient, gcIntervalMs: 0, orphanGraceMs: 10, now: () => clock });
+  const service = new GatewayService({ createClient: makeClient, gcIntervalMs: 0, orphanGraceMs: 10, now: () => clock, terminalSandbox: terminalSandboxOrStandIn });
   try {
     service.attachRoot("main-a");
     const opened = await service.call("session_open", { provider: "claude", cwd: process.cwd(), permissionPolicy: "auto_approve" }, { rootId: "main-a" });
@@ -1128,7 +1129,7 @@ test("a worker that cannot be told about a cancel is still sealed and finalized"
 test("an explicit cancel a worker cannot be told about still moves the session", async () => {
   const makeClient = (_provider, options) =>
     new AcpClient({ provider: "mock", command: process.execPath, args: [capabilityAgent], permissionPolicy: "auto_approve" }, options);
-  const service = new GatewayService({ createClient: makeClient, gcIntervalMs: 0 });
+  const service = new GatewayService({ createClient: makeClient, gcIntervalMs: 0, terminalSandbox: terminalSandboxOrStandIn });
   try {
     service.attachRoot("main-a");
     const opened = await service.call("session_open", { provider: "claude", cwd: process.cwd(), permissionPolicy: "auto_approve" }, { rootId: "main-a" });
@@ -1151,7 +1152,7 @@ test("Gateway clears the orphan lease when Main reconnects before grace expires"
   let clock = Date.now();
   const makeClient = (_provider, options) =>
     new AcpClient({ provider: "mock", command: process.execPath, args: [capabilityAgent], permissionPolicy: "auto_approve" }, options);
-  const service = new GatewayService({ createClient: makeClient, gcIntervalMs: 0, orphanGraceMs: 10, now: () => clock });
+  const service = new GatewayService({ createClient: makeClient, gcIntervalMs: 0, orphanGraceMs: 10, now: () => clock, terminalSandbox: terminalSandboxOrStandIn });
   try {
     service.attachRoot("main-a");
     const opened = await service.call("session_open", { provider: "claude", cwd: process.cwd(), permissionPolicy: "auto_approve" }, { rootId: "main-a" });
@@ -1305,7 +1306,7 @@ test("Gateway routes ACP elicitation through the durable inbox and back to the w
 test("Gateway cancellation terminates an active terminal and completes the task as cancelled", async () => {
   const makeClient = (_provider, options) =>
     new AcpClient({ provider: "mock", command: process.execPath, args: [capabilityAgent], permissionPolicy: "auto_approve" }, options);
-  const service = new GatewayService({ createClient: makeClient });
+  const service = new GatewayService({ createClient: makeClient, terminalSandbox: terminalSandboxOrStandIn });
   try {
     const opened = await service.call("session_open", { provider: "claude", cwd: process.cwd(), permissionPolicy: "auto_approve" }, { rootId: "main-a" });
     const task = await service.call("task_prompt", { sessionId: opened.sessionId, prompt: "long-terminal" }, { rootId: "main-a" });
