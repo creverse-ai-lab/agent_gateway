@@ -461,26 +461,82 @@ test("W3: every Gateway terminal runs in the sandbox, auto-approved or approved 
   });
 });
 
-test("W3: a command word with a .acp-gateway path segment counts as protected, relative or absolute", async () => {
+test("W3: a .acp-gateway path segment goes to Main under ask and auto_approve; only a resolved protected path is refused unasked", async () => {
   await withTemp("acp-w3-segment-", async (directory) => {
     const guarded = join(directory, "home", ".acp-gateway");
     await mkdir(guarded, { recursive: true });
-    await withClient({ cwd: directory, policy: "auto_approve", protectedPaths: [guarded], terminalSandbox: standInSandbox() }, async ({ run }) => {
-      const execute = (command) => ({ permission: { kind: "execute", command } });
-      assert.deepEqual(await run([
-        execute("cd ~ && cat .acp-gateway/install.json"),
-        execute("cat ../../.acp-gateway/install.json"),
-        execute("T=.acp-gateway/install.json; cat \"$T\""),
-        execute(["bash", "-lc", "cd ~; cat .acp-gateway/install.json"]),
-        execute("cd .acp-gateway && cat install.json"),
+    await mkdir(join(directory, "src"));
+    await writeFile(join(directory, "src", "paths.js"), "const directory = \".acp-gateway\";\n");
+    const execute = (command) => ({ permission: { kind: "execute", command } });
+    // A .acp-gateway segment, relative or absolute, that resolved from the
+    // session root reaches nothing protected.
+    const segments = [
+      "cd ~ && cat .acp-gateway/install.json",
+      "cat ../../.acp-gateway/install.json",
+      "T=.acp-gateway/install.json; cat \"$T\"",
+      ["bash", "-lc", "cd ~; cat .acp-gateway/install.json"],
+      "cd .acp-gateway && cat install.json",
+      "grep -rn \".acp-gateway\" src"
+    ];
+    for (const policy of ["ask", "auto_approve"]) {
+      await withClient({ cwd: directory, policy, protectedPaths: [guarded], terminalSandbox: standInSandbox() }, async ({ client, sessionId, requests, run }) => {
+        // A word that resolves into a protected path, literally or from the
+        // root, is an error and never shown to Main.
+        assert.deepEqual(await run([
+          execute(`cat ${join(guarded, "install.json")}`),
+          execute("cat home/.acp-gateway/install.json"),
+          { terminal: { command: "/bin/cat", args: ["home/.acp-gateway/install.json"] } }
+        ]), ["reject", "reject", "terminal-error: Terminal command names a path protected by the Gateway"], policy);
+        assert.equal(requests.length, 0, `${policy}: a protected path is never shown to Main`);
+
+        // A segment alone is a normal prompt, with the command the worker named.
+        const asked = run(segments.map(execute));
+        for (const [index, command] of segments.entries()) {
+          const pending = await request(requests, index + 1);
+          assert.deepEqual(pending.toolCall.rawInput, { command }, `${policy}: ${JSON.stringify(command)}`);
+          client.respondPermission(pending.requestId, "reject", sessionId);
+        }
+        assert.deepEqual(await asked, segments.map(() => "reject"), policy);
+
+        // A terminal too, with its full command, and what Main allows runs.
+        const terminals = run([
+          { terminal: { command: "grep", args: ["-rn", ".acp-gateway", "src"] } },
+          { terminal: { command: "/bin/sh", args: ["-c", "cd ~ && cat .acp-gateway/install.json"] } }
+        ]);
+        const grep = await request(requests, segments.length + 1);
+        assert.equal(grep.toolCall.title, "Run: grep -rn .acp-gateway src", policy);
+        assert.deepEqual(grep.toolCall.rawInput, { command: "grep", args: ["-rn", ".acp-gateway", "src"], cwd: directory, env: [] });
+        await client.respondPermission(grep.requestId, "allow-once", sessionId);
+        const cat = await request(requests, segments.length + 2);
+        assert.equal(cat.toolCall.title, "Run: /bin/sh -c 'cd ~ && cat .acp-gateway/install.json'", policy);
+        await client.respondPermission(cat.requestId, "reject-once", sessionId);
+        const [searched, refused] = await terminals;
+        assert.match(searched.output, /^src\/paths\.js:1:.*\.acp-gateway/, policy);
+        assert.equal(refused, "terminal-error: Main rejected ACP operation", policy);
+      });
+    }
+
+    // Without the segment auto_approve still decides on its own.
+    await withClient({ cwd: directory, policy: "auto_approve", protectedPaths: [guarded], terminalSandbox: standInSandbox() }, async ({ requests, run }) => {
+      const [rg, longer, grep] = await run([
         execute("rg acp-gateway src"),
         execute("ls ~/.acp-gateway-old"),
-        { terminal: { command: "/bin/sh", args: ["-c", "cd ~ && cat .acp-gateway/install.json"] } }
-      ]), [
-        "reject", "reject", "reject", "reject", "reject",
-        "allow", "allow",
-        "terminal-error: Terminal command names a path protected by the Gateway"
+        { terminal: { command: "grep", args: ["-rn", "acp-gateway", "src"] } }
       ]);
+      assert.deepEqual([rg, longer], ["allow", "allow"]);
+      assert.match(grep.output, /^src\/paths\.js:1:/);
+      assert.equal(requests.length, 0);
+    });
+
+    // read_only cannot ask Main, so it refuses one, even a search.
+    await withClient({ cwd: directory, policy: "read_only", protectedPaths: [guarded], terminalSandbox: standInSandbox() }, async ({ requests, run }) => {
+      assert.deepEqual(await run([
+        { permission: { kind: "search", command: "grep -rn \".acp-gateway\" src" } },
+        { permission: { kind: "search", command: "grep -rn acp-gateway src" } },
+        execute("cd ~ && cat .acp-gateway/install.json"),
+        { terminal: { command: "grep", args: ["-rn", ".acp-gateway", "src"] } }
+      ]), ["reject", "allow", "reject", "terminal-error: Session permission policy is read_only"]);
+      assert.equal(requests.length, 0);
     });
   });
 });
@@ -573,5 +629,77 @@ test("P2: stop() ends a provider and terminals that ignore SIGTERM, process grou
         for (const file of pidFiles) await rm(file, { force: true });
       }
     }
+  });
+});
+
+test("P2: once a terminal's group is found gone its SIGKILL is disarmed, and that group id is never signalled again", async () => {
+  const graceMs = 100;
+  const sleep = (how) => ({ terminal: { command: "/bin/sleep", args: ["30"], [how]: true } });
+  // Each way the Gateway ends a running terminal: the turn that starts it, and
+  // what ends it then.
+  const endings = [
+    ["terminal/release", [sleep("release")], async () => {}],
+    ["cancel", [sleep("hold")], async ({ client, sessionId }) => client.cancelSession(sessionId)],
+    ["provider exit", [sleep("hold")], async ({ client }) => {
+      client.proc.kill("SIGKILL");
+      await until(() => !client.alive, "the provider exit");
+    }],
+    ["stop()", [sleep("hold")], async ({ client }) => client.stop()]
+  ];
+  await withTemp("acp-p2-disarm-", async (directory) => {
+    for (const [ending, steps, end] of endings) {
+      // What the client signals and checks the terminal's group with. A check
+      // finds a member left the first time and none the second; after that the
+      // id answers as if another group of this user had taken it. Only the
+      // SIGTERM is really sent, so the terminal still ends.
+      let group = null;
+      let checks = 0;
+      const signals = [];
+      const killProcess = (pid, signal) => {
+        if (group === null && pid < 0) group = -pid;
+        if (pid !== -group) return process.kill(pid, signal);
+        signals.push(signal);
+        if (signal === "SIGTERM") return process.kill(pid, signal);
+        if (signal !== 0) return true;
+        checks += 1;
+        if (checks === 2) throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+        return true;
+      };
+      await withClient({ cwd: directory, policy: "auto_approve", protectedPaths: [], killGraceMs: graceMs, killProcess }, async (session) => {
+        await session.run(steps);
+        await end(session);
+        await until(() => checks >= 2 || signals.includes("SIGKILL"), `${ending}: the group found gone`);
+        await delay(graceMs * 3);
+        assert.deepEqual(signals, ["SIGTERM", 0, 0], `${ending}: nothing reaches the id once its group was found gone`);
+        await until(() => processGone(group), `${ending}: the terminal to end`);
+      });
+    }
+  });
+});
+
+test("P2: a terminal's group that keeps a member through the grace still gets the SIGKILL", async () => {
+  await withTemp("acp-p2-armed-", async (directory) => {
+    // Every check of the group finds a member left; only the SIGTERM is sent.
+    const signals = [];
+    let group = null;
+    const killProcess = (pid, signal) => {
+      if (group === null && pid < 0) group = -pid;
+      if (pid !== -group) return process.kill(pid, signal);
+      signals.push(signal);
+      return signal === "SIGTERM" ? process.kill(pid, signal) : true;
+    };
+    await withClient({ cwd: directory, policy: "auto_approve", protectedPaths: [], killGraceMs: 100, killProcess }, async ({ run }) => {
+      assert.deepEqual(await run([{ terminal: { command: "/bin/sleep", args: ["30"], release: true } }]), ["terminal-released"]);
+      await until(() => signals.includes("SIGKILL"), "the SIGKILL");
+      assert.equal(signals[0], "SIGTERM");
+      assert.ok(signals.slice(1, signals.indexOf("SIGKILL")).every((signal) => signal === 0), "checked until then");
+      // A grace (100 ms) after the SIGKILL the checks stop as well.
+      await delay(500);
+      const settled = signals.length;
+      await delay(150);
+      assert.equal(signals.length, settled, "and left alone a grace after the SIGKILL");
+      assert.equal(signals.filter((signal) => signal === "SIGKILL").length, 1);
+      await until(() => processGone(group), "the terminal to end");
+    });
   });
 });

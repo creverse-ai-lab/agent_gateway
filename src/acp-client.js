@@ -39,6 +39,8 @@ const CHILD_STDIN_QUEUE_BYTES = 128 * 1024 * 1024;
 // How long a process the Gateway ends gets after SIGTERM before SIGKILL, and
 // how long it then gets to be gone before a stop() stops waiting for it.
 const KILL_GRACE_MS = 2_000;
+// How often a terminal's process group being ended is checked for a member.
+const GROUP_POLL_MS = 25;
 // Approvals that wait for their operation, per session. Main has to click each
 // one, so this only bounds what a long turn whose worker never consumes them
 // (Codex runs its own commands) keeps; the oldest goes first, and a dropped one
@@ -78,8 +80,11 @@ export class AcpClient {
     // checks (terminal-sandbox.js): left out, whatever this OS offers; null,
     // none. Without one, auto_approve no longer starts terminals on its own.
     this.terminalSandbox = options.terminalSandbox === undefined ? detectTerminalSandbox() : options.terminalSandbox;
-    // SIGTERM to SIGKILL for the provider and terminals. Injectable for tests.
+    // SIGTERM to SIGKILL for the provider and terminals, and what signals and
+    // checks a terminal's process group, with process.kill's contract.
+    // Injectable for tests.
     this.killGraceMs = options.killGraceMs ?? KILL_GRACE_MS;
+    this.killProcess = options.killProcess ?? signalProcess;
     this.writeTimeoutMs = options.writeTimeoutMs;
     this.proc = null;
     this.rl = null;
@@ -211,7 +216,7 @@ export class AcpClient {
     proc?.stdin?.end();
     await Promise.all([
       proc ? endProvider(proc, this.killGraceMs) : null,
-      ...[...this.terminals.values()].map((terminal) => endTerminal(terminal, this.killGraceMs))
+      ...[...this.terminals.values()].map((terminal) => endTerminal(terminal, this.killGraceMs, this.killProcess))
     ]);
     this.terminals.clear();
     this.proc = null;
@@ -562,6 +567,12 @@ export class AcpClient {
     // not be one mistaken click away from handing a worker the Control token.
     if (scope === "protected") return this.#selectPermission(params, ["reject_once", "reject_always"]);
     if (policy === "ask") return null;
+    // A .acp-gateway path segment that resolves into nothing protected is
+    // never decided automatically: auto_approve hands it to Main, read_only
+    // refuses it.
+    if (this.#namesGatewayDirectory(commandText(params.toolCall?.rawInput))) {
+      return policy === "auto_approve" ? null : this.#selectPermission(params, ["reject_once", "reject_always"]);
+    }
     const readLike = READ_ONLY_TOOL_KINDS.has(params.toolCall?.kind);
     if (scope === "outside") {
       // Nothing outside the declared roots is ever approved automatically.
@@ -601,13 +612,22 @@ export class AcpClient {
   }
 
   // The string checks on a command line, best effort: a protected path in any
-  // spelling the shell would expand, a word that resolves into one from cwd,
-  // and any .acp-gateway path segment. Nothing to find when nothing is protected.
+  // spelling the shell would expand, and a word that resolves into one from
+  // cwd. What they find is refused under every policy, before Main is asked.
+  // Nothing to find when nothing is protected.
   #namesProtectedPath(command, cwd) {
     if (!command || !this.protectedPaths.length) return false;
     return mentionsProtectedPath(command, this.protectedPaths)
-      || commandPathsHitProtected(command, cwd, this.protectedPaths)
-      || namesGatewayDirectory(command);
+      || commandPathsHitProtected(command, cwd, this.protectedPaths);
+  }
+
+  // A command word with a .acp-gateway path segment. It may name the
+  // directory holding the Control token from a cwd the checks never see
+  // (`cd ~ && cat .acp-gateway/install.json`), or be only a search pattern
+  // (`grep -rn ".acp-gateway" src`), so it is not refused, but not left to
+  // auto_approve either: Main sees it first. Nothing when nothing is protected.
+  #namesGatewayDirectory(command) {
+    return this.protectedPaths.length > 0 && namesGatewayDirectory(command);
   }
 
   // The approval a worker's execute or edit permission request would become:
@@ -797,7 +817,7 @@ export class AcpClient {
 
   #releaseTerminal(params) {
     const terminal = this.#terminal(params.sessionId, params.terminalId);
-    if (!terminal.exitStatus) terminateChild(terminal, this.killGraceMs);
+    this.#terminate(terminal);
     this.terminals.delete(params.terminalId);
     return {};
   }
@@ -809,7 +829,7 @@ export class AcpClient {
 
   #killTerminal(params) {
     const terminal = this.#terminal(params.sessionId, params.terminalId);
-    if (!terminal.exitStatus) killChild(terminal.child, params.signal ?? "SIGTERM");
+    if (!terminal.exitStatus) killChild(terminal.child, params.signal ?? "SIGTERM", this.killProcess);
     return {};
   }
 
@@ -841,8 +861,10 @@ export class AcpClient {
     // auto_approve runs a write, and a terminal the OS keeps off the protected
     // paths (or when nothing is protected). Without that, all that stands
     // between a terminal and install.json is its command line, which a shell
-    // can always hide behind cd, a variable or a script, so Main sees it first.
-    if (policy === "auto_approve" && (operation.kind === "write" || await this.#terminalConfined())) {
+    // can always hide behind cd, a variable or a script, so Main sees it first;
+    // as it does one whose command line has a .acp-gateway path segment.
+    if (policy === "auto_approve" && (operation.kind === "write"
+      || (!operation.namesGatewayDirectory && await this.#terminalConfined()))) {
       this.#respond(id, await run() ?? {});
       return;
     }
@@ -913,6 +935,7 @@ export class AcpClient {
     return {
       kind: "terminal",
       command: argvCommand([request.command, ...request.args]),
+      namesGatewayDirectory: this.#namesGatewayDirectory([request.command, ...request.args].join(" ")),
       // What waiting for Main holds: the whole request, env values included.
       bytes: Buffer.byteLength(JSON.stringify({ command: request.command, args: request.args, cwd: request.cwd, env: request.env })),
       toolCall: {
@@ -938,9 +961,15 @@ export class AcpClient {
   #closeSessionTerminals(sessionId) {
     for (const [terminalId, terminal] of this.terminals) {
       if (terminal.sessionId !== sessionId) continue;
-      if (!terminal.exitStatus) terminateChild(terminal, this.killGraceMs);
+      this.#terminate(terminal);
       this.terminals.delete(terminalId);
     }
+  }
+
+  // A terminal the Gateway is done with, ended through terminateChild without
+  // waiting for it. Only one whose output is still open (endTerminal).
+  #terminate(terminal) {
+    if (!terminal.exitStatus) void terminateChild(terminal, this.killGraceMs, { kill: this.killProcess });
   }
 
   #addOperationGrant(sessionId, grant) {
@@ -1046,9 +1075,7 @@ export class AcpClient {
     for (const operation of this.pendingOperations.values()) operation.reject(error);
     this.pendingOperations.clear();
     this.sessionOperationGrants.clear();
-    for (const terminal of this.terminals.values()) {
-      if (!terminal.exitStatus) terminateChild(terminal, this.killGraceMs);
-    }
+    for (const terminal of this.terminals.values()) this.#terminate(terminal);
     this.terminals.clear();
     this.proc = null;
     if (wasAlive) this.onExit?.(error);
@@ -1061,11 +1088,17 @@ function grantKindForTool(toolKind) {
   return null;
 }
 
+// What signals and checks a terminal's process group unless a test injects
+// its own (killProcess).
+function signalProcess(pid, signal) {
+  return process.kill(pid, signal);
+}
+
 // A terminal is detached, so it leads a process group of its own, and a signal
 // to the group reaches what the command started as well.
-function killChild(child, signal) {
+function killChild(child, signal, kill = signalProcess) {
   try {
-    if (process.platform !== "win32" && child.pid) process.kill(-child.pid, signal);
+    if (process.platform !== "win32" && child.pid) kill(-child.pid, signal);
     else child.kill(signal);
   } catch (error) {
     if (error?.code !== "ESRCH") throw error;
@@ -1074,13 +1107,13 @@ function killChild(child, signal) {
 
 // Whether anything of a terminal's process group is still there, the command
 // or something it started, also after the command itself exited. A group id
-// is not reused while the group has a member, so within the grace after a
-// SIGTERM to it, a group that answers is this one.
-function groupAlive(child) {
+// is not reused while the group has a member, so a group that answers is this
+// one only until the group has once been found empty.
+function groupAlive(child, kill = signalProcess) {
   if (!child.pid) return false;
   if (process.platform === "win32") return !exited(child);
   try {
-    process.kill(-child.pid, 0);
+    kill(-child.pid, 0);
     return true;
   } catch (error) {
     return error?.code === "EPERM";
@@ -1088,27 +1121,51 @@ function groupAlive(child) {
 }
 
 // SIGTERM to the terminal's group now, SIGKILL to whatever of it is left after
-// the grace. Never throws: it runs on teardown paths and from a timer.
-function terminateChild(terminal, graceMs = KILL_GRACE_MS) {
-  quietly(() => killChild(terminal.child, "SIGTERM"));
-  const timer = setTimeout(() => {
-    if (groupAlive(terminal.child)) quietly(() => killChild(terminal.child, "SIGKILL"));
-  }, graceMs);
-  timer.unref();
+// the grace. Polled meanwhile, because the command may exit while what it
+// started has not, and the SIGKILL stays armed only while the group still has
+// a member: once the last one is gone its id is free, and a group of the same
+// user that takes it before the grace ends is not this one. Resolves once the
+// group is gone, or a second grace after the SIGKILL; its timers keep the
+// process up only for a caller that waits (hold). Never throws or rejects: it
+// runs on teardown paths and from timers.
+function terminateChild(terminal, graceMs = KILL_GRACE_MS, { kill = signalProcess, hold = false } = {}) {
+  const { child } = terminal;
+  const gone = () => !groupAlive(child, kill);
+  quietly(() => killChild(child, "SIGTERM", kill));
+  return new Promise((done) => {
+    if (gone()) {
+      done();
+      return;
+    }
+    const timer = (handle) => (hold ? handle : handle.unref());
+    let giveUp = null;
+    const finish = () => {
+      clearInterval(poll);
+      clearTimeout(sigkill);
+      clearTimeout(giveUp);
+      done();
+    };
+    const poll = timer(setInterval(() => {
+      if (gone()) finish();
+    }, GROUP_POLL_MS));
+    const sigkill = timer(setTimeout(() => {
+      if (gone()) {
+        finish();
+        return;
+      }
+      quietly(() => killChild(child, "SIGKILL", kill));
+      giveUp = timer(setTimeout(finish, graceMs));
+    }, graceMs));
+  });
 }
 
-// stop(): a terminal through terminateChild, then waited for until its group is
-// gone, at most a second grace after the SIGKILL. Polled, because the command
-// may exit while what it started has not. Only one whose output is still open,
-// like every other teardown: a terminal that exited and closed it long ago may
-// have left a group id that is free again, and could by now be anyone's.
-async function endTerminal(terminal, graceMs) {
+// stop(): a terminal through terminateChild, and waited for. Only one whose
+// output is still open, like every other teardown: a terminal that exited and
+// closed it long ago may have left a group id that is free again, and could by
+// now be anyone's.
+async function endTerminal(terminal, graceMs, kill) {
   if (terminal.exitStatus) return;
-  terminateChild(terminal, graceMs);
-  const deadline = Date.now() + graceMs * 2;
-  while (groupAlive(terminal.child) && Date.now() < deadline) {
-    await new Promise((done) => setTimeout(done, 25));
-  }
+  await terminateChild(terminal, graceMs, { kill, hold: true });
 }
 
 // stop(): the provider is not detached, so it has no process group of its own
@@ -1232,8 +1289,9 @@ function canonicalizePhysical(path) {
 // Path-looking words of a command line, resolved physically against the working
 // directory: catches "cat link/../.acp-gateway/install.json" where the literal
 // never names the protected directory. Best effort, like any shell parsing; the
-// literal check above, the .acp-gateway segment check, the Grok/Claude sandbox
-// rules and the terminal sandbox (terminal-sandbox.js) are the other layers.
+// literal check above, the .acp-gateway segment that keeps a command from
+// auto_approve, the Grok/Claude sandbox rules and the terminal sandbox
+// (terminal-sandbox.js) are the other layers.
 function commandPathsHitProtected(text, cwd, protectedPaths) {
   if (!text || !protectedPaths.length) return false;
   const words = String(text).replace(/["'\\]/g, "").split(/[\s;|&()<>=]+/);
@@ -1254,9 +1312,10 @@ function commandText(input) {
 }
 
 // The directory that holds the Control token. A command word with a path
-// segment of this name counts as protected wherever it points: in
+// segment of this name may point there wherever it resolves from: in
 // `cd ~ && cat .acp-gateway/install.json` the path resolves against a cwd the
-// checks never see.
+// checks never see. It is also how a search for the name is spelled, so it
+// only sends the command to Main (#namesGatewayDirectory).
 const GATEWAY_DIRECTORY = ".acp-gateway";
 
 function namesGatewayDirectory(text) {

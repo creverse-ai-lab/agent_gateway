@@ -12,10 +12,12 @@ import { createInterface } from "node:readline";
 //   {"steps": [step, ...]} runs each step in turn and reports every outcome as
 //   a JSON array in stopReason. A step is one of:
 //     {"permission": {...}}  as above (a "command" may also be an array)
-//     {"terminal": {..., "cwd"?, "hold"?, "kill"?}}
+//     {"terminal": {..., "cwd"?, "hold"?, "release"?, "kill"?}}
 //                                        -> {output, exitStatus}, or
 //                                           "terminal-error: <message>";
 //                                           hold: "terminal-held" without waiting;
+//                                           release: terminal/release without
+//                                           waiting, "terminal-released";
 //                                           kill: terminal/kill before the wait
 //     {"write": {"path", "content" | "bytes"}} -> "write-ok" | "write-error: <message>"
 //     {"parallel": [step, ...]}             -> the steps at once, their outcomes
@@ -82,6 +84,10 @@ async function runStep(sessionId, step) {
     if (created.error) return `terminal-error: ${created.error.message}`;
     const { terminalId } = created.result;
     if (step.terminal.hold) return "terminal-held";
+    if (step.terminal.release) {
+      const released = await request("terminal/release", { sessionId, terminalId });
+      return released.error ? `terminal-error: ${released.error.message}` : "terminal-released";
+    }
     if (step.terminal.kill) await request("terminal/kill", { sessionId, terminalId });
     const exited = await request("terminal/wait_for_exit", { sessionId, terminalId });
     const output = await request("terminal/output", { sessionId, terminalId });
