@@ -193,6 +193,82 @@ test("OS-side and channel-side backlog share one aggregate ceiling", () => {
   assert.equal(fatals.length, 1);
 });
 
+// 1.8.0 (P5): a reply larger than the whole budget used to fail the connection
+// even with nothing queued, although a client asked for it and it fit the frame
+// cap. It now goes out on its own, and only that one frame gets the exemption.
+test("one HIGH reply larger than the whole budget goes out when nothing is queued", () => {
+  const stream = new MockStream({ credits: 0 });
+  const fatals = [];
+  const channel = new NdjsonChannel(stream, {
+    maxQueueBytes: 4_000,
+    maxFrameBytes: 64_000,
+    writeTimeoutMs: 0,
+    onFatal: (error) => fatals.push(error)
+  });
+  assert.equal(channel.write(LANE_HIGH, { tag: "reply", pad: "x".repeat(10_000) }), true);
+  assert.deepEqual(stream.tags(), ["reply"]);
+  assert.equal(fatals.length, 0);
+  assert.equal(channel.blocked, true, "the stream took it and asked for a pause");
+  // The OS still holds the reply. The frames behind it are charged only for
+  // themselves: the reply's unsent bytes are nobody else's budget.
+  stream.writableLength = Buffer.byteLength(stream.frames[0]);
+  assert.equal(channel.backlogBytes(), 0);
+  assert.equal(channel.write(LANE_HIGH, { tag: "next", pad: "y".repeat(3_000) }), true);
+  assert.equal(channel.write(LANE_NORMAL, { tag: "event" }), true);
+  // ...and that budget still holds, as does the rule that a congested reserved
+  // lane fails the connection.
+  assert.throws(
+    () => channel.write(LANE_HIGH, { tag: "over", pad: "z".repeat(2_000) }),
+    isCode(ERROR_CODES.TRANSPORT_CONGESTED)
+  );
+  assert.equal(fatals.length, 1);
+});
+
+test("only one oversized reply is in flight, and the allowance returns once it is sent", () => {
+  const stream = new MockStream({ credits: 1 });
+  const channel = new NdjsonChannel(stream, { maxQueueBytes: 4_000, maxFrameBytes: 64_000, writeTimeoutMs: 0 });
+  channel.write(LANE_HIGH, { tag: "first", pad: "x".repeat(10_000) });
+  assert.equal(channel.blocked, false);
+  // The stream accepted it but still holds it: a second oversized reply now
+  // would put two of them in memory at once.
+  stream.writableLength = Buffer.byteLength(stream.frames[0]);
+  assert.throws(
+    () => channel.write(LANE_HIGH, { tag: "second", pad: "x".repeat(10_000) }),
+    isCode(ERROR_CODES.TRANSPORT_CONGESTED)
+  );
+
+  const fresh = new MockStream({ credits: 0 });
+  const next = new NdjsonChannel(fresh, { maxQueueBytes: 4_000, maxFrameBytes: 64_000, writeTimeoutMs: 0 });
+  next.write(LANE_HIGH, { tag: "first", pad: "x".repeat(10_000) });
+  fresh.writableLength = Buffer.byteLength(fresh.frames[0]);
+  next.write(LANE_HIGH, { tag: "queued" });
+  // The OS flushed it: the queued frame drains and the next oversized reply is
+  // allowed again.
+  fresh.writableLength = 0;
+  fresh.release(10);
+  assert.deepEqual(fresh.tags(), ["first", "queued"]);
+  assert.equal(next.write(LANE_HIGH, { tag: "again", pad: "x".repeat(10_000) }), true);
+  assert.deepEqual(fresh.tags(), ["first", "queued", "again"]);
+});
+
+test("the oversized allowance is for replies only and never passes the frame cap", () => {
+  const drops = [];
+  const channel = new NdjsonChannel(new MockStream({ credits: 0 }), {
+    maxQueueBytes: 4_000, maxFrameBytes: 64_000, writeTimeoutMs: 0, onDrop: (items) => drops.push(...items)
+  });
+  assert.equal(channel.write(LANE_LOW, { tag: "low", pad: "x".repeat(10_000) }), false, "LOW is still shed");
+  assert.equal(drops.length, 1);
+  assert.throws(
+    () => channel.write(LANE_NORMAL, { tag: "normal", pad: "x".repeat(10_000) }),
+    isCode(ERROR_CODES.TRANSPORT_CONGESTED)
+  );
+  const capped = new NdjsonChannel(new MockStream({ credits: 0 }), { maxQueueBytes: 4_000, maxFrameBytes: 8_000, writeTimeoutMs: 0 });
+  assert.throws(
+    () => capped.write(LANE_HIGH, { tag: "huge", pad: "x".repeat(10_000) }),
+    isCode(ERROR_CODES.FRAME_TOO_LARGE)
+  );
+});
+
 test("LOW sheds frames at its budget, reports every drop, and spares HIGH", () => {
   const stream = new MockStream({ credits: 0 });
   const drops = [];

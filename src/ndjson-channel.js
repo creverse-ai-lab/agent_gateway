@@ -16,6 +16,8 @@ const LANE_ORDER = [LANE_HIGH, LANE_NORMAL, LANE_LOW];
 // Hard backlog ceilings. LOW can use half the connection, NORMAL can borrow all
 // but HIGH's 1/8 reserve, and HIGH can use the full global budget. The global
 // ceiling is checked as well, so these overlapping limits never multiply memory.
+// The one exception is a single HIGH frame larger than the whole budget, which
+// goes out alone when nothing is queued (see write).
 export const LANE_BUDGET_FRACTION = Object.freeze({
   [LANE_HIGH]: 1,
   [LANE_NORMAL]: 7 / 8,
@@ -50,6 +52,10 @@ export class NdjsonChannel {
       budget: Math.max(1, Math.floor(maxQueueBytes * LANE_BUDGET_FRACTION[lane]))
     }]));
     this.queuedBytes = 0;
+    // The one HIGH frame admitted past the budget (see write) while the stream
+    // still holds part of it: {bytes, after}, where after counts what was written
+    // to the stream behind it.
+    this.oversize = null;
     this.blocked = false;
     this.closed = false;
     this.fatal = null;
@@ -84,8 +90,21 @@ export class NdjsonChannel {
     // FIFO see exactly the order they saw before lanes existed. Reordering is
     // only ever visible under real backpressure.
     if (this.queuedBytes === 0 && !this.blocked) {
-      if (!this.#fits(state, frame.length)) return this.#rejectBudget(lane, state, frame, coalesceKey, meta);
+      if (this.#fits(state, frame.length)) {
+        this.#toStream(frame);
+        return true;
+      }
+      // A reply larger than the whole budget can never fit, however long it
+      // waits, and failing the connection over it punished a client for an
+      // answer it asked for (a full subscription replay, an unpaged inbox list).
+      // With nothing queued it goes out on its own, still capped by
+      // maxFrameBytes. One at a time, and its unsent bytes are not charged to
+      // the frames behind it, which keep exactly the budget they had.
+      if (lane !== LANE_HIGH || this.#oversizeUnsent() > 0) {
+        return this.#rejectBudget(lane, state, frame, coalesceKey, meta);
+      }
       this.#toStream(frame);
+      this.oversize = { bytes: frame.length, after: 0 };
       return true;
     }
     if (coalesceKey != null) {
@@ -188,6 +207,14 @@ export class NdjsonChannel {
     this.#teardown(error ?? new GatewayError(ERROR_CODES.TRANSPORT_CLOSED, "Transport is closed"));
   }
 
+  // The connection's backlog as the budget counts it: what the stream still
+  // holds plus what is queued here, less the unsent part of an oversized reply
+  // (see write). The daemon's per-connection gates read this rather than the
+  // raw stream length, so that one reply cannot push them over either.
+  backlogBytes() {
+    return this.#streamBytes() + this.queuedBytes;
+  }
+
   snapshot() {
     return {
       queuedBytes: this.queuedBytes,
@@ -209,7 +236,23 @@ export class NdjsonChannel {
   }
 
   #streamBytes() {
+    const length = this.#streamLength();
+    return length - this.#oversizeUnsent(length);
+  }
+
+  #streamLength() {
     return Number.isFinite(this.stream.writableLength) ? Math.max(0, this.stream.writableLength) : 0;
+  }
+
+  // The unsent rest of the oversized frame, dropping the record once it is all
+  // sent. The stream is FIFO, and everything written behind that frame is still
+  // in it until the frame is gone: what the stream holds beyond those bytes is
+  // the frame's own rest.
+  #oversizeUnsent(length = this.#streamLength()) {
+    if (!this.oversize) return 0;
+    const unsent = Math.min(this.oversize.bytes, Math.max(0, length - this.oversize.after));
+    if (unsent === 0) this.oversize = null;
+    return unsent;
   }
 
   #fits(state, addedBytes) {
@@ -235,6 +278,7 @@ export class NdjsonChannel {
   #toStream(frame) {
     this.stats.frames += 1;
     this.stats.bytes += frame.length;
+    if (this.oversize) this.oversize.after += frame.length;
     if (this.stream.write(frame)) return;
     // The peer stopped taking bytes. From here the deadline runs and lane order
     // becomes observable.
@@ -319,6 +363,7 @@ export class NdjsonChannel {
       state.bytes = 0;
     }
     this.queuedBytes = 0;
+    this.oversize = null;
   }
 
   #rejectWaiters(error) {

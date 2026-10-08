@@ -15,6 +15,7 @@ import {
   providerDefinition,
   selectDistribution
 } from "./acp-registry.js";
+import { BoundedUtf8Text, utf8ByteHead } from "./bounded-utf8.js";
 import { childEnv, CONTROL_IDENTITY_ENV } from "./caller.js";
 import { GatewayRpcClient } from "./socket-rpc.js";
 import { gatewaySocketPath } from "./config.js";
@@ -1378,19 +1379,143 @@ function hiddenEnv(env) {
   return Object.fromEntries(Object.keys(env).map((name) => [name, "<redacted>"]));
 }
 
+// Every command the installer runs gets a deadline and a bounded capture. Both
+// are generous on purpose: `npm install --global` or `uv tool install` over a
+// slow network legitimately takes minutes, and an `npm list --json` is parsed
+// whole. What they stop is a command that never ends, or never stops printing,
+// which in the daemon held an automatic update, and with it every shutdown,
+// forever.
+export const COMMAND_TIMEOUT_MS = 10 * 60_000;
+// Per stream. Past it the first and last halves are kept around a marker.
+export const COMMAND_OUTPUT_BYTES = 1024 * 1024;
+// SIGTERM first, so npm can stop the lifecycle scripts it runs; SIGKILL if the
+// command is still there after this.
+const COMMAND_KILL_GRACE_MS = 2_000;
+
 // Agent CLIs, and npm and uv installing adapters (their packages' lifecycle
 // scripts run too): none of them gets the Control token, the socket or a
 // session marker, whether the installer runs from a shell or in the daemon.
-export function runCommand(command, args) {
+// A command past timeoutMs, or one whose signal aborts, is killed and rejects
+// with code COMMAND_TIMEOUT or COMMAND_ABORTED. The child stays in the
+// installer's process group, so Ctrl-C at a terminal still reaches it.
+export function runCommand(command, args, {
+  timeoutMs = COMMAND_TIMEOUT_MS,
+  maxOutputBytes = COMMAND_OUTPUT_BYTES,
+  signal = null
+} = {}) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(commandStopped(command, "COMMAND_ABORTED", `was not started: ${stopReason(signal)}`));
+      return;
+    }
     const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], env: childEnv() });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
-    child.once("error", reject);
-    child.once("close", (code) => resolve({ code: code ?? 1, stdout, stderr }));
+    const stdout = boundedOutput(maxOutputBytes);
+    const stderr = boundedOutput(maxOutputBytes);
+    // Decoded as a stream, so a character split across two reads stays whole.
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => stdout.append(chunk));
+    child.stderr.on("data", (chunk) => stderr.append(chunk));
+    let stopped = null;
+    let exited = false;
+    let killTimer = null;
+    const settle = () => {
+      clearTimeout(deadline);
+      clearTimeout(killTimer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    // A stopped command is done once it has exited. Waiting for "close" as well
+    // would wait on any grandchild still holding its pipes, such as a lifecycle
+    // script npm started, which is the very hang the deadline is for.
+    const finishStopped = () => {
+      settle();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      reject(stopped);
+    };
+    const stop = (error) => {
+      if (stopped) return;
+      stopped = error;
+      if (exited) {
+        finishStopped();
+        return;
+      }
+      child.kill("SIGTERM");
+      killTimer = setTimeout(() => child.kill("SIGKILL"), COMMAND_KILL_GRACE_MS);
+      killTimer.unref?.();
+    };
+    const deadline = Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? setTimeout(() => stop(commandStopped(
+          command, "COMMAND_TIMEOUT", `did not finish within ${Math.round(timeoutMs / 1000)}s and was stopped`
+        )), timeoutMs)
+      : null;
+    deadline?.unref?.();
+    const onAbort = () => stop(commandStopped(command, "COMMAND_ABORTED", `was stopped: ${stopReason(signal)}`));
+    signal?.addEventListener("abort", onAbort, { once: true });
+    child.once("error", (error) => {
+      settle();
+      reject(error);
+    });
+    child.once("exit", () => {
+      exited = true;
+      if (stopped) finishStopped();
+    });
+    child.once("close", (code) => {
+      settle();
+      if (stopped) {
+        reject(stopped);
+        return;
+      }
+      const truncated = stdout.omittedBytes > 0 || stderr.omittedBytes > 0;
+      resolve({ code: code ?? 1, stdout: stdout.text(), stderr: stderr.text(), ...(truncated ? { outputTruncated: true } : {}) });
+    });
   });
+}
+
+// The message names the command, never its args or what it printed: this
+// error also travels paths that do not redact (requireSuccess).
+function commandStopped(command, code, what) {
+  const error = new Error(`${command} ${what}`);
+  error.code = code;
+  return error;
+}
+
+function stopReason(signal) {
+  const reason = signal?.reason;
+  return reason?.message ?? (reason == null ? "aborted" : String(reason));
+}
+
+// The head and the tail of what a command printed: the head says what it was
+// doing, the tail why it stopped. What fell in between is counted and marked,
+// never silently dropped.
+function boundedOutput(maxBytes) {
+  const headLimit = Math.floor(maxBytes / 2);
+  const tail = new BoundedUtf8Text(maxBytes - headLimit);
+  let head = "";
+  let headBytes = 0;
+  let headOpen = headLimit > 0;
+  return {
+    append(text) {
+      if (headOpen) {
+        const taken = utf8ByteHead(text, headLimit - headBytes);
+        head += taken;
+        headBytes += Buffer.byteLength(taken);
+        if (taken.length === text.length) return;
+        headOpen = false;
+        text = text.slice(taken.length);
+      }
+      tail.append(text);
+    },
+    get omittedBytes() {
+      return tail.trimmedBytes;
+    },
+    text() {
+      const omitted = tail.trimmedBytes;
+      return omitted > 0
+        ? `${head}\n[... ${omitted} bytes of output omitted ...]\n${tail.toString()}`
+        : head + tail.toString();
+    }
+  };
 }
 
 async function restartGatewayDaemon({ identity, makeRpc, socketPath }) {

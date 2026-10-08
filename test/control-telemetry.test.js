@@ -410,10 +410,14 @@ test("a superseded update's artifact ages out while the newest one is kept alive
       });
       service.handleUpdate(session, oversized(1));
       const stale = session.events.at(-1).dataArtifact.path;
+      // A poll hands the path out. (Since 1.8.0 an update that never left the
+      // Gateway is reclaimed at once; see the test below.)
+      const polled = await service.call("poll", { sessionId: session.id, includeToolEvents: true }, { rootId: "main-a" });
+      assert.equal(polled.events.at(-1).dataArtifact.path, stale);
       service.handleUpdate(session, oversized(2));
       const fresh = session.events.at(-1).dataArtifact.path;
       assert.notEqual(stale, fresh);
-      // Never unlinked eagerly: a poll may already have handed the path out, so
+      // Never unlinked eagerly once delivered: the poll handed the path out, so
       // it stays readable for the retention window.
       assert.equal(existsSync(stale), true, "the superseded artifact is not deleted under a live reader");
       assert.equal(

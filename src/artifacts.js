@@ -1,7 +1,7 @@
 import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 const DEFAULT_MAX_FILE_BYTES = 100 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES = 512 * 1024 * 1024;
@@ -15,17 +15,39 @@ export class ArtifactStore {
   constructor({
     root = defaultArtifactRoot(),
     maxFileBytes = DEFAULT_MAX_FILE_BYTES,
-    maxTotalBytes = DEFAULT_MAX_TOTAL_BYTES
+    maxTotalBytes = DEFAULT_MAX_TOTAL_BYTES,
+    // The part of maxTotalBytes only durable writers may fill (create(...,
+    // {durable: true})): a durable Task result whose artifact is cut short has
+    // nothing but its preview to recover from, so transcripts, terminal output
+    // and tool-event spills stop short of it. 0 shares the whole quota.
+    durableReserveBytes = 0
   } = {}) {
     this.root = root;
     this.maxFileBytes = maxFileBytes;
     this.maxTotalBytes = maxTotalBytes;
+    this.durableReserveBytes = Math.max(0, Math.min(durableReserveBytes, maxTotalBytes));
     this.usedBytes = directoryBytes(root);
     this.activePaths = new Set();
   }
 
-  create(sessionId, kind) {
-    return new ArtifactWriter(this, sessionId, kind);
+  create(sessionId, kind, { durable = false } = {}) {
+    return new ArtifactWriter(this, sessionId, kind, durable);
+  }
+
+  // Deletes one finished artifact ahead of age retention, for a caller that
+  // knows no reader can have been handed its path. Best effort: a file that
+  // cannot be removed now is still reclaimed by prune.
+  discard(path) {
+    if (typeof path !== "string" || this.activePaths.has(path)) return false;
+    if (resolve(dirname(path)) !== resolve(this.root) || !basename(path).startsWith(ARTIFACT_PREFIX)) return false;
+    try {
+      const { size } = statSync(path);
+      unlinkSync(path);
+      this.usedBytes = Math.max(0, this.usedBytes - size);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   prune(retentionMs, now = Date.now(), keepPaths = null) {
@@ -63,11 +85,12 @@ export class ArtifactStore {
     }
   }
 
-  reserve(requested, fileBytes) {
+  reserve(requested, fileBytes, durable = false) {
+    const ceiling = durable ? this.maxTotalBytes : this.maxTotalBytes - this.durableReserveBytes;
     return Math.max(0, Math.min(
       requested,
       this.maxFileBytes - fileBytes,
-      this.maxTotalBytes - this.usedBytes
+      ceiling - this.usedBytes
     ));
   }
 
@@ -81,8 +104,9 @@ export class ArtifactStore {
 }
 
 class ArtifactWriter {
-  constructor(store, sessionId, kind) {
+  constructor(store, sessionId, kind, durable = false) {
     this.store = store;
+    this.durable = durable === true;
     this.sessionId = safeName(sessionId);
     this.kind = safeName(kind);
     this.path = null;
@@ -104,7 +128,7 @@ class ArtifactWriter {
   append(value) {
     if (this.complete || this.error != null || value == null || value.length === 0) return;
     const buffer = Buffer.isBuffer(value) ? value : Buffer.from(String(value), "utf8");
-    let accepted = this.store.reserve(buffer.length, this.bytes);
+    let accepted = this.store.reserve(buffer.length, this.bytes, this.durable);
     if (accepted > 0 && accepted < buffer.length) {
       // Never end a truncated text artifact mid-character.
       while (accepted > 0 && (buffer[accepted] & 0xc0) === 0x80) accepted -= 1;

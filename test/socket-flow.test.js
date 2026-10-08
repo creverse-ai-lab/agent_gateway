@@ -230,6 +230,34 @@ test("the channel never admits a backlog beyond the connection budget", () => {
   assert.equal(socket.destroyed, false);
 });
 
+// 1.8.0 (P5): the per-connection gates read the channel's backlog, which leaves
+// out the unsent rest of an oversized reply. Reading the raw socket length would
+// have destroyed the connection on the very next reply, and unsubscribed every
+// subscriber that had not opted into gaps.
+test("a reply bigger than the connection budget reaches the client without dooming what follows", () => {
+  const socket = mockSocket({ credits: 0 });
+  const removed = [];
+  const sender = createSocketSender(socket, {
+    unsubscribe: (id) => removed.push(id),
+    removeSubscription: (id) => removed.push(id),
+    maxSubscriptionBytes: 100,
+    maxQueueBytes: 400,
+    maxFrameBytes: 10_000,
+    writeTimeoutMs: 0
+  });
+  sender.send({ id: "big", ok: true, result: { pad: "x".repeat(2_000) } });
+  assert.equal(socket.destroyed, false);
+  // The OS still holds the reply.
+  socket.writableLength = Buffer.byteLength(socket.frames[0]);
+  sender.send({ id: "next", ok: true });
+  assert.equal(sender.sendEvent("sub-plain", { sessionId: "session-a", sequence: 1, type: "turn_start" }), true);
+  assert.equal(socket.destroyed, false);
+  assert.deepEqual(removed, [], "a subscriber is not too slow because of someone else's reply");
+  socket.writableLength = 0;
+  socket.release();
+  assert.deepEqual(socket.messages().map((message) => message.id ?? message.type), ["big", "next", "event"]);
+});
+
 // Reworked for the overtaking fix: durable events used to be queued here purely
 // to watch them jump the droppable backlog, which is the reordering that made a
 // receiver discard the jumped frames in silence. Overtaking now retracts what it

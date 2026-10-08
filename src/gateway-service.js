@@ -131,6 +131,18 @@ const CONTROL_SERVER_PATTERN = /(?:acp-gateway-control|acp-mcp-bridge|gateway-da
 // rotation and shutdown write it regardless.
 const PERSIST_DEBOUNCE_MS = 50;
 const SNAPSHOT_INTERVAL_MS = 1_000;
+// The share of the artifact quota only durable Task results may use (64MiB of
+// the default 512MiB). A result artifact is the JSON of one envelope, a few
+// hundred KiB at most, so this holds hundreds of them; everything else that
+// spills (transcripts, terminal output, tool events) stops short of it.
+const DURABLE_ARTIFACT_RESERVE = 1 / 8;
+// How long shutdown waits for an adapter update that is still running, then how
+// long at most it gives the aborted one to take its npm/uv process down (the
+// command's own SIGKILL fallback is 2s). Short on purpose: the update runs again
+// at the next daemon's first check, and a daemon that cannot stop cannot be
+// restarted either.
+const AGENT_UPDATE_STOP_MS = 5_000;
+const AGENT_UPDATE_ABORT_GRACE_MS = 3_000;
 // The calls that record a caller. One of them arriving over the control socket
 // with no caller is work nobody can attribute; management calls (admin CLI,
 // installer health checks) are not front doors and do not count.
@@ -194,6 +206,9 @@ export class GatewayService {
     // calls the provider degraded. Nothing else is automatic.
     maxConsecutiveRestoreFailures = DEFAULT_MAX_CONSECUTIVE_RESTORE_FAILURES,
     agentUpdateManager = null,
+    // How long shutdown waits for a running adapter update before aborting it
+    // (AGENT_UPDATE_STOP_MS). Not a setting; injectable so a test need not wait.
+    agentUpdateStopMs = AGENT_UPDATE_STOP_MS,
     // Canonical paths no worker may read or write (Control token, settings,
     // state, socket). Injectable so tests can point them at a temp directory.
     protectedPaths = null,
@@ -267,6 +282,9 @@ export class GatewayService {
     this.rootPresence = new Map();
     this.createClient = createClient;
     this.agentUpdateManager = agentUpdateManager;
+    this.agentUpdateStopMs = agentUpdateStopMs;
+    // What the last shutdown could not finish in time, and why (set by shutdown).
+    this.shutdownReport = null;
     this.now = now;
     // Task semantics (TTL from createdAt, budgets, waiters, keyset pagination)
     // live in the store. Budgets stay module defaults on purpose: they are a
@@ -305,7 +323,9 @@ export class GatewayService {
     this.artifactStore = artifactStore ?? new ArtifactStore({
       root: artifactRoot,
       maxFileBytes: maxArtifactBytes,
-      maxTotalBytes: maxArtifactTotalBytes
+      maxTotalBytes: maxArtifactTotalBytes,
+      // Without a state store no result is durable, and nothing would ever use it.
+      durableReserveBytes: this.stateStore ? Math.floor(maxArtifactTotalBytes * DURABLE_ARTIFACT_RESERVE) : 0
     });
     this.resourceLimits = {
       maxEvents,
@@ -327,6 +347,10 @@ export class GatewayService {
       maxSessionsPerRoot,
       maxInboxHistoryPerRoot
     };
+    // A subscribe reply carries its whole replay in one frame. Half the queue
+    // budget leaves room for the sessions it lists and for whatever else the
+    // connection has in flight. Derived from the setting, not a setting itself.
+    this.maxReplayBytes = Math.max(1, Math.floor(maxQueueBytes / 2));
     this.lifecycle = {
       gcIntervalMs, idleUnloadMs, orphanGraceMs, resultRetentionMs, inboxRetentionMs,
       sessionRetentionMs, taskRetentionMs
@@ -365,6 +389,9 @@ export class GatewayService {
     // The settings file lives outside the state directory (beside install.json),
     // so open() below does not see what a crashed settings write left there.
     if (typeof this.settings?.path === "string") sweepStaleTemporaries(this.settings.path);
+    // Nor what a crashed installer left: its install.json.<pid>.tmp
+    // (writeInstallState) is a full copy of install.json, Control token included.
+    if (typeof this.settings?.legacy === "string") sweepStaleTemporaries(this.settings.legacy);
     if (!this.statePath) return;
     // open() repairs, replays and reports. It returns the same {sessions, tasks,
     // inbox} shape the v4 reader produced, so the restart transformations below
@@ -680,20 +707,38 @@ export class GatewayService {
     const events = [];
     const cursorTruncated = {};
     const replay = {};
-    for (const session of sessions) {
+    const lanes = sessions.map((session) => {
       const cursor = requireNonNegativeNumber(cursors[session.id], `cursors.${session.id}`, 0);
       const firstIndex = session.events[0]?.i ?? session.eventSequence;
       // Replay is the ring only: chunks are a live-delivery concern, and a
       // reconnecting monitor re-reading a full stream of them is the burst that
       // makes a slow subscriber slower. It gains the complete control history in
       // exchange, which is the part a cold start actually needs.
+      const candidates = session.events.filter((item) =>
+        item.i >= Math.max(cursor, firstIndex) && shouldDeliverEvent(subscription, item));
+      return { session, cursor, candidates };
+    });
+    // The whole replay is one reply frame, so it is bounded the way the
+    // transport is: by serialized bytes.
+    boundReplay(lanes, this.maxReplayBytes);
+    for (const { session, cursor, candidates, from, kept } of lanes) {
       const missingLive = cursor <= Math.max(session.lastMessageSequence ?? -1, args.includeThoughts === true ? session.lastThoughtSequence ?? -1 : -1);
       const missingRetained = cursorTruncatedFor(session, cursor);
-      cursorTruncated[session.id] = missingRetained || missingLive;
-      replay[session.id] = { complete: !cursorTruncated[session.id], retainedTruncated: missingRetained, liveOnlyMissing: missingLive, fromCursor: cursor, nextCursor: session.eventSequence };
-      for (const event of session.events.filter((item) => item.i >= Math.max(cursor, firstIndex))) {
-        if (shouldDeliverEvent(subscription, event)) events.push(publicEvent(session, event));
-      }
+      // A budget cut is reported like any other history this reply cannot hold:
+      // a client that knows only cursorTruncated still learns the replay is
+      // incomplete. The cut events stay in the ring, readable with a poll from
+      // fromCursor up to omittedBefore.
+      cursorTruncated[session.id] = missingRetained || missingLive || from > 0;
+      replay[session.id] = {
+        complete: !cursorTruncated[session.id],
+        retainedTruncated: missingRetained,
+        liveOnlyMissing: missingLive,
+        fromCursor: cursor,
+        nextCursor: session.eventSequence,
+        ...(from > 0 ? { budgetTruncated: true, omittedEvents: from, omittedBefore: candidates[from]?.i ?? session.eventSequence } : {})
+      };
+      for (let index = from; index < candidates.length; index += 1) this.store.markDelivered(candidates[index]);
+      for (const event of kept) events.push(event);
     }
     this.subscriptions.set(subscriptionId, subscription);
     return {
@@ -725,6 +770,9 @@ export class GatewayService {
       const watchesSession = subscription.sessionIds.has(session.id)
         || (subscription.watchAll && subscription.rootId === session.ownerRootId);
       if (!watchesSession || !shouldDeliverEvent(subscription, event)) continue;
+      // Before the emit: a frame the transport queues or sheds may still have
+      // reached the peer, so handing it over is what counts.
+      this.store.markDelivered(event);
       try {
         subscription.emit(publicEvent(session, event));
       } catch {
@@ -2471,8 +2519,16 @@ export class GatewayService {
     if (waitMs && toCursor === Infinity && ACTIVE_STATUSES.has(session.status)
       && !visible().some(deliverable)) {
       const statusAtWait = session.status;
+      // The request's own signal (RPC cancel, or the socket closing) ends the
+      // wait at once: an abandoned long poll used to keep its waiter and timer
+      // until the next event or the full waitMs.
       await this.store.wait(session, waitMs, () =>
-        session.status !== statusAtWait || visible().some(deliverable));
+        session.status !== statusAtWait || visible().some(deliverable), context.signal);
+    }
+    // Nobody is left to read the answer, so none is built: building it would
+    // also count its result as delivered to a Main that never received it.
+    if (context.signal?.aborted) {
+      throw new GatewayError(ERROR_CODES.WAIT_ABORTED, `Poll of session ${session.id} was aborted`);
     }
     // maxEvents counts deliverable events; the cursor still advances over the
     // filtered-out ones in between so sparse type reads do not return empty
@@ -2484,6 +2540,7 @@ export class GatewayService {
       consumed += 1;
       if (deliverable(event)) {
         events.push(event);
+        this.store.markDelivered(event);
         if (events.length >= maxEvents) break;
       }
     }
@@ -2584,14 +2641,23 @@ export class GatewayService {
     };
   }
 
+  // Each part is serialized once and the total is assembled from the parts. The
+  // whole response used to be serialized again on top of its result and events,
+  // which doubled the metric's cost on exactly the polls that carry a transcript.
   recordPollMetrics(response) {
     const metrics = this.metrics;
     metrics.pollResponses += 1;
-    metrics.pollBytes += Buffer.byteLength(JSON.stringify(response));
-    if (response.result) metrics.resultBytes += Buffer.byteLength(JSON.stringify(response.result));
-    if (response.events.length) {
-      metrics.eventBytes += Buffer.byteLength(JSON.stringify(response.events));
-      for (const event of response.events) {
+    const { events, result, ...rest } = response;
+    const eventBytes = Buffer.byteLength(JSON.stringify(events));
+    const resultBytes = result === undefined ? 0 : Buffer.byteLength(JSON.stringify(result));
+    // `,"events":` and `,"result":` are 10 bytes each; rest is never empty (ok,
+    // sessionId and nextCursor are on every profile), so the commas are real.
+    metrics.pollBytes += Buffer.byteLength(JSON.stringify(rest)) + 10 + eventBytes
+      + (result === undefined ? 0 : 10 + resultBytes);
+    if (result) metrics.resultBytes += resultBytes;
+    if (events.length) {
+      metrics.eventBytes += eventBytes;
+      for (const event of events) {
         metrics.eventsByType[event.type] = (metrics.eventsByType[event.type] ?? 0) + 1;
       }
     }
@@ -2716,7 +2782,13 @@ export class GatewayService {
         usage: this.store.usageSnapshot(session),
         // Raw event dumps drop the unbounded data field; the capped text
         // preview and dataArtifact pointers stay.
-        events: args.includeEvents ? session.events.map(({ data, ...rest }) => rest) : undefined
+        events: args.includeEvents
+          ? session.events.map((event) => {
+            this.store.markDelivered(event);
+            const { data, ...rest } = event;
+            return rest;
+          })
+          : undefined
       };
     }
     if (args.action === "check") return this.#checkSession(session);
@@ -3290,7 +3362,9 @@ export class GatewayService {
       return { result: result ?? null };
     }
     const preview = utf8ByteHead(json, this.stateStore.inlineResultBytes);
-    const writer = this.artifactStore.create(session?.id ?? taskId, "task-result");
+    // Durable: allowed into the quota's reserve, so a flood of tool-event spills
+    // cannot leave a finished result with only its preview.
+    const writer = this.artifactStore.create(session?.id ?? taskId, "task-result", { durable: true });
     writer.append(json);
     writer.finalize(null, { sync: true });
     const metadata = writer.metadata();
@@ -4086,10 +4160,14 @@ export class GatewayService {
     if (!this.stateStore.rotateIfNeeded()) this.stateStore.writeSnapshot({ sync: false });
   }
 
+  // Returns shutdownReport: null when everything stopped in time, else what was
+  // cut short and why, for the daemon to print.
   async shutdown() {
     this.stopped = true;
     this.draining = true;
-    await this.agentUpdateManager?.stop();
+    this.shutdownReport = null;
+    const agentUpdates = await this.#stopAgentUpdates();
+    if (agentUpdates) this.shutdownReport = { agentUpdates };
     if (this.gcTimer) clearInterval(this.gcTimer);
     this.gcTimer = null;
     if (this.persistTimer) clearTimeout(this.persistTimer);
@@ -4114,6 +4192,44 @@ export class GatewayService {
     // rather than hang on a waiter timer nobody will ever resolve. Clearing
     // before the flush would persist an empty task set instead.
     this.taskStore.clear();
+    return this.shutdownReport;
+  }
+
+  // Waiting on the update manager without a bound let one hung `npm install`
+  // keep the daemon from stopping, and so from restarting, forever. An update
+  // still running after agentUpdateStopMs is aborted, which kills the command it
+  // is running; shutdown then goes on to stop workers and flush state whether or
+  // not that has landed. Returns null when the manager stopped in time, else
+  // what happened to the update.
+  async #stopAgentUpdates() {
+    const manager = this.agentUpdateManager;
+    if (!manager) return null;
+    const stopped = Promise.resolve().then(() => manager.stop()).catch(() => {});
+    if (await settlesWithin(stopped, this.agentUpdateStopMs)) return null;
+    manager.abort?.(new Error("the Gateway is shutting down"));
+    // Never longer than the first wait, so a test's short one stays short.
+    const landed = await settlesWithin(stopped, Math.min(AGENT_UPDATE_ABORT_GRACE_MS, this.agentUpdateStopMs));
+    return {
+      outcome: landed ? "aborted" : "abandoned",
+      waitedMs: this.agentUpdateStopMs,
+      reason: landed
+        ? `an adapter update was still running after ${this.agentUpdateStopMs}ms and was aborted`
+        : `an adapter update was still running after ${this.agentUpdateStopMs}ms and did not stop when aborted`
+    };
+  }
+}
+
+// True when the promise settles within ms; never rejects, and never leaves the
+// timer behind to hold the process open.
+async function settlesWithin(promise, ms) {
+  let timer = null;
+  const expired = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(false), Math.max(0, ms));
+  });
+  try {
+    return await Promise.race([promise.then(() => true, () => true), expired]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -4396,6 +4512,40 @@ function shouldDeliverEvent(subscription, event) {
 // absent from the ring, so only an actual ring eviction advances this watermark.
 function cursorTruncatedFor(session, cursor) {
   return cursor <= (session.eventsEvictedThrough ?? -1);
+}
+
+// Fills a subscribe replay newest first, one event per session per round, until
+// the next event does not fit the budget. Round robin, so one busy session cannot
+// crowd the others out of the reply; newest first, so what a session keeps is a
+// suffix of its history and the cut is always at the old end, the end
+// cursorTruncated describes. Sets lane.from (the first kept candidate) and
+// lane.kept (the public events, oldest first). Sizes are the serialized bytes the
+// transport will pay, measured only for events actually considered.
+function boundReplay(lanes, budget) {
+  let remaining = budget;
+  let open = [];
+  for (const lane of lanes) {
+    lane.from = lane.candidates.length;
+    lane.kept = [];
+    if (lane.from > 0) open.push(lane);
+  }
+  while (open.length > 0) {
+    const next = [];
+    for (const lane of open) {
+      const event = publicEvent(lane.session, lane.candidates[lane.from - 1]);
+      // +1 for the separator the array adds.
+      const bytes = Buffer.byteLength(JSON.stringify(event)) + 1;
+      // The first event that does not fit ends this session's replay: skipping
+      // it to take an older one would leave a hole no cursor can describe.
+      if (bytes > remaining) continue;
+      remaining -= bytes;
+      lane.from -= 1;
+      lane.kept.push(event);
+      if (lane.from > 0) next.push(lane);
+    }
+    open = next;
+  }
+  for (const lane of lanes) lane.kept.reverse();
 }
 
 function publicEvent(session, event) {

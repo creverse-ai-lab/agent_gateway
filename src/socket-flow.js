@@ -101,8 +101,10 @@ export function createSocketSender(socket, {
   // would never reach a megabyte again and the gates below would be unreachable.
   // These are disjoint buffers: writableLength is already handed to Node/the OS,
   // queuedBytes is still owned by the channel. The connection budget covers the
-  // sum so neither layer can hide backlog in the other.
-  const backlog = () => socket.writableLength + channel.queuedBytes;
+  // sum so neither layer can hide backlog in the other. The channel does the sum
+  // because it alone knows which stream bytes belong to an oversized reply it let
+  // through: those are not charged to anything sent after it.
+  const backlog = () => channel.backlogBytes();
 
   const send = (message) => {
     if (socket.destroyed) throw new Error("Gateway socket closed");

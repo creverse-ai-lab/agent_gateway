@@ -167,15 +167,39 @@ export async function readTextLines(path, {
   return { text: window.toString("utf8"), bytes: window.length, truncated };
 }
 
+// A fragment below this many bytes is copied into the open tail block instead of
+// becoming a Buffer of its own. A worker streams its answer a token at a time,
+// and one Buffer object per token costs far more memory than the token.
+const SMALL_APPEND_BYTES = 4096;
+// Tail blocks start small and double up to the cap, so a two-word answer does not
+// pay for 16KiB and a long transcript is not cut into thousands of blocks.
+const MIN_BLOCK_BYTES = 256;
+const MAX_BLOCK_BYTES = 16 * 1024;
+// How many released slots the chunk list may carry before it is compacted.
+const COMPACT_AFTER_SLOTS = 32;
+
 // Bounded tail accumulator for UTF-8 text: append cost is proportional to the
-// new/evicted chunks, not the full accumulated size. A string is materialized
+// new/evicted bytes, not the full accumulated size. A string is materialized
 // only when read.
+//
+// What it keeps alive is bounded too, not just what it returns. Small appends
+// share tail blocks, so the chunk count follows the byte bound rather than the
+// number of appends; an evicted chunk is released at once; and a large backing
+// store whose live part has shrunk to a small tail is copied out instead of
+// staying pinned by a view of it.
 export class BoundedUtf8Text {
   constructor(maxBytes, { onTrim = null } = {}) {
     this.maxBytes = maxBytes;
     this.onTrim = onTrim;
+    // Sealed chunks, oldest first; slots before head are released (undefined).
     this.chunks = [];
     this.head = 0;
+    // The open tail block small appends are copied into. Its bytes from
+    // blockStart to blockEnd are live and come after every sealed chunk.
+    this.block = null;
+    this.blockStart = 0;
+    this.blockEnd = 0;
+    this.nextBlockBytes = MIN_BLOCK_BYTES;
     this.totalBytes = 0;
     this.trimmedBytes = 0;
     this.pendingHighSurrogate = "";
@@ -193,10 +217,20 @@ export class BoundedUtf8Text {
       this.pendingBytes = Buffer.byteLength(this.pendingHighSurrogate, "utf8");
       value = value.slice(0, -1);
     }
-    const chunk = Buffer.from(value, "utf8");
-    if (chunk.length > 0) {
+    const bytes = Buffer.byteLength(value, "utf8");
+    if (bytes >= SMALL_APPEND_BYTES) {
+      this.#seal();
+      // Exactly sized and never pooled: a pooled Buffer is a view of a shared
+      // slab that this chunk would keep alive for as long as it is retained.
+      const chunk = Buffer.allocUnsafeSlow(bytes);
+      chunk.write(value, 0, bytes, "utf8");
       this.chunks.push(chunk);
-      this.totalBytes += chunk.length;
+      this.totalBytes += bytes;
+    } else if (bytes > 0) {
+      this.#makeRoom(bytes);
+      this.block.write(value, this.blockEnd, bytes, "utf8");
+      this.blockEnd += bytes;
+      this.totalBytes += bytes;
     }
     this.#trim();
   }
@@ -204,6 +238,10 @@ export class BoundedUtf8Text {
   reset(text = "") {
     this.chunks = [];
     this.head = 0;
+    this.block = null;
+    this.blockStart = 0;
+    this.blockEnd = 0;
+    this.nextBlockBytes = MIN_BLOCK_BYTES;
     this.totalBytes = 0;
     this.trimmedBytes = 0;
     this.pendingHighSurrogate = "";
@@ -212,36 +250,115 @@ export class BoundedUtf8Text {
   }
 
   toString() {
-    const liveChunks = this.chunks.length - this.head;
-    if (liveChunks === 0) return "";
-    if (liveChunks > 1) this.chunks = [Buffer.concat(this.chunks.slice(this.head), this.totalBytes)];
-    else if (this.head > 0) this.chunks = [this.chunks[this.head]];
+    const sealed = this.chunks.length - this.head;
+    const open = this.blockEnd - this.blockStart;
+    if (sealed === 0) return open > 0 ? this.block.toString("utf8", this.blockStart, this.blockEnd) : "";
+    if (sealed === 1 && open === 0) return this.chunks[this.head].toString("utf8");
+    // Collapsed into one chunk, so the next read is a single decode. The open
+    // block keeps only its free room: the bytes it held are in the copy now.
+    const merged = Buffer.allocUnsafeSlow(this.totalBytes);
+    let offset = 0;
+    for (let index = this.head; index < this.chunks.length; index += 1) {
+      offset += this.chunks[index].copy(merged, offset);
+    }
+    if (open > 0) this.block.copy(merged, offset, this.blockStart, this.blockEnd);
+    this.chunks = [merged];
     this.head = 0;
-    return this.chunks[0].toString("utf8");
+    this.blockStart = this.blockEnd;
+    this.#dropSpentBlock();
+    return merged.toString("utf8");
+  }
+
+  // What this accumulator keeps allocated: the Buffers it references and the
+  // backing stores behind them, each store counted once. For tests and
+  // diagnostics; nothing on the append path reads it.
+  memoryStats() {
+    const stores = new Set();
+    let chunks = 0;
+    for (const chunk of this.chunks) {
+      if (!chunk) continue;
+      chunks += 1;
+      stores.add(chunk.buffer);
+    }
+    if (this.block) {
+      chunks += 1;
+      stores.add(this.block.buffer);
+    }
+    let retainedBytes = 0;
+    for (const store of stores) retainedBytes += store.byteLength;
+    return { chunks, retainedBytes };
+  }
+
+  // Ends the open region: its bytes become a sealed chunk (a view of the block)
+  // so that whatever is appended next comes after them. The block keeps its
+  // free room for the next small append.
+  #seal() {
+    if (this.blockEnd > this.blockStart) {
+      this.chunks.push(this.block.subarray(this.blockStart, this.blockEnd));
+    }
+    this.blockStart = this.blockEnd;
+  }
+
+  #makeRoom(bytes) {
+    if (this.block && this.block.length - this.blockEnd >= bytes) return;
+    this.#seal();
+    const cap = Math.min(MAX_BLOCK_BYTES, Math.max(MIN_BLOCK_BYTES, this.maxBytes));
+    // Buffer.alloc never draws from the shared pool, and zero-filled bytes past
+    // blockEnd can never be read as stale memory.
+    this.block = Buffer.alloc(Math.max(bytes, Math.min(cap, this.nextBlockBytes)));
+    this.blockStart = 0;
+    this.blockEnd = 0;
+    this.nextBlockBytes = Math.min(cap, this.nextBlockBytes * 2);
+  }
+
+  // A full block with nothing live left in it is only memory.
+  #dropSpentBlock() {
+    if (!this.block || this.blockEnd !== this.blockStart || this.blockEnd !== this.block.length) return;
+    this.block = null;
+    this.blockStart = 0;
+    this.blockEnd = 0;
+  }
+
+  #evicted(bytes) {
+    this.totalBytes -= bytes;
+    this.trimmedBytes += bytes;
   }
 
   #trim() {
-    while (this.totalBytes + this.pendingBytes > this.maxBytes && this.head < this.chunks.length) {
-      const front = this.chunks[this.head];
+    while (this.totalBytes + this.pendingBytes > this.maxBytes) {
       const excess = this.totalBytes + this.pendingBytes - this.maxBytes;
-      if (front.length <= excess) {
-        this.onTrim?.(front);
-        this.totalBytes -= front.length;
-        this.trimmedBytes += front.length;
-        this.head += 1;
+      if (this.head < this.chunks.length) {
+        const front = this.chunks[this.head];
+        const start = front.length <= excess ? front.length : utf8Boundary(front, excess);
+        this.onTrim?.(start === front.length ? front : front.subarray(0, start));
+        this.#evicted(start);
+        if (start < front.length) {
+          this.chunks[this.head] = released(front.subarray(start));
+        } else {
+          // Released now, not at the next compaction.
+          this.chunks[this.head] = undefined;
+          this.head += 1;
+        }
         continue;
       }
-      let start = excess;
-      while (start < front.length && (front[start] & 0xc0) === 0x80) start += 1;
-      this.onTrim?.(front.subarray(0, start));
-      this.totalBytes -= start;
-      this.trimmedBytes += start;
-      this.chunks[this.head] = front.subarray(start);
+      if (this.blockEnd > this.blockStart) {
+        const live = this.block.subarray(this.blockStart, this.blockEnd);
+        const start = live.length <= excess ? live.length : utf8Boundary(live, excess);
+        this.onTrim?.(live.subarray(0, start));
+        this.#evicted(start);
+        this.blockStart += start;
+        continue;
+      }
+      break;
     }
-    if (this.head > 1024 && this.head * 2 > this.chunks.length) {
+    if (this.head === this.chunks.length) {
+      if (this.head > 0) this.chunks = [];
+      this.head = 0;
+    } else if (this.head >= COMPACT_AFTER_SLOTS && this.head * 2 >= this.chunks.length) {
       this.chunks = this.chunks.slice(this.head);
       this.head = 0;
     }
+    this.#dropSpentBlock();
     if (this.totalBytes + this.pendingBytes > this.maxBytes) {
       if (this.pendingHighSurrogate) this.onTrim?.(Buffer.from(this.pendingHighSurrogate, "utf8"));
       this.trimmedBytes += this.pendingBytes;
@@ -249,4 +366,23 @@ export class BoundedUtf8Text {
       this.pendingBytes = 0;
     }
   }
+}
+
+// The first character boundary at or after offset: evicting up to it never
+// leaves a partial character at the front.
+function utf8Boundary(buffer, offset) {
+  let start = offset;
+  while (start < buffer.length && (buffer[start] & 0xc0) === 0x80) start += 1;
+  return start;
+}
+
+// A view keeps its whole backing store alive. Once most of a store larger than a
+// tail block is evicted text, the live rest is worth a copy of its own: a 5MB
+// append trimmed to a 1MB bound must not keep holding 5MB.
+function released(view) {
+  const store = view.buffer.byteLength;
+  if (store <= MAX_BLOCK_BYTES || view.length * 2 >= store) return view;
+  const copy = Buffer.allocUnsafeSlow(view.length);
+  view.copy(copy);
+  return copy;
 }

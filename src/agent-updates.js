@@ -1,6 +1,6 @@
 import { loadOfficialRegistry, selectDistribution } from "./acp-registry.js";
 import { gatewayUpdateMessage } from "./gateway-source-monitor.js";
-import { parseInstallerArgs, runInstaller } from "./installer.js";
+import { parseInstallerArgs, runCommand, runInstaller } from "./installer.js";
 import { detectProviders } from "./providers.js";
 
 const REGISTRY_IDS = {
@@ -31,6 +31,8 @@ export class AgentUpdateManager {
     this.now = now;
     this.timer = null;
     this.running = null;
+    // Aborts the refresh in flight, and with it any install command it runs.
+    this.controller = null;
     this.state = {
       status: "pending",
       lastCheckedAt: null,
@@ -58,9 +60,21 @@ export class AgentUpdateManager {
     await this.running;
   }
 
+  // Ends the refresh in flight: an `npm install` or `uv tool install` it is
+  // running is killed, and the refresh records the abort as its error. For a
+  // shutdown that cannot wait; the next check (at the next start) tries again.
+  abort(reason = new Error("aborted")) {
+    this.controller?.abort(reason);
+  }
+
   refresh() {
     if (this.running) return this.running;
-    this.running = this.#refresh().finally(() => { this.running = null; });
+    const controller = new AbortController();
+    this.controller = controller;
+    this.running = this.#refresh(controller.signal).finally(() => {
+      this.running = null;
+      if (this.controller === controller) this.controller = null;
+    });
     return this.running;
   }
 
@@ -114,7 +128,7 @@ export class AgentUpdateManager {
     };
   }
 
-  async #refresh() {
+  async #refresh(signal) {
     this.state.status = "checking";
     this.state.error = null;
     if (this.sourceChecker) {
@@ -141,7 +155,7 @@ export class AgentUpdateManager {
       const manual = loaded.stale ? candidates : candidates.filter((item) => !item.automatic);
 
       if (this.enabled && automatic.length) {
-        await this.applyUpdates(automatic);
+        await this.applyUpdates(automatic, { signal });
         const verified = updateCandidates(loaded.registry, await this.detect());
         const appliedIds = new Set(automatic.map((item) => item.registryId));
         const unresolvedAutomatic = verified.filter((item) => appliedIds.has(item.registryId));
@@ -209,7 +223,7 @@ function parseVersion(value) {
   return { parts: match.slice(1, 4).map(Number), prerelease: match[4] ?? null };
 }
 
-async function defaultApplyUpdates(updates) {
+async function defaultApplyUpdates(updates, { signal = null } = {}) {
   const options = parseInstallerArgs([
     "--install-adapters",
     "--refresh-registry",
@@ -217,7 +231,9 @@ async function defaultApplyUpdates(updates) {
   ]);
   options.registryAgents = updates.map((item) => item.registryId);
   options.registryAgentsOnly = true;
-  return runInstaller(options);
+  // Every command the install runs (npm/uv, and `npm list` to see what is
+  // there) is tied to the refresh, so aborting the refresh stops it.
+  return runInstaller(options, { runCommand: (command, args) => runCommand(command, args, { signal }) });
 }
 
 function formatUpdates(updates) {

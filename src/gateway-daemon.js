@@ -221,7 +221,10 @@ async function shutdown() {
   shutdownPromise = (async () => {
     for (const socket of clients) socket.destroy();
     await new Promise((resolve) => server.close(resolve));
-    await service.shutdown();
+    const report = await service.shutdown();
+    // Whatever shutdown had to cut short (a hung adapter update) is said where an
+    // operator or a supervisor capturing stderr can see it.
+    if (report?.agentUpdates) process.stderr.write(`acp-gateway-daemon: ${report.agentUpdates.reason}\n`);
     await unlink(socketPath).catch(() => {});
     await releaseDaemonLock(daemonLock);
   })();

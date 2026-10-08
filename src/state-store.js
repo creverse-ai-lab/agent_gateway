@@ -1057,11 +1057,12 @@ function degradedResult(preview) {
 }
 
 // Half-finished atomic writes a crashed writer left beside `path`: the
-// snapshot writer's `${path}.<pid>.tmp` (the v4 writer used the same form),
-// and updateJsonFile's `${path}.<uuid>.tmp` (settings). Only a dead writer's
-// file goes. A pid-named one once that process is gone; a uuid-named one only
-// while no writer holds the file's lock, and only long after any write could
-// still be running, because its name does not say who made it.
+// snapshot writer's `${path}.<pid>.tmp` (the v4 writer and the installer's
+// install.json writer use the same form), and updateJsonFile's
+// `${path}.<uuid>.tmp` (settings). Only a dead writer's file goes. A pid-named
+// one once that process is gone; a uuid-named one only while no writer holds
+// the file's lock, and only long after any write could still be running,
+// because its name does not say who made it.
 export function sweepStaleTemporaries(path, { minAgeMs = STALE_TEMPORARY_MS } = {}) {
   const directory = dirname(path);
   const prefix = `${basename(path)}.`;

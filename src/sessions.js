@@ -2,6 +2,11 @@ import { randomUUID } from "node:crypto";
 import { BoundedUtf8Text, readHeadBytes, utf8ByteHead } from "./bounded-utf8.js";
 
 const textAccumulators = new WeakMap();
+// Ring events whose spilled payload (dataArtifact) has left the Gateway in a
+// poll, a replay, a live delivery or a session get. Only those can have their
+// artifact path in a caller's hands. Weak, so it lives exactly as long as the
+// events do.
+const deliveredEvents = new WeakSet();
 
 // The control lane. An event worth persisting is an event worth never dropping,
 // so one closed list decides all three of its consumers: the ring slots telemetry
@@ -429,9 +434,10 @@ export class SessionStore {
   // would keep the old number, which a subscriber past that cursor drops as
   // already-seen — leaving it permanently unable to observe the new state. The
   // re-push preserves monotonicity, live delivery and "at most one entry per
-  // call" all at once. The oversized artifact of a superseded update becomes
-  // age-prune eligible by leaving the ring; it is never unlinked eagerly,
-  // because a poll may already have handed its path out.
+  // call" all at once. The oversized artifact of a superseded update is
+  // reclaimed here when its event never left the Gateway (#reclaimSpill);
+  // otherwise it becomes age-prune eligible by leaving the ring, because a
+  // poll may already have handed its path out.
   pushToolCallUpdate(session, event, toolCallId) {
     const state = toolCallId == null ? null : textAccumulators.get(session);
     if (state) {
@@ -439,6 +445,7 @@ export class SessionStore {
       state.toolCalls.delete(toolCallId);
       const at = prior ? session.events.indexOf(prior) : -1;
       if (at >= 0) session.events.splice(at, 1);
+      this.#reclaimSpill(prior);
     }
     const stored = this.push(session, event);
     if (state) {
@@ -451,6 +458,25 @@ export class SessionStore {
       }
     }
     return stored;
+  }
+
+  // Every path that hands a ring event out calls this before the event can be
+  // serialized, so a later supersession never deletes a file a caller was told
+  // about. Events without a spill have nothing to reclaim and are not tracked.
+  markDelivered(event) {
+    if (event?.dataArtifact?.path) deliveredEvents.add(event);
+  }
+
+  // A superseded update's spill is deleted at once when no caller can hold its
+  // path: the event never left the Gateway, and nothing else points at the file
+  // (each oversized update is spilled to a file of its own; tool updates have no
+  // inbox row and are never persisted). Without this, a long tool call left one
+  // file per update on disk for the whole retention period, all counted against
+  // the shared artifact quota.
+  #reclaimSpill(event) {
+    const path = event?.dataArtifact?.path;
+    if (!path || deliveredEvents.has(event)) return;
+    this.artifactStore?.discard?.(path);
   }
 
   projectionSnapshot(session) {
@@ -523,12 +549,18 @@ export class SessionStore {
 
   // Waiters fire only for retained events or status changes. Raw progress is a
   // subscription stream and never wakes a poll, even when its filter names a
-  // chunk type.
-  wait(session, waitMs, shouldWake = () => true) {
+  // chunk type. An aborted signal ends the wait at once and takes its waiter and
+  // timer with it; the caller decides what an aborted wait means.
+  wait(session, waitMs, shouldWake = () => true, signal = null) {
     return new Promise((done) => {
+      if (signal?.aborted) {
+        done();
+        return;
+      }
       const finish = () => {
         clearTimeout(timer);
         session.waiters.delete(wake);
+        signal?.removeEventListener("abort", finish);
         done();
       };
       const wake = () => {
@@ -536,6 +568,7 @@ export class SessionStore {
       };
       const timer = setTimeout(finish, waitMs);
       session.waiters.add(wake);
+      signal?.addEventListener("abort", finish, { once: true });
     });
   }
 }

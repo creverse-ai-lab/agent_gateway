@@ -138,9 +138,11 @@ Preview is advisory: time, new work, references and settings can change before a
 
 `subscribe` returns the existing sessions/events/cursorTruncated fields and `replay`, keyed by session ID: `{complete,retainedTruncated,liveOnlyMissing,fromCursor,nextCursor}`. Message/thought chunks remain live-only; retained control/tool events remain bounded. A missing relevant raw chunk now also sets cursorTruncated, so older consumers cannot call that replay complete. Poll remains a retained-result/control view and does not treat intentional absence of raw chunks as poll history loss.
 
+The replay is one reply, so since 1.8.0 it is bounded by bytes: half of `maxQueueBytes` (2MB by default) of serialized events across all sessions it covers. It is filled newest first, one event per session in turn, so one busy session cannot crowd out the others, and each session keeps an unbroken run of its newest events. A session whose older events did not fit reports it the way any incomplete replay does (`cursorTruncated` true, `complete` false), plus `budgetTruncated: true`, `omittedEvents` (how many matching events were left out) and `omittedBefore` (the first replayed sequence). Those events are still retained: `poll` with `cursor` set to `fromCursor` and `toCursor` set to `omittedBefore` reads them. A replay that fits has the same shape as before.
+
 On client reconnect, `subscription_replay_truncated` still notifies callbacks of incomplete history. A gap/reconnect and healthy transport must never imply complete history. After daemon restart, the prior non-persisted event history is explicitly marked truncated. Fetch completed tasks through task_list/task_result and follow bounded artifact pointers for results; do not resubmit prompts to reconstruct a timeline. No persistent raw transcript journal is advertised.
 
-At most 64 subscriptions per root. Invalid cursors fail before registration. Aborting a run wait releases its waiter immediately and leaves the worker running. Only explicit task/session cancellation cancels the worker.
+At most 64 subscriptions per root. Invalid cursors fail before registration. Aborting a run wait releases its waiter immediately and leaves the worker running. Since 1.8.0 a long `poll` does the same: when its request is cancelled or its connection closes, the wait ends at once with `WAIT_ABORTED` and no response is built, so a result it would have carried is not counted as delivered. Only explicit task/session cancellation cancels the worker.
 
 ## Runtime identity and invariants
 

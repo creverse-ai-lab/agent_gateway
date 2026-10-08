@@ -25,7 +25,13 @@ test("socket Gateway separates public guide access from Main control", async () 
       ACP_GATEWAY_SOCKET: socketPath,
       ACP_GATEWAY_STATE: statePath,
       ACP_GATEWAY_CONTROL_TOKEN: token,
-      ACP_GATEWAY_ROOT_ID: "main-a"
+      ACP_GATEWAY_ROOT_ID: "main-a",
+      // Install state and settings (beside it) in the temp directory: the
+      // daemon sweeps leftovers next to both at startup, and must not touch the
+      // developer's own. No adapter update runs from a test daemon either.
+      ACP_GATEWAY_INSTALL_STATE: join(directory, "install.json"),
+      ACP_GATEWAY_AGENT_AUTO_UPDATE: "0",
+      ACP_GATEWAY_AGENT_UPDATE_NOTIFICATIONS: "0"
     }
   });
   let daemonError = "";
@@ -200,7 +206,10 @@ test("concurrent daemon starts leave exactly one owner for a socket and state fi
       ACP_GATEWAY_SOCKET: socketPath,
       ACP_GATEWAY_STATE: statePath,
       ACP_GATEWAY_CONTROL_TOKEN: token,
-      ACP_GATEWAY_ROOT_ID: "main-a"
+      ACP_GATEWAY_ROOT_ID: "main-a",
+      ACP_GATEWAY_INSTALL_STATE: join(directory, "install.json"),
+      ACP_GATEWAY_AGENT_AUTO_UPDATE: "0",
+      ACP_GATEWAY_AGENT_UPDATE_NOTIFICATIONS: "0"
     }
   }));
   const errors = ["", ""];
