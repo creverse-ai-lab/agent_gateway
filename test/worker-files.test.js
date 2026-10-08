@@ -181,6 +181,32 @@ test("on macOS and Linux the OS-level check alone refuses the swap, even where t
   });
 });
 
+// F4 (1.8.0 review): link(2) needs no read permission on its target, so a Worker
+// can give a protected file a second name inside its roots (ln the token to
+// ./notes). The path check passes — the name is in-root and under no protected
+// path — and /proc and the realpath both show that in-root name, so only the
+// descriptor's inode tells the two names apart. Read and write refuse it by
+// (dev, ino), before a byte is read or the file is truncated.
+test("a hard link to a protected file is refused for reads and writes, and an ordinary one still works", async () => {
+  await withLayout(async ({ root, secret, options }) => {
+    const toSecret = join(root, "notes");
+    await link(secret, toSecret);
+    await assert.rejects(openWorkerFile(toSecret, options), /hard link to a Gateway-protected file/);
+    await assert.rejects(openWorkerFile(toSecret, { ...options, write: true }), /hard link to a Gateway-protected file/);
+    assert.equal(await readFile(secret, "utf8"), TOKEN, "neither read out nor truncated through the link");
+
+    // A hard link to an ordinary in-root file is no protected inode: it still works.
+    const toPlain = join(root, "b.txt");
+    await link(join(root, "a.txt"), toPlain);
+    const handle = await openWorkerFile(toPlain, options);
+    try {
+      assert.equal(await readAll(handle), "inside\nsecond line");
+    } finally {
+      await handle.close();
+    }
+  });
+});
+
 test("a dangling symlink as the last component cannot make a write create its target", async () => {
   await withLayout(async ({ directory, root, options }) => {
     // realpath fails on a dangling link, so the check resolves its parent and

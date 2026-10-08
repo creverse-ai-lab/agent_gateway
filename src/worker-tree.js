@@ -33,6 +33,18 @@ const PS = existsSync("/bin/ps") ? "/bin/ps" : "ps";
 const PROC_FS = process.platform === "linux" && existsSync("/proc/self/stat");
 
 /**
+ * Whether this platform tells a worker from a Main by process ancestry at all.
+ * Windows has neither /proc nor ps, so there every chain reads as unreadable and
+ * the marker is the only signal: ancestry is not consulted and an unreadable
+ * chain is never failed closed. Everywhere else it is, so the rare broken host
+ * (no /proc and ps missing or blocked) fails closed rather than let a worker that
+ * cannot be placed pass for a Main. Injectable for tests.
+ */
+export function canReadAncestry(platform = process.platform) {
+  return platform !== "win32";
+}
+
+/**
  * {ppid, command} of a running process, or null when it cannot be read: gone,
  * or no /proc and no ps (Windows). Linux reads /proc and starts no process;
  * elsewhere it is one ps per call, a few milliseconds.
@@ -93,7 +105,19 @@ export function runsGatewayDaemon(command) {
  * container's entrypoint) cannot be told apart this way, only by the worker
  * marker.
  */
-export async function findAncestor(pid, {
+export async function findAncestor(pid, options = {}) {
+  return (await traceAncestry(pid, options)).match;
+}
+
+/**
+ * The same walk as findAncestor, as {match, unreadable}: unreadable when it was
+ * cut short because a process could not be read, so the chain cannot be told to
+ * hold the daemon or not. A walk that reaches pid 1, loops, or exhausts maxDepth
+ * read everything it looked at and is not unreadable; a match is never
+ * unreadable. The front door and the daemon fail closed on unreadable where the
+ * host can read ancestry at all (canReadAncestry).
+ */
+async function traceAncestry(pid, {
   pids = [],
   commandMatches = () => false,
   verifyPids = false,
@@ -102,21 +126,21 @@ export async function findAncestor(pid, {
 } = {}) {
   const seen = new Set();
   for (let depth = 0; depth < maxDepth; depth += 1) {
-    if (!Number.isInteger(pid) || pid <= 1 || seen.has(pid)) return null;
+    if (!Number.isInteger(pid) || pid <= 1 || seen.has(pid)) return { match: null, unreadable: false };
     seen.add(pid);
     const listed = pids.includes(pid);
-    if (listed && !verifyPids) return { pid, command: null };
+    if (listed && !verifyPids) return { match: { pid, command: null }, unreadable: false };
     let info = null;
     try {
       info = await readProcess(pid);
     } catch {}
     const command = typeof info?.command === "string" && info.command.trim() ? info.command : null;
-    if (listed && (command === null || commandMatches(command))) return { pid, command };
-    if (!info) return null;
-    if (command !== null && commandMatches(command)) return { pid, command };
+    if (listed && (command === null || commandMatches(command))) return { match: { pid, command }, unreadable: false };
+    if (!info) return { match: null, unreadable: true };
+    if (command !== null && commandMatches(command)) return { match: { pid, command }, unreadable: false };
     pid = info.ppid;
   }
-  return null;
+  return { match: null, unreadable: false };
 }
 
 /** The pid the daemon serving socketPath recorded in its lock file, or null. */
@@ -146,21 +170,31 @@ export async function workerTreeReason({
   ppid = process.ppid,
   socketPath = gatewaySocketPath(),
   readProcess = readProcessInfo,
-  maxDepth = MAX_ANCESTRY_DEPTH
+  maxDepth = MAX_ANCESTRY_DEPTH,
+  ancestrySupported = canReadAncestry()
 } = {}) {
   if (env[GATEWAY_WORKER_ENV] === "1") return `${GATEWAY_WORKER_ENV}=1 is set`;
   const lockPid = daemonLockPid(socketPath);
-  const daemon = await findAncestor(ppid, {
+  const { match: daemon, unreadable } = await traceAncestry(ppid, {
     pids: lockPid ? [lockPid] : [],
     verifyPids: true,
     commandMatches: runsGatewayDaemon,
     readProcess,
     maxDepth
   });
-  if (!daemon) return null;
-  return daemon.pid === lockPid
-    ? `ancestor process ${daemon.pid} holds the Gateway daemon lock ${socketPath}.lock`
-    : `ancestor process ${daemon.pid} runs the Gateway daemon: ${daemon.command.slice(0, 200)}`;
+  if (daemon) {
+    return daemon.pid === lockPid
+      ? `ancestor process ${daemon.pid} holds the Gateway daemon lock ${socketPath}.lock`
+      : `ancestor process ${daemon.pid} runs the Gateway daemon: ${daemon.command.slice(0, 200)}`;
+  }
+  // No daemon above it. If the chain could not be read, and this host can read
+  // one at all, a worker could be hiding its daemon by denying the lookup: fail
+  // closed. A Main's own front door can always read its parent chain, and the
+  // marker already decided before any of this.
+  if (unreadable && ancestrySupported) {
+    return "its process ancestry cannot be read (no /proc and ps is unavailable or blocked), so a worker cannot be told from a Main";
+  }
+  return null;
 }
 
 /**
@@ -174,19 +208,40 @@ export async function runsUnder(pid, daemonPid, { readProcess = readProcessInfo,
 /**
  * One control connection's verdict on its caller. Called with each request's
  * caller pid, it returns null while the connection has named none, else
- * {pid, denied}: denied a promise of whether that pid runs under the daemon.
- * The verdict is computed for the first pid and reused while the pid stays the
- * same, which it does for a front door, so a connection pays for one lookup;
- * a request that names another pid gets a lookup, and a verdict, of its own.
- * A request with no pid gets the connection's latest verdict, so it waits
- * behind a lookup in flight instead of overtaking the requests before it.
+ * {pid, denied}: denied a promise of whether that pid is a worker's — it runs
+ * under the daemon, or the host cannot read process ancestry at all and so cannot
+ * place it, which fails closed the same way the front door does. The verdict is
+ * computed for the first pid and reused while the pid stays the same, which it
+ * does for a front door, so a connection pays for one lookup; a request that
+ * names another pid gets a lookup, and a verdict, of its own. A request with no
+ * pid gets the connection's latest verdict, so it waits behind a lookup in flight
+ * instead of overtaking the requests before it.
  */
-export function callerVerdicts({ daemonPid = process.pid, ...options } = {}) {
+export function callerVerdicts({ daemonPid = process.pid, ancestrySupported = canReadAncestry(), ...options } = {}) {
   let verdict = null;
   return (pid) => {
     if (Number.isInteger(pid) && pid > 1 && pid !== verdict?.pid) {
-      verdict = { pid, denied: runsUnder(pid, daemonPid, options) };
+      verdict = { pid, denied: callerDenied(pid, daemonPid, ancestrySupported, options) };
     }
     return verdict;
   };
+}
+
+// Whether a caller pid is a worker's. Under the daemon is the clear case. The
+// walk not placing it there is not: unlike the front door, which walks from its
+// own live parent, the daemon walks from a caller pid it does not control, and
+// that pid may simply be gone — no worker. So a broken host is told from a gone
+// pid by reading a process known to be alive, the daemon itself: a read that
+// fails there means the host cannot place any caller and fails closed; one that
+// succeeds means the caller really runs outside the daemon. Windows, which can
+// read no ancestry (ancestrySupported false), stays marker-only.
+async function callerDenied(pid, daemonPid, ancestrySupported, options) {
+  if (await runsUnder(pid, daemonPid, options)) return true;
+  if (!ancestrySupported) return false;
+  const readProcess = options.readProcess ?? readProcessInfo;
+  try {
+    return (await readProcess(daemonPid)) === null;
+  } catch {
+    return true;
+  }
 }

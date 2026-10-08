@@ -1,5 +1,5 @@
 import { constants, realpathSync } from "node:fs";
-import { open, readlink, realpath, stat } from "node:fs/promises";
+import { open, readdir, readlink, realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 // fs/read_text_file and fs/write_text_file act on a file a Worker names: inside
@@ -135,4 +135,44 @@ async function verifyOpened(handle, requested, path, { roots, protectedPaths, pl
   if (again.normalize("NFC") !== path.normalize("NFC")) throw changed();
   const current = await stat(again, { bigint: true }).catch(() => null);
   if (current?.dev !== opened.dev || current?.ino !== opened.ino) throw changed();
+  // Every check so far is about the name, and a hard link is a second name for
+  // one inode: link(2) needs no read permission on its target, so a Worker can
+  // name a protected file inside its roots (ln ~/.acp-gateway/install.json
+  // ./notes). The name is in-root and under no protected path, /proc and the
+  // realpath above both show that in-root name, and the stat finds the
+  // descriptor's inode through it, so nothing above tells the two names apart.
+  // The inode does. Reads and writes both reach here before a byte is read or
+  // the file is truncated, so neither reads out nor empties a protected file.
+  if (await descriptorIsProtected(opened, protectedPaths)) {
+    throw new Error(`Path is a hard link to a Gateway-protected file: ${path}`);
+  }
+}
+
+/**
+ * Whether the opened descriptor (its bigint stat) is one of the regular files a
+ * Worker must never reach by inode, not only by name: the regular files directly
+ * inside gatewayProtectedPaths() (the token in install.json, and the engine
+ * settings and state kept beside it) and a protected path that is itself a file.
+ * A directory cannot be hard-linked and the socket is not a regular file, so
+ * comparing regular files is enough, and the walk stays one level deep: those
+ * files sit directly in the directory, and recursing would stat the snapshot and
+ * workspace trees on every read. Resolved per call, so a file recreated with a
+ * new inode is never matched by a stale one.
+ */
+async function descriptorIsProtected(opened, protectedPaths) {
+  const sameFile = (info) => info?.isFile() && info.dev === opened.dev && info.ino === opened.ino;
+  for (const base of protectedPaths) {
+    const info = await stat(base, { bigint: true }).catch(() => null);
+    if (sameFile(info)) return true;
+    if (!info?.isDirectory()) continue;
+    const entries = await readdir(base, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      // A dirent of a known other kind is skipped without a stat; an unknown one
+      // (some filesystems leave the type out) is settled by the stat.
+      if (entry.isDirectory() || entry.isSymbolicLink() || entry.isSocket()
+        || entry.isBlockDevice() || entry.isCharacterDevice() || entry.isFIFO()) continue;
+      if (sameFile(await stat(join(base, entry.name), { bigint: true }).catch(() => null))) return true;
+    }
+  }
+  return false;
 }

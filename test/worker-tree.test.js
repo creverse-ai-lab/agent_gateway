@@ -12,8 +12,8 @@ import { sanitizeWorkerMcpServers } from "../src/gateway-service.js";
 import { readNdjson } from "../src/ndjson.js";
 import { GatewayRpcClient } from "../src/socket-rpc.js";
 import {
-  callerVerdicts, daemonLockPid, findAncestor, MAX_ANCESTRY_DEPTH, readProcessInfo, runsGatewayDaemon, runsUnder,
-  WORKER_TREE_EXIT_CODE, workerTreeReason
+  callerVerdicts, canReadAncestry, daemonLockPid, findAncestor, MAX_ANCESTRY_DEPTH, readProcessInfo, runsGatewayDaemon,
+  runsUnder, WORKER_TREE_EXIT_CODE, workerTreeReason
 } from "../src/worker-tree.js";
 import { startDaemon } from "./helpers/daemon-harness.js";
 import { withTemp } from "./helpers/scratch.js";
@@ -131,7 +131,10 @@ test("W1: pid 1 is the top of every chain, never the daemon, even when the lock 
   await withTemp("acp-worker-tree-init-", async (directory) => {
     const socketPath = join(directory, "gateway.sock");
     await writeFile(`${socketPath}.lock`, "1\n");
-    const { readProcess, reads } = processTable({ 100: [90, "/usr/local/bin/claude"], 90: [1, "/bin/sh -c claude"] });
+    // pid 1 is in the table and readable (init always is), so the daemon-side
+    // probe of a pid-1 daemon finds the host healthy; the walk still never reads
+    // or matches it.
+    const { readProcess, reads } = processTable({ 100: [90, "/usr/local/bin/claude"], 90: [1, "/bin/sh -c claude"], 1: [0, "/sbin/init"] });
     assert.equal(await workerTreeReason({ env: {}, ppid: 100, socketPath, readProcess }), null);
     assert.deepEqual(reads, [100, 90], "pid 1 is neither matched nor read");
     assert.equal(await findAncestor(1, { pids: [1], readProcess: () => assert.fail("pid 1 is never read") }), null);
@@ -211,13 +214,66 @@ test("W1: the ancestry lookup is bounded and treats what it cannot read as no ev
   for (const readProcess of fails) {
     assert.equal(await findAncestor(100, { pids: [40], commandMatches: runsGatewayDaemon, readProcess }), null);
     assert.equal(await runsUnder(100, 40, { readProcess }), false);
-    assert.equal(await workerTreeReason({ env: {}, ppid: 100, socketPath: "/nonexistent/gateway.sock", readProcess }), null);
+    // F6: findAncestor and runsUnder stay predicates — an unreadable chain is not
+    // a match and not "under". Where the host cannot read ancestry at all, the
+    // front door keeps treating it as no evidence; where it can, F6 fails closed
+    // (the next test), so the marker stays the only signal on such a host.
+    assert.equal(await workerTreeReason({ env: {}, ppid: 100, socketPath: "/nonexistent/gateway.sock", readProcess, ancestrySupported: false }), null);
   }
   // A chain that loops (a pid reused mid-walk) ends instead of spinning to the bound.
   const loop = processTable({ 10: [11, "a"], 11: [10, "b"] });
   assert.equal(await findAncestor(10, { pids: [40], readProcess: loop.readProcess }), null);
   assert.deepEqual(loop.reads, [10, 11]);
   for (const pid of [0, -1, 1.5, null, undefined]) assert.equal(await findAncestor(pid, { pids: [pid], readProcess: () => assert.fail() }), null);
+});
+
+// F6 (1.8.0 review): when the ancestry walk cannot read parents — no /proc and
+// ps missing or blocked — workerTreeReason used to return null (front door
+// starts) and the daemon's caller check treated the chain as not-under-it
+// (caller allowed), so a worker CLI that forwards no marker (Codex) got Control
+// on such a host. The checks now tell "walked, no daemon" from "could not read"
+// and fail closed on the latter, where the host can read ancestry at all.
+test("F6: an unreadable ancestry fails closed at the front door and the daemon, the marker still first", async () => {
+  // No /proc and no ps: every read fails. canReadAncestry is true on this Unix
+  // test host, so this is the rare broken host the checks fail closed on.
+  for (const readProcess of [async () => null, async () => { throw new Error("ps blocked"); }]) {
+    assert.match(
+      await workerTreeReason({ env: {}, ppid: 100, socketPath: "/nonexistent/gateway.sock", readProcess }),
+      /process ancestry cannot be read/
+    );
+    assert.equal(await callerVerdicts({ daemonPid: 40, readProcess })(100).denied, true, "the daemon refuses the caller pid");
+  }
+  // The marker decides before any lookup, unreadable chain or not.
+  assert.equal(
+    await workerTreeReason({ env: { [GATEWAY_WORKER_ENV]: "1" }, ppid: 100, socketPath: "/nonexistent/gateway.sock", readProcess: () => assert.fail("the marker decides first") }),
+    "ACP_GATEWAY_WORKER=1 is set"
+  );
+});
+
+test("F6: a readable chain with no daemon is allowed, and a no-caller request is never refused", async () => {
+  // Read all the way to pid 1, no daemon above: a Main, allowed at both ends. The
+  // daemon (pid 40) is alive and readable, so the daemon-side probe finds the
+  // host healthy and the caller merely outside it.
+  const { readProcess } = processTable({ 100: [90, "/bin/zsh"], 90: [1, "/sbin/launchd"], 40: [1, "node /x/gateway-daemon.js"] });
+  assert.equal(await workerTreeReason({ env: {}, ppid: 100, socketPath: "/nonexistent/gateway.sock", readProcess }), null);
+  assert.equal(await callerVerdicts({ daemonPid: 40, readProcess })(100).denied, false);
+  // A management request names no caller: a fresh connection asked for none has
+  // no verdict and is never looked up.
+  assert.equal(callerVerdicts({ daemonPid: 40, readProcess })(undefined), null);
+});
+
+test("F6: where no host can read ancestry at all (no /proc, no ps), an unreadable chain is not failed closed", async () => {
+  // Windows has neither, so there the marker is the only signal and an unreadable
+  // chain must not be treated as a worker; canReadAncestry draws that line.
+  assert.equal(canReadAncestry("win32"), false);
+  assert.equal(canReadAncestry("linux"), true);
+  assert.equal(canReadAncestry("darwin"), true);
+  const unreadable = async () => null;
+  assert.equal(
+    await workerTreeReason({ env: {}, ppid: 100, socketPath: "/nonexistent/gateway.sock", readProcess: unreadable, ancestrySupported: false }),
+    null
+  );
+  assert.equal(await callerVerdicts({ daemonPid: 40, readProcess: unreadable, ancestrySupported: false })(100).denied, false);
 });
 
 test("W1: the daemon lock yields a pid only when it holds one", async () => {
@@ -247,8 +303,12 @@ test("W1: a connection's caller is looked up once per pid, and a pid-less reques
   const second = verdictFor(300);
   assert.notEqual(second, first);
   assert.equal(await second.denied, false);
-  assert.deepEqual(reads, [100, 50, 45, 300]);
-  // The daemon itself as the caller's agent CLI.
+  // 300 is read and found not under the daemon; then (F6) the daemon reads its
+  // own live pid once to confirm the host can place callers at all, so 300 is a
+  // caller outside it rather than one it cannot read.
+  assert.deepEqual(reads, [100, 50, 45, 300, 40]);
+  // The daemon itself as the caller's agent CLI: under the daemon by the walk, so
+  // it is refused before any probe (the reader is never called).
   assert.equal(await callerVerdicts({ daemonPid: 40, readProcess: () => assert.fail() })(40).denied, true);
 });
 
