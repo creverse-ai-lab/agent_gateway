@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 // CLI and GUI use the same public management RPC. No independent policy here.
-import { readFileSync } from "node:fs";
 import { GatewayRpcClient } from "../gateway-client/index.js";
-import { settingsPaths } from "./settings.js";
+import { installedIdentity } from "./config.js";
 
 const allowed = new Set(["setup", "gateway_config", "provider", "retention_preview", "shutdown_if_idle"]);
 const [method = "setup", argument = "{}"] = process.argv.slice(2);
@@ -12,7 +11,7 @@ try {
   const args = JSON.parse(argument);
   if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("arguments must be a JSON object");
   let identity = {};
-  try { identity = JSON.parse(readFileSync(settingsPaths().legacy, "utf8")).identity ?? {}; }
+  try { identity = installedIdentity(); }
   catch (error) { if (!process.env.ACP_GATEWAY_CONTROL_TOKEN || !process.env.ACP_GATEWAY_ROOT_ID) throw error; }
   rpc = new GatewayRpcClient({ token: process.env.ACP_GATEWAY_CONTROL_TOKEN ?? identity.token,
     rootId: process.env.ACP_GATEWAY_ROOT_ID ?? identity.rootId, autoStart: false });

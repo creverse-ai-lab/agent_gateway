@@ -79,6 +79,9 @@ async function chooseFrontDoor(options) {
 
 function runUpdatedBootstrap(bootstrapPath, args) {
   return new Promise((resolve, reject) => {
+    // The same installer, updated: it keeps the operator's env, ACP_GATEWAY_SOCKET
+    // and the install-state path included. The commands it runs get the scrubbed
+    // one (installer.js runCommand).
     const child = spawn(process.execPath, [bootstrapPath, ...args], {
       stdio: "inherit",
       env: { ...process.env, ACP_GATEWAY_BOOTSTRAP_STAGE: "apply" }

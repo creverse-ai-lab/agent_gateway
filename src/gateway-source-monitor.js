@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { childEnv } from "./caller.js";
 import { detectInstallMode, PACKAGE_ROOT } from "./install-mode.js";
 import { GATEWAY_VERSION } from "./version.js";
 
@@ -142,7 +143,7 @@ function parseVersion(value) {
 
 function runGit(root, args) {
   return new Promise((resolve, reject) => {
-    execFile("git", args, { cwd: root, encoding: "utf8", timeout: 10_000 }, (error, stdout) => {
+    execFile("git", args, { cwd: root, encoding: "utf8", timeout: 10_000, env: childEnv() }, (error, stdout) => {
       if (error) reject(error);
       else resolve(stdout);
     });

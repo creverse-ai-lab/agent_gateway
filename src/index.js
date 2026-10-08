@@ -12,7 +12,7 @@ import {
   RELATED_TASK_META_KEY
 } from "@modelcontextprotocol/sdk/types.js";
 import { callerForCall, callerFromProcess } from "./caller.js";
-import { controlToken, rootId } from "./config.js";
+import { controlIdentity } from "./config.js";
 import { errorEnvelope } from "./errors.js";
 import { staleFrontDoorNotice } from "./front-door.js";
 import { GatewayRpcClient } from "./socket-rpc.js";
@@ -20,7 +20,9 @@ import { PERMISSION_POLICIES } from "./acp-client.js";
 import { GATEWAY_VERSION } from "./version.js";
 
 const processCaller = callerFromProcess();
-const rpc = new GatewayRpcClient({ token: controlToken(), rootId: rootId(), caller: processCaller });
+// The installer registers this server without the token: it comes from
+// install.json unless the entry's env still sets it (config.js controlIdentity).
+const rpc = new GatewayRpcClient({ ...controlIdentity(), caller: processCaller });
 const tools = controlTools();
 const server = new Server(
   { name: "acp-gateway-control", version: GATEWAY_VERSION },

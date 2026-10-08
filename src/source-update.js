@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { mkdtemp, open, readFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { childEnv } from "./caller.js";
 import { checkNpmRelease, NPM_UPGRADE_COMMAND } from "./gateway-source-monitor.js";
 import { detectInstallMode } from "./install-mode.js";
 import { GATEWAY_VERSION } from "./version.js";
@@ -225,7 +226,9 @@ async function inspectUpstream(run, root) {
 
 export function runSourceCommand(command, args, cwd) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    // npm ci runs lifecycle scripts and npm run ci the whole suite: neither gets
+    // the Control token or the socket of the Gateway that is running.
+    const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"], env: childEnv() });
     let stdout = "";
     let stderr = "";
     child.stdout.setEncoding("utf8");

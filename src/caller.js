@@ -36,6 +36,27 @@ export function withoutSessionMarkers(env) {
   return copy;
 }
 
+// The Control identity a Main authenticates with.
+export const CONTROL_IDENTITY_ENV = Object.freeze(["ACP_GATEWAY_CONTROL_TOKEN", "ACP_GATEWAY_ROOT_ID"]);
+
+// What lets a process reach the Control and act as a Main: the identity, and
+// the socket to present it on. The daemon is the only child ever handed them,
+// by its autostart (socket-rpc.js), explicitly.
+export const GATEWAY_ACCESS_ENV = Object.freeze([...CONTROL_IDENTITY_ENV, "ACP_GATEWAY_SOCKET"]);
+
+/**
+ * The env a child process may get: the inherited env without session markers,
+ * then what the spawner sets explicitly, and never the Gateway access env, not
+ * even when it is asked for. Markers set explicitly stay: a worker naming its
+ * own session is not claiming the Main's. Workers, terminals, installer and
+ * update commands (npm and uv run third-party lifecycle scripts) all get this.
+ */
+export function childEnv(explicit = {}, inherited = process.env) {
+  const env = { ...withoutSessionMarkers(inherited), ...explicit };
+  for (const name of GATEWAY_ACCESS_ENV) delete env[name];
+  return env;
+}
+
 /**
  * The agent CLI a process name belongs to, or null. Whole name tokens only, and
  * an ambiguous name (two providers) is nobody's: "grok-codex-bridge" must not
@@ -49,7 +70,7 @@ export function agentFromCommand(command) {
 
 function readParentCommand(ppid) {
   try {
-    return execFileSync("ps", ["-o", "comm=", "-p", String(ppid)], { encoding: "utf8", timeout: 1_000 }).trim();
+    return execFileSync("ps", ["-o", "comm=", "-p", String(ppid)], { encoding: "utf8", timeout: 1_000, env: childEnv() }).trim();
   } catch {
     return null;
   }

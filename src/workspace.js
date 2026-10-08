@@ -4,6 +4,7 @@ import { constants, lstatSync } from "node:fs";
 import { cp, lstat, mkdir, readdir, readFile, readlink, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { childEnv } from "./caller.js";
 import { ERROR_CODES, GatewayError } from "./errors.js";
 
 // A snapshot workspace is a private copy of the session cwd. The worker edits the
@@ -280,7 +281,7 @@ function isWithin(root, path) {
 // buffering a multi-gigabyte patch in the daemon.
 function runGit(args, { cwd, maxBytes = MAX_DIFF_BYTES } = {}) {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"], env: childEnv() });
     const out = [];
     let size = 0;
     let overLimit = false;

@@ -4,7 +4,7 @@ import { realpath, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { BoundedUtf8Text, readTextHead, readTextLines } from "./bounded-utf8.js";
-import { withoutSessionMarkers } from "./caller.js";
+import { childEnv } from "./caller.js";
 import { ERROR_CODES, GatewayError } from "./errors.js";
 import { readNdjson } from "./ndjson.js";
 import { LANE_HIGH, LANE_NORMAL, NdjsonChannel } from "./ndjson-channel.js";
@@ -86,13 +86,9 @@ export class AcpClient {
     // autostarted the daemon, and a worker carrying them would be recorded as
     // that Main. What the provider config sets explicitly is layered on top;
     // CODEX_HOME, CLAUDE_HOME and the other config paths are not markers.
-    const childEnv = { ...withoutSessionMarkers(process.env), ...this.config.env, NO_COLOR: "1" };
-    delete childEnv.ACP_GATEWAY_CONTROL_TOKEN;
-    delete childEnv.ACP_GATEWAY_ROOT_ID;
-    delete childEnv.ACP_GATEWAY_SOCKET;
     this.proc = spawn(this.config.command, this.config.args, {
       stdio: ["pipe", "pipe", "pipe"],
-      env: childEnv,
+      env: childEnv({ ...this.config.env, NO_COLOR: "1" }),
       ...(this.config.cwd ? { cwd: this.config.cwd } : {})
     });
     this.alive = true;
@@ -625,13 +621,9 @@ export class AcpClient {
     const limit = Math.min(Math.max(Number(params.outputByteLimit ?? 1_000_000), 1), this.maxTerminalOutputBytes);
     // Same scrub as the worker's own env. What the worker asks for explicitly is
     // its own identity, not the Main's, and is kept.
-    const env = { ...withoutSessionMarkers(process.env), ...Object.fromEntries((params.env ?? []).map(({ name, value }) => [name, value])) };
-    delete env.ACP_GATEWAY_CONTROL_TOKEN;
-    delete env.ACP_GATEWAY_ROOT_ID;
-    delete env.ACP_GATEWAY_SOCKET;
     const child = spawn(params.command, params.args ?? [], {
       cwd,
-      env,
+      env: childEnv(Object.fromEntries((params.env ?? []).map(({ name, value }) => [name, value]))),
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32"
     });

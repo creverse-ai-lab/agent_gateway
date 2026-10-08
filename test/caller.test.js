@@ -516,3 +516,39 @@ test("overlapping front-door calls from one Codex process each keep their own th
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+// W5: since 1.8.0 the installer registers the Control MCP with no identity in its
+// env, so the agent CLI's config holds no token. The front door finds it in install.json.
+test("through the real front door registered without identity, the token and root id come from install.json", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-caller-installed-identity-"));
+  let daemon = null;
+  let mcpClient = null;
+  try {
+    const providers = await writeMockProviders(directory);
+    // The harness daemon pins its root id: a front door that fell back to main-<ppid>
+    // would be refused as surely as one with the wrong token.
+    daemon = await startDaemon({ directory, env: providers });
+    const installState = join(directory, "front-door-install.json");
+    await writeFile(installState, JSON.stringify({ version: 1, identity: { token: daemon.token, rootId: daemon.rootId }, managedMcp: {} }), { mode: 0o600 });
+    // What an agent CLI starts an identity-free entry with: its own env and nothing of the Gateway's.
+    const env = withoutSessionMarkers(process.env);
+    delete env.ACP_GATEWAY_CONTROL_TOKEN;
+    delete env.ACP_GATEWAY_ROOT_ID;
+    mcpClient = new Client({ name: "w5-installed-identity", version: "1.0.0" });
+    await mcpClient.connect(new StdioClientTransport({
+      command: process.execPath,
+      args: [frontDoor],
+      stderr: "pipe",
+      env: { ...env, ACP_GATEWAY_SOCKET: daemon.socketPath, ACP_GATEWAY_INSTALL_STATE: installState, ...providers }
+    }));
+    const call = async (name, args) => (await mcpClient.callTool({ name, arguments: args })).structuredContent;
+    const setup = await call("agent_acp_setup", { mode: "summary" });
+    assert.equal(setup.ok, true, JSON.stringify(setup));
+    const opened = await call("agent_acp_session_open", { provider: "mock", cwd: directory, permissionPolicy: "read_only" });
+    assert.equal(opened.ok, true, JSON.stringify(opened));
+  } finally {
+    await mcpClient?.close().catch(() => {});
+    await daemon?.stop?.();
+    await rm(directory, { recursive: true, force: true });
+  }
+});

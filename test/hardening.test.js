@@ -7,14 +7,17 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { AcpClient, acpRequestError } from "../src/acp-client.js";
 import { defaultProviderRegistryPath, providerRegistryReadPath } from "../src/acp-registry.js";
-import { SESSION_MARKER_ENV, withoutSessionMarkers } from "../src/caller.js";
-import { gatewayProtectedPaths } from "../src/config.js";
+import { childEnv, GATEWAY_ACCESS_ENV, SESSION_MARKER_ENV, withoutSessionMarkers } from "../src/caller.js";
+import { controlIdentity, gatewayProtectedPaths, takeDaemonIdentity } from "../src/config.js";
 import { ERROR_CODES } from "../src/errors.js";
 import { GatewayService } from "../src/gateway-service.js";
+import { runCommand } from "../src/installer.js";
 import { partialPolicyEnforcement, providerConfig, setProviderEnabled, workerSessionMeta } from "../src/providers.js";
 import { prepareGrokSandbox } from "../src/grok-sandbox.js";
 import { GatewayRpcClient } from "../src/socket-rpc.js";
+import { runSourceCommand } from "../src/source-update.js";
 import { createSnapshot, removeSnapshot, snapshotDiff } from "../src/workspace.js";
+import { startDaemon } from "./helpers/daemon-harness.js";
 
 // v1.5.2 hardening: every case below reproduces a defect found by running the
 // Gateway against real Claude, Codex and Grok workers (docs/live-usecases.md).
@@ -734,4 +737,134 @@ test("W1: the marker scrub is a copy that keeps config paths", () => {
   assert.deepEqual([...SESSION_MARKER_ENV].sort(), [
     "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "GROK_SESSION_ID"
   ]);
+});
+
+// ------------------------------------------------------- gateway secrets (W2, W5)
+
+// Before 1.8 the daemon kept the token in its env for life, and the installer
+// spawned with it: an automatic adapter update ran npm and uv, and their
+// packages' lifecycle scripts, with the Control token in their environment.
+
+test("W2: the env a child may get keeps what it inherits but never the Gateway's access", () => {
+  const inherited = {
+    PATH: "/bin",
+    CODEX_HOME: "/c",
+    // Inheritance stays (W7): provider credentials keep reaching the workers that need them.
+    OPENAI_API_KEY: "sk-provider-key",
+    ACP_GATEWAY_STATE: "/state.json",
+    ...Object.fromEntries(SESSION_MARKER_ENV.map((name) => [name, "main"])),
+    ACP_GATEWAY_CONTROL_TOKEN: "inherited-control-token-at-least-24",
+    ACP_GATEWAY_ROOT_ID: "main-inherited",
+    ACP_GATEWAY_SOCKET: "/tmp/inherited.sock"
+  };
+  const env = childEnv({ NO_COLOR: "1", CLAUDE_CODE_SESSION_ID: "worker-own", ACP_GATEWAY_CONTROL_TOKEN: "asked-for" }, inherited);
+  assert.deepEqual(env, {
+    PATH: "/bin",
+    CODEX_HOME: "/c",
+    OPENAI_API_KEY: "sk-provider-key",
+    ACP_GATEWAY_STATE: "/state.json",
+    NO_COLOR: "1",
+    // A marker the child is given explicitly is its own, not the Main's.
+    CLAUDE_CODE_SESSION_ID: "worker-own"
+  });
+  assert.equal(inherited.ACP_GATEWAY_CONTROL_TOKEN, "inherited-control-token-at-least-24", "a copy: the caller's env is untouched");
+  assert.deepEqual([...GATEWAY_ACCESS_ENV].sort(), ["ACP_GATEWAY_CONTROL_TOKEN", "ACP_GATEWAY_ROOT_ID", "ACP_GATEWAY_SOCKET"]);
+});
+
+test("W2: installer and source-update commands never hand their child the token, the socket or a session marker", async () => {
+  const probe = ["-e", "process.stdout.write(JSON.stringify(process.env))"];
+  await withEnv({
+    ACP_GATEWAY_CONTROL_TOKEN: "parent-control-token-at-least-24",
+    ACP_GATEWAY_ROOT_ID: "main-parent",
+    ACP_GATEWAY_SOCKET: "/tmp/parent.sock",
+    CLAUDE_CODE_SESSION_ID: "main-session",
+    ACP_TEST_INHERITED: "kept"
+  }, async () => {
+    // runCommand runs the agent CLIs and the npm/uv adapter installs, in the daemon too.
+    for (const result of [await runCommand(process.execPath, probe), await runSourceCommand(process.execPath, probe, tmpdir())]) {
+      assert.equal(result.code, 0, result.stderr);
+      const env = JSON.parse(result.stdout);
+      for (const name of [...GATEWAY_ACCESS_ENV, ...SESSION_MARKER_ENV]) assert.equal(Object.hasOwn(env, name), false, name);
+      assert.equal(env.ACP_TEST_INHERITED, "kept");
+    }
+  });
+});
+
+test("W2: the daemon takes its identity once and leaves it out of its own env", () => {
+  const token = "daemon-control-token-at-least-24";
+  const env = { ACP_GATEWAY_CONTROL_TOKEN: token, ACP_GATEWAY_ROOT_ID: "main-daemon", ACP_GATEWAY_SOCKET: "/tmp/gateway.sock", PATH: "/bin" };
+  assert.deepEqual(takeDaemonIdentity(env), { token, rootId: "main-daemon" });
+  // The socket stays: the daemon reads it again for its protected paths.
+  assert.deepEqual(env, { ACP_GATEWAY_SOCKET: "/tmp/gateway.sock", PATH: "/bin" });
+  assert.deepEqual(takeDaemonIdentity({ ACP_GATEWAY_CONTROL_TOKEN: token }), { token, rootId: null });
+  assert.throws(() => takeDaemonIdentity({}), /^Error: ACP_GATEWAY_CONTROL_TOKEN must be set to at least 24 characters$/);
+});
+
+test("W2: a daemon child cannot inherit the token, even through a spawn that forgets to scrub its env", async () => {
+  await withTemp("acp-daemon-child-env-", async (directory) => {
+    const envLog = join(directory, "worker-env.json");
+    const providersPath = join(directory, "providers.json");
+    await writeFile(providersPath, JSON.stringify({
+      version: 1,
+      providers: { mockenv: { command: process.execPath, args: [permissionAgent], permissionPolicy: "read_only" } }
+    }));
+    const daemon = await startDaemon({
+      directory,
+      // Every spawn in this daemon drops the env it builds: the worker gets process.env as it is.
+      execArgv: ["--import", fileURLToPath(new URL("./helpers/forgetful-spawn.js", import.meta.url))],
+      // Only the daemon's own env names the log, so a worker that writes it inherited that env.
+      env: { ACP_GATEWAY_PROVIDERS: providersPath, ACP_MOCK_ENV_LOG: envLog }
+    });
+    const client = new GatewayRpcClient({
+      socketPath: daemon.socketPath,
+      token: daemon.token,
+      rootId: daemon.rootId,
+      statePath: daemon.statePath,
+      autoStart: false
+    });
+    try {
+      await client.call("session_open", { provider: "mockenv", cwd: directory, permissionPolicy: "read_only" });
+      const worker = JSON.parse(await readFile(envLog, "utf8"));
+      assert.equal(worker.ACP_MOCK_ENV_LOG, envLog, "the worker inherited the daemon's own env");
+      assert.equal(Object.hasOwn(worker, "ACP_GATEWAY_CONTROL_TOKEN"), false);
+      assert.equal(Object.hasOwn(worker, "ACP_GATEWAY_ROOT_ID"), false);
+      assert.equal(JSON.stringify(worker).includes(daemon.token), false);
+      // The daemon still authenticates with what it took at startup.
+      assert.equal((await client.call("setup", {})).ok, true);
+    } finally {
+      client.close();
+      await daemon.stop();
+    }
+  });
+});
+
+test("W5: a front door takes its identity from the env first, then install.json, then the old fallback", async () => {
+  await withTemp("acp-front-door-identity-", async (directory) => {
+    const installState = join(directory, "install.json");
+    const missing = join(directory, "missing.json");
+    const stored = { token: "stored-control-token-at-least-24", rootId: "main-stored" };
+    const envToken = "env-control-token-at-least-24-chars";
+    await writeFile(installState, JSON.stringify({ version: 1, identity: { ...stored, createdAt: "2026-10-01T00:00:00.000Z" }, managedMcp: {} }));
+    const identity = (values, path = installState) => controlIdentity({ env: { ACP_GATEWAY_INSTALL_STATE: path, ...values }, ppid: 4242 });
+
+    // Registered since 1.8.0, with no identity in its env: all of it from install.json.
+    assert.deepEqual(identity({}), stored);
+    // Registered before, a test, an isolated deployment: the env decides, field by field.
+    assert.deepEqual(identity({ ACP_GATEWAY_CONTROL_TOKEN: envToken, ACP_GATEWAY_ROOT_ID: "main-env" }), { token: envToken, rootId: "main-env" });
+    assert.deepEqual(identity({ ACP_GATEWAY_CONTROL_TOKEN: envToken }), { token: envToken, rootId: "main-stored" });
+    assert.deepEqual(identity({ ACP_GATEWAY_ROOT_ID: "main-env" }), { token: stored.token, rootId: "main-env" });
+    // A token the env sets is checked as before, never patched from the file.
+    assert.throws(() => identity({ ACP_GATEWAY_CONTROL_TOKEN: "short" }), /^Error: ACP_GATEWAY_CONTROL_TOKEN must be set to at least 24 characters$/);
+    // With the token in the env, an install state that cannot say the root id costs only
+    // that: the old per-process fallback, never an error.
+    assert.deepEqual(identity({ ACP_GATEWAY_CONTROL_TOKEN: envToken }, missing), { token: envToken, rootId: "main-4242" });
+    // With neither, the old error, naming the file it also looked in.
+    assert.throws(() => identity({}, missing), (error) => {
+      assert.match(error.message, /^ACP_GATEWAY_CONTROL_TOKEN must be set to at least 24 characters, or install\.json must hold the Control identity/);
+      assert.ok(error.message.includes(missing));
+      return true;
+    });
+    await writeFile(installState, JSON.stringify({ version: 1, identity: { token: "too-short" }, managedMcp: {} }));
+    assert.throws(() => identity({}), new RegExp(`${installState.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} holds no valid Control identity`));
+  });
 });

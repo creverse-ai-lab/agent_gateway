@@ -7,8 +7,8 @@ import { timingSafeEqual } from "node:crypto";
 import { chmod, open, readFile, unlink, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import {
-  controlToken, gatewayAgentUpdateConfig, gatewayLifecycleConfig, gatewayObservabilityConfig,
-  gatewayPersistenceConfig, gatewaySocketPath, gatewayStatePath
+  gatewayAgentUpdateConfig, gatewayLifecycleConfig, gatewayObservabilityConfig,
+  gatewayPersistenceConfig, gatewaySocketPath, gatewayStatePath, takeDaemonIdentity
 } from "./config.js";
 import { AgentUpdateManager } from "./agent-updates.js";
 import { ERROR_CODES, GatewayError, errorEnvelope } from "./errors.js";
@@ -29,10 +29,12 @@ const STATE_RECOVERY_EXIT_CODE = 78; // EX_CONFIG: operator action required
 // parked requests, so 256 is that with room to spare. A naive 64 would break the
 // intended usage instead of an abusive one.
 const MAX_INFLIGHT_REQUESTS_PER_CONNECTION = 256;
+// First, before anything copies the env (GatewaySettings keeps one): from here
+// on process.env holds neither the token nor the root id, so no child the
+// daemon starts can inherit them, whether or not its spawn scrubs its env.
+const { token: expectedToken, rootId: expectedRootId } = takeDaemonIdentity();
 const socketPath = gatewaySocketPath();
 const statePath = gatewayStatePath();
-const expectedToken = controlToken();
-const expectedRootId = process.env.ACP_GATEWAY_ROOT_ID || null;
 const settings = new GatewaySettings();
 const gatewayConfig = gatewayLifecycleConfig(settings.activeValues);
 const agentUpdateManager = new AgentUpdateManager({ ...gatewayAgentUpdateConfig(settings.activeValues), sourceChecker: checkGatewaySource });

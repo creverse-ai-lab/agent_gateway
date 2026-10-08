@@ -15,6 +15,7 @@ import {
   providerDefinition,
   selectDistribution
 } from "./acp-registry.js";
+import { childEnv, CONTROL_IDENTITY_ENV } from "./caller.js";
 import { GatewayRpcClient } from "./socket-rpc.js";
 import { gatewaySocketPath } from "./config.js";
 import { GatewaySettings, settingsPaths } from "./settings.js";
@@ -34,12 +35,15 @@ const MISSING_PATH_CODES = new Set(["ENOENT", "ENOTDIR"]);
 const GATEWAY_PACKAGE_NAMES = new Set(["acp-gateway", "acp-gateway-daemon"]);
 // Captured env values at least this long are also redacted wherever a CLI echoes them.
 const MIN_ECHOED_SECRET_LENGTH = 8;
-// Why an existing managed entry was left as it is, keyed by repointDecision.
+const CONTROL_TOKEN_ENV = "ACP_GATEWAY_CONTROL_TOKEN";
+// Why an existing managed entry was left as it is, keyed by repointDecision
+// (and updateDecision).
 const KEPT_ENTRY_WARNINGS = {
   unknown: "could not verify the registered path; rerun with --force to re-register it",
   foreign: "registered command is not one this installer wrote; rerun with --force to replace it",
   unrecorded: "the entry predates this installer's ownership records, so it cannot tell the entry is still its own and does not update it automatically; rerun with --force once to update it (later updates are automatic)",
   customized: "its env is not the one this installer registered (a variable was added, removed or changed since), so it is left as it is; rerun with --force to re-register it without those changes",
+  "other-gateway": "it launches another Gateway install, whose front door may read the Control identity from this entry's env only, so its env is left as it is; rerun with --force to re-register it for this install",
   "keep-stale": "the registered path goes through a symlink to an older gateway; update it with the app that manages that link, or rerun with --force to re-register it",
   "keep-broken-link": "the registered path goes through a broken symlink; fix it with the app that manages it, or rerun with --force to re-register it",
   "keep-link-missing": "the registered path goes through a symlink to a missing script; fix it with the app that manages that link, or rerun with --force to re-register it"
@@ -52,6 +56,16 @@ export function defaultInstallStatePath() {
 // Where `claude mcp add --scope user` records user-scope servers (mcpServers).
 function defaultClaudeConfigPath() {
   return join(process.env.CLAUDE_CONFIG_DIR || homedir(), ".claude.json");
+}
+
+// The files the agent CLIs keep their user-scope MCP servers in, and so the env
+// of each entry the installer adds. Auggie's is not known here.
+function defaultAgentConfigPaths(claudeConfigPath) {
+  return {
+    codex: join(process.env.CODEX_HOME || join(homedir(), ".codex"), "config.toml"),
+    claude: claudeConfigPath,
+    grok: join(process.env.GROK_HOME || join(homedir(), ".grok"), "config.toml")
+  };
 }
 
 export function parseInstallerArgs(argv) {
@@ -187,6 +201,7 @@ export async function runInstaller(options, dependencies = {}) {
   const registryDiscover = dependencies.registryDiscover ?? discoverRegistryAgents;
   const providerRegistryPath = dependencies.providerRegistryPath ?? defaultProviderRegistryPath();
   const claudeConfigPath = dependencies.claudeConfigPath ?? defaultClaudeConfigPath();
+  const agentConfigPaths = { ...defaultAgentConfigPaths(claudeConfigPath), ...dependencies.agentConfigPaths };
   const skillRoots = dependencies.skillRoots ?? {
     codex: join(process.env.CODEX_HOME || join(homedir(), ".codex"), "skills"),
     claude: join(process.env.CLAUDE_HOME || join(homedir(), ".claude"), "skills"),
@@ -306,12 +321,14 @@ export async function runInstaller(options, dependencies = {}) {
   const managedControlTargets = [...new Set(Object.values(state?.managedMcp ?? {})
     .filter((item) => item?.kind === "control" && availableTargets.includes(item.agent))
     .map((item) => item.agent))];
+  // An update or a token rotation works on the Control entries this installer
+  // manages; a rotation must not add a front door nobody chose.
   const controlTargets = options.installControl
     ? (options.targets.length
         ? requestedTargets
         : options.installAll
           ? [options.frontDoor ?? "codex"]
-          : options.update && managedControlTargets.length
+          : (options.update || options.rotateToken) && managedControlTargets.length
             ? managedControlTargets
             : [availableTargets.includes("codex") ? "codex" : availableTargets[0]].filter(Boolean))
     : [];
@@ -336,6 +353,9 @@ export async function runInstaller(options, dependencies = {}) {
       : [];
 
   let identity = state?.identity ?? null;
+  // The identity existing entries were registered with, which is what tells an
+  // entry this installer wrote, even after --rotate-token replaces it below.
+  const registeredIdentity = identity;
   if ((options.installControl || options.installGuide || options.installSkill || configuresAgentUpdates) && !state) {
     state = { version: 1, managedMcp: {}, managedSkills: {}, agentUpdates: { autoUpdate: true, notifications: true } };
   }
@@ -356,6 +376,9 @@ export async function runInstaller(options, dependencies = {}) {
   }
 
   const installedSkillDestinations = new Map();
+  // migrated counts the entries whose Control token this run took out of an agent config.
+  const mcpContext = { options, state, run, actions, warnings, claudeConfigPath, agentConfigPaths, migrated: 0 };
+  const specOptions = { registeredIdentity, statePath };
   for (const target of new Set([...controlTargets, ...guideTargets, ...skillTargets])) {
     const provider = providers.find((item) => item.id === target);
     const providerInstalled = provider?.agentInstalled || registry.configured.includes(target);
@@ -363,12 +386,10 @@ export async function runInstaller(options, dependencies = {}) {
     if (needsMcp && !providerInstalled) {
       warnings.push(`${target} is not installed; MCP registration skipped`);
     } else if (controlTargets.includes(target)) {
-      const spec = mcpSpec(target, "control", identity);
-      await installMcp(spec, { options, state, run, actions, warnings, claudeConfigPath });
+      await installMcp(mcpSpec(target, "control", identity, specOptions), mcpContext);
     }
     if (guideTargets.includes(target) && providerInstalled) {
-      const spec = mcpSpec(target, "guide", identity);
-      await installMcp(spec, { options, state, run, actions, warnings, claudeConfigPath });
+      await installMcp(mcpSpec(target, "guide", identity, specOptions), mcpContext);
     }
     const managedSkill = state?.managedSkills?.[`${target}:${DELEGATOR_SKILL_NAME}`];
     const canManageSkill = installedProviderIds.has(target) || (options.updateSkill && managedSkill?.path);
@@ -413,6 +434,12 @@ export async function runInstaller(options, dependencies = {}) {
     } else if (skillTargets.includes(target)) {
       warnings.push(`${target} is not installed; skill installation skipped`);
     }
+  }
+  // Rotating is the user's call, not the migration's: an app such as AgenLynk
+  // keeps the identity it read, and a new token would lock it out.
+  if (mcpContext.migrated && !options.rotateToken) {
+    const removed = mcpContext.migrated === 1 ? "one MCP registration" : `${mcpContext.migrated} MCP registrations`;
+    warnings.push(`The Control token was removed from ${removed}, but copies made before, such as the agent CLIs' config backups (*.bak), may still hold it. To retire it, stop the Gateway when it is idle (acp-gateway-admin shutdown_if_idle), run acp-gateway-bootstrap --rotate-token, and reconnect apps that keep the identity, such as AgenLynk`);
   }
 
   if (state && !options.dryRun && (options.installControl || options.installGuide || options.installSkill || configuresAgentUpdates)) {
@@ -508,7 +535,7 @@ export function installerHelp() {
     "  --install-skill        Initially install agent-delegator for discovered agents",
     "  --update-skill         Update unchanged installer-managed agent-delegator copies",
     "  --target <agent>       codex, claude, grok, auggie, or all (repeatable)",
-    "  --rotate-token         Rotate credentials and update Control MCP entries",
+    "  --rotate-token         Replace the Control token and Main ID kept in install.json",
     "  --dry-run              Print planned changes without modifying the system",
     "  --force                Replace unmanaged entries or overwrite customized managed skills",
     "  --skip-health-check    Do not start/connect to the daemon after installation",
@@ -525,19 +552,21 @@ function parseOnOff(value, option) {
   throw new Error(`${option} requires on or off`);
 }
 
-// No error out of an MCP registration carries a value of the identity env it
-// passes (the Control token and root id), including wherever a CLI echoed it.
+// No error out of an MCP registration carries a value of the Control identity
+// (token and root id), including wherever a CLI echoed it, and after
+// --rotate-token the retired one too: a running daemon still accepts it.
 async function installMcp(spec, context) {
   try {
     await applyMcp(spec, context);
   } catch (error) {
-    throw new Error(redactEnv(error?.message ?? String(error), spec.identityEnv));
+    throw new Error(redactEnv(redactEnv(error?.message ?? String(error), spec.identityEnv), spec.registeredIdentityEnv));
   }
 }
 
-async function applyMcp(spec, { options, state, run, actions, warnings, claudeConfigPath }) {
+async function applyMcp(spec, context) {
+  const { options, state, run, actions, warnings, claudeConfigPath } = context;
   const key = `${spec.agent}:${spec.name}`;
-  const action = { type: "mcp", agent: spec.agent, name: spec.name, command: spec.command, args: spec.shownArgs };
+  const action = { type: "mcp", agent: spec.agent, name: spec.name, command: spec.command, args: spec.args };
   actions.push(action);
 
   const inspected = await inspectEntry(spec, run, key, { dryRun: options.dryRun, claudeConfigPath });
@@ -548,42 +577,38 @@ async function applyMcp(spec, { options, state, run, actions, warnings, claudeCo
   }
   const { exists, registered } = inspected;
   const record = state?.managedMcp?.[key];
-  const recorded = recordedLaunch(record);
   if (exists && !record && !options.force) {
     throw new Error(`${key} already exists and is not managed by this installer; rerun with --force to replace it`);
   }
-  if (exists && record && !options.force && !options.rotateToken) {
-    const decision = await repointDecision(registered, spec, record);
-    if (decision !== "repoint") {
+  // A token rotation re-registers nothing on its own account: an entry
+  // without the identity reads the new one from install.json, and one with it
+  // moves only when it is provably this installer's, as on any update.
+  let launch = spec.launch;
+  if (exists && record && !options.force) {
+    const update = await updateDecision(registered, spec, record);
+    if (update.kept) {
       action.status = "unchanged";
-      if (KEPT_ENTRY_WARNINGS[decision]) warnings.push(`${key}: ${KEPT_ENTRY_WARNINGS[decision]}`);
+      const reason = update.kept === "gap"
+        ? `could not read the entry fully enough to put it back if the update failed (${update.gap}); rerun with --force to re-register it`
+        : KEPT_ENTRY_WARNINGS[update.kept];
+      if (reason) warnings.push(`${key}: ${reason}`);
+      await warnHeldToken(key, spec, registered, context);
       return;
     }
-    // Replacing means removing first, so an update nobody asked for goes
-    // ahead only when the entry could be put back as it was.
-    const gap = restoreGap(registered);
-    if (gap) {
-      action.status = "unchanged";
-      warnings.push(`${key}: could not read the entry fully enough to put it back if the update failed (${gap}); rerun with --force to re-register it`);
-      return;
-    }
-    // Only a recorded launch gets here (repointDecision), and it proves the
-    // command and args. The env is part of the entry too: a variable the user
-    // added (HTTP_PROXY, NODE_OPTIONS) or an identity value changed since
-    // would be lost to the replacement, so such an entry stays as it is.
-    if (!recorded || !ownEnv(registered.env, spec.identityEnv, recorded.envKeys)) {
-      action.status = "unchanged";
-      warnings.push(`${key}: ${KEPT_ENTRY_WARNINGS.customized}`);
-      return;
-    }
+    launch = update.launch;
     action.status = options.dryRun ? "would-update" : "updated";
+    action.args = spec.addArgs(launch, spec.env);
     action.previous = { command: registered.command, args: redactArgs(registered.args) };
-    action.next = { command: spec.launch.command, args: redactArgs(spec.launch.args) };
+    action.next = { command: launch.command, args: redactArgs(launch.args) };
   } else if (options.dryRun) {
     action.status = exists ? "would-replace" : "would-install";
   }
+  // By name only, as everywhere: what the replacement leaves out of the env.
+  const removedEnv = identityNames(registered?.env);
+  if (removedEnv.length) action.removedEnv = removedEnv;
   if (options.dryRun) return;
-  await registerMcp(spec, key, exists ? registered : null, run, { recorded, rotating: options.rotateToken });
+  await registerMcp(spec, key, exists ? registered : null, run, launch);
+  if (removedEnv.includes(CONTROL_TOKEN_ENV)) context.migrated += 1;
   state.managedMcp ??= {};
   state.managedMcp[key] = {
     agent: spec.agent,
@@ -591,34 +616,100 @@ async function applyMcp(spec, { options, state, run, actions, warnings, claudeCo
     kind: spec.kind,
     installedAt: new Date().toISOString(),
     // What this installer registered, so a later run can tell the entry is
-    // still its own. The env is recorded by name only: its values are secrets.
-    launch: { command: spec.launch.command, args: [...spec.launch.args], envKeys: Object.keys(spec.identityEnv) }
+    // still its own. The env is recorded by name only; since 1.8.0 it never
+    // names the Control identity, which is how an identity-free entry is
+    // recognized as this installer's later.
+    launch: { command: launch.command, args: [...launch.args], envKeys: Object.keys(spec.env) }
   };
 }
 
-// Adds the entry, replacing `previous` when there is one. The CLIs have no
-// atomic replace, so a failed add after the remove puts the previous entry
-// back, with the command, args and env it had, rather than leave the agent
-// with no entry; the error reports both outcomes. The env goes back exactly
-// as it was, with one exception: after --rotate-token the install state
-// already holds the new identity, and a launch this installer wrote (this
-// install's own node and script, or the launch the install state records)
-// gets it over its own env, since the old one is being retired. A look-alike
-// path is not enough to be handed the Control token.
-async function registerMcp(spec, key, previous, run, { recorded, rotating }) {
-  const own = { env: spec.identityEnv };
-  if (previous) await requireSuccess(run, spec.command, spec.removeArgs, `remove existing ${key}`, own);
-  const failure = await attemptCommand(run, spec.command, spec.args, `install ${key}`, { ...own, shown: spec.shownArgs });
+// What an update does with an existing entry this installer manages: {launch}
+// re-registers it with that launch and this install's env; {kept} leaves it,
+// for a KEPT_ENTRY_WARNINGS reason (none for a plain "keep"), or "gap" with
+// {gap}. An entry moves only when it is provably still this installer's, and
+// either provably stale (repointDecision) or, already launching this install,
+// still holding the Control identity in its env: that one is re-registered in
+// place, launch unchanged, without the identity. One launching any other
+// install keeps its env, since that install's front door may read the
+// identity from nowhere else.
+async function updateDecision(registered, spec, record) {
+  const decision = await repointDecision(registered, spec, record);
+  const recorded = recordedLaunch(record);
+  let launch;
+  if (decision === "repoint") {
+    launch = spec.launch;
+  } else if (decision === "keep" && identityNames(registered.env).length) {
+    if (!recorded) return { kept: "unrecorded" };
+    if (!(await samePath(registered.args[0], spec.launch.args[0]))) return { kept: "other-gateway" };
+    launch = { command: registered.command, args: [...registered.args] };
+  } else {
+    return { kept: decision };
+  }
+  // Replacing means removing first, so an update nobody asked for goes
+  // ahead only when the entry could be put back as it was.
+  const gap = restoreGap(registered);
+  if (gap) return { kept: "gap", gap };
+  // Only a recorded launch gets here, and it proves the command and args. The
+  // env is part of the entry too: a variable the user added (HTTP_PROXY,
+  // NODE_OPTIONS) or an identity value changed since would be lost to the
+  // replacement, so such an entry stays as it is.
+  if (!recorded || !ownEnv(registered.env, { ...spec.registeredIdentityEnv, ...spec.env }, recorded.envKeys)) {
+    return { kept: "customized" };
+  }
+  return { launch };
+}
+
+// The Control identity variables an entry's env holds, as its CLI reports it.
+function identityNames(env) {
+  return env ? CONTROL_IDENTITY_ENV.filter((name) => Object.hasOwn(env, name)) : [];
+}
+
+// An entry left as it is while its env still holds the Control token: the
+// warning says so, and the agent config it sits in becomes readable by its
+// owner only (Grok writes its config 0644). After --rotate-token the token is
+// the retired one, which the daemon stops accepting once it restarts.
+async function warnHeldToken(key, spec, registered, { options, warnings, agentConfigPaths }) {
+  const token = registered?.env?.[CONTROL_TOKEN_ENV];
+  if (!token) return;
+  const path = agentConfigPaths?.[spec.agent];
+  const tightened = !options.dryRun && await tightenAgentConfig(path, token);
+  const which = options.rotateToken ? "the retired Control token, which stops working once the daemon restarts" : "the Control token";
+  warnings.push(`${key}: its env still holds ${which}, and so does ${spec.agent}'s MCP configuration${tightened ? ` (${path} is now readable only by you)` : ""}; rerun with --force to re-register it without the token`);
+}
+
+// Makes the file mode 0600 when it is wider, and says whether it did. Only a
+// file that holds this very token is touched: a CLI may keep the entry
+// elsewhere (another home, a project config), and a file that does not hold
+// the token has nothing of the Gateway's to protect.
+async function tightenAgentConfig(path, token) {
+  if (!path) return false;
+  try {
+    const info = await stat(path);
+    if (!info.isFile() || (info.mode & 0o077) === 0) return false;
+    if (!(await readFile(path, "utf8")).includes(token)) return false;
+    await chmod(path, 0o600);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Adds the entry with this install's env, replacing `previous` when there is
+// one. The CLIs have no atomic replace, so a failed add after the remove puts
+// the previous entry back exactly as it was, with the command, args and env it
+// had, rather than leave the agent with no entry; the error reports both
+// outcomes. That restore is the one command whose argv may carry a secret: the
+// Control token an older registration kept in its env.
+async function registerMcp(spec, key, previous, run, launch) {
+  const redaction = { env: { ...spec.identityEnv, ...(previous?.env ?? {}) } };
+  if (previous) await requireSuccess(run, spec.command, spec.removeArgs, `remove existing ${key}`, redaction);
+  const failure = await attemptCommand(run, spec.command, spec.addArgs(launch, spec.env), `install ${key}`, redaction);
   if (!failure) return;
   if (!previous) throw failure;
   if (!previous.command || !previous.args || previous.exact === false) {
     throw new Error(`${failure.message}; the previous ${key} entry was removed and could not be restored because ${spec.agent} did not report its full launch command; re-add it or rerun the installer`);
   }
-  const rotated = rotating && ((recorded && sameLaunch(previous, recorded))
-    || (previous.args.length === 1
-      && await samePath(previous.command, spec.launch.command)
-      && await samePath(previous.args[0], spec.launch.args[0])));
-  const env = { ...(previous.env ?? {}), ...(rotated ? spec.identityEnv : {}) };
+  const env = previous.env ?? {};
   const restoreFailure = await attemptCommand(run, spec.command, spec.addArgs(previous, env), `restore the previous ${key}`, {
     shown: spec.addArgs(previous, hiddenEnv(env)),
     env: { ...spec.identityEnv, ...env }
@@ -840,7 +931,7 @@ async function skillTreeDigest(root) {
   return hash.digest("hex");
 }
 
-function mcpSpec(agent, kind, identity) {
+function mcpSpec(agent, kind, identity, { registeredIdentity = identity, statePath = defaultInstallStatePath() } = {}) {
   const isControl = kind === "control";
   const name = isControl ? CONTROL_NAME : GUIDE_NAME;
   const script = join(sourceDirectory, isControl ? "index.js" : "guide.js");
@@ -848,20 +939,31 @@ function mcpSpec(agent, kind, identity) {
   const serverArgs = [script];
   // What the host will launch, as opposed to the CLI call that registers it.
   const launch = { command: serverCommand, args: serverArgs };
-  const identityEnv = isControl
-    ? { ACP_GATEWAY_CONTROL_TOKEN: identity.token, ACP_GATEWAY_ROOT_ID: identity.rootId }
+  // The env the entry is registered with. Never the Control identity: the
+  // front door reads it from install.json (config.js controlIdentity), so
+  // neither the agent CLI's config nor the argv that registers the entry holds
+  // a secret. An install state away from its default path is named, or the
+  // front door, started with the agent CLI's env, would look for it there.
+  const installState = resolve(statePath);
+  const env = isControl && installState !== join(homedir(), ".acp-gateway", "install.json")
+    ? { ACP_GATEWAY_INSTALL_STATE: installState }
+    : {};
+  // The identity values: hidden from whatever a CLI prints, and for an entry
+  // registered before 1.8.0, part of the env this installer gave it
+  // (registeredIdentity, the one before any --rotate-token of this run).
+  const identityEnvOf = (value) => isControl && value
+    ? { ACP_GATEWAY_CONTROL_TOKEN: value.token, ACP_GATEWAY_ROOT_ID: value.rootId }
     : {};
   // addArgs registers any launch under this entry's name with the given env,
   // so a failed replacement can put the previous entry back as it was.
-  // shownArgs is the registration as actions and messages print it: every
-  // identity env value, not only the token, is <redacted>.
-  const pairs = (flag, env) => Object.entries(env).flatMap(([name, value]) => [flag, `${name}=${value}`]);
+  const pairs = (flag, values) => Object.entries(values).flatMap(([name, value]) => [flag, `${name}=${value}`]);
   const withAdd = (fields, addArgs) => ({
     ...fields,
-    identityEnv,
+    env,
+    identityEnv: identityEnvOf(identity),
+    registeredIdentityEnv: identityEnvOf(registeredIdentity),
     addArgs,
-    args: addArgs(launch, identityEnv),
-    shownArgs: addArgs(launch, hiddenEnv(identityEnv))
+    args: addArgs(launch, env)
   });
   if (agent === "codex") {
     return withAdd({
@@ -980,7 +1082,7 @@ function parseJson(text) {
 // since, with the same shape. So an entry moves only when it is provably
 // still this installer's and provably stale, and never to an older gateway.
 // Proof of ownership is the launch the state records this installer
-// registering (and, checked by applyMcp, the env it registered). A record
+// registering (and, checked by updateDecision, the env it registered). A record
 // from before launches were recorded leaves only the shape, which a user's
 // own older Gateway install has too, so such an entry never moves on its own:
 // it stays, "unrecorded", until --force re-registers it and records it.
@@ -1043,16 +1145,20 @@ function recordedLaunch(record) {
 }
 
 // Whether an entry's env, as its CLI reports it, is still the one this
-// installer registered: exactly the recorded names, with this install's
-// current identity values (token, root id) wherever those appear. Any other
-// value is neither compared nor kept; an env not reported proves nothing.
-function ownEnv(env, identityEnv, envKeys) {
+// installer registered: exactly the recorded names, with the values this
+// installer gives them (the identity it registered before 1.8.0, the install
+// state path since) wherever those appear. A Control identity it holds no
+// value for is not its own. Any other value is neither compared nor kept; an
+// env not reported proves nothing.
+function ownEnv(env, ownValues, envKeys) {
   if (!env) return false;
   const names = new Set(envKeys);
   const registered = Object.keys(env);
   return registered.length === names.size
     && registered.every((name) => names.has(name))
-    && Object.entries(identityEnv).every(([name, value]) => !Object.hasOwn(env, name) || env[name] === value);
+    && registered.every((name) => Object.hasOwn(ownValues, name)
+      ? env[name] === ownValues[name]
+      : !CONTROL_IDENTITY_ENV.includes(name));
 }
 
 // Whether two launches are the same command and args, compared as normalized
@@ -1248,9 +1354,12 @@ function hiddenEnv(env) {
   return Object.fromEntries(Object.keys(env).map((name) => [name, "<redacted>"]));
 }
 
+// Agent CLIs, and npm and uv installing adapters (their packages' lifecycle
+// scripts run too): none of them gets the Control token, the socket or a
+// session marker, whether the installer runs from a shell or in the daemon.
 export function runCommand(command, args) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], env: childEnv() });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => { stdout += chunk; });
