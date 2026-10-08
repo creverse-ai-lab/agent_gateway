@@ -6,8 +6,10 @@ import { readFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { fileURLToPath } from "node:url";
 import { gatewayLifecycleConfig, gatewaySocketPath, gatewayStatePath } from "./config.js";
+import { ERROR_CODES } from "./errors.js";
 import { readNdjson } from "./ndjson.js";
 import { LANE_HIGH, LANE_NORMAL, NdjsonChannel } from "./ndjson-channel.js";
+import { requireOwnSocket } from "./private-socket.js";
 import { statePaths } from "./state-store.js";
 
 // Lane B has no droppable traffic: every frame here has a pending promise behind
@@ -181,6 +183,9 @@ export class GatewayRpcClient {
     try {
       await this.#connectOnce();
     } catch (error) {
+      // Someone else's file at the path is reported as such: starting a daemon
+      // cannot fix it, and no recovery marker explains it.
+      if (error?.code === ERROR_CODES.SOCKET_UNTRUSTED) throw error;
       if (!autoStart || !["ENOENT", "ECONNREFUSED"].includes(error?.code)) throw recoveryError(error, this.statePath);
       this.#startDaemon();
       let lastError = error;
@@ -191,6 +196,7 @@ export class GatewayRpcClient {
           lastError = null;
           break;
         } catch (retryError) {
+          if (retryError?.code === ERROR_CODES.SOCKET_UNTRUSTED) throw retryError;
           lastError = retryError;
         }
       }
@@ -200,35 +206,52 @@ export class GatewayRpcClient {
     this.reconnectAttempt = 0;
   }
 
-  #connectOnce() {
-    return new Promise((resolve, reject) => {
-      const socket = createConnection(this.socketPath);
+  // Every request carries the token, so nothing is written to a socket before it
+  // is known to be this user's own (private-socket.js): checked before the
+  // connect, and again once connected, because whoever could create the path
+  // may have bound it in between. A connection that fails the second check is
+  // destroyed unused.
+  async #connectOnce() {
+    await requireOwnSocket(this.socketPath);
+    const socket = await new Promise((resolve, reject) => {
+      const candidate = createConnection(this.socketPath);
       const onError = (error) => {
-        socket.destroy();
+        candidate.destroy();
         reject(error);
       };
-      socket.once("error", onError);
-      socket.once("connect", () => {
-        socket.off("error", onError);
-        socket.on("error", (error) => this.#disconnect(error, socket));
-        socket.on("close", () => this.#disconnect(new Error("Gateway socket closed"), socket));
-        readNdjson(socket, {
-          maxLineBytes: this.maxFrameBytes,
-          onLine: (line) => this.#onLine(line),
-          onOverflow: (overflowError) => socket.destroy(overflowError)
-        });
-        this.channel = new NdjsonChannel(socket, {
-          maxFrameBytes: this.maxFrameBytes,
-          maxQueueBytes: this.maxQueueBytes,
-          writeTimeoutMs: this.writeTimeoutMs,
-          // The existing disconnect machine is the recovery: it rejects every
-          // pending call and reconnects with the subscription cursors intact.
-          onFatal: (error) => this.#disconnect(error, socket)
-        });
-        this.socket = socket;
-        resolve();
+      candidate.once("error", onError);
+      candidate.once("connect", () => {
+        candidate.off("error", onError);
+        resolve(candidate);
       });
     });
+    const drop = () => socket.destroy();
+    socket.on("error", drop);
+    try {
+      await requireOwnSocket(this.socketPath, { allowMissing: false });
+    } catch (error) {
+      socket.destroy();
+      throw error;
+    } finally {
+      socket.off("error", drop);
+    }
+    if (socket.destroyed) throw new Error("Gateway socket closed");
+    socket.on("error", (error) => this.#disconnect(error, socket));
+    socket.on("close", () => this.#disconnect(new Error("Gateway socket closed"), socket));
+    readNdjson(socket, {
+      maxLineBytes: this.maxFrameBytes,
+      onLine: (line) => this.#onLine(line),
+      onOverflow: (overflowError) => socket.destroy(overflowError)
+    });
+    this.channel = new NdjsonChannel(socket, {
+      maxFrameBytes: this.maxFrameBytes,
+      maxQueueBytes: this.maxQueueBytes,
+      writeTimeoutMs: this.writeTimeoutMs,
+      // The existing disconnect machine is the recovery: it rejects every
+      // pending call and reconnects with the subscription cursors intact.
+      onFatal: (error) => this.#disconnect(error, socket)
+    });
+    this.socket = socket;
   }
 
   #requestConnected(method, args, timeoutMs, options = {}) {

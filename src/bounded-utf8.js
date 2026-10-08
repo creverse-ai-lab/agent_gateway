@@ -68,12 +68,26 @@ export async function readInto(handle, buffer) {
   return bytesRead;
 }
 
+// Both readers below take a path or an open FileHandle. A path is opened here and
+// closed again; a handle stays the caller's to close, which is how a Worker's
+// fs/read_text_file reads the very descriptor that was verified (worker-files.js)
+// instead of a name that can be swapped in between. Every read names its
+// position, so where the handle's offset stands does not matter.
+async function withReadHandle(source, read) {
+  if (typeof source !== "string") return await read(source);
+  const handle = await open(source, "r");
+  try {
+    return await read(handle);
+  } finally {
+    await handle.close();
+  }
+}
+
 // The async sibling of readHeadBytes, for a request path that must not block the
 // event loop and must report why a read failed rather than swallow it. Allocates
 // maxBytes, never the file size: a 2GB file costs the cap.
-export async function readTextHead(path, maxBytes) {
-  const handle = await open(path, "r");
-  try {
+export async function readTextHead(source, maxBytes) {
+  return await withReadHandle(source, async (handle) => {
     const buffer = Buffer.alloc(maxBytes + 3);
     const bytesRead = await readInto(handle, buffer);
     if (bytesRead <= maxBytes) {
@@ -81,15 +95,13 @@ export async function readTextHead(path, maxBytes) {
     }
     const head = trimIncompleteUtf8(buffer.subarray(0, maxBytes));
     return { text: head.toString("utf8"), bytes: head.length, truncated: true };
-  } finally {
-    await handle.close();
-  }
+  });
 }
 
 // Reads a line window in one forward pass with a fixed buffer: time is O(bytes
 // scanned), memory is the buffer plus what is actually returned. Nothing
 // proportional to the skipped prefix is ever allocated.
-export async function readTextLines(path, {
+export async function readTextLines(source, {
   line = 1,
   limit = Infinity,
   maxBytes = Infinity,
@@ -106,7 +118,6 @@ export async function readTextLines(path, {
   if (!Number.isFinite(requestedLine) || Number.isNaN(requestedLimit) || !(requestedLimit > 0)) {
     return { text: "", bytes: 0, truncated: false };
   }
-  const handle = await open(path, "r");
   const skip = Math.max(0, Math.floor(requestedLine) - 1);
   const chunks = [];
   let skipped = 0;
@@ -115,9 +126,9 @@ export async function readTextLines(path, {
   let truncated = false;
   let position = 0;
   let done = false;
-  try {
-    // Inside the try: an allocation between open() and it leaks the handle when
-    // it throws, and a caller-supplied chunk size can throw.
+  await withReadHandle(source, async (handle) => {
+    // Inside the handle's scope: an allocation between open() and it leaks the
+    // handle when it throws, and a caller-supplied chunk size can throw.
     const buffer = Buffer.allocUnsafe(chunkBytes);
     while (!done) {
       const { bytesRead } = await handle.read(buffer, 0, chunkBytes, position);
@@ -158,9 +169,7 @@ export async function readTextLines(path, {
       chunks.push(Buffer.from(slice));
       bytes += slice.length;
     }
-  } finally {
-    await handle.close();
-  }
+  });
   const window = truncated
     ? trimIncompleteUtf8(Buffer.concat(chunks, bytes))
     : Buffer.concat(chunks, bytes);

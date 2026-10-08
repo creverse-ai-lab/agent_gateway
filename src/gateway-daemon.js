@@ -4,7 +4,7 @@ import { authorizeCall, requireAccess } from "./access.js";
 import { normalizeCaller } from "./caller.js";
 import { GatewaySettings } from "./settings.js";
 import { timingSafeEqual } from "node:crypto";
-import { chmod, open, readFile, unlink, writeFile } from "node:fs/promises";
+import { open, readFile, unlink, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import {
   gatewayAgentUpdateConfig, gatewayLifecycleConfig, gatewayObservabilityConfig,
@@ -15,6 +15,7 @@ import { ERROR_CODES, GatewayError, errorEnvelope } from "./errors.js";
 import { checkGatewaySource } from "./gateway-source-monitor.js";
 import { GatewayService } from "./gateway-service.js";
 import { readNdjson } from "./ndjson.js";
+import { listenPrivately } from "./private-socket.js";
 import { createSocketSender } from "./socket-flow.js";
 import { statePaths } from "./state-store.js";
 import { GATEWAY_VERSION } from "./version.js";
@@ -238,11 +239,8 @@ const server = createServer((socket) => {
 });
 
 try {
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(socketPath, resolve);
-  });
-  await chmod(socketPath, 0o600);
+  // Bound under umask 077, then 0600: never reachable by another user.
+  await listenPrivately(server, socketPath);
 } catch (error) {
   await releaseDaemonLock(daemonLock);
   throw error;

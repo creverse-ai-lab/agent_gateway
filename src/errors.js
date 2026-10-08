@@ -41,6 +41,12 @@ export const ERROR_CODES = Object.freeze({
   ROOT_REQUIRED: "ROOT_REQUIRED",
   ROOT_MISMATCH: "ROOT_MISMATCH",
   SOCKET_ALREADY_BOUND: "SOCKET_ALREADY_BOUND",
+  // Raised by the client, never by the daemon: the socket path holds something
+  // other than a socket owned by this user (on Linux the default path is in the
+  // shared /tmp, where another user can create it first). Nothing was written
+  // to it, the token included, and no daemon was started. details: socketPath,
+  // type, ownerUid, uid.
+  SOCKET_UNTRUSTED: "SOCKET_UNTRUSTED",
   // The caller's pid is the daemon or runs under it: the agent CLI behind this
   // connection is a worker, or something a worker or its terminal started.
   // Workers never get the Control, whatever token they present. Refused before

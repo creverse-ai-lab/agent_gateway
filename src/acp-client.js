@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { realpathSync } from "node:fs";
-import { realpath, stat, writeFile } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { realpath } from "node:fs/promises";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { BoundedUtf8Text, readTextHead, readTextLines } from "./bounded-utf8.js";
 import { workerEnv } from "./caller.js";
@@ -10,6 +10,7 @@ import { readNdjson } from "./ndjson.js";
 import { LANE_HIGH, LANE_NORMAL, NdjsonChannel } from "./ndjson-channel.js";
 import { GATEWAY_VERSION } from "./version.js";
 import { ACP_PROTOCOL_VERSION } from "./acp-version.js";
+import { isWithin, openWorkerFile } from "./worker-files.js";
 
 export const PERMISSION_POLICIES = ["ask", "read_only", "auto_approve"];
 const READ_ONLY_TOOL_KINDS = new Set(["read", "search", "think", "fetch"]);
@@ -573,37 +574,48 @@ export class AcpClient {
   // return up to ~1.5MB), and that nothing proportional to the file size is ever
   // allocated — a 2GB file costs the cap.
   async #readTextFile(params) {
-    const path = await this.#sessionPath(params.sessionId, params.path);
     const cap = this.maxFileReadBytes;
     const windowed = params.line != null || params.limit != null;
-    const info = await stat(path);
-    const read = windowed
-      ? await readTextLines(path, {
-          line: Number(params.line ?? 1),
-          limit: params.limit == null ? Infinity : Math.max(0, Number(params.limit)),
-          maxBytes: cap
-        })
-      : await readTextHead(path, cap);
-    // An untruncated answer stays byte-identical to every previous version: no
-    // _meta key at all. Truncation used to be silent, which is the actual bug.
-    if (!read.truncated) return { content: read.text };
-    return {
-      content: read.text,
-      _meta: {
-        "acp-gateway/read": {
-          truncated: true,
-          bytes: read.bytes,
-          fileBytes: info.size,
-          maxBytes: cap,
-          ...(windowed ? { line: Number(params.line ?? 1), limit: params.limit ?? null } : {})
+    // Read through the descriptor that was verified, never by name again.
+    const handle = await this.#openWorkerFile(params.sessionId, params.path);
+    try {
+      const read = windowed
+        ? await readTextLines(handle, {
+            line: Number(params.line ?? 1),
+            limit: params.limit == null ? Infinity : Math.max(0, Number(params.limit)),
+            maxBytes: cap
+          })
+        : await readTextHead(handle, cap);
+      // An untruncated answer stays byte-identical to every previous version: no
+      // _meta key at all. Truncation used to be silent, which is the actual bug.
+      if (!read.truncated) return { content: read.text };
+      return {
+        content: read.text,
+        _meta: {
+          "acp-gateway/read": {
+            truncated: true,
+            bytes: read.bytes,
+            fileBytes: (await handle.stat()).size,
+            maxBytes: cap,
+            ...(windowed ? { line: Number(params.line ?? 1), limit: params.limit ?? null } : {})
+          }
         }
-      }
-    };
+      };
+    } finally {
+      await handle.close();
+    }
   }
 
   async #writeTextFile(params) {
-    const path = await this.#sessionPath(params.sessionId, params.path, true);
-    await writeFile(path, String(params.content ?? ""), "utf8");
+    const handle = await this.#openWorkerFile(params.sessionId, params.path, true);
+    try {
+      // Emptied only now, once the descriptor passed the check: an open that
+      // truncated would already have cut whatever a swapped path led to.
+      await handle.truncate(0);
+      await handle.writeFile(String(params.content ?? ""), "utf8");
+    } finally {
+      await handle.close();
+    }
   }
 
   async #createTerminal(params) {
@@ -716,19 +728,14 @@ export class AcpClient {
     return terminal;
   }
 
-  async #sessionPath(sessionId, requestedPath, allowMissing = false) {
-    const roots = this.sessionRoots.get(sessionId) ?? [];
-    const requested = resolve(requestedPath);
-    let path;
-    try {
-      path = await realpath(requested);
-    } catch (error) {
-      if (!allowMissing || error?.code !== "ENOENT") throw error;
-      path = join(await realpath(dirname(requested)), basename(requested));
-    }
-    if (!roots.some((root) => isWithin(root, path))) throw new Error(`Path is outside ACP session roots: ${path}`);
-    if (this.protectedPaths.some((item) => isWithin(item, path))) throw new Error(`Path is protected by the Gateway: ${path}`);
-    return path;
+  // The file a Worker's fs/ request names, opened once and verified
+  // (worker-files.js); a write creates it when missing.
+  #openWorkerFile(sessionId, requestedPath, write = false) {
+    return openWorkerFile(requestedPath, {
+      roots: this.sessionRoots.get(sessionId) ?? [],
+      protectedPaths: this.protectedPaths,
+      write
+    });
   }
 
   async #runProtectedOperation(id, method, params, run) {
@@ -1014,11 +1021,6 @@ function mentionsProtectedPath(raw, protectedPaths) {
     }
   }
   return false;
-}
-
-function isWithin(root, path) {
-  const rel = relative(root, path);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
 async function canonicalRoots(cwd, additionalDirectories) {
