@@ -65,6 +65,10 @@ export const ERROR_CODES = Object.freeze({
   STATE_SNAPSHOT_CORRUPT: "STATE_SNAPSHOT_CORRUPT",
   STATE_VERSION_UNSUPPORTED: "STATE_VERSION_UNSUPPORTED",
   STATE_DIR_LOCKED: "STATE_DIR_LOCKED",
+  // Startup-only too: a daemon told to read its Control identity from stdin
+  // (the autostart, socket-rpc.js) got no line, or one that holds no usable
+  // identity. Halts the same way, marker and exit code included.
+  DAEMON_IDENTITY_INVALID: "DAEMON_IDENTITY_INVALID",
   // Bounded transport (NdjsonChannel): the write side of an NDJSON connection.
   // A frame nobody can send, a backlog nobody is draining, or a peer that
   // stopped taking bytes at all.

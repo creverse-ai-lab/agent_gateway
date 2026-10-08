@@ -828,14 +828,16 @@ test("W2: installer and source-update commands never hand their child the token,
   });
 });
 
-test("W2: the daemon takes its identity once and leaves it out of its own env", () => {
+// Asynchronous since an autostarted daemon reads its identity from stdin
+// (daemon-identity.test.js); the env path answers exactly as before.
+test("W2: the daemon takes its identity once and leaves it out of its own env", async () => {
   const token = "daemon-control-token-at-least-24";
   const env = { ACP_GATEWAY_CONTROL_TOKEN: token, ACP_GATEWAY_ROOT_ID: "main-daemon", ACP_GATEWAY_SOCKET: "/tmp/gateway.sock", PATH: "/bin" };
-  assert.deepEqual(takeDaemonIdentity(env), { token, rootId: "main-daemon" });
+  assert.deepEqual(await takeDaemonIdentity(env), { token, rootId: "main-daemon" });
   // The socket stays: the daemon reads it again for its protected paths.
   assert.deepEqual(env, { ACP_GATEWAY_SOCKET: "/tmp/gateway.sock", PATH: "/bin" });
-  assert.deepEqual(takeDaemonIdentity({ ACP_GATEWAY_CONTROL_TOKEN: token }), { token, rootId: null });
-  assert.throws(() => takeDaemonIdentity({}), /^Error: ACP_GATEWAY_CONTROL_TOKEN must be set to at least 24 characters$/);
+  assert.deepEqual(await takeDaemonIdentity({ ACP_GATEWAY_CONTROL_TOKEN: token }), { token, rootId: null });
+  await assert.rejects(takeDaemonIdentity({}), /^Error: ACP_GATEWAY_CONTROL_TOKEN must be set to at least 24 characters$/);
 });
 
 test("W2: a daemon child cannot inherit the token, even through a spawn that forgets to scrub its env", async () => {

@@ -4,8 +4,9 @@ import { authorizeCall, CallerPresence, requireAccess } from "./access.js";
 import { normalizeCaller } from "./caller.js";
 import { GatewaySettings } from "./settings.js";
 import { timingSafeEqual } from "node:crypto";
-import { open, readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, unlink, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
+import { dirname } from "node:path";
 import {
   gatewayAgentUpdateConfig, gatewayLifecycleConfig, gatewayObservabilityConfig,
   gatewayPersistenceConfig, gatewaySocketPath, gatewayStatePath, takeDaemonIdentity
@@ -21,22 +22,31 @@ import { statePaths } from "./state-store.js";
 import { GATEWAY_VERSION } from "./version.js";
 import { callerVerdicts } from "./worker-tree.js";
 
-// A start that dies in init() is invisible: autostart spawns this process with
-// stdio ignored, so the only thing a Main ever sees is a socket that never
-// appears. Recovery failures leave their reason in a file the client reads.
-const STATE_RECOVERY_EXIT_CODE = 78; // EX_CONFIG: operator action required
+// A start that dies before it serves is invisible: autostart spawns this
+// process with stdout and stderr ignored, so the only thing a Main ever sees is
+// a socket that never appears. Recovery failures, and an identity the autostart
+// failed to hand over, leave their reason in a file the client reads (halt).
+const STARTUP_HALT_EXIT_CODE = 78; // EX_CONFIG: operator action required
 // Admission bound per control connection, as a module constant (the PR2
 // precedent for safety valves). The arithmetic that rules out a smaller number:
 // a 120s long poll across maxSessionsPerRoot (64) sessions is 64 legitimately
 // parked requests, so 256 is that with room to spare. A naive 64 would break the
 // intended usage instead of an abusive one.
 const MAX_INFLIGHT_REQUESTS_PER_CONNECTION = 256;
-// First, before anything copies the env (GatewaySettings keeps one): from here
-// on process.env holds neither the token nor the root id, so no child the
-// daemon starts can inherit them, whether or not its spawn scrubs its env.
-const { token: expectedToken, rootId: expectedRootId } = takeDaemonIdentity();
 const socketPath = gatewaySocketPath();
 const statePath = gatewayStatePath();
+// First, before anything copies the env (GatewaySettings keeps one): from here
+// on process.env holds neither the token nor the root id, so no child the
+// daemon starts can inherit them, whether or not its spawn scrubs its env. An
+// autostarted daemon never had them there: it reads them from stdin.
+let identity;
+try {
+  identity = await takeDaemonIdentity();
+} catch (error) {
+  if (error?.code !== ERROR_CODES.DAEMON_IDENTITY_INVALID) throw error;
+  await halt(error);
+}
+const { token: expectedToken, rootId: expectedRootId } = identity;
 const settings = new GatewaySettings();
 const gatewayConfig = gatewayLifecycleConfig(settings.activeValues);
 const agentUpdateManager = new AgentUpdateManager({ ...gatewayAgentUpdateConfig(settings.activeValues), sourceChecker: checkGatewaySource });
@@ -62,11 +72,7 @@ try {
   await removeStaleSocket(socketPath);
 } catch (error) {
   await releaseDaemonLock(daemonLock);
-  if (typeof error?.code === "string" && error.code.startsWith("STATE_")) {
-    await writeRecoveryMarker(error);
-    process.stderr.write(`acp-gateway-daemon: ${error.message}\n`);
-    process.exit(STATE_RECOVERY_EXIT_CODE);
-  }
+  if (typeof error?.code === "string" && error.code.startsWith("STATE_")) await halt(error);
   throw error;
 }
 
@@ -277,6 +283,12 @@ async function shutdown() {
 process.once("SIGTERM", () => void shutdown().finally(() => process.exit(0)));
 process.once("SIGINT", () => void shutdown().finally(() => process.exit(0)));
 
+async function halt(error) {
+  await writeRecoveryMarker(error);
+  process.stderr.write(`acp-gateway-daemon: ${error.message}\n`);
+  process.exit(STARTUP_HALT_EXIT_CODE);
+}
+
 async function writeRecoveryMarker(error) {
   const marker = statePaths(statePath).marker;
   const document = {
@@ -286,6 +298,9 @@ async function writeRecoveryMarker(error) {
     errorCode: error.code,
     error: error.message
   };
+  // An identity halt comes before init(), so on a first start the state
+  // directory may not exist yet.
+  await mkdir(dirname(marker), { recursive: true, mode: 0o700 }).catch(() => {});
   await writeFile(marker, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 }).catch(() => {});
 }
 

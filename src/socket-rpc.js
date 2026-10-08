@@ -1,11 +1,11 @@
 import { requireAccess } from "./access.js";
-import { withoutSessionMarkers } from "./caller.js";
+import { CONTROL_IDENTITY_ENV, withoutSessionMarkers } from "./caller.js";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { fileURLToPath } from "node:url";
-import { gatewayLifecycleConfig, gatewaySocketPath, gatewayStatePath } from "./config.js";
+import { DAEMON_IDENTITY_STDIN_ENV, gatewayLifecycleConfig, gatewaySocketPath, gatewayStatePath } from "./config.js";
 import { ERROR_CODES } from "./errors.js";
 import { readNdjson } from "./ndjson.js";
 import { LANE_HIGH, LANE_NORMAL, NdjsonChannel } from "./ndjson-channel.js";
@@ -350,18 +350,40 @@ export class GatewayRpcClient {
 
   #startDaemon() {
     const daemon = fileURLToPath(new URL("./gateway-daemon.js", import.meta.url));
+    // The daemon outlives this Main and serves every other one: it must not
+    // carry this Main's session identity into the workers it starts.
+    const env = { ...withoutSessionMarkers(process.env), ACP_GATEWAY_SOCKET: this.socketPath };
+    // This client's identity, else the one this process inherited: what the
+    // daemon's env used to carry.
+    const token = this.token || env.ACP_GATEWAY_CONTROL_TOKEN || null;
+    const rootId = this.rootId || env.ACP_GATEWAY_ROOT_ID || null;
+    for (const name of CONTROL_IDENTITY_ENV) delete env[name];
+    // Over a pipe, not in its env: the OS keeps a process's initial environment
+    // for its whole life, readable by any process of this user (`ps -E`,
+    // /proc/<pid>/environ), and the daemon's pid sits in <socket>.lock. Except
+    // on Windows, which keeps the env: Node documents that a detached child stays
+    // in the background after its parent exits only when its stdio is not
+    // connected to the parent, and a pipe is exactly that.
+    const viaStdin = process.platform !== "win32";
     const child = spawn(process.execPath, [daemon], {
       detached: true,
-      stdio: "ignore",
-      // The daemon outlives this Main and serves every other one: it must not
-      // carry this Main's session identity into the workers it starts.
-      env: {
-        ...withoutSessionMarkers(process.env),
-        ACP_GATEWAY_SOCKET: this.socketPath,
-        ...(this.token ? { ACP_GATEWAY_CONTROL_TOKEN: this.token } : {}),
-        ...(this.rootId ? { ACP_GATEWAY_ROOT_ID: this.rootId } : {})
-      }
+      // stdout and stderr stay ignored: a failed start reports through the
+      // recovery marker, as before.
+      stdio: viaStdin ? ["pipe", "ignore", "ignore"] : "ignore",
+      env: viaStdin
+        ? { ...env, [DAEMON_IDENTITY_STDIN_ENV]: "1" }
+        : { ...env, ...(token ? { ACP_GATEWAY_CONTROL_TOKEN: token } : {}), ...(rootId ? { ACP_GATEWAY_ROOT_ID: rootId } : {}) }
     });
+    // A spawn that failed, or a daemon gone before it read the line, is the
+    // connect loop's to report, never an unhandled error in this Main.
+    child.on("error", () => {});
+    if (viaStdin) {
+      // One line, then the end: the pipe has nothing more to carry, and neither
+      // it nor the daemon may keep this process alive.
+      child.stdin?.on("error", () => {});
+      child.stdin?.end(`${JSON.stringify({ token, rootId })}\n`);
+      child.stdin?.unref();
+    }
     child.unref();
   }
 
