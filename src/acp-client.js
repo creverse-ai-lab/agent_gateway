@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { realpathSync, statSync } from "node:fs";
-import { realpath } from "node:fs/promises";
+import { readlink, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { BoundedUtf8Text, readTextHead, readTextLines } from "./bounded-utf8.js";
@@ -86,6 +86,9 @@ export class AcpClient {
     this.killGraceMs = options.killGraceMs ?? KILL_GRACE_MS;
     this.killProcess = options.killProcess ?? signalProcess;
     this.writeTimeoutMs = options.writeTimeoutMs;
+    // A test seam that runs between a write's approval-path pre-check and opening
+    // the descriptor, where a racing worker would swap a parent directory.
+    this.beforeWriteOpen = options.beforeWriteOpen ?? null;
     this.proc = null;
     this.rl = null;
     this.channel = null;
@@ -625,7 +628,9 @@ export class AcpClient {
     const kind = grantKindForTool(params.toolCall?.kind);
     if (kind === "terminal") {
       const command = approvedCommand(params.toolCall?.rawInput);
-      if (!command) return null;
+      // A command whose decisive variable the Gateway cannot know ahead of time
+      // (indirect or arithmetic expansion names it at runtime) is never bound.
+      if (!command || usesDynamicExpansion(command.text)) return null;
       // Bound to the cwd and env Main approved, not the command alone: the same
       // argv in another directory, or with PATH/LD_PRELOAD/an interpolated
       // variable changed, runs something Main did not see, so it is asked anew.
@@ -684,6 +689,9 @@ export class AcpClient {
   // to another in-root file. The write opens the approved path directly and
   // refuses if params.path no longer resolves to it; the worker can re-request.
   async #writeTextFile(params, approvedPath, approvedTarget) {
+    // Only the approved path is named in the error, never the path the worker
+    // steered it to: that resolution skips the root/protected check, so echoing
+    // it could report a path under ~/.acp-gateway back to the worker.
     let current;
     try {
       current = workerFilePathSync(params.path, { allowMissing: true });
@@ -691,17 +699,24 @@ export class AcpClient {
       throw new Error(`Write target no longer resolves since it was approved: ${approvedPath}`);
     }
     if (current !== approvedPath) {
-      throw new Error(`Write target changed since it was approved: ${approvedPath} is now ${current}`);
+      throw new Error(`Write target changed since it was approved: ${approvedPath}`);
     }
+    await this.beforeWriteOpen?.(approvedPath);
     const handle = await this.#openWorkerFile(params.sessionId, approvedPath, true);
     try {
-      // A target that already existed when Main saw it must still be the same
-      // file, not a new inode swapped onto the approved path in the meantime.
       if (approvedTarget) {
+        // A target that already existed when Main saw it must still be the same
+        // file, not a new inode swapped onto the approved path in the meantime.
         const opened = await handle.stat({ bigint: true });
         if (opened.dev !== approvedTarget.dev || opened.ino !== approvedTarget.ino) {
           throw new Error(`Write target changed since it was approved: ${approvedPath}`);
         }
+      } else {
+        // A new file: openWorkerFile resolves the approved path's parent, so a
+        // parent directory swapped for an in-root symlink after the pre-check
+        // (O_NOFOLLOW guards only the final component) would have the file created
+        // somewhere else in-root. The descriptor must be the approved path itself.
+        await this.#requireApprovedNewFile(handle, approvedPath);
       }
       // Emptied only now, once the descriptor passed the check: an open that
       // truncated would already have cut whatever a swapped path led to.
@@ -710,6 +725,32 @@ export class AcpClient {
     } finally {
       await handle.close();
     }
+  }
+
+  // The descriptor just opened for a new file leads to the approved path and no
+  // other. On Linux the descriptor's own name settles it (/proc); without /proc
+  // the approved path must realpath to itself and to this very inode, which also
+  // rejects a parent symlink swapped back after the open — the file is then not
+  // at the approved path at all.
+  async #requireApprovedNewFile(handle, approvedPath) {
+    const changed = () => new Error(`Write target changed since it was approved: ${approvedPath}`);
+    if (process.platform === "linux") {
+      const actual = await readlink(`/proc/self/fd/${handle.fd}`).catch(() => null);
+      if (actual !== null) {
+        if (actual !== approvedPath) throw changed();
+        return;
+      }
+    }
+    let resolved;
+    try {
+      resolved = realpathSync(approvedPath);
+    } catch {
+      throw changed();
+    }
+    if (resolved !== approvedPath) throw changed();
+    const opened = await handle.stat({ bigint: true });
+    const onPath = statSync(approvedPath, { bigint: true });
+    if (onPath.dev !== opened.dev || onPath.ino !== opened.ino) throw changed();
   }
 
   // A terminal/create, checked: cwd inside the roots, a command, args that are
@@ -974,14 +1015,15 @@ export class AcpClient {
   // grant is spent only by a request with the same ones.
   #terminalOperation(id, params) {
     const request = this.#terminalRequest(params);
-    const commandLine = [request.command, ...request.args].join(" ");
-    const decisive = interpolatedEnvNames(commandLine);
+    const argv = [request.command, ...request.args];
+    const command = commandForm(argv);
+    const decisive = interpolatedEnvNames(command.text);
     return {
       kind: "terminal",
-      command: argvCommand([request.command, ...request.args]),
+      command,
       cwd: request.cwd,
       env: envMap(request.env),
-      namesGatewayDirectory: this.#namesGatewayDirectory(commandLine),
+      namesGatewayDirectory: this.#namesGatewayDirectory(argv.join(" ")),
       // What waiting for Main actually holds is the whole retained request, so a
       // worker cannot pad it with an unused field it does not pay the budget for.
       bytes: Buffer.byteLength(JSON.stringify(params)),
@@ -1041,12 +1083,16 @@ export class AcpClient {
     const index = grants?.findIndex((grant) => {
       if (grant.kind !== operation.kind) return false;
       if (operation.kind === "write") return grant.paths.has(operation.path);
-      // A terminal grant covers the operation only with the same command, the
-      // same cwd, and the same values for the execution-affecting env of that
-      // command (which also rejects a request that adds one not approved).
-      return grant.command === operation.command
+      // A terminal grant covers the operation only with the same command form
+      // (a literal argv never matches a shell script, nor a login shell a
+      // non-login one), the same cwd, and the same values for the
+      // execution-affecting env of that command (which also rejects a request
+      // that adds one not approved). A command using dynamic expansion is never
+      // bound, so it never matches.
+      if (usesDynamicExpansion(operation.command.text)) return false;
+      return sameCommand(grant.command, operation.command)
         && grant.cwd === operation.cwd
-        && sameEnv(executionEnv(operation.command, grant.env), executionEnv(operation.command, operation.env));
+        && sameEnv(executionEnv(operation.command.text, grant.env), executionEnv(operation.command.text, operation.env));
     }) ?? -1;
     if (index === -1) return false;
     const grant = grants[index];
@@ -1401,35 +1447,67 @@ function namesGatewayDirectory(text) {
     .some((word) => word.split("/").includes(GATEWAY_DIRECTORY));
 }
 
-// An approval and the terminal/create that spends it are compared as commands:
-// whitespace collapsed, and a shell given one script (`bash -lc X`, `sh -c X`,
-// `zsh -c X`, `bash -l -c X`) counts as that script. An argv unwraps only in
-// exactly that shape, because a word after the script becomes the script's $0
-// instead of an argument.
+// An approval and the terminal/create that spends it are compared as commands.
+// A command normalizes to a comparable form: a literal argv (what spawn runs
+// directly), or a shell script with whether it is a login shell. A non-login
+// shell whose `-c` script is only plain words is equal to the literal argv of
+// those words, because the shell would exec exactly them (`echo bound` ≡
+// `sh -c echo bound`). A script with any shell syntax — operators, quotes,
+// $expansion, globs, assignments — or a login shell (which sources profiles
+// first) keeps shell:true, so it is spent only by the same shell request, never
+// by a bare argv, and vice versa: approving the literal `["echo","a; ./x"]`
+// (which spawn does not interpret) does not authorize `sh -c "echo a; ./x"`.
 const SHELLS = new Set(["sh", "bash", "zsh", "dash"]);
 const SCRIPT_FLAG = /^-(?:c|lc|cl)$/;
 const LOGIN_FLAG = /^(?:-l|--login)$/;
-const SHELL_LINE = /^(?:\S*\/)?(?:sh|bash|zsh|dash)(?: (?:-l|--login))? -(?:c|lc|cl) (.+)$/;
+// A shell command *line* string (not an argv): a shell by name, an optional
+// login flag, a `-c` flag, then the script. Captures the login flag and script.
+const SHELL_LINE = /^(?:\S*\/)?(?:sh|bash|zsh|dash)(?:\s+(-l|--login))?\s+(-c|-lc|-cl)\s+(.+)$/;
+// A `-c` script a shell would tokenize into exactly a plain argv: unquoted words
+// of safe characters only. Anything else is more than its words.
+const PLAIN_WORD = /^[A-Za-z0-9_@%+,:./-]+$/;
 
-function argvCommand(argv) {
-  const words = argv.map(String);
-  if (SHELLS.has(basename(words[0] ?? ""))) {
-    if (words.length === 3 && SCRIPT_FLAG.test(words[1])) return shellCommand(words[2]);
-    if (words.length === 4 && LOGIN_FLAG.test(words[1]) && words[2] === "-c") return shellCommand(words[3]);
-  }
-  return collapse(words.join(" "));
+function isSimpleScript(text) {
+  const words = collapse(text).split(" ");
+  return words[0] !== "" && words.every((word) => PLAIN_WORD.test(word));
 }
 
-// A command line as text: the same, and a wrapper's quotes around its script
-// come off with it, a few levels deep.
-function shellCommand(text) {
-  let command = collapse(text);
-  for (let depth = 0; depth < 3; depth += 1) {
-    const script = SHELL_LINE.exec(command)?.[1];
-    if (script == null) break;
-    command = collapse(unquoted(script));
+// The comparable form of an argv.
+function commandForm(argv) {
+  const words = argv.map(String);
+  if (SHELLS.has(basename(words[0] ?? ""))) {
+    if (words.length === 3 && SCRIPT_FLAG.test(words[1])) return scriptForm(words[2], words[1].includes("l"));
+    if (words.length === 4 && LOGIN_FLAG.test(words[1]) && words[2] === "-c") return scriptForm(words[3], true);
   }
-  return command;
+  return { shell: false, login: false, text: collapse(words.join(" ")) };
+}
+
+// The comparable form of a `-c` script: a simple non-login script becomes the
+// literal argv of its words; anything else stays a (login-)shell form.
+function scriptForm(script, login) {
+  const text = collapse(unquoted(script));
+  if (!login && isSimpleScript(text)) return { shell: false, login: false, text };
+  return { shell: true, login, text };
+}
+
+// The comparable form of a shell command *line* string: a `sh -c SCRIPT`
+// invocation unwraps to that script's form (login-aware); anything else is the
+// line itself, run as a command.
+function shellCommand(text) {
+  const match = SHELL_LINE.exec(collapse(text));
+  if (match) return scriptForm(unquoted(match[3]), Boolean(match[1]) || match[2].includes("l"));
+  return scriptForm(collapse(text), false);
+}
+
+function sameCommand(a, b) {
+  return a.shell === b.shell && a.login === b.login && a.text === b.text;
+}
+
+// Indirect (`${!NAME}`) or arithmetic (`$((...))` / `$[...]`) expansion reads a
+// variable the Gateway cannot name ahead of time, so a grant is never bound to a
+// command that uses it — such a command is asked about every time.
+function usesDynamicExpansion(text) {
+  return /\$\{!/.test(text) || /\$\(\(/.test(text) || /\$\[/.test(text);
 }
 
 function unquoted(text) {
@@ -1443,14 +1521,15 @@ function collapse(text) {
   return String(text).replace(/\s+/g, " ").trim();
 }
 
-// The command an execute permission request names, in that form: an array
-// (Codex) or a command with args is an argv, a string a command line.
+// The command an execute permission request names, in comparable form, or null
+// when it names none: an array (Codex) or a command with args is an argv, a bare
+// string a command line.
 function approvedCommand(input) {
-  if (!input || typeof input !== "object") return "";
+  if (!input || typeof input !== "object") return null;
   const command = input.command ?? input.cmd;
-  if (Array.isArray(command)) return argvCommand(command);
-  if (typeof command !== "string") return "";
-  return Array.isArray(input.args) ? argvCommand([command, ...input.args]) : shellCommand(command);
+  if (Array.isArray(command)) return commandForm(command);
+  if (typeof command !== "string") return null;
+  return Array.isArray(input.args) ? commandForm([command, ...input.args]) : shellCommand(command);
 }
 
 // The file a path names, resolved the way fs/write_text_file resolves it, so an
@@ -1477,9 +1556,13 @@ function grantCwd(rawCwd, roots) {
 }
 
 // Env vars that change which program runs or how it is loaded, not data a
-// command reads: a grant is bound to their values and Main is shown them. DYLD_*
-// is a family (the macOS dynamic linker), so it is matched by prefix.
-const EXECUTION_ENV_NAMES = new Set(["PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "NODE_OPTIONS", "BASH_ENV"]);
+// command reads: a grant is bound to their values and Main is shown them. The
+// glibc loader injection vars (LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH, GCONV_PATH)
+// run attacker code at load time as surely as PATH does; DYLD_* is their macOS
+// family, matched by prefix.
+const EXECUTION_ENV_NAMES = new Set([
+  "PATH", "LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH", "GCONV_PATH", "NODE_OPTIONS", "BASH_ENV"
+]);
 
 function isExecutionEnvName(name) {
   return EXECUTION_ENV_NAMES.has(name) || name.startsWith("DYLD_");

@@ -194,17 +194,17 @@ test("W4: Main's inbox shows the operation, in full and in the summary", async (
 
 // ------------------------------------------------------------------ W4: binding
 
-test("W4: approving an execute request lets that command through once, wrapped in a shell or not", async () => {
+test("W4: approving an execute request lets a genuinely-equivalent command through once, wrapped in a non-login shell or not", async () => {
   await withTemp("acp-w4-bind-", (directory) => withClient({ cwd: directory, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
     // [what the permission request named, the terminal/create argv that follows].
-    // No login shell is run: what a profile prints would be this machine's.
+    // Each pair runs exactly `echo bound`: a bare argv, or a non-login shell whose
+    // -c script is only plain words tokenizes to that same argv. A login shell or
+    // a script with shell syntax is NOT equivalent — those are the next test.
     const cases = [
       ["echo bound", ["echo", "bound"]],
       ["echo   bound", ["sh", "-c", "echo bound"]],
-      ["bash -lc 'echo bound'", ["echo", "bound"]],
       ["sh -c \"echo bound\"", ["/bin/bash", "-c", "echo  bound"]],
-      [["bash", "-lc", "echo bound"], ["sh", "-c", "echo bound"]],
-      [["/bin/zsh", "-l", "-c", "echo bound"], ["echo", "bound"]]
+      [["sh", "-c", "echo bound"], ["echo", "bound"]]
     ];
     for (const [approved, argv] of cases) {
       const before = requests.length;
@@ -218,6 +218,34 @@ test("W4: approving an execute request lets that command through once, wrapped i
       assert.equal(permission, "allow");
       assert.equal(terminal.output, "bound\n", JSON.stringify(approved));
       assert.equal(requests.length, before + 1, `${JSON.stringify(approved)} ran ${argv.join(" ")} without a second request`);
+    }
+  }));
+});
+
+test("F1: a literal argv, a shell-metacharacter script and a login shell are distinct grants, not interchangeable", async () => {
+  await withTemp("acp-f1-shell-", (directory) => withClient({ cwd: directory, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
+    // [approved permission command, the terminal/create that must NOT be covered].
+    // A literal argv is what spawn runs verbatim; a shell -c with metacharacters
+    // runs a different program; a login shell sources profiles first.
+    const notCovered = [
+      // The literal args "a;" and "./x" are printed, not run; sh -c would run ./x.
+      [["echo", "a; ./x"], { command: "sh", args: ["-c", "echo a; ./x"] }],
+      [["echo", "$(./x)"], { command: "sh", args: ["-c", "echo $(./x)"] }],
+      // A plain command must not be spent as a login shell.
+      ["echo hi", { command: "bash", args: ["-lc", "echo hi"] }],
+      [["echo", "hi"], { command: "zsh", args: ["-l", "-c", "echo hi"] }]
+    ];
+    for (const [approved, terminal] of notCovered) {
+      const before = requests.length;
+      const turn = run([
+        { permission: { kind: "execute", command: approved } },
+        { terminal }
+      ]);
+      client.respondPermission((await request(requests, before + 1)).requestId, "allow", sessionId);
+      // The grant does not cover it: the terminal comes back to Main as its own request.
+      const asked = await request(requests, before + 2);
+      await client.respondPermission(asked.requestId, "reject-once", sessionId);
+      assert.deepEqual(await turn, ["allow", "terminal-error: Main rejected ACP operation"], JSON.stringify(approved));
     }
   }));
 });
@@ -754,19 +782,47 @@ test("F1: an execute approval is bound to its execution-affecting env; a changed
       { terminal: { command: "/bin/echo", args: ["hi"], env: [{ name: "PATH", value: "/evil/bin" }] } },
       // LD_PRELOAD added, which the approval never carried.
       { terminal: { command: "/bin/echo", args: ["hi"], env: [{ name: "PATH", value: "/safe/bin" }, { name: "LD_PRELOAD", value: "/x.so" }] } },
+      // LD_AUDIT added: the glibc audit interface loads it like LD_PRELOAD.
+      { terminal: { command: "/bin/echo", args: ["hi"], env: [{ name: "PATH", value: "/safe/bin" }, { name: "LD_AUDIT", value: "/a.so" }] } },
       // The approved PATH plus a non-execution-affecting var: still the one approval.
       { terminal: { command: "/bin/echo", args: ["hi"], env: [{ name: "PATH", value: "/safe/bin" }, { name: "NOTE", value: "fyi" }] } }
     ]);
     client.respondPermission((await request(requests, 1)).requestId, "allow", sessionId);
     await client.respondPermission((await request(requests, 2)).requestId, "reject-once", sessionId);
     await client.respondPermission((await request(requests, 3)).requestId, "reject-once", sessionId);
+    await client.respondPermission((await request(requests, 4)).requestId, "reject-once", sessionId);
     assert.deepEqual(await turn, [
       "allow",
       "terminal-error: Main rejected ACP operation",
       "terminal-error: Main rejected ACP operation",
+      "terminal-error: Main rejected ACP operation",
       { output: "hi\n", exitStatus: { exitCode: 0, signal: null } }
     ]);
-    assert.equal(requests.length, 3, "both the swapped and the added env went back to Main");
+    assert.equal(requests.length, 4, "each added or swapped loader var went back to Main");
+  }));
+});
+
+test("F1: a command that uses indirect or arithmetic expansion is never bound; it is asked about every time", async () => {
+  await withTemp("acp-f1-dynamic-", (directory) => withClient({ cwd: directory, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
+    // ${!CMD} reads whatever CMD holds, and $((i)) evaluates i: the Gateway cannot
+    // know which variable decides what runs, so no approval covers a later run.
+    const dynamic = [
+      ["sh", "-c", "${!CMD}"],
+      ["sh", "-c", "echo $((i))"]
+    ];
+    for (const argv of dynamic) {
+      const before = requests.length;
+      const turn = run([
+        { permission: { kind: "execute", command: argv } },
+        { terminal: { command: argv[0], args: argv.slice(1), env: [{ name: "CMD", value: "echo" }, { name: "i", value: "1" }] } }
+      ]);
+      // Approving the permission grants nothing.
+      client.respondPermission((await request(requests, before + 1)).requestId, "allow", sessionId);
+      // So the terminal is asked about on its own; reject it (we do not run it).
+      const asked = await request(requests, before + 2);
+      await client.respondPermission(asked.requestId, "reject-once", sessionId);
+      assert.deepEqual(await turn, ["allow", "terminal-error: Main rejected ACP operation"], argv.join(" "));
+    }
   }));
 });
 
@@ -808,6 +864,63 @@ test("F2: a write to an unchanged target still goes through", async () => {
     assert.deepEqual(await turn, ["write-ok"]);
     assert.equal(await readFile(approved, "utf8"), "NEW");
   }));
+});
+
+test("F2: a retarget-changed write reports only the approved path, never the out-of-root path it was steered to", async () => {
+  await withTemp("acp-f2-noleak-", async (directory) => {
+    const root = join(directory, "root");
+    await mkdir(root, { recursive: true });
+    const approved = join(root, "approved.txt");
+    const link = join(root, "link");
+    // A secret outside the roots; its resolution skips the root/protected check.
+    const secret = join(directory, "SECRET-OUTSIDE");
+    await writeFile(approved, "APPROVED");
+    await writeFile(secret, "secret");
+    await symlink(approved, link);
+    await withClient({ cwd: root, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
+      const turn = run([{ write: { path: link, content: "x" } }]);
+      const asked = await request(requests, 1);
+      await rm(link);
+      await symlink(secret, link);
+      await client.respondPermission(asked.requestId, "allow-once", sessionId);
+      const [outcome] = await turn;
+      assert.match(outcome, /^write-error: Write target changed since it was approved/);
+      assert.doesNotMatch(outcome, /SECRET-OUTSIDE/, "the steered-to path is not echoed back to the worker");
+      assert.equal(await readFile(secret, "utf8"), "secret", "and the secret is untouched");
+    });
+  });
+});
+
+test("F2: a new-file write whose parent is swapped to a symlink after the pre-check is refused on the fd-path check", async () => {
+  await withTemp("acp-f2-newfile-", async (directory) => {
+    const root = join(directory, "root");
+    const sub = join(root, "sub");
+    const evil = join(root, "evil");
+    await mkdir(sub, { recursive: true });
+    await mkdir(evil, { recursive: true });
+    const approvedPath = join(sub, "new.txt");
+    // Swap sub -> evil between the pre-check (sub still a real dir, so the check
+    // passes) and the open, and leave it there (stable through openWorkerFile, so
+    // its own recheck is self-consistent). The file then lands in evil, not at the
+    // approved path — only the fd-path check catches it.
+    let swapped = false;
+    const beforeWriteOpen = async () => {
+      if (swapped) return;
+      swapped = true;
+      await rm(sub, { recursive: true });
+      await symlink(evil, sub);
+    };
+    await withClient({ cwd: root, protectedPaths: [], beforeWriteOpen }, async ({ client, sessionId, requests, run }) => {
+      const turn = run([{ write: { path: approvedPath, content: "PWNED" } }]);
+      const asked = await request(requests, 1);
+      assert.deepEqual(asked.toolCall.locations, [{ path: approvedPath }]);
+      await client.respondPermission(asked.requestId, "allow-once", sessionId);
+      const [outcome] = await turn;
+      assert.match(outcome, /^write-error: Write target changed since it was approved/);
+      const landed = await readFile(join(evil, "new.txt"), "utf8").catch(() => null);
+      assert.notEqual(landed, "PWNED", "the content never reached the swapped-in directory");
+    });
+  });
 });
 
 // ---------------------------------------------------------------- F3: output byte limit
