@@ -7,6 +7,8 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { AcpClient } from "../src/acp-client.js";
 import { GatewayService, sanitizeWorkerMcpServers } from "../src/gateway-service.js";
+import { statePaths } from "../src/state-store.js";
+import { readSnapshotBody } from "./helpers/state-files.js";
 
 const mockAgent = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 const capabilityAgent = fileURLToPath(new URL("./mock-capability-agent.js", import.meta.url));
@@ -179,7 +181,7 @@ test("Gateway isolates Main ownership, persists sessions, and resumes them", asy
     assert.equal(first.result.text, "READY DENIED");
     await service.shutdown();
 
-    const saved = JSON.parse(await readFile(statePath, "utf8"));
+    const saved = await readSnapshotBody(statePath);
     assert.equal(saved.sessions[0].ownerRootId, "main-a");
 
     service = new GatewayService({ statePath, createClient: makeClient });
@@ -952,10 +954,13 @@ test("Gateway keeps task handles in memory but persists only a minimal resume ch
     assert.equal((await service.call("task_get", { taskId: task.taskId }, { rootId: "main-a" })).status, "completed");
     assert.equal((await service.call("task_result", { taskId: task.taskId }, { rootId: "main-a" })).result.text, "DONE");
     await service.flushPersist();
-    const saved = JSON.parse(await readFile(statePath, "utf8"));
-    assert.equal(saved.version, 4);
-    assert.deepEqual(saved.tasks, []);
-    assert.deepEqual(saved.inbox, []);
+    // 1.8.0: no v4 state.json any more (it left terminal tasks and answered rows
+    // out). The v5 snapshot keeps both by design; its session checkpoint is
+    // still the minimal one.
+    await assert.rejects(readFile(statePath, "utf8"), /ENOENT/);
+    const saved = await readSnapshotBody(statePath);
+    assert.deepEqual(saved.tasks.map((item) => [item.taskId, item.status]), [[task.taskId, "completed"]]);
+    assert.deepEqual(saved.inbox.map((item) => item.status), ["answered"]);
     assert.equal(saved.sessions[0].acpSessionId, opened.acpSessionId);
     assert.equal(saved.sessions[0].ownerRootId, "main-a");
     assert.equal(Object.hasOwn(saved.sessions[0], "events"), false);
@@ -1414,6 +1419,9 @@ test("Gateway marks an in-flight durable task failed after restart", async () =>
     new AcpClient({ provider: "mock", command: process.execPath, args: [mockAgent], permissionPolicy: "ask" }, options);
   let service = new GatewayService({ statePath, createClient: makeClient });
   try {
+    // init() is what opens the state: before 1.8.0 an un-initialized service
+    // still reached disk through the v4 writer, which no longer exists.
+    await service.init();
     const opened = await service.call("session_open", { provider: "claude", cwd: process.cwd(), permissionPolicy: "ask" }, { rootId: "main-a" });
     const task = await service.call("task_prompt", { sessionId: opened.sessionId, prompt: "go" }, { rootId: "main-a" });
     await waitForStatus(service, opened.sessionId, "waiting_permission");
@@ -1500,14 +1508,24 @@ test("Gateway rejects concurrent task prompts without losing the active task lin
 test("Gateway surfaces persistence failures", async () => {
   const directory = await mkdtemp(join(tmpdir(), "acp-gateway-persist-error-"));
   const statePath = join(directory, "state.json");
-  await mkdir(statePath);
-  const service = new GatewayService({ statePath });
+  const service = new GatewayService({ statePath, gcIntervalMs: 0 });
   try {
+    await service.init();
+    // The snapshot (the only file the debounced writer writes since 1.8.0) can
+    // no longer be replaced: its name is now a non-empty directory.
+    const { snapshot } = statePaths(statePath);
+    await rm(snapshot, { force: true });
+    await mkdir(join(snapshot, "blocker"), { recursive: true });
     service.persistDirty = true;
     await assert.rejects(service.flushPersist());
     assert.equal(typeof service.persistError, "string");
     assert.ok(service.persistError.length > 0);
   } finally {
+    // Unblock it, and let one good write settle the chain so shutdown can close.
+    await rm(statePaths(statePath).snapshot, { recursive: true, force: true });
+    service.persistDirty = true;
+    await service.flushPersist().catch(() => {});
+    await service.shutdown().catch(() => {});
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -1552,12 +1570,15 @@ test("Gateway recreates its state directory if it is removed while running", asy
   const statePath = join(stateDirectory, "state.json");
   const service = new GatewayService({ statePath, gcIntervalMs: 0 });
   try {
+    await service.init();
     service.persistDirty = true;
     await service.flushPersist();
     await rm(stateDirectory, { recursive: true, force: true });
     service.persistDirty = true;
     await service.flushPersist();
-    assert.equal(JSON.parse(await readFile(statePath, "utf8")).version, 4);
+    // The v5 snapshot writer recreates it (the v4 writer did, until 1.8.0).
+    const header = JSON.parse((await readFile(statePaths(statePath).snapshot, "utf8")).split("\n", 1)[0]);
+    assert.equal(header.version, 5);
   } finally {
     await service.shutdown().catch(() => {});
     await rm(directory, { recursive: true, force: true });

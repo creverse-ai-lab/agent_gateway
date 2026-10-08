@@ -6,7 +6,7 @@
 // Every case drives an in-process fake worker on an injected clock.
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -15,6 +15,7 @@ import { CHECK_CAVEATS, GatewayService } from "../src/gateway-service.js";
 import { POLL_OMITTED_SESSION_KEYS } from "../src/sessions.js";
 import { SETTING_DEFINITIONS, validateSetting } from "../src/settings.js";
 import { statePaths, WAL_TYPES } from "../src/state-store.js";
+import { readSnapshotBody } from "./helpers/state-files.js";
 
 const MAIN = { rootId: "main-a" };
 const EPOCH = Date.parse("2026-01-01T00:00:00.000Z");
@@ -455,7 +456,7 @@ test("the count and the quarantine survive a daemon restart, which itself counts
       await quarantine(before.service, before.clock, before.factory, stopped, 3);
       quarantined = stopped.quarantined;
       await before.service.flushPersist();
-      const saved = JSON.parse(await readFile(statePath, "utf8")).sessions;
+      const saved = (await readSnapshotBody(statePath)).sessions;
       const byId = Object.fromEntries(saved.map((record) => [record.id, record]));
       assert.deepEqual([byId[counting.id].restoreFailures, byId[counting.id].quarantined], [2, null]);
       assert.deepEqual([byId[stopped.id].restoreFailures, byId[stopped.id].quarantined], [3, quarantined]);

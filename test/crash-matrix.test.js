@@ -560,13 +560,17 @@ test("C14: a corrupt snapshot never starts empty", async () => {
     assert.equal(exit.exitCode, 78);
     assert.match(exit.stderr, /body checksum mismatch/);
 
-    // snapshot-drop falls back to the v4 dual-write, which is the entire reason
-    // that file is still being written.
+    // 1.8.0: there is no v4 dual-write to fall back to any more, so snapshot-drop
+    // is an explicit choice to start from what the log alone holds. After this
+    // clean shutdown (which rotated) that is nothing, and the start says so.
     daemon = await boot(directory, { env: { ACP_GATEWAY_STATE_RECOVERY: "snapshot-drop" } });
     client = connect(daemon);
     try {
+      const setup = await client.call("setup");
+      assert.ok(setup.alerts.some((alert) => alert.code === "STATE_SNAPSHOT_DROPPED"), "the dropped snapshot is reported");
+      assert.ok(setup.persistence.lastRecovery.quarantined.includes(".corrupt-"), "and kept aside for the operator");
       const sessions = (await client.call("session", { action: "list" })).sessions;
-      assert.equal(sessions.length, 1, "the session came back from state.json, not from nothing");
+      assert.equal(sessions.length, 0, "only what the log held comes back");
     } finally {
       client.close();
       await daemon.killHard();

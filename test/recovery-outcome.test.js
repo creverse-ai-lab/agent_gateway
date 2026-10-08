@@ -16,6 +16,7 @@ import { CHECK_CAVEATS, GatewayService } from "../src/gateway-service.js";
 import { decodeRecord, encodeRecord, statePaths, WAL_TYPES } from "../src/state-store.js";
 import { EXECUTION_OUTCOMES, INTERRUPTION_REASONS } from "../src/task-store.js";
 import { createSnapshot } from "../src/workspace.js";
+import { readSnapshotBody } from "./helpers/state-files.js";
 
 const MAIN = { rootId: "main-a" };
 const EPOCH = Date.parse("2026-01-01T00:00:00.000Z");
@@ -1080,7 +1081,7 @@ test("generation, lastRestore and the known capabilities survive a restart; pre-
       assert.equal(session.generation, 2);
       lastRestore = session.lastRestore;
       await before.service.flushPersist();
-      const [record] = JSON.parse(await readFile(statePath, "utf8")).sessions;
+      const [record] = (await readSnapshotBody(statePath)).sessions;
       assert.deepEqual([record.generation, record.lastRestore, record.restoreCapabilities],
         [2, lastRestore, { resume: true, load: false }]);
     } finally {
@@ -1103,8 +1104,9 @@ test("generation, lastRestore and the known capabilities survive a restart; pre-
       await after.service.shutdown();
     }
 
-    // A checkpoint written before 1.7 has none of the three.
-    const legacy = JSON.parse(await readFile(statePath, "utf8"));
+    // A checkpoint written before 1.7 has none of the three. Such a daemon's v4
+    // state.json is rebuilt here from the v5 snapshot (1.8.0 writes no v4 file).
+    const legacy = { version: 4, ...(await readSnapshotBody(statePath)) };
     for (const record of legacy.sessions) {
       delete record.generation;
       delete record.lastRestore;

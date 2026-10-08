@@ -221,8 +221,7 @@ test("characterization: setup reports gateway, API and state schema versions wit
     assert.equal(setup.gatewayApiVersion, 1);
     assert.deepEqual(setup.responseProfiles, ["current", "compact", "diagnostic"]);
     // GOLDEN DIFF (1.4.0 PR 4): the persisted schema is v5 (snapshot + WAL). The
-    // v4 state.json is still written alongside it as downgrade insurance, which is
-    // why every other assertion about that file is unchanged.
+    // v4 state.json written alongside it as downgrade insurance stopped in 1.8.0.
     assert.equal(setup.stateSchemaVersion, 5);
     assert.deepEqual(sorted(Object.keys(setup.persistence)), PERSISTENCE_KEYS);
     assert.equal(setup.persistence.healthy, true);
@@ -309,7 +308,7 @@ test("characterization: inbox list returns the same full payload as inbox get", 
   }
 });
 
-test("characterization: a completed task stays in memory and is never persisted", async () => {
+test("characterization: a completed task stays in memory, and no v4 state.json is written", async () => {
   const directory = await mkdtemp(join(tmpdir(), "acp-characterization-task-"));
   const statePath = join(directory, "state.json");
   const service = new GatewayService({
@@ -330,9 +329,9 @@ test("characterization: a completed task stays in memory and is never persisted"
     await waitForIdle(service, opened.sessionId);
     await service.flushPersist();
 
-    const saved = JSON.parse(await readFile(statePath, "utf8"));
-    assert.equal(saved.version, 4);
-    assert.deepEqual(saved.tasks, [], "terminal tasks are dropped from state.json");
+    // GOLDEN DIFF (1.8.0): the v4 state.json this checked (terminal tasks left
+    // out of it) is no longer written at all; the v5 snapshot keeps the handle.
+    await assert.rejects(readFile(statePath, "utf8"), /ENOENT/, "no v4 state.json is written");
     const got = await service.call("task_get", { taskId: task.taskId }, MAIN);
     assert.equal(got.status, "completed", "the terminal task is still readable in memory");
     assert.deepEqual(sorted(Object.keys(got)), TASK_KEYS);

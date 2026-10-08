@@ -1,6 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, rename, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { realpath, stat } from "node:fs/promises";
 import { AcpClient, PERMISSION_POLICIES, requirePermissionPolicy } from "./acp-client.js";
 import { ArtifactStore, defaultArtifactRoot } from "./artifacts.js";
@@ -12,7 +11,9 @@ import {
 } from "./providers.js";
 import { prepareGrokSandbox } from "./grok-sandbox.js";
 import { gatewayProtectedPaths } from "./config.js";
-import { createSnapshot, defaultWorkspaceRoot, removeSnapshot, snapshotDiff } from "./workspace.js";
+import {
+  adoptSnapshot, createSnapshot, defaultWorkspaceRoot, MAX_SNAPSHOT_TOTAL_BYTES, ownedSnapshots, removeSnapshot, snapshotDiff
+} from "./workspace.js";
 import {
   capPendingOptions, compareInboxDesc, decodeInboxCursor, encodeInboxCursor, isAfterInboxCursor,
   projectInboxItem, projectPoll, projectResult, PROFILES, relevantAlerts, requireInboxDetail,
@@ -23,9 +24,9 @@ import {
   CHUNK_EVENT_TYPES, DEFAULT_STALL_HINT_MS, DURABLE_EVENT_TYPES, normalizeThoughtCapture, POLL_OMITTED_SESSION_KEYS,
   publicSession, SessionStore, workerSilence
 } from "./sessions.js";
-import { crashAfter, StateStore, WAL_TYPES } from "./state-store.js";
+import { crashAfter, StateStore, sweepStaleTemporaries, WAL_TYPES } from "./state-store.js";
 import { requireTaskLinks, taskInterruption, TaskStore, TERMINAL_TASK_STATUSES } from "./task-store.js";
-import { GATEWAY_API_VERSION, GATEWAY_VERSION, LEGACY_STATE_SCHEMA_VERSION, STATE_SCHEMA_VERSION } from "./version.js";
+import { GATEWAY_API_VERSION, GATEWAY_VERSION, STATE_SCHEMA_VERSION } from "./version.js";
 
 import { authorizeCall, isReadOnlyCall } from "./access.js";
 import {
@@ -123,6 +124,13 @@ const DEFAULT_MAX_CONSECUTIVE_RESTORE_FAILURES = 3;
 // persistence error in STATE_RESTORE_NOT_DURABLE.
 const PROVIDER_ALERT_ERROR_BYTES = 300;
 const CONTROL_SERVER_PATTERN = /(?:acp-gateway-control|acp-mcp-bridge|gateway-daemon|control-mcp)/i;
+// The debounced state writer. With the WAL off the snapshot is the only file,
+// so it keeps the short debounce. With the WAL on, every fact a restart must
+// not lose is already in the log, so the full snapshot (whose cost grows with
+// everything retained) is rewritten at most about once a second while dirty;
+// rotation and shutdown write it regardless.
+const PERSIST_DEBOUNCE_MS = 50;
+const SNAPSHOT_INTERVAL_MS = 1_000;
 // The calls that record a caller. One of them arriving over the control socket
 // with no caller is work nobody can attribute; management calls (admin CLI,
 // installer health checks) are not front doors and do not count.
@@ -169,6 +177,9 @@ export class GatewayService {
     sessionRetentionMs = 7 * 24 * 60 * 60_000,
     taskRetentionMs = 24 * 60 * 60_000,
     persistence = {},
+    // With the WAL on, the shortest gap between two debounced snapshot writes
+    // (see #persistDelay). Not a setting; injectable so a test need not wait.
+    snapshotIntervalMs = SNAPSHOT_INTERVAL_MS,
     // Gateway-wide default for how much worker reasoning a session retains.
     // Per-session overrides ride session_open/session_restore.
     thoughtCapture = "tail",
@@ -188,6 +199,9 @@ export class GatewayService {
     protectedPaths = null,
     // Where workspace=snapshot copies live. Never under a protected path.
     workspaceRoot = defaultWorkspaceRoot(),
+    // Every live snapshot copy together, checked at session_open (workspace.js).
+    // A constant rather than a setting; injectable for tests.
+    maxSnapshotTotalBytes = MAX_SNAPSHOT_TOTAL_BYTES,
     // Process-wide Grok sandbox profile (grok-sandbox.js). Off when a test
     // injects its own client factory, unless asked for explicitly.
     grokSandbox = createClient == null,
@@ -198,6 +212,21 @@ export class GatewayService {
     now = () => Date.now()
   } = {}) {
     this.workspaceRoot = workspaceRoot;
+    this.maxSnapshotTotalBytes = maxSnapshotTotalBytes;
+    // What owner.json says in the copies this state makes: the canonical state
+    // path, set by init(). Null without one, and then no orphan is reclaimed.
+    this.workspaceOwner = null;
+    // Snapshot opens between their first copied directory and the registration
+    // that records it. While any is in flight, an unreferenced copy may be one
+    // of theirs, so orphan reconciliation waits.
+    this.workspaceOpens = 0;
+    // Bytes admitted for copies whose session is not registered yet.
+    this.workspaceBytesPending = 0;
+    // home -> {workspace, removing, failures, error}: copies whose session
+    // record is already gone, being deleted or waiting to be retried. This is
+    // the last reference to them, so a failed delete stays here.
+    this.workspaceRemovals = new Map();
+    this.snapshotIntervalMs = snapshotIntervalMs;
     this.grokSandbox = grokSandbox;
     this.grokSandboxDir = grokSandboxDir;
     this.providerDetector = providerDetector;
@@ -333,12 +362,16 @@ export class GatewayService {
 
   async init() {
     this.agentUpdateManager?.start();
+    // The settings file lives outside the state directory (beside install.json),
+    // so open() below does not see what a crashed settings write left there.
+    if (typeof this.settings?.path === "string") sweepStaleTemporaries(this.settings.path);
     if (!this.statePath) return;
     // open() repairs, replays and reports. It returns the same {sessions, tasks,
     // inbox} shape the v4 reader produced, so the restart transformations below
     // are untouched — and it throws rather than ever hand back a state it could
     // not read, because a silent empty start is how durable handles disappear.
     const loaded = this.stateStore.open();
+    this.workspaceOwner = await canonicalStatePath(this.statePath);
     for (const record of loaded.sessions) {
       const status = record.status === "closed" ? "closed" : "disconnected";
       // This bypasses #setStatus, so it records the reason itself, under the
@@ -381,6 +414,7 @@ export class GatewayService {
     this.taskStore.recover(loaded.tasks, {
       next: (record, interruption) => this.#interruptionNext(record.sessionId, interruption)
     });
+    this.stateStore.retainResultRefs(new Set(this.taskStore.records.keys()));
     for (const record of loaded.inbox) {
       const item = compactRecoveredInbox(record, this.resourceLimits.maxInboxItemBytes);
       // An ACP permission request is tied to the old worker process. It cannot
@@ -391,6 +425,11 @@ export class GatewayService {
         item.resolvedAt = new Date(this.now()).toISOString();
       }
       this.inbox.set(item.inboxId, item);
+    }
+    // A copy made before 1.8.0 has no owner marker. This state references it, so
+    // it is this state's: marked now, it can be reclaimed once nothing does.
+    for (const session of this.store.list()) {
+      if (session.workspace) await adoptSnapshot(session.workspace, this.workspaceOwner);
     }
     // Rotate immediately: the snapshot this writes is the first one that contains
     // the restart transformations, and it retires the log that produced them, so
@@ -945,17 +984,96 @@ export class GatewayService {
     const client = await this.getClient(provider, requestedModel);
     const permissionPolicy = requirePermissionPolicy(args.permissionPolicy ?? "ask");
     const mcpServers = sanitizeWorkerMcpServers(args.mcpServers ?? []);
-    // The copy is made before the worker ever sees a path, so the worker's cwd is
-    // the copy from its first request onward.
-    const workspace = workspaceMode === "snapshot"
-      ? await createSnapshot(requestedCwd, this.workspaceRoot, { protectedPaths: this.protectedPaths })
-      : null;
-    const cwd = workspace?.path ?? requestedCwd;
+    const opening = { args, context, provider, client, requestedModel, permissionPolicy, mcpServers };
+    if (workspaceMode !== "snapshot") return this.#openSessionIn({ ...opening, cwd: requestedCwd, workspace: null });
+    // From its first directory until the registration that records it, the copy
+    // is referenced by nothing; reconciliation must not take it for an orphan.
+    this.workspaceOpens += 1;
+    let admitted = 0;
     try {
-      return await this.#openSessionIn({ args, context, provider, cwd, client, requestedModel, permissionPolicy, mcpServers, workspace });
-    } catch (error) {
-      if (workspace) await removeSnapshot(workspace).catch(() => {});
-      throw error;
+      // The copy is made before the worker ever sees a path, so the worker's cwd
+      // is the copy from its first request onward.
+      const workspace = await createSnapshot(requestedCwd, this.workspaceRoot, {
+        protectedPaths: this.protectedPaths,
+        owner: this.workspaceOwner,
+        admit: (bytes) => {
+          this.#admitSnapshotBytes(bytes);
+          admitted = bytes;
+          this.workspaceBytesPending += bytes;
+        }
+      });
+      try {
+        return await this.#openSessionIn({ ...opening, cwd: workspace.path, workspace });
+      } catch (error) {
+        await this.#removeWorkspace(workspace);
+        throw error;
+      }
+    } finally {
+      this.workspaceBytesPending -= admitted;
+      this.workspaceOpens -= 1;
+    }
+  }
+
+  // The aggregate budget across snapshot copies: live sessions' copies, copies
+  // still being opened, and deleted sessions' copies that are not gone yet,
+  // since all of them are on disk. Synchronous, so two opens cannot both fit
+  // into the same remaining room.
+  #admitSnapshotBytes(bytes) {
+    let used = this.workspaceBytesPending;
+    for (const session of this.store.list()) {
+      if (!CLOSED_STATUSES.has(session.status)) used += snapshotBytes(session.workspace);
+    }
+    for (const entry of this.workspaceRemovals.values()) used += snapshotBytes(entry.workspace);
+    const limit = this.maxSnapshotTotalBytes;
+    if (used + bytes <= limit) return;
+    throw new GatewayError(
+      ERROR_CODES.WORKSPACE_ERROR,
+      `Snapshot workspaces would exceed their combined limit (${used} bytes in use + ${bytes} for this copy; `
+        + `limit ${limit} bytes). Close sessions opened with workspace=snapshot, or use workspace=direct`,
+      { bytes, usedBytes: used, limitBytes: limit }
+    );
+  }
+
+  // Deletes a snapshot copy whose session record is gone (or never existed).
+  // One deletion per copy at a time, and a failed one is kept and retried by
+  // maintenance: nothing else remembers the copy any more. Never throws.
+  #removeWorkspace(workspace) {
+    const home = workspace?.home;
+    if (typeof home !== "string") return Promise.resolve(false);
+    const entry = this.workspaceRemovals.get(home) ?? { workspace, removing: null, failures: 0, error: null };
+    if (entry.removing) return entry.removing;
+    this.workspaceRemovals.set(home, entry);
+    entry.removing = removeSnapshot(workspace).then(
+      () => {
+        this.workspaceRemovals.delete(home);
+        return true;
+      },
+      (error) => {
+        entry.removing = null;
+        entry.failures += 1;
+        entry.error = error?.message ?? String(error);
+        return false;
+      }
+    );
+    return entry.removing;
+  }
+
+  // Startup and every maintenance pass. Retries deletes that failed, then
+  // reclaims copies this state made that no session references: left by a crash
+  // between the copy and the registration, or by a delete a restart forgot.
+  async #reconcileWorkspaces() {
+    for (const entry of [...this.workspaceRemovals.values()]) {
+      if (!entry.removing) await this.#removeWorkspace(entry.workspace);
+    }
+    if (this.workspaceOwner == null || this.workspaceOpens > 0) return;
+    for (const workspace of await ownedSnapshots(this.workspaceRoot, this.workspaceOwner)) {
+      // Re-checked per copy, right before deleting it: across the awaits an open
+      // may have started, or registered a session on this very copy.
+      if (this.workspaceOpens > 0) return;
+      if (this.workspaceRemovals.has(workspace.home)) continue; // retried above
+      const name = basename(workspace.home);
+      if (this.store.list().some((session) => session.workspace?.home && basename(session.workspace.home) === name)) continue;
+      await this.#removeWorkspace(workspace);
     }
   }
 
@@ -2736,7 +2854,7 @@ export class GatewayService {
     // registration record is still in the log ahead of this one.
     this.stateStore?.append(WAL_TYPES.SESSION_CLOSED, session.id, {});
     // The copy goes with the session. Main collects workspace_diff before close.
-    if (session.workspace) await removeSnapshot(session.workspace).catch(() => {});
+    if (session.workspace) await this.#removeWorkspace(session.workspace);
     // Anything still queued behind this close was written for a session that
     // now does not exist; waking it up would act on the deleted record.
     queue.closeWith(new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`));
@@ -3189,7 +3307,9 @@ export class GatewayService {
       bytes: metadata.bytes,
       sha256: createHash("sha256").update(json).digest("hex")
     };
-    this.stateStore.rememberResultRef(taskId, ref);
+    // result is the object the task record is about to hold: the snapshot then
+    // writes this same pointer and preview instead of the envelope itself.
+    this.stateStore.rememberResultRef(taskId, ref, { result, preview });
     return { ref, preview };
   }
 
@@ -3250,7 +3370,9 @@ export class GatewayService {
     return {
       sessions: this.store.checkpoints(),
       // v5 keeps terminal handles and answered inbox items: a completed Task
-      // surviving a restart until its TTL is the point of this release.
+      // surviving a restart until its TTL is the point of this release. A result
+      // spilled to an artifact is written by reference (StateStore#durableBody),
+      // so a snapshot no longer grows with every retained transcript.
       tasks: this.taskStore.toPersistedRecords(),
       inbox: [...this.inbox.values()]
     };
@@ -3336,12 +3458,14 @@ export class GatewayService {
 
   // A count bound on inbox history, per root and resolved only. A pending row is
   // an obligation Main has not discharged, so it is never evictable; retention
-  // still removes rows by age, this one removes them by depth.
-  #evictInboxHistory() {
+  // still removes rows by age, this one removes them by depth. Enforced for one
+  // root each time one of its rows resolves, and for all of them by maintenance:
+  // between two gc ticks an ask-policy session can resolve far more than the cap.
+  #evictInboxHistory(rootId = null) {
     const limit = this.resourceLimits.maxInboxHistoryPerRoot;
     const byRoot = new Map();
     for (const item of this.inbox.values()) {
-      if (item.status === "pending") continue;
+      if (item.status === "pending" || (rootId != null && item.ownerRootId !== rootId)) continue;
       const rows = byRoot.get(item.ownerRootId) ?? [];
       rows.push(item);
       byRoot.set(item.ownerRootId, rows);
@@ -3497,6 +3621,7 @@ export class GatewayService {
     item.resolution = resolution;
     item.resolvedAt = new Date(this.now()).toISOString();
     this.#appendInboxResolved(item);
+    this.#evictInboxHistory(item.ownerRootId);
     this.schedulePersist();
   }
 
@@ -3594,17 +3719,17 @@ export class GatewayService {
 
   taskRetentionEligible(task, policy, now) {
     return TERMINAL_TASK_STATUSES.has(task.status)
-      && !this.store.get(task.sessionId)?.pinned
+      && !pinHolds(this.store.get(task.sessionId))
       && isExpired(task.createdAt, policy.taskRetentionMs, now);
   }
 
   inboxRetentionEligible(item, policy, now) {
-    return item.status !== "pending" && !this.store.get(item.sessionId)?.pinned
+    return item.status !== "pending" && !pinHolds(this.store.get(item.sessionId))
       && isExpired(item.resolvedAt ?? item.createdAt, policy.inboxRetentionMs, now);
   }
 
   sessionRetentionEligible(session, policy, now) {
-    return !session.pinned && !ACTIVE_STATUSES.has(session.status) && this.#sessionQuiet(session)
+    return !pinHolds(session) && !ACTIVE_STATUSES.has(session.status) && this.#sessionQuiet(session)
       && !session._reserved && !session._queue?.depth
       && isExpired(session.completedAt ?? session.updatedAt, policy.sessionRetentionMs, now);
   }
@@ -3631,7 +3756,7 @@ export class GatewayService {
         sessions: sessions.filter(s => this.sessionRetentionEligible(s, policy, now)).length,
         tasks: tasks.filter(t => this.taskRetentionEligible(t, policy, now)).length,
         inbox: inbox.filter(i => this.inboxRetentionEligible(i, policy, now)).length,
-        results: sessions.filter(s => !s.pinned && !ACTIVE_STATUSES.has(s.status) && !s.transientClearedAt && s.completedAt && isExpired(s.completedAt, policy.resultRetentionMs, now)).length
+        results: sessions.filter(s => !pinHolds(s) && !ACTIVE_STATUSES.has(s.status) && !s.transientClearedAt && s.completedAt && isExpired(s.completedAt, policy.resultRetentionMs, now)).length
       },
       // Artifact bytes are shared across roots and retained through references.
       // Do not manufacture a deletion count from age alone.
@@ -3713,7 +3838,7 @@ export class GatewayService {
 
       // Never clear a session whose current turn is still active: completedAt
       // belongs to the previous turn until the prompt path resets it.
-      if (!session.pinned && !session.transientClearedAt && session.completedAt
+      if (!pinHolds(session) && !session.transientClearedAt && session.completedAt
         && !ACTIVE_STATUSES.has(session.status)
         && isExpired(session.completedAt, this.lifecycle.resultRetentionMs, now)) {
         session.resultText = "";
@@ -3746,7 +3871,7 @@ export class GatewayService {
         }
         this.store.delete(session.id);
         this.stateStore?.append(WAL_TYPES.SESSION_CLOSED, session.id, {});
-        if (session.workspace) await removeSnapshot(session.workspace).catch(() => {});
+        if (session.workspace) await this.#removeWorkspace(session.workspace);
         // Task handles deliberately survive their session now: a Task's lifetime
         // is its own ttl and taskRetentionMs, not its session's retention. Deleting
         // them here made a completed handle unreadable long before its TTL.
@@ -3758,6 +3883,9 @@ export class GatewayService {
         changed = true;
       }
     }
+    // After session retention, so it judges references against the records that
+    // are left.
+    await this.#reconcileWorkspaces();
 
     for (const [provider, client] of [...this.clients]) {
       if (this.store.list().some((session) => session.client === client)) continue;
@@ -3847,7 +3975,10 @@ export class GatewayService {
     }
     // Cancelling a session that has no Task used to leave these marks in memory
     // only: no caller on that path touches the persistence hook.
-    if (interrupted > 0) this.schedulePersist();
+    if (interrupted > 0) {
+      this.#evictInboxHistory(session.ownerRootId);
+      this.schedulePersist();
+    }
   }
 
   // No command owns this session right now, so background work may take its
@@ -3906,7 +4037,19 @@ export class GatewayService {
       void this.flushPersist().catch((error) => {
         this.persistError = error?.message ?? String(error);
       });
-    }, 50);
+    }, this.#persistDelay());
+  }
+
+  // WAL off: the debounce, as always, because the snapshot is the only file.
+  // WAL on: the debounce after a quiet interval, otherwise whatever is left of
+  // the interval since the last snapshot landed (a rotation's included), so a
+  // burst of changes costs one full rewrite per interval. What can be lost to a
+  // crash in between is snapshot-only by design (session metadata, owner
+  // activity): every WAL record is written straight through as before.
+  #persistDelay() {
+    if (this.stateStore?.mode !== "wal") return PERSIST_DEBOUNCE_MS;
+    const remaining = this.snapshotIntervalMs - (performance.now() - this.stateStore.lastSnapshotAt);
+    return Math.min(this.snapshotIntervalMs, Math.max(PERSIST_DEBOUNCE_MS, remaining));
   }
 
   flushPersist() {
@@ -3934,37 +4077,13 @@ export class GatewayService {
   }
 
   // flushPersist's body, unchanged in name and meaning: the debounced writer. It
-  // barriers the WAL, writes the v5 snapshot (unsynced — same cost the v4 writer
-  // always had) or rotates when the log is due, then dual-writes v4.
+  // barriers the WAL and writes the v5 snapshot (unsynced), or rotates when the
+  // log is due. The v4 state.json it also wrote until 1.7.x (downgrade insurance
+  // promised through 1.5.x) is gone: the store reads and migrates a leftover one
+  // at startup, then deletes it.
   async persist() {
-    if (this.stateStore) {
-      if (!this.stateStore.rotateIfNeeded()) this.stateStore.writeSnapshot({ sync: false });
-    }
-    await this.persistLegacySnapshot();
-  }
-
-  // Downgrade insurance, sunsetting in 1.5.0. Byte-for-byte the 1.3.2 writer plus
-  // two marker fields, so a rolled-back daemon reads it and recovers every
-  // session; writerVersion is also how the next v5 start can tell that an older
-  // daemon wrote here (v4 cannot preserve a field it does not know about).
-  async persistLegacySnapshot() {
-    await mkdir(dirname(this.statePath), { recursive: true, mode: 0o700 });
-    const temporary = `${this.statePath}.${process.pid}.tmp`;
-    await writeFile(
-      temporary,
-      `${JSON.stringify({
-        version: LEGACY_STATE_SCHEMA_VERSION,
-        writerVersion: GATEWAY_VERSION,
-        epoch: this.stateStore?.status().snapshotEpoch ?? 0,
-        sessions: this.store.checkpoints(),
-        // v4 shape: terminal handles and answered requests stay out. The v5
-        // snapshot is where they survive a restart.
-        tasks: this.taskStore.toPersistedRecords({ includeTerminal: false }),
-        inbox: [...this.inbox.values()].filter((item) => ["pending", "interrupted"].includes(item.status))
-      })}\n`,
-      { mode: 0o600 }
-    );
-    await rename(temporary, this.statePath);
+    if (!this.stateStore) return;
+    if (!this.stateStore.rotateIfNeeded()) this.stateStore.writeSnapshot({ sync: false });
   }
 
   async shutdown() {
@@ -4208,6 +4327,31 @@ function taskStatusPayload(task) {
     turnId: task.turnId ?? null,
     ...(task.promptDispatchedAt ? { promptDispatchedAt: task.promptDispatchedAt } : {})
   };
+}
+
+// A pin keeps a session, its tasks and its inbox rows out of age retention, but
+// only while the session can still be used: a closed record can never be
+// prompted again, so a pin on it would only keep its bytes forever.
+function pinHolds(session) {
+  return session?.pinned === true && !CLOSED_STATUSES.has(session.status);
+}
+
+// What a snapshot copy counts against the combined budget: the source size its
+// copy measured (absent on a record that is not a snapshot).
+function snapshotBytes(workspace) {
+  return workspace?.mode === "snapshot" && Number.isSafeInteger(workspace.bytes) && workspace.bytes > 0 ? workspace.bytes : 0;
+}
+
+// The state's identity in workspace owner markers: one string per state file
+// however its directory was spelled (macOS /var and /private/var, a symlinked
+// home), so a marker written under one spelling matches under another.
+async function canonicalStatePath(statePath) {
+  const absolute = resolve(statePath);
+  try {
+    return join(await realpath(dirname(absolute)), basename(absolute));
+  } catch {
+    return absolute;
+  }
 }
 
 // Equal as given, or equal once both resolve on disk (a symlinked tmpdir, a

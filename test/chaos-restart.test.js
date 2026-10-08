@@ -6,7 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { GatewayRpcClient } from "../src/socket-rpc.js";
+import { statePaths } from "../src/state-store.js";
 import { daemonPaths, HARNESS_ROOT_ID, startDaemon } from "./helpers/daemon-harness.js";
+import { readSnapshotBody } from "./helpers/state-files.js";
 
 const SESSION_ID = "acp-chaos-session";
 const INBOX_ID = "inbox-chaos-pending";
@@ -36,8 +38,12 @@ test("daemon restart after SIGKILL reapplies restart semantics without duplicati
     client = connect(daemon);
     await assertRestartSemantics(client);
 
-    const saved = JSON.parse(await readFile(statePath, "utf8"));
-    assert.equal(saved.version, 4, "state schema version must survive a hard restart");
+    // 1.8.0: the seeded v4 file was migrated on the first start and deleted once
+    // the v5 snapshot holding it was synced, so the snapshot is what to inspect.
+    const header = JSON.parse((await readFile(statePaths(statePath).snapshot, "utf8")).split("\n", 1)[0]);
+    assert.equal(header.version, 5, "state schema version must survive a hard restart");
+    await assert.rejects(readFile(statePath, "utf8"), /ENOENT/, "the migrated v4 file is not left behind");
+    const saved = await readSnapshotBody(statePath);
     assert.equal(saved.sessions.length, 1, "the session record must not be duplicated");
     assert.equal(saved.sessions[0].id, SESSION_ID);
     assert.equal(saved.inbox.length, 1, "the inbox record must not be duplicated");
@@ -77,8 +83,8 @@ async function assertRestartSemantics(client) {
   assert.deepEqual((await client.call("inbox", { action: "list", status: "pending" })).items, []);
 }
 
-// Mirrors SessionStore.checkpoints() plus the raw inbox record shape written by
-// GatewayService.persist().
+// Mirrors SessionStore.checkpoints() plus the raw inbox record shape the v4
+// writer (GatewayService.persist() until 1.7.x) put in state.json.
 function seedState() {
   const timestamp = new Date().toISOString();
   return {

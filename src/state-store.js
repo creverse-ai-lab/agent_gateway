@@ -14,9 +14,9 @@
 import { createHash } from "node:crypto";
 import {
   closeSync, copyFileSync, existsSync, fstatSync, fsyncSync, ftruncateSync, mkdirSync, openSync,
-  readFileSync, renameSync, statSync, unlinkSync, writeSync
+  readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeSync
 } from "node:fs";
-import { dirname } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { ERROR_CODES, GatewayError } from "./errors.js";
 import { GATEWAY_API_VERSION, GATEWAY_VERSION, STATE_SCHEMA_VERSION } from "./version.js";
 
@@ -24,6 +24,18 @@ import { GATEWAY_API_VERSION, GATEWAY_VERSION, STATE_SCHEMA_VERSION } from "./ve
 // guess: an unknown envelope may put the payload somewhere else entirely.
 export const WAL_RECORD_VERSION = 1;
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+
+// Copies #quarantine sets aside for an operator. Bounded both ways: the newest
+// few per file and reason (a daemon autostarted into the same damaged log adds
+// one per attempt), and none past an age, because every copy holds task results
+// and inbox payloads that retention let go of long ago.
+const QUARANTINE_KEEP = 3;
+const QUARANTINE_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
+const QUARANTINE_NAME = /^(corrupt|downgraded|gap)-(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z$/u;
+// A uuid-named temporary says nothing about its writer, so only its age can.
+// Any write finishes in milliseconds; this is far past that.
+const STALE_TEMPORARY_MS = 10 * 60_000;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 
 // The complete write-ahead vocabulary. session.owner_changed is deliberately
 // absent: ownerRootId is assigned once at registration and never reassigned, so
@@ -146,7 +158,14 @@ export class StateStore {
   #closed = false;
   #opened = false;
   #snapshotDirty = false;
+  #lastSnapshotAt = -Infinity;
+  // state.json was on disk at open(). It goes once a synced snapshot holds
+  // everything it could still contribute.
+  #legacyPending = false;
   #lastRecovery = null;
+  // taskId -> { ref, result, fallback }: a terminal result that lives in an
+  // artifact. result is the very object that was spilled (see #durableBody);
+  // fallback is the degraded head recovery serves when the artifact is gone.
   #resultRefs = new Map();
 
   constructor({
@@ -187,6 +206,12 @@ export class StateStore {
     return this.#seq;
   }
 
+  // performance.now() of the last snapshot that landed, for the writer's
+  // cadence. Monotonic on purpose: the injected clock is business time.
+  get lastSnapshotAt() {
+    return this.#lastSnapshotAt;
+  }
+
   // ---------------------------------------------------------------- recovery
 
   // Returns the recovered state in the same shape the v4 reader produced, so the
@@ -215,8 +240,15 @@ export class StateStore {
       quarantined: null,
       alerts: []
     };
+    // Under the lock, so no live writer of ours owns any of these. What a dead
+    // one left behind is either a torn copy of state (a temporary) or an old
+    // forensic copy, and both hold payloads retention has already let go of.
+    sweepStaleTemporaries(this.paths.snapshot);
+    sweepStaleTemporaries(this.paths.state);
+    this.#pruneQuarantine();
     let snapshot = this.#readSnapshot(recovery);
     const legacy = this.#readLegacyState();
+    this.#legacyPending = legacy != null;
     // (c2) Downgrade loop closure. A v4 daemon's persist() writes fixed literals,
     // so it cannot preserve our marker: state.json without a writerVersion but
     // newer than the snapshot means an older gateway ran and the user has been
@@ -253,6 +285,7 @@ export class StateStore {
     this.#seq = baseWalSeq;
     this.#consume(this.paths.rotating, state, baseWalSeq, recovery, false);
     this.#consume(this.paths.wal, state, baseWalSeq, recovery, true);
+    this.#restoreResultRefs(state);
     this.#rotatedAt = this.#now();
     this.#openWal();
     this.#opened = true;
@@ -277,18 +310,23 @@ export class StateStore {
     }
     const mtimeMs = statSync(this.paths.snapshot).mtimeMs;
     const split = raw.indexOf(0x0a);
+    // Since 1.8.0 nothing writes state.json any more, so snapshot-drop falls
+    // back to the write-ahead log alone, plus a v4 file only if one is left.
     const fail = (reason) => {
       if (this.#config.stateRecovery === "cold" || this.#config.stateRecovery === "snapshot-drop") {
         this.#quarantine(this.paths.snapshot, "corrupt", recovery);
-        recovery.alerts.push({ code: "STATE_SNAPSHOT_DROPPED", message: `${reason}; started from ${this.#config.stateRecovery === "cold" ? "empty state" : "state.json"}` });
+        recovery.alerts.push({
+          code: "STATE_SNAPSHOT_DROPPED",
+          message: `${reason}; started from ${this.#config.stateRecovery === "cold" ? "empty state" : "the write-ahead log (and a v4 state.json, if one was left)"}`
+        });
         return null;
       }
       const quarantined = this.#quarantine(this.paths.snapshot, "corrupt", recovery);
       throw new GatewayError(
         ERROR_CODES.STATE_SNAPSHOT_CORRUPT,
         `Gateway state snapshot is unusable (${reason}). A copy is at ${quarantined}. `
-        + "Start with ACP_GATEWAY_STATE_RECOVERY=snapshot-drop to fall back to the v4 state.json, "
-        + "or =cold to start from an empty state."
+        + "Start with ACP_GATEWAY_STATE_RECOVERY=snapshot-drop to start from the write-ahead log alone "
+        + "(and a v4 state.json, if one was left), or =cold to start from an empty state."
       );
     };
     if (split < 0) return fail("no header line");
@@ -299,6 +337,9 @@ export class StateStore {
       return fail(`header is not JSON: ${error?.message}`);
     }
     const version = Number(header?.version);
+    // Additive in 1.8.0 within schema v5: a task record may carry resultRef
+    // (see #durableBody). An older v5 reader drops the key and keeps the
+    // degraded head beside it, which is how it already treats a lost artifact.
     if (version !== STATE_SCHEMA_VERSION) {
       // Never guess at either direction: an older snapshot needs an explicit
       // migrator just as much as a newer one needs a newer reader.
@@ -497,20 +538,37 @@ export class StateStore {
   // the 4KB head rather than losing the fact that the task completed.
   #materializeResult(taskId, payload) {
     if (payload?.result !== undefined) return payload.result;
-    const ref = payload?.ref;
-    if (ref?.path) {
-      try {
-        const raw = readFileSync(ref.path);
-        if (createHash("sha256").update(raw).digest("hex") === ref.sha256) {
-          this.#resultRefs.set(taskId, ref);
-          return JSON.parse(raw.toString("utf8"));
-        }
-      } catch {
-        // Fall through to the preview.
-      }
+    const fallback = degradedResult(payload?.preview);
+    const loaded = this.#loadResultRef(taskId, payload?.ref, fallback);
+    return loaded === undefined ? fallback : loaded;
+  }
+
+  // The snapshot half of the same rule (#durableBody wrote it). After replay, so
+  // a task the log removed is never read back from its artifact. The record
+  // already holds the fallback, so a lost artifact leaves it as it is.
+  #restoreResultRefs(state) {
+    for (const task of state.tasks.values()) {
+      if (!Object.hasOwn(task, "resultRef")) continue;
+      const ref = task.resultRef;
+      delete task.resultRef;
+      const loaded = this.#loadResultRef(task.taskId, ref, task.result ?? null);
+      if (loaded !== undefined) task.result = loaded;
     }
-    if (payload?.preview == null) return null;
-    return { ...safeParsePreview(payload.preview), resultDegraded: true };
+  }
+
+  // The artifact behind a by-reference result, checked against its digest.
+  // undefined when it cannot be used, so each caller keeps its own fallback.
+  #loadResultRef(taskId, ref, fallback) {
+    if (!ref?.path) return undefined;
+    try {
+      const raw = readFileSync(ref.path);
+      if (createHash("sha256").update(raw).digest("hex") !== ref.sha256) return undefined;
+      const result = JSON.parse(raw.toString("utf8"));
+      this.#resultRefs.set(taskId, { ref, result, fallback });
+      return result;
+    } catch {
+      return undefined;
+    }
   }
 
   #quarantine(path, reason, recovery) {
@@ -522,7 +580,40 @@ export class StateStore {
       return path;
     }
     recovery.quarantined = target;
+    // Pruned after the copy, so the one the error message names is the newest
+    // and always kept.
+    this.#pruneQuarantine();
     return target;
+  }
+
+  #pruneQuarantine() {
+    const now = this.#now();
+    const groups = new Map();
+    const names = listDirectory(this.paths.directory);
+    for (const path of [this.paths.snapshot, this.paths.wal, this.paths.rotating]) {
+      const prefix = `${basename(path)}.`;
+      for (const name of names) {
+        // Anchored, so "state.wal.ndjson." never claims the .rot file's copies.
+        const match = name.startsWith(prefix) ? QUARANTINE_NAME.exec(name.slice(prefix.length)) : null;
+        if (!match) continue;
+        const [, reason, day, hours, minutes, seconds, millis] = match;
+        const key = `${path}\0${reason}`;
+        const group = groups.get(key) ?? [];
+        group.push({ name, at: Date.parse(`${day}T${hours}:${minutes}:${seconds}.${millis}Z`) });
+        groups.set(key, group);
+      }
+    }
+    for (const group of groups.values()) {
+      group.sort((left, right) => right.at - left.at);
+      group.forEach((copy, index) => {
+        if (index < QUARANTINE_KEEP && !(now - copy.at > QUARANTINE_MAX_AGE_MS)) return;
+        try {
+          unlinkSync(join(this.paths.directory, copy.name));
+        } catch {
+          // Already gone, or not removable by us: the next start tries again.
+        }
+      });
+    }
   }
 
   #truncate(path, bytes) {
@@ -627,13 +718,14 @@ export class StateStore {
 
   // --------------------------------------------------------------- snapshot
 
-  // tmp -> (fsync) -> rename -> (dir fsync). Unsynced on the 50ms debounce path
-  // for cost parity with the v4 writer; synced when it is the file that makes a
-  // WAL rotation safe.
+  // tmp -> (fsync) -> rename -> (dir fsync). Unsynced on the debounced path,
+  // where the WAL (or, with it off, the synced barrier) already holds every
+  // fact a restart must keep; synced when it is the file that makes a WAL
+  // rotation safe.
   writeSnapshot({ sync = false } = {}) {
     if (!this.#opened || this.#closed) return null;
     if (this.#config.wal) this.barrier();
-    const body = Buffer.from(JSON.stringify(this.#snapshotProvider()), "utf8");
+    const body = Buffer.from(JSON.stringify(this.#durableBody(this.#snapshotProvider())), "utf8");
     const header = Buffer.from(`${JSON.stringify({
       version: STATE_SCHEMA_VERSION,
       gatewayApiVersion: GATEWAY_API_VERSION,
@@ -655,9 +747,46 @@ export class StateStore {
       closeSync(fd);
     }
     renameSync(temporary, this.paths.snapshot);
-    if (sync) this.#syncDirectory();
+    if (sync) {
+      this.#syncDirectory();
+      this.#retireLegacyState();
+    }
     this.#snapshotDirty = false;
+    this.#lastSnapshotAt = performance.now();
     return { bytes: body.length, walSeq: this.#seq, epoch: this.#epoch };
+  }
+
+  // A result the WAL holds by reference is held the same way here: its artifact
+  // has the envelope, the snapshot the pointer plus the degraded head recovery
+  // falls back to (also all a pre-1.8 reader, which ignores resultRef, gets).
+  // Only while the record still holds the very object that was spilled: one
+  // replaced since (a failed barrier's failure, a corrected verdict) is no
+  // longer what the artifact says, and stays inline.
+  #durableBody(body) {
+    if (!this.#resultRefs.size || !Array.isArray(body?.tasks)) return body;
+    return {
+      ...body,
+      tasks: body.tasks.map((task) => {
+        const entry = this.#resultRefs.get(task?.taskId);
+        if (!entry || task.result == null || entry.result !== task.result) return task;
+        return { ...task, result: entry.fallback, resultRef: entry.ref };
+      })
+    };
+  }
+
+  // The v4 file stopped being written in 1.8.0. Once a synced snapshot holds
+  // everything it could still contribute, it is a stale copy of old sessions
+  // and inbox payloads that nothing would ever delete. The downgrade check in
+  // open() still works without it: a v4 daemon that runs later writes a new one.
+  #retireLegacyState() {
+    if (!this.#legacyPending) return;
+    try {
+      unlinkSafe(this.paths.state);
+      this.#legacyPending = false;
+      this.#syncDirectory();
+    } catch {
+      // Kept for the next synced snapshot; the file is only stale, not wrong.
+    }
   }
 
   // Roll, never truncate in place: the old segment keeps its bytes under .rot
@@ -718,17 +847,29 @@ export class StateStore {
     return { inline: bytes <= this.#config.walInlineResultBytes, bytes };
   }
 
-  rememberResultRef(taskId, ref) {
-    if (ref?.path) this.#resultRefs.set(taskId, ref);
+  // result is the envelope the task record will hold (the snapshot writes it by
+  // reference only while that is still so); preview is the head the WAL record
+  // carries, the same fallback recovery would serve from either file.
+  rememberResultRef(taskId, ref, { result = null, preview = null } = {}) {
+    if (ref?.path) this.#resultRefs.set(taskId, { ref, result, fallback: degradedResult(preview) });
     else this.#resultRefs.delete(taskId);
   }
 
   resultRefPaths() {
-    return [...this.#resultRefs.values()].map((ref) => ref.path).filter(Boolean);
+    return [...this.#resultRefs.values()].map((entry) => entry.ref.path).filter(Boolean);
   }
 
   forgetTask(taskId) {
     this.#resultRefs.delete(taskId);
+  }
+
+  // Recovery can drop records replay brought back (a TTL that elapsed while the
+  // daemon was down). Their references would otherwise pin artifacts for the
+  // life of the process.
+  retainResultRefs(taskIds) {
+    for (const taskId of [...this.#resultRefs.keys()]) {
+      if (!taskIds.has(taskId)) this.#resultRefs.delete(taskId);
+    }
   }
 
   // ------------------------------------------------------------------ status
@@ -907,6 +1048,56 @@ function safeParsePreview(preview) {
     return parsed && typeof parsed === "object" ? parsed : { preview: String(preview) };
   } catch {
     return { preview: String(preview) };
+  }
+}
+
+// What a by-reference result becomes when its artifact cannot be read.
+function degradedResult(preview) {
+  return preview == null ? null : { ...safeParsePreview(preview), resultDegraded: true };
+}
+
+// Half-finished atomic writes a crashed writer left beside `path`: the
+// snapshot writer's `${path}.<pid>.tmp` (the v4 writer used the same form),
+// and updateJsonFile's `${path}.<uuid>.tmp` (settings). Only a dead writer's
+// file goes. A pid-named one once that process is gone; a uuid-named one only
+// while no writer holds the file's lock, and only long after any write could
+// still be running, because its name does not say who made it.
+export function sweepStaleTemporaries(path, { minAgeMs = STALE_TEMPORARY_MS } = {}) {
+  const directory = dirname(path);
+  const prefix = `${basename(path)}.`;
+  let removed = 0;
+  for (const name of listDirectory(directory)) {
+    if (!name.startsWith(prefix) || !name.endsWith(".tmp")) continue;
+    const writer = name.slice(prefix.length, -".tmp".length);
+    const file = join(directory, name);
+    if (/^\d+$/u.test(writer)) {
+      const pid = Number(writer);
+      if (pid === process.pid || processIsAlive(pid)) continue;
+    } else if (UUID.test(writer)) {
+      if (existsSync(`${path}.write.lock`)) continue;
+      try {
+        if (Date.now() - statSync(file).mtimeMs < minAgeMs) continue;
+      } catch {
+        continue;
+      }
+    } else {
+      continue;
+    }
+    try {
+      unlinkSync(file);
+      removed += 1;
+    } catch {
+      // Gone already, or not ours to remove.
+    }
+  }
+  return removed;
+}
+
+function listDirectory(directory) {
+  try {
+    return readdirSync(directory);
+  } catch {
+    return [];
   }
 }
 

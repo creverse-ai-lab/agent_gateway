@@ -4,11 +4,9 @@ export const GATEWAY_VERSION = "1.7.2";
 export const GATEWAY_API_VERSION = 1;
 // Persisted state schema version. Bump only when the persisted shape becomes
 // incompatible with the previous reader. v5 = state.snapshot.json + state.wal.ndjson.
+// The v4 state.json is no longer written (1.8.0); a leftover one is still read
+// and migrated at startup, then deleted.
 export const STATE_SCHEMA_VERSION = 5;
-// The shape still written to state.json alongside v5, as downgrade insurance: an
-// older daemon rolled back onto this machine reads it and recovers every session.
-// Retained through 1.5.x for explicit 1.4.0 rollback compatibility.
-export const LEGACY_STATE_SCHEMA_VERSION = 4;
 
 // Numeric major.minor.patch order of two release labels (-1, 0 or 1); null
 // when either does not parse. A suffix such as -rc.1 is ignored.

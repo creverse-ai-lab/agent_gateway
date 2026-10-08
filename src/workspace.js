@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants, lstatSync } from "node:fs";
-import { cp, lstat, mkdir, readdir, readlink, realpath, rm, symlink, unlink } from "node:fs/promises";
+import { cp, lstat, mkdir, readdir, readFile, readlink, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { ERROR_CODES, GatewayError } from "./errors.js";
@@ -19,9 +19,20 @@ import { ERROR_CODES, GatewayError } from "./errors.js";
 //
 // It deliberately lives outside every Gateway-protected directory: a copy under
 // ~/.acp-gateway would be unreadable to the very worker it was made for.
+//
+// <root>/ws-<uuid>/owner.json names the Gateway state that made the copy. The
+// root is shared: every daemon with its own state but the default root (an
+// isolated deployment, a test daemon) copies into the same directory, so "no
+// session of mine references it" never by itself means "nobody needs it". Only
+// a copy marked as this state's is ever reclaimed as an orphan.
 export const MAX_SNAPSHOT_BYTES = 1024 * 1024 * 1024;
 export const MAX_SNAPSHOT_ENTRIES = 200_000;
+// All live copies together, in the same unit as MAX_SNAPSHOT_BYTES (bytes of
+// the source as measured at copy time; each is stored twice, tree and base).
+export const MAX_SNAPSHOT_TOTAL_BYTES = 4 * 1024 * 1024 * 1024;
 export const MAX_DIFF_BYTES = 64 * 1024 * 1024;
+const OWNER_FILE = "owner.json";
+const HOME_NAME = /^ws-[0-9a-f-]{36}$/;
 
 export function defaultWorkspaceRoot() {
   return process.env.ACP_GATEWAY_WORKSPACES || join(homedir(), ".cache", "acp-gateway", "workspaces");
@@ -31,7 +42,12 @@ export function defaultWorkspaceRoot() {
 // and one nested under cwd (cwd = the home directory) is left out of the copy:
 // the copy sits outside every protected root, so anything copied into it would
 // lose its protection.
-export async function createSnapshot(source, root = defaultWorkspaceRoot(), { protectedPaths = [] } = {}) {
+//
+// owner: what to write into owner.json (null writes none). admit(bytes) runs
+// synchronously after the size checks and before the first byte is copied, so
+// a caller can enforce a budget across copies without racing another open; it
+// throws to refuse.
+export async function createSnapshot(source, root = defaultWorkspaceRoot(), { protectedPaths = [], owner = null, admit = null } = {}) {
   const canonicalSource = await realpath(source);
   if (protectedPaths.some((item) => isWithin(item, canonicalSource))) {
     throw new GatewayError(ERROR_CODES.WORKSPACE_ERROR, "cwd is inside a Gateway-protected directory and cannot be snapshotted");
@@ -51,11 +67,15 @@ export async function createSnapshot(source, root = defaultWorkspaceRoot(), { pr
   if (isWithin(canonicalSource, canonicalRoot)) {
     throw new GatewayError(ERROR_CODES.WORKSPACE_ERROR, "cwd contains the snapshot workspace root; choose a narrower cwd");
   }
+  admit?.(usage.bytes);
   const home = join(canonicalRoot, `ws-${randomUUID()}`);
   const tree = join(home, "tree");
   const base = join(home, "base");
   try {
     await mkdir(home, { mode: 0o700 });
+    // Before the copy, so a crash mid-copy still leaves a copy its owner can
+    // recognize and reclaim on the next start.
+    if (owner != null) await writeOwner(home, owner);
     const droppedLinks = await copyTree(canonicalSource, tree, excluded);
     await copyTree(canonicalSource, base, excluded);
     return {
@@ -118,11 +138,63 @@ async function copyTree(source, destination, excluded) {
 // Only ever removes a directory this module created: a record whose home is not
 // a ws-* child of its own root is left alone rather than trusted.
 export async function removeSnapshot(workspace) {
-  if (workspace?.mode !== "snapshot" || typeof workspace.home !== "string" || typeof workspace.root !== "string") return false;
-  const rel = relative(workspace.root, workspace.home);
-  if (!/^ws-[0-9a-f-]{36}$/.test(rel)) return false;
+  if (!snapshotHome(workspace)) return false;
   await rm(workspace.home, { recursive: true, force: true });
   return true;
+}
+
+// Marks a copy a state already references (one made before 1.8.0 has no
+// marker), so that once nothing references it any more it can be reclaimed
+// like any other. An existing marker is never rewritten: whoever made the copy
+// keeps it.
+export async function adoptSnapshot(workspace, owner) {
+  const home = snapshotHome(workspace);
+  if (!home || owner == null) return false;
+  try {
+    await writeOwner(home, owner);
+    return true;
+  } catch {
+    return false; // marked already, or the copy is gone
+  }
+}
+
+// The copies under root that owner made, as records removeSnapshot accepts.
+// Directories only: lstat-typed, so a link planted under the root is never
+// followed. A copy with no marker, or another state's, is not listed.
+export async function ownedSnapshots(root, owner) {
+  if (owner == null) return [];
+  let canonicalRoot;
+  let entries;
+  try {
+    canonicalRoot = await realpath(root);
+    entries = await readdir(canonicalRoot, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const owned = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !HOME_NAME.test(entry.name)) continue;
+    const home = join(canonicalRoot, entry.name);
+    try {
+      if (JSON.parse(await readFile(join(home, OWNER_FILE), "utf8"))?.state === owner) {
+        owned.push({ mode: "snapshot", home, root: canonicalRoot });
+      }
+    } catch {
+      // No marker, or not one we wrote: not ours to reclaim.
+    }
+  }
+  return owned;
+}
+
+function snapshotHome(workspace) {
+  if (workspace?.mode !== "snapshot" || typeof workspace.home !== "string" || typeof workspace.root !== "string") return null;
+  return HOME_NAME.test(relative(workspace.root, workspace.home)) ? workspace.home : null;
+}
+
+// Beside tree and base, never inside them: the worker's cwd and the diff both
+// stay exactly the copy of the source.
+function writeOwner(home, owner) {
+  return writeFile(join(home, OWNER_FILE), `${JSON.stringify({ state: owner })}\n`, { mode: 0o600, flag: "wx" });
 }
 
 // Unified diff from the snapshot baseline (a/) to the worker's copy (b/). git is

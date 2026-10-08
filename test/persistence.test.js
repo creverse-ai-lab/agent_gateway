@@ -91,7 +91,7 @@ async function withDirectory(name, run) {
   }
 }
 
-test("v5 writes a two-line checksummed snapshot beside a crc32 WAL, and keeps writing v4", async () => {
+test("v5 writes a two-line checksummed snapshot beside a crc32 WAL, and no longer writes v4", async () => {
   await withDirectory("state-format", async (directory) => {
     const paths = statePaths(join(directory, "state.json"));
     const service = makeService(directory);
@@ -128,12 +128,9 @@ test("v5 writes a two-line checksummed snapshot beside a crc32 WAL, and keeps wr
         records.map((_, index) => first + index)
       );
 
-      // The v4 file keeps its exact 1.3.2 shape, plus the two marker fields.
-      const legacy = JSON.parse(await readFile(paths.state, "utf8"));
-      assert.equal(legacy.version, 4);
-      assert.equal(typeof legacy.writerVersion, "string");
-      assert.deepEqual(legacy.tasks, [], "terminal handles stay out of the v4 file");
-      assert.equal(legacy.sessions.length, 1);
+      // 1.8.0: the v4 dual-write (downgrade insurance through 1.5.x) is gone.
+      await assert.rejects(readFile(paths.state, "utf8"), /ENOENT/, "no v4 state.json is written");
+      await assert.rejects(stat(`${paths.state}.${process.pid}.tmp`), /ENOENT/);
     } finally {
       await service.shutdown().catch(() => {});
     }
@@ -415,6 +412,9 @@ test("a v4 state.json migrates into v5 on first start", async () => {
       assert.equal((await service.call("session", { action: "list" }, MAIN)).sessions[0].sessionId, "acp-migrated");
       // init rotates, so the migrated state is already in a v5 snapshot.
       assert.equal((await readSnapshot(paths)).body.tasks.length, 1);
+      // That synced snapshot is what makes the v4 file redundant, so it is gone:
+      // left behind, it would keep its sessions and inbox payloads forever.
+      await assert.rejects(stat(statePath), /ENOENT/, "the migrated v4 file is deleted once v5 is durable");
     } finally {
       await service.shutdown();
     }
@@ -433,8 +433,10 @@ test("an unmarked state.json newer than the snapshot re-migrates and raises DOWN
     } finally {
       await first.shutdown();
     }
-    const before = JSON.parse(await readFile(statePath, "utf8"));
-    assert.equal(typeof before.writerVersion, "string", "a v5 write always carries the marker");
+    // Since 1.8.0 a v5 run writes no state.json at all, so any that appears was
+    // written by someone else; the session shape is taken from our snapshot.
+    await assert.rejects(stat(statePath), /ENOENT/, "a v5 run leaves no state.json");
+    const before = (await readSnapshot(paths)).body;
 
     // What a rolled-back 1.3.2 daemon leaves behind: the same file shape with no
     // marker (its persist() writes fixed literals), newer than our snapshot.
@@ -475,7 +477,7 @@ test("an unmarked state.json with the same mtime as the snapshot is treated as a
     } finally {
       await first.shutdown();
     }
-    const before = JSON.parse(await readFile(statePath, "utf8"));
+    const before = (await readSnapshot(paths)).body;
     await writeFile(statePath, `${JSON.stringify({
       version: 4,
       sessions: [{ ...before.sessions[0], id: "acp-equal-mtime", title: "written by v4" }],
@@ -588,24 +590,28 @@ test("a newline-terminated bad CRC and a sequence gap both halt WAL replay", asy
   }
 });
 
-test("a corrupt snapshot halts instead of starting empty, and snapshot-drop falls back to v4", async () => {
+test("a corrupt snapshot halts instead of starting empty; snapshot-drop starts from the log and a leftover v4 file", async () => {
   await withDirectory("state-snapshot-corrupt", async (directory) => {
     const statePath = join(directory, "state.json");
     const paths = statePaths(statePath);
     const service = makeService(directory);
+    let sessionId = null;
     try {
       await service.init();
-      await openSession(service);
-      await service.flushPersist();
+      sessionId = (await openSession(service)).sessionId;
     } finally {
-      await service.shutdown();
+      // The log as a killed daemon leaves it, next to the snapshot damaged below.
+      await keepLogAcrossShutdown(service, paths, { dropSnapshot: false });
     }
 
-    const raw = await readFile(paths.snapshot, "utf8");
-    const split = raw.indexOf("\n");
-    // One flipped byte in the body: the header's length still matches.
-    const body = raw.slice(split + 1).replace(/"provider":"claude"/, '"provider":"clauda"');
-    await writeFile(paths.snapshot, `${raw.slice(0, split)}\n${body}`);
+    const corrupt = async () => {
+      const raw = await readFile(paths.snapshot, "utf8");
+      const split = raw.indexOf("\n");
+      // One flipped byte in the body: the header's length still matches.
+      const body = raw.slice(split + 1).replace(/"provider":"claude"/, '"provider":"clauda"');
+      await writeFile(paths.snapshot, `${raw.slice(0, split)}\n${body}`);
+    };
+    await corrupt();
 
     const halting = makeService(directory);
     await assert.rejects(halting.init(), (error) => {
@@ -615,15 +621,35 @@ test("a corrupt snapshot halts instead of starting empty, and snapshot-drop fall
       return true;
     });
 
+    // No v4 dual-write since 1.8.0: the log alone is the fallback, and the
+    // session registered in it comes back.
     const dropping = makeService(directory, { persistence: { stateRecovery: "snapshot-drop" } });
     try {
       await dropping.init();
       const setup = await dropping.call("setup", {}, MAIN);
       assert.ok(setup.alerts.some((alert) => alert.code === "STATE_SNAPSHOT_DROPPED"));
-      // The v4 dual-write is what made the fallback possible.
-      assert.equal((await dropping.call("session", { action: "list" }, MAIN)).sessions.length, 1);
+      assert.deepEqual((await dropping.call("session", { action: "list" }, MAIN)).sessions.map((item) => item.sessionId), [sessionId]);
     } finally {
       await dropping.shutdown();
+    }
+
+    // A v4 file an older Gateway left behind is still read when the snapshot is
+    // dropped, and retired once the state it fed is durable.
+    const [record] = (await readSnapshot(paths)).body.sessions;
+    await corrupt();
+    await writeFile(statePath, `${JSON.stringify({
+      version: 4, writerVersion: "1.7.2", sessions: [{ ...record, id: "acp-from-v4" }], tasks: [], inbox: []
+    })}\n`, { mode: 0o600 });
+    const fallback = makeService(directory, { persistence: { stateRecovery: "snapshot-drop" } });
+    try {
+      await fallback.init();
+      assert.deepEqual(
+        (await fallback.call("session", { action: "list" }, MAIN)).sessions.map((item) => item.sessionId),
+        ["acp-from-v4"]
+      );
+      await assert.rejects(stat(statePath), /ENOENT/);
+    } finally {
+      await fallback.shutdown();
     }
   });
 });

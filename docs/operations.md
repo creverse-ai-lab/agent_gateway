@@ -169,13 +169,15 @@ All data beyond the inline limit is spilled to a file in `~/.acp-gateway/artifac
 ## Sessions and data
 
 - State files (schema v5): `~/.acp-gateway/state.snapshot.json` (full state) + `~/.acp-gateway/state.wal.ndjson` (control transition log)
-- `~/.acp-gateway/state.json` continues to be written in the v4 format. It is still written in the current version so that you can explicitly roll back to a 1.4 Gateway.
+- Since v1.8.0, `~/.acp-gateway/state.json` (the v4 format) is no longer written. A leftover one is still read and migrated at startup, then deleted once a synced v5 snapshot holds its contents. A 1.4 to 1.7 Gateway still reads the v5 files after a rollback, though it serves a large Task result only as its preview (marked `resultDegraded`); a Gateway older than 1.4 finds no state and starts empty.
+- While state changes, the full snapshot is rewritten at most about once a second when the WAL is on, and also on every WAL rotation and on shutdown. The WAL records themselves are written immediately, as before.
 - Idle resumable sessions are unloaded after 30 minutes by default
 - Results and events are retained for 24 hours by default
 - Session resume checkpoints are retained for 7 days by default, and the bytes of a Task handle are retained for 24 hours by default (`ACP_GATEWAY_TASK_RETENTION_MS`)
-- Use `pin` for sessions that need to be kept for a long time
-- Response bodies, thoughts, and the full event history are not persisted in the state file
+- Use `pin` for sessions that need to be kept for a long time. A pin protects a session only while it is open: a closed pinned session ages out like any other.
+- Response bodies, thoughts, and the full event history are not persisted in the state file. A Task result larger than `ACP_GATEWAY_WAL_INLINE_RESULT_BYTES` is kept in the snapshot as a reference to its artifact plus a short preview, the same form the WAL uses, so the snapshot does not grow with retained transcripts.
 - Results and terminal output beyond the inline limit are stored temporarily in `~/.acp-gateway/artifacts` and cleaned up according to the result retention period
+- Copies of damaged state files that a failed start sets aside for an operator (`state.wal.ndjson.corrupt-<time>`, `state.snapshot.json.downgraded-<time>` and so on) are limited to the newest three per file and reason, and deleted after 7 days. Temporary files that a crashed writer left next to the state and settings files are removed at the next start.
 
 ### Status, interruptions and attention
 
@@ -191,16 +193,16 @@ Since v1.7.0 the Gateway reports where delegated work stands instead of leaving 
 
 Task creation and result finalization are appended to the WAL and fsynced before the response is returned. That is, a Task handle that Main has received survives a daemon crash, and after a restart an incomplete Task is finalized as `failed` (with a restart message). Since v1.7.0 it also carries `interruption` (see below). The remaining transitions (permission and question records, session registration/termination, state changes) use a 5ms group commit. Since v1.7.2, a failed session restore (the failure count, a quarantine and `lastRestore`) and a successful restore that ends a failure streak are also fsynced before the response is returned, so a crash neither undoes a quarantine nor brings back one that a success lifted. If that synced write fails, the restore's outcome stands but is reported: persistence becomes unhealthy, `setup` raises a `STATE_RESTORE_NOT_DURABLE` warning, which the next successful write does not clear, and the restore's answer carries `durability: { persisted: false, errorCode: "PERSISTENCE_UNHEALTHY" }` (in `details.durability` of the error when the restore failed). On macOS, Node does not expose `F_FULLFSYNC`, so only `fsync(2)` is used — an abnormal process exit is fully protected, and a power loss exposes only the group commit window (5ms by default).
 
-If the state file is corrupted, the daemon **does not silently start with an empty state** and aborts instead. At that point it records the reason in `~/.acp-gateway/state.recovery-required` and exits with exit 78, and its contents are surfaced in the Control MCP connection failure message. Recovery is chosen explicitly.
+If the state file is corrupted, the daemon **does not silently start with an empty state** and aborts instead. At that point it records the reason in `~/.acp-gateway/state.recovery-required` and exits with exit 78, and its contents are surfaced in the Control MCP connection failure message. A copy of the damaged file is kept next to it (see the retention limits above). Recovery is chosen explicitly.
 
 | Environment variable | Default | Description |
 | --- | --- | --- |
-| `ACP_GATEWAY_WAL` | `on` | If `off`, the snapshot is written synchronously on every critical mutation without a WAL (the same durability promise, at a higher write cost) |
+| `ACP_GATEWAY_WAL` | `on` | If `off`, the snapshot is written synchronously on every critical mutation without a WAL (the same durability promise, at a higher write cost), and other changes reach it about 50ms after they happen. With the WAL on, the full snapshot is rewritten at most about once a second |
 | `ACP_GATEWAY_WAL_GROUP_COMMIT_MS` | `5` | Group commit interval for non-critical transitions |
 | `ACP_GATEWAY_WAL_ROTATE_BYTES` / `_RECORDS` / `_INTERVAL_MS` | `4MiB` / `10000` / `15m` | WAL rotation conditions |
-| `ACP_GATEWAY_WAL_INLINE_RESULT_BYTES` | `4096` | A Task result larger than this size is split out into an artifact, and the WAL records only the reference + preview |
+| `ACP_GATEWAY_WAL_INLINE_RESULT_BYTES` | `4096` | A Task result larger than this size is split out into an artifact, and the WAL and the snapshot record only the reference + preview |
 | `ACP_GATEWAY_FSYNC` | `normal` | `off` is for tests and temporary volumes only |
-| `ACP_GATEWAY_STATE_RECOVERY` | (none) | `truncate`: replay the WAL up to just before the corruption, then start / `snapshot-drop`: discard the snapshot and recover from `state.json` / `cold`: start with an empty state |
+| `ACP_GATEWAY_STATE_RECOVERY` | (none) | `truncate`: replay the WAL up to just before the corruption, then start / `snapshot-drop`: discard the snapshot and recover from the WAL alone, plus a leftover v4 `state.json` if there is one (since v1.8.0 nothing writes that file, so after a clean shutdown the WAL holds nothing) / `cold`: start with an empty state |
 | `ACP_GATEWAY_TASK_RETENTION_MS` | `24h` | Disk lifetime of Task records and result artifacts (independent of session retention) |
 | `ACP_GATEWAY_MAX_QUEUE_BYTES` | `4000000` | Combined OS+channel write budget per control connection. HIGH may use all of it, NORMAL up to 7/8, and LOW up to 1/2 |
 | `ACP_GATEWAY_WRITE_TIMEOUT_MS` | `10000` | If the OS accepts not a single byte for this long, the connection or provider is terminated |
@@ -211,7 +213,7 @@ If the state file is corrupted, the daemon **does not silently start with an emp
 | `ACP_GATEWAY_MAX_INBOX_ITEM_BYTES` | `65536` | Byte limit for retaining a single worker permission/elicitation |
 | `ACP_GATEWAY_MAX_PENDING_INBOX_BYTES_PER_SESSION` | `524288` | Combined byte limit of pending inbox per session |
 | `ACP_GATEWAY_MAX_PENDING_INBOX_BYTES_PER_ROOT` | `4194304` | Combined byte limit of pending inbox per Main |
-| `ACP_GATEWAY_MAX_INBOX_HISTORY_PER_ROOT` | `1000` | Number of processed inbox entries retained per Main (pending entries are not subject to removal) |
+| `ACP_GATEWAY_MAX_INBOX_HISTORY_PER_ROOT` | `1000` | Number of processed inbox entries retained per Main, enforced as entries are processed (pending entries are not subject to removal) |
 | `ACP_GATEWAY_STALL_HINT_MS` | `300000` | Setting `stallHintMs` (minimum `10000`). How long a running Worker may send nothing before session reads report `stallSuspected`. A hint only |
 | `ACP_GATEWAY_ATTENTION_STALE_MS` | `600000` | Setting `attentionStaleMs` (minimum `10000`). How long a Worker request may wait before the attention view and `setup` call it stale. A label only |
 | `ACP_GATEWAY_MAX_CONSECUTIVE_RESTORE_FAILURES` | `3` | Setting `maxConsecutiveRestoreFailures` (minimum `1`). Consecutive failed restores before a session is quarantined (`SESSION_QUARANTINED`); the same count of provider start failures raises the `provider_degraded` alert |

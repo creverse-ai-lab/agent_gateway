@@ -62,7 +62,7 @@
     "guide": "node src/guide.js",
     "bootstrap": "node src/bootstrap.js",
     "prepack": "node scripts/pack-release.js --prepack",
-    "test": "sh -c 'export ACP_GATEWAY_DISABLE_DYNAMIC_PROVIDERS=1 ACP_GATEWAY_ARTIFACTS=\"$(mktemp -d)\"; node --test test/*.test.js; s=$?; rm -rf \"$ACP_GATEWAY_ARTIFACTS\"; exit $s'",
+    "test": "sh -c 'export ACP_GATEWAY_DISABLE_DYNAMIC_PROVIDERS=1 ACP_GATEWAY_ARTIFACTS=\"$(mktemp -d)\" ACP_GATEWAY_WORKSPACES=\"$(mktemp -d)\"; node --test test/*.test.js; s=$?; rm -rf \"$ACP_GATEWAY_ARTIFACTS\" \"$ACP_GATEWAY_WORKSPACES\"; exit $s'",
     "test:persistence:stress": "node scripts/stress-persistence.js",
     "bench:payload": "node scripts/bench-payload.js",
     "release:runtime": "node scripts/build-runtime-release.js",

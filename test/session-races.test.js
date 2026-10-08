@@ -3,7 +3,7 @@
 // timer — so a failure means the serialization is wrong rather than that the
 // machine was busy.
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { AcpClient } from "../src/acp-client.js";
 import { GatewayService } from "../src/gateway-service.js";
 import { SESSION_QUEUE_LIMIT } from "../src/session-queue.js";
+import { readSnapshotBody } from "./helpers/state-files.js";
 
 const raceAgent = fileURLToPath(new URL("./mock-race-agent.js", import.meta.url));
 const MAIN = { rootId: "main-a" };
@@ -729,6 +730,8 @@ test("T17 shutdown drains in-flight commands and stops arming the persist timer"
   const statePath = join(directory, "state.json");
   const service = makeService({ hold: "prompt", statePath });
   try {
+    // Opens the state; before 1.8.0 the v4 writer reached disk without it.
+    await service.init();
     const opened = await open(service);
     await service.call("prompt", { sessionId: opened.sessionId, prompt: "one" }, MAIN);
     await waitForMarker(service, opened.sessionId, "hold:prompt");
@@ -745,7 +748,7 @@ test("T17 shutdown drains in-flight commands and stops arming the persist timer"
     service.schedulePersist();
     assert.equal(service.persistTimer, null);
 
-    const persisted = JSON.parse(await readFile(statePath, "utf8"));
+    const persisted = await readSnapshotBody(statePath);
     assert.equal(persisted.sessions.length, 1);
     assert.equal(persisted.sessions[0].id, opened.sessionId);
     assert.equal(service.illegalTransitions, 0);

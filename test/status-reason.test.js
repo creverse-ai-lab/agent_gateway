@@ -9,6 +9,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { DURABLE_EVENT_TYPES, GatewayService, STATUS_REASONS } from "../src/gateway-service.js";
 import { SETTING_DEFINITIONS, validateSetting } from "../src/settings.js";
+import { readSnapshotBody } from "./helpers/state-files.js";
 
 const MAIN = { rootId: "main-a" };
 const EPOCH = Date.parse("2026-01-01T00:00:00.000Z");
@@ -382,7 +383,7 @@ test("reason, its time and worker activity survive a restart; live records read 
       await until(() => live.session.status === "idle", "turn end");
       await before.service.flushPersist();
 
-      const saved = JSON.parse(await readFile(statePath, "utf8"));
+      const saved = await readSnapshotBody(statePath);
       const record = saved.sessions.find((item) => item.id === first);
       assert.equal(record.statusReason, "turn_end");
       assert.equal(record.statusChangedAt, iso(EPOCH + 61_000));
