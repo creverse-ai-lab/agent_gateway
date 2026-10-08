@@ -113,7 +113,11 @@ acp-gateway-bootstrap --install-all --refresh-registry
 | `ask` | 修改文件或执行命令之前，需要编排器批准 |
 | `auto_approve` | 在用户允许的会话边界内自动批准 |
 
-Control token、编排器标识符（Main ID）和 Gateway socket 路径都会从 ACP Worker 的环境中移除，同时也会阻止向 Worker 会话重新注入 Control MCP。但这并不能让所有 Worker 都拿不到 token：用自身工具读取文件、不经过 Gateway 的 Worker（实测 Codex 即使在 `read_only` 下也会这样读取）可以读到保存在 front door 的 MCP 配置中的 Control token，并以 Main 的身份操作。因此，不要把不可信的内容（可能藏有提示词注入的仓库、文档或网页）交给这类 Worker；这类工作请优先使用由 Gateway 中转文件读取或用沙箱加以限制的 provider。Gateway 在某个会话中无法强制执行的项目，会列在 `permission_policy_partial` 警告中。更强的隔离计划在后续版本中提供。
+Control token、编排器标识符（Main ID）和 Gateway socket 路径都会从 ACP Worker 的环境中移除，同时也会阻止向 Worker 会话重新注入 Control MCP，无论是凭名称、安装路径还是环境变量中的身份信息。Worker 自己的 CLI 也无法像 Codex Worker 读取 `~/.codex/config.toml` 那样，从你的 agent 配置中启动它：Control MCP 拒绝在 Worker 的进程树内运行，daemon 也拒绝向运行在其下的任何调用方提供 Control（`WORKER_CONTROL_DENIED`）。daemon 在启动时还会从自身环境中删除 token 和 Main ID，因此它启动的任何进程（包括通过 npm 或 uv 进行的 adapter 更新）都不会继承它们。daemon 环境中的其余部分来自启动它的进程（通常是 front door 或安装程序），会原样传给 Worker 及其终端，包括 API 密钥、云凭据和 `SSH_AUTH_SOCK`，因此通过环境变量登录的 provider 仍能正常工作。
+
+Gateway 代 Worker 进行的文件读写（ACP `fs/read_text_file` 和 `fs/write_text_file`）即使在执行过程中被 Worker 换成符号链接或其他目录，也会留在会话根目录之内，碰不到受保护的路径。不过在 Linux 上，写入过程中的这种替换仍可能在换入的链接所指向的位置留下一个新的空文件；写入会被拒绝，该文件中不会写入任何内容。包括 Control MCP 在内的 Gateway 客户端只会把 token 发给同一用户拥有的 socket。Gateway 为 Worker 打开的终端在 macOS 上运行于一个拒绝访问受保护路径（`~/.acp-gateway`、状态目录和 socket）的沙箱中；`ps`、`top` 等 setuid 程序无法在其中启动，无法启动的命令会以退出状态 71 结束。在没有这种沙箱的环境中，即使是 `auto_approve`，也会把每个终端先交给编排器处理。批准 Worker 的某条命令或某次编辑，只会放行那条命令或那些文件；其他终端或写入会连同命令、参数、工作目录和环境变量名（从不包含其值），或者路径和大小，一起交给编排器。
+
+但这并不能让所有 Worker 都拿不到 token：用自身工具读取文件、不经过 Gateway 的 Worker（实测 Codex 即使在 `read_only` 下也会这样读取）可以读到 `~/.acp-gateway/install.json` 中的 Control token，或 1.8.0 之前的安装程序写入了 token 的 agent 配置，并以 Main 的身份操作。因此，不要把不可信的内容（可能藏有提示词注入的仓库、文档或网页）交给这类 Worker；这类工作请优先使用由 Gateway 中转文件读取或用沙箱加以限制的 provider。Gateway 在某个会话中无法强制执行的项目，会列在 `permission_policy_partial` 警告中。更强的隔离计划在后续版本中提供。
 
 ### 更新
 
@@ -170,6 +174,7 @@ Gateway 还会告诉编排器委派出去的工作进展到了哪一步，因此
 - **中断留下了哪些未知** — 因重启或 Worker 丢失而被中断的任务，会说明 Worker 是否可能已经根据 prompt 采取了行动，以及下一步该做什么。`agent_acp_session {action: "check"}` 只读、不启动任何进程，报告会话能否恢复。
 - **attention inbox** — `agent_acp_inbox {action: "attention"}` 列出正在等待编排器处理的请求，以及编排器尚未收到的已完成结果；可用 `ack` 将其标记为已读。
 - **声明任务之间的关联** — run 可以指明它所跟进的任务（`parentTaskId`）以及使用了其结果的任务（`inputTaskIds`）。指定 `scope: "mine"` 时，会话和任务列表只显示发起调用的编排器自己的工作。
+- **各编排器只处理自己的工作** — 多个编排器共用 Gateway 时（例如两个 Claude Code 对话，或两个 Codex thread），每个编排器只能查看和操作自己打开的会话及其任务、请求和结果，以及由不标明编排器的工具打开的会话。AgenLynk 这类不标明编排器的应用和管理工具仍然能看到全部内容。以新对话身份回来的编排器，可以在原来的编排器断开连接之后，显式调用 `agent_acp_session_restore`（provider、acpSessionId、cwd）取回之前的会话。这是为了让协同工作的 agent 互不干扰，并不是针对持有 Control token 的进程的安全边界。详见 [Per-Main isolation](docs/management-api.md#per-main-isolation)（英文）。
 - **多次恢复失败后隔离** — 恢复连续失败（默认 3 次）后，Gateway 不再自动恢复该会话，而是返回 `SESSION_QUARANTINED` 并附上可选的后续操作；显式恢复成功后即解除隔离。
 
 ## 什么是 ACP 和 MCP？
@@ -215,7 +220,8 @@ Gateway 还会告诉编排器委派出去的工作进展到了哪一步，因此
 
 - **Gateway 软件包（npm 安装）** — `npm install -g` 会把软件包安装到 npm 的全局 prefix 下：文件位于 `$(npm root -g)/acp-gateway-daemon`，`acp-gateway-*` 命令位于 `$(npm prefix -g)/bin`，下面注册的 MCP 服务器也从这里运行。从源码安装时，则由 `npm link` 把 checkout 链接到相同的位置。
 - **安装 ACP agent/adapter** — 从 PATH、常见的 CLI 路径和全局 npm 包中查找已安装的 AI，与 ACP 官方 registry 比对，然后全局安装或更新 registry 所指定的 `npx`、`uvx` 包（`npm install --global` 或 `uv tool install --force`）。registry 中没有的 AI 不会被自动注册。
-- **注册 MCP** — 通过各 CLI 的 `mcp add` 命令（Auggie 为 `mcp add-json`）注册两个 MCP 服务器。面向编排器的 Control MCP `agent-acp` 只会注册到你选作 front door 的那一个 CLI（`--front-door`；非交互式安装时为 Codex），只读的 Guide MCP `agent-acp-guide` 则会注册到所有被发现的受支持 CLI（Codex、Claude、Grok、Auggie）。注册 Control MCP 时，Control token 和 Main ID 会作为服务器的运行环境变量（`ACP_GATEWAY_CONTROL_TOKEN`、`ACP_GATEWAY_ROOT_ID`）一并传入，所以请只在你信任的本地 agent 上安装 Control MCP。如果已经存在同名但并非由安装程序创建的条目，没有 `--force` 时不会覆盖，而是报错中止。
+- **注册 MCP** — 通过各 CLI 的 `mcp add` 命令（Auggie 为 `mcp add-json`）注册两个 MCP 服务器。面向编排器的 Control MCP `agent-acp` 只会注册到你选作 front door 的那一个 CLI（`--front-door`；非交互式安装时为 Codex），只读的 Guide MCP `agent-acp-guide` 则会注册到所有被发现的受支持 CLI（Codex、Claude、Grok、Auggie）。Control MCP 注册时不带 Control token 和 Main ID：服务器在启动时从 `install.json` 读取它们（如果条目的环境变量中设置了 `ACP_GATEWAY_CONTROL_TOKEN` 和 `ACP_GATEWAY_ROOT_ID`，仍以它们为准），因此 agent CLI 的配置和注册条目所用的命令行中都不会出现 token。只有当 `install.json` 不在默认路径时，条目才会带上 `ACP_GATEWAY_INSTALL_STATE`，即它的位置。Control MCP 拥有 Gateway 的全部控制权，所以请只在你信任的本地 agent 上安装。如果已经存在同名但并非由安装程序创建的条目，没有 `--force` 时不会覆盖，而是报错中止。
+- **迁移早期安装留下的 token** — 1.8.0 之前，安装程序会把 token 和 Main ID 放进 Control MCP 条目的环境变量中。安装程序能证明由自己注册的条目（所有权检查见[运维指南](docs/operations.md#control-identity-and-token-rotation)（英文））会在不带它们的情况下重新注册；原先启动旧版 Gateway 的条目也会同时改为指向本次安装。其他仍持有 token 的条目（1.7.2 之前注册的、之后环境变量被改动过的，或启动另一个 Gateway 安装的条目）会保持原样并给出警告；如果它所在的配置文件并非只有你可读，安装程序会将其改为只有你可读（Grok CLI 会把自己的配置写成 0644）。使用 `--force` 可以不带 token 重新注册。agent CLI 生成的配置备份（`*.bak`）中可能仍留有旧 token，因此迁移之后安装程序会建议你作废它：在 Gateway 空闲时将其停止（`acp-gateway-admin shutdown_if_idle`），运行 `acp-gateway-bootstrap --rotate-token`，然后重新连接各个宿主会话以及 AgenLynk 这类会保存身份信息的应用，因为它们都只在启动时读取一次。安装程序从不自行更换 token。`--rotate-token` 只替换 `install.json` 中的身份信息：不带 token 的条目会在下次启动时读取新值。只要有一个条目未能更新，这次更换就不会生效，`install.json` 会保留之前的身份信息；安装程序改写的每个条目都会在改写后立即记入 `install.json`。
 - **安装 `agent-delegator` skill** — 把 Gateway 自带的 skill 复制到每个被发现的 AI 的 skills 目录。
 
   | AI | 安装路径 | 用于改变路径的环境变量 |
@@ -228,7 +234,7 @@ Gateway 还会告诉编排器委派出去的工作进展到了哪一步，因此
 
   如果有多个 provider 使用同一路径，skill 文件只会复制一次。skill 只在首次 `--install-all` 时安装，`--update` 不会碰它。如果已经存在同名但不受安装程序管理的 skill，没有 `--force` 时不会覆盖，而是报错中止。
 - **状态文件 `~/.acp-gateway/`** — 会创建以下文件：
-  - `install.json`（权限 `0600`）：Control token、Main ID、安装程序所注册的 MCP 和 skill 的记录，以及 ACP agent 自动更新和通知的设置
+  - `install.json`（权限 `0600`）：Control token 和 Main ID（安装程序保存的唯一一份，Control MCP 在启动时读取）、安装程序所注册的 MCP 和 skill 的记录，以及 ACP agent 自动更新和通知的设置
   - `registry.json`：ACP 官方 registry 的 24 小时缓存
   - `providers.json`：被发现的 provider 的运行定义
 

@@ -60,7 +60,7 @@ acp-gateway-bootstrap --update-skill    # 2. skill 갱신 (수정본이면 --for
 3. **호스트 재연결** — Claude Code는 `/mcp reconnect` 또는 새 세션, Codex·Grok·Auggie는 새 세션을 시작합니다.
 4. **검증** — tool 목록에 `agent_acp_run`이 있고, `agent_acp_setup` 응답에 `staleFrontDoor`가 없으면 정상입니다.
 
-`staleFrontDoor`는 프론트 도어(호스트에 등록된 MCP 프로세스)의 버전과 실행 중인 daemon 버전이 다를 때 `agent_acp_setup`·`agent_acp_session_open` 응답에 붙는 알림으로, `frontDoorVersion`·`gatewayVersion`·필요한 조치(`action`)와, 두 버전의 순서를 정할 수 있으면 `reason`을 담고 있습니다. `reason: "front_door_older"`이거나 `reason`이 없으면 3번을 수행하세요. `reason: "gateway_older"`이면 daemon 쪽이 오래된 것이라 재연결해도 같은 daemon에 다시 붙을 뿐입니다. 한가할 때 `acp-gateway-admin shutdown_if_idle`로 daemon을 재시작하면(작업이 진행 중이면 거부하므로 나중에 다시 시도) 다음 `agent-acp` 호출이 프론트 도어 버전으로 daemon을 띄웁니다. `acp-gateway-bootstrap --update`는 스크립트가 사라졌거나 더 오래된 Gateway를 고정 경로로 가리키는 관리 중인 `agent-acp` 항목을 현재 설치본을 가리키도록 다시 등록합니다. 단, 그 항목이 이 installer가 등록한 바로 그 항목임이 입증될 때만 그렇게 합니다. 1.7.2부터 설치 상태에 등록할 때마다 그 실행 정보(command와 args)와 환경 변수 이름을 기록하며, 항목이 여전히 정확히 그것을, 정확히 그 환경 변수들과 현재 Control token·Main ID로 실행해야 합니다. 그 뒤 env가 바뀐 항목(`HTTP_PROXY`나 `NODE_OPTIONS` 같은 변수를 추가했거나, 변수를 지웠거나, token이나 Main ID가 다른 경우)은 교체하면 그 변경이 사라지므로 경고와 함께 그대로 둡니다. 1.7.2 이전에 등록한 항목에는 이 기록이 없고, 사용자가 직접 가리켜 둔 이전 Gateway 설치본과 구별할 방법도 없으므로 자동으로는 절대 옮기지 않습니다. 이미 이 설치본을 실행하는 항목이 아니면 경고와 함께 그대로 두며, `--force`로 한 번 다시 실행하면 다시 등록하고 실행 정보를 기록합니다. 그 뒤로는 `--update`가 알아서 옮깁니다. 이 확인을 통과하지 못한 항목은 경고와 함께 그대로 두고, `--force`로 다시 등록할 수 있습니다. 다른 앱이 관리하는 symlink를 거치는 항목도 그대로 두고, 더 오래된 Gateway로 이어지거나 링크가 끊겼거나 그 뒤에 스크립트가 없으면 경고만 남깁니다. agent CLI에는 원자적인 교체 명령이 없으므로, installer는 항목을 지우기 전에 그 command·args·env를 읽어 둡니다. 그 뒤 새 항목을 추가하지 못하면 이전 항목을 원래 모습 그대로 되돌립니다(`--rotate-token` 뒤에는 이 installer가 쓴 항목에 폐기된 값 대신 새 Control token과 Main ID를 넣어 되돌립니다). 정확히 되돌릴 수 없는 항목(예: CLI가 env를 알려 주지 않는 경우)은 업데이트가 지우지 않고 경고와 함께 그대로 두며, `--force`를 주면 그래도 교체합니다.
+`staleFrontDoor`는 프론트 도어(호스트에 등록된 MCP 프로세스)의 버전과 실행 중인 daemon 버전이 다를 때 `agent_acp_setup`·`agent_acp_session_open` 응답에 붙는 알림으로, `frontDoorVersion`·`gatewayVersion`·필요한 조치(`action`)와, 두 버전의 순서를 정할 수 있으면 `reason`을 담고 있습니다. `reason: "front_door_older"`이거나 `reason`이 없으면 3번을 수행하세요. `reason: "gateway_older"`이면 daemon 쪽이 오래된 것이라 재연결해도 같은 daemon에 다시 붙을 뿐입니다. 한가할 때 `acp-gateway-admin shutdown_if_idle`로 daemon을 재시작하면(작업이 진행 중이면 거부하므로 나중에 다시 시도) 다음 `agent-acp` 호출이 프론트 도어 버전으로 daemon을 띄웁니다. `acp-gateway-bootstrap --update`는 스크립트가 사라졌거나 더 오래된 Gateway를 고정 경로로 가리키는 관리 중인 `agent-acp` 항목을 현재 설치본을 가리키도록 다시 등록합니다. 단, 그 항목이 이 installer가 등록한 바로 그 항목임이 입증될 때만 그렇게 합니다. 1.7.2부터 설치 상태에 등록할 때마다 그 실행 정보(command와 args)와 환경 변수 이름을 기록하며, 항목이 여전히 정확히 그것을, 정확히 그 환경 변수들로 실행해야 합니다. 그 변수에 Control token과 Main ID가 들어 있다면(1.8.0 이전에 등록한 항목) 값도 `install.json`에 있는 것과 같아야 합니다. 다음 두 가지 차이는 installer 자신이 만든 것이므로 그래도 installer의 항목으로 봅니다. token이나 Main ID 변수가 사라진 경우(항목을 다시 쓴 뒤 기록하기 전에 실행이 멈춘 경우)와, `install.json`이 기본 경로에 있지 않을 때 `ACP_GATEWAY_INSTALL_STATE`가 정확히 이 설치본의 `install.json`을 가리키는 경우입니다. 그 밖에 env가 바뀐 항목(`HTTP_PROXY`나 `NODE_OPTIONS` 같은 변수를 추가했거나, 변수를 지웠거나, token이나 Main ID가 다른 경우)은 교체하면 그 변경이 사라지므로 경고와 함께 그대로 둡니다. 1.7.2 이전에 등록한 항목에는 이 기록이 없고, 사용자가 직접 가리켜 둔 이전 Gateway 설치본과 구별할 방법도 없으므로 자동으로는 절대 옮기지 않습니다. 이미 이 설치본을 실행하는 항목이 아니면 경고와 함께 그대로 두며, `--force`로 한 번 다시 실행하면 다시 등록하고 실행 정보를 기록합니다. 그 뒤로는 `--update`가 알아서 옮깁니다. 이 확인을 통과하지 못한 항목은 경고와 함께 그대로 두고, `--force`로 다시 등록할 수 있습니다. 다른 앱이 관리하는 symlink를 거치는 항목도 그대로 두고, 더 오래된 Gateway로 이어지거나 링크가 끊겼거나 그 뒤에 스크립트가 없으면 경고만 남깁니다. agent CLI에는 원자적인 교체 명령이 없으므로, installer는 항목을 지우기 전에 그 command·args·env를 읽어 둡니다. 그 뒤 새 항목을 추가하지 못하면 이전 항목을 원래 모습 그대로 되돌립니다. 1.8.0부터는 `--rotate-token`에서도 마찬가지입니다. 어떤 항목에도 새 token을 넣지 않으며, 실패한 교체는 `install.json`에 이전 식별 정보를 그대로 둡니다([Control 식별 정보와 token 교체](#control-식별-정보와-token-교체) 참고). 정확히 되돌릴 수 없는 항목(예: CLI가 env를 알려 주지 않는 경우)은 업데이트가 지우지 않고 경고와 함께 그대로 두며, `--force`를 주면 그래도 교체합니다.
 
 ### 주요 installer 옵션
 
@@ -80,18 +80,35 @@ acp-gateway-bootstrap --update-skill    # 2. skill 갱신 (수정본이면 --for
 | `--offline` | 저장된 registry cache만 사용 |
 | `--target codex\|claude\|grok\|auggie\|all` | 오케스트레이터용 Control MCP 설치 대상 선택 |
 | `--dry-run` | 실제 변경 없이 계획만 출력 |
-| `--rotate-token` | Control token과 오케스트레이터 식별자(Main ID) 교체 |
+| `--rotate-token` | `install.json`에 보관한 Control token과 오케스트레이터 식별자(Main ID) 교체([Control 식별 정보와 token 교체](#control-식별-정보와-token-교체) 참고) |
 | `--force` | 관리하지 않던 항목 또는 사용자가 수정한 관리 skill을 명시적으로 교체 |
 | `--agent-auto-update on\|off` | ACP agent/adapter 자동 업데이트 설정 후 daemon 재시작 |
 | `--agent-update-notifications on\|off` | health check 업데이트 알림 설정 후 daemon 재시작 |
 
-Control token과 오케스트레이터 식별자(Main ID)는 `~/.acp-gateway/install.json`에 권한 `0600`으로 저장되며 반복 설치에서도 재사용됩니다.
-
 Skill은 Codex `~/.codex/skills`, Claude `~/.claude/skills`, Grok `~/.grok/skills`, Auggie `~/.augment/skills`에 설치합니다. 별도 경로가 알려지지 않은 registry provider는 공용 `~/.agents/skills`를 사용합니다. 같은 공용 경로를 사용하는 provider가 여러 개면 skill 파일은 한 번만 복사하고 installer 상태에는 각 provider를 모두 기록합니다.
 
-Control·Guide MCP 등록은 Codex, Claude, Grok, Auggie를 지원합니다. 기본 `--install-all`에서 Control은 사용자가 프론트 도어로 선택한 Codex·Claude·Grok 중 하나에만 등록되고, Guide와 skill은 발견된 지원 agent 전체에 설치됩니다. `--target`은 고급 수동 대상 지정 용도로 유지됩니다. Control MCP는 Gateway 전체 제어 권한이 있으므로 신뢰하는 로컬 agent에만 설치하세요. 이 토큰은 그 agent의 MCP 설정에 저장되므로, 자기 도구로 Gateway를 거치지 않고 파일을 읽는 Worker(Codex는 `read_only`에서도 그렇게 읽는 것을 확인했습니다)가 읽어서 Main처럼 행동할 수 있습니다. 이런 Worker에게 신뢰할 수 없는 자료를 맡기기 전에 [권한 정책](../README.ko.md#권한-정책)을 확인하세요.
+Control·Guide MCP 등록은 Codex, Claude, Grok, Auggie를 지원합니다. 기본 `--install-all`에서 Control은 사용자가 프론트 도어로 선택한 Codex·Claude·Grok 중 하나에만 등록되고, Guide와 skill은 발견된 지원 agent 전체에 설치됩니다. `--target`은 고급 수동 대상 지정 용도로 유지됩니다. Control MCP는 Gateway 전체 제어 권한이 있으므로 신뢰하는 로컬 agent에만 설치하세요. v1.8.0부터 이 항목에는 token이 들어 있지 않지만(아래 참고), 자기 도구로 Gateway를 거치지 않고 파일을 읽는 Worker(Codex는 `read_only`에서도 그렇게 읽는 것을 확인했습니다)는 여전히 `install.json`에서, 또는 이전 installer가 써서 아직 token이 남아 있는 항목에서 token을 읽어 Main처럼 행동할 수 있습니다. 이런 Worker에게 신뢰할 수 없는 자료를 맡기기 전에 [권한 정책](../README.ko.md#권한-정책)을 확인하세요. Worker 자신의 agent CLI가 사용자 설정에서 Control MCP를 불러올 수도 있습니다(Codex Worker는 `~/.codex/config.toml`을 읽습니다). v1.8.0부터 이 서버는 Worker의 프로세스 트리 안에서는 시작을 거부하고 상태 코드 77로 종료하며 stderr에 한 줄을 남깁니다. 그래서 Worker의 CLI가 `agent-acp`를 시작하지 못했다고 보고할 수 있는데, 정상 동작입니다.
 
 공식 registry 원본은 `https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json`이며 `~/.acp-gateway/registry.json`에 24시간 캐시합니다. 발견된 provider 실행 정의는 `~/.acp-gateway/providers.json`에 저장됩니다. `npx`·`uvx` 배포는 registry에 고정된 버전을 설치하고, binary 배포는 이미 설치된 실행 파일을 사용합니다. registry에 등록되지 않은 임의의 AI는 ACP 실행 계약을 안전하게 추론할 수 없으므로 자동 등록하지 않습니다.
+
+### Control 식별 정보와 token 교체
+
+Control token과 오케스트레이터 식별자(Main ID)는 `~/.acp-gateway/install.json`에 권한 `0600`으로 저장되며 반복 설치에서도 재사용됩니다. v1.8.0부터 installer는 이 파일에만 이 값을 보관합니다. Control MCP 항목은 이 값 없이 등록하고, `install.json`이 기본 경로에 있지 않을 때만 `ACP_GATEWAY_INSTALL_STATE`를 넣습니다. Control MCP는 시작할 때 `install.json`에서 이 값을 읽습니다. 항목의 환경 변수에 `ACP_GATEWAY_CONTROL_TOKEN`과 `ACP_GATEWAY_ROOT_ID`가 있으면 여전히 그 값이 우선합니다. agent CLI의 설정에도, 항목을 등록하는 명령줄에도 token이 남지 않습니다.
+
+v1.8.0부터 daemon을 띄우는 프론트 도어나 installer는 token과 Main ID를 daemon의 환경 변수가 아니라 stdin으로 넘깁니다. 환경 변수는 같은 사용자의 다른 프로세스가 읽을 수 있기 때문입니다(`ps -E`, `/proc/<pid>/environ`). Windows는 여전히 환경 변수를 씁니다. `ACP_GATEWAY_CONTROL_TOKEN`을 설정해 직접 띄운 daemon은 계속 그 값을 씁니다. 넘겨받기에 실패하면 daemon은 상태 코드 78로 종료하고, 상태 복구 중단 때처럼 그 이유(`DAEMON_IDENTITY_INVALID`)가 Control MCP 연결 오류에 나타납니다. 어느 경우든 daemon은 자기 환경에서 이 값을 지우므로 daemon이 띄우는 프로세스는 이 값을 물려받지 않습니다. daemon 환경의 나머지는 여전히 Worker와 그 터미널에 전달됩니다([권한 정책](../README.ko.md#권한-정책) 참고).
+
+v1.8.0 이전에 등록한 항목은 환경 변수에 token과 Main ID를 가지고 있습니다. `--install-all`, `--install-control`, `--update`, `--rotate-token`은 이런 항목이 [호스트 재연결 절차](#호스트-재연결-절차)의 소유 확인을 통과하면 이 값 없이 다시 등록합니다. 더 오래된 Gateway를 실행하던 항목은 이때 이 설치본을 가리키도록 함께 옮깁니다. 그 밖에 아직 token을 가진 항목, 예컨대 1.7.2 이전에 등록한 항목, 그 뒤 환경 변수가 바뀐 항목, 다른 Gateway 설치본을 실행하는 항목은 경고와 함께 그대로 둡니다. 이때 token이 든 agent 설정 파일을 다른 사용자도 읽을 수 있으면 installer가 그 파일을 `0600`으로 바꿉니다(Grok CLI는 자기 설정을 `0644`로 씁니다). `--force`를 주면 이런 항목도 token 없이 다시 등록합니다. 항목 하나 이상에서 token을 뺀 실행은 마지막에 token 교체를 권하는 경고를 남깁니다. agent CLI의 설정 백업(`*.bak`)처럼 그 전에 만든 사본에는 token이 그대로 남아 있기 때문입니다. installer가 알아서 교체하지는 않습니다. AgenLynk 같은 앱은 읽어 둔 식별 정보를 계속 쓰므로, 새 token이 생기면 접속하지 못하게 됩니다.
+
+token과 Main ID를 교체하려면 순서대로 실행하세요.
+
+```bash
+acp-gateway-admin shutdown_if_idle      # 1. 진행 중인 작업이 없을 때 Gateway 중지
+acp-gateway-bootstrap --rotate-token    # 2. install.json에 새 식별 정보 기록, health check가 그 값으로 daemon 시작
+```
+
+3. **재연결** — 모든 호스트 세션(호스트 재연결 절차의 3번)과 AgenLynk처럼 식별 정보를 보관하는 앱을 다시 연결합니다. 모두 시작할 때 식별 정보를 한 번만 읽었고, 다시 시작한 daemon은 이전 값을 거부합니다.
+
+`--rotate-token`은 새 식별 정보를 `install.json`에 쓰고, 거기서 식별 정보를 읽는 항목은 다시 등록하지 않습니다. 아직 token을 가진 항목은 다른 업데이트 때와 마찬가지로 이 installer의 것임이 입증되면 token을 빼고 다시 등록하며, 그렇지 않으면 폐기된 token을 가지고 있어 daemon이 다시 시작하면 더는 쓸 수 없다는 경고와 함께 그대로 둡니다. 항목 하나라도 갱신하지 못한 교체는 확정하지 않습니다. 이때 `install.json`은 실행 중인 daemon과 모든 항목이 함께 쓰는 이전 식별 정보를 그대로 유지하며, 다시 실행하면 교체를 마무리합니다. installer가 다시 쓴 항목은 쓰는 즉시 `install.json`에 기록합니다. 실행 중인 daemon은 자신이 시작할 때 받은 식별 정보만 받아들이므로 1번에서 daemon을 멈춥니다. daemon이 아직 실행 중이거나 그 사이에 이전 식별 정보를 가진 프론트 도어가 daemon을 다시 띄웠다면, 새 식별 정보가 이미 `install.json`에 기록된 상태에서 2번의 health check가 `CONTROL_ACCESS_DENIED`로 실패하고, 새 식별 정보를 읽는 `acp-gateway-admin`으로도 그 daemon을 멈출 수 없습니다. 이때는 `<socket>.lock`에 적힌 pid에 SIGTERM을 보내 daemon을 끝내세요(실행 중인 Worker까지 멈추는 무조건 종료입니다). 그러면 다음 호출이 새 식별 정보로 daemon을 띄웁니다.
 
 ### ACP 상류 버전 모니터링
 
@@ -114,7 +131,7 @@ maintainer가 `npm run update:upstream`을 실행하면 snapshot 갱신, 관리 
 
 현재 runtime은 ACP wire version 1을 사용합니다. 공식 저장소의 `schema/v2`도 감지되지만, v2 지원으로 표시하거나 자동 전환하지 않습니다. Snapshot 갱신은 알림과 검토 시작점이며 자동 병합 또는 Gateway release를 수행하지 않습니다.
 
-v1.1.0부터 daemon은 시작 시점과 이후 24시간마다 ACP 공식 registry를 확인합니다. 발견된 `npx`·`uvx` adapter가 새 버전이면 자동으로 설치하고 provider 정의를 갱신합니다. 이미 실행 중인 Worker process는 중단하지 않으며, 새 process나 session부터 갱신된 adapter가 적용됩니다. 직접 설치해야 하는 binary 배포는 자동 교체하지 않고 health 경고로 남깁니다.
+v1.1.0부터 daemon은 시작 시점과 이후 24시간마다 ACP 공식 registry를 확인합니다. 발견된 `npx`·`uvx` adapter가 새 버전이면 자동으로 설치하고 provider 정의를 갱신합니다. 이미 실행 중인 Worker process는 중단하지 않으며, 새 process나 session부터 갱신된 adapter가 적용됩니다. 직접 설치해야 하는 binary 배포는 자동 교체하지 않고 health 경고로 남깁니다. v1.8.0부터 installer가 실행하는 모든 명령은 이 설치를 포함해 10분이 지나면 멈추고 시간 초과로 보고되며, 출력은 스트림마다 처음과 마지막 512KB만 남기고 그 사이에 생략한 바이트 수를 표시합니다. 업데이트가 아직 진행 중일 때 종료 요청을 받은 daemon은 최대 5초만 기다린 뒤 업데이트를 중단하고(그 `npm`/`uv` 프로세스도 멈춥니다), 이어서 worker를 멈추고 상태를 저장합니다. 다음에 시작할 때 다시 확인합니다. 이런 일이 생기면 daemon이 stderr에 그 사실을 남깁니다.
 
 `agent_acp_setup` health 응답의 `agentUpdates`에는 확인 시각, 적용된 버전, 남은 수동 업데이트와 오류가 포함됩니다. 알림이 켜져 있으면 같은 응답의 `alerts`에 사용자에게 보여줄 메시지가 들어갑니다. 즉 Gateway가 임의로 화면에 push하는 방식은 아니며, 오케스트레이터가 health check 결과를 받을 때 알림을 사용자에게 전달합니다. 즉시 다시 확인하려면 `refreshAgentUpdates: true`로 setup을 호출합니다.
 
@@ -164,18 +181,21 @@ Gateway는 Worker가 공개하지 않은 `temperature`, `max_tokens` 같은 값�
 
 v1.3.0부터 poll 기본값이 절약형입니다. 턴이 진행 중일 때 `result`는 자동으로 생략되고(`includeResult: true`로 명시할 때만 포함), 종료 후 poll의 `result.text`에는 누적 transcript가 아니라 **최종 답변 세그먼트**(마지막 작업 경계 이후의 메시지 텍스트)만 담깁니다. 진행 narration은 `includeInspection: true`로 조회합니다. `agent_acp_session` `get`의 `includeTranscript: true`는 메모리에 남은 bounded transcript를 반환하며, overflow된 전체 transcript는 `resultArtifact`를 따라 회수합니다. `cursor`/`toCursor`/`eventTypes`로 보존된 이벤트 이력도 범위 조회할 수 있습니다. 자세한 회수 경로는 `agent-delegator` skill의 "Retrieve the correct result" 표를 따르세요.
 
-인라인 상한을 넘는 데이터는 전부 `~/.acp-gateway/artifacts`의 파일로 스필되고 응답에는 잘린 미리보기와 포인터(경로·바이트 수·완료 여부)가 실립니다 — 4KB(UTF-8)를 넘는 tool 이벤트 payload는 `dataArtifact`, 64KB를 넘는 최종 답변은 `textArtifact`, 메모리 상한(1MB)을 넘는 transcript는 `resultArtifact`. 인라인에는 상한 내 내용만 유지하므로 RAM과 오케스트레이터 컨텍스트가 결과 크기에 따라 늘어나지 않습니다. Artifact는 파일당 100MB·전체 512MB이고, 라이브 세션이 참조하는 파일은 24시간 정리에서 보존됩니다. 동시 미응답 권한·질문 요청은 세션당 64개의 안전 상한을 따르며, 큰 설명 chunk는 32MB protocol frame 상한 안에서 그대로 처리합니다. 전송·세션·Main 단위 예산도 `setup().resourceLimits`에 함께 실립니다 — control 연결당 쓰기 큐 4MB와 10초 무진행 상한(worker stdin 쪽 큐는 동시 요청 상한에서 파생), prompt 1MB, 파일 읽기 500KB(바이트 기준, 초과분은 `_meta["acp-gateway/read"]`로 절단을 알림), terminal 출력 10MB, Main당 세션 64개와 처리 완료 inbox 이력 1000건.
+인라인 상한을 넘는 데이터는 전부 `~/.acp-gateway/artifacts`의 파일로 스필되고 응답에는 잘린 미리보기와 포인터(경로·바이트 수·완료 여부)가 실립니다 — 4KB(UTF-8)를 넘는 tool 이벤트 payload는 `dataArtifact`, 64KB를 넘는 최종 답변은 `textArtifact`, 메모리 상한(1MB)을 넘는 transcript는 `resultArtifact`. 인라인에는 상한 내 내용만 유지하므로 RAM과 오케스트레이터 컨텍스트가 결과 크기에 따라 늘어나지 않습니다. Artifact는 파일당 100MB·전체 512MB이며, 그중 마지막 1/8(64MB)은 내구성 있는 Task 결과만 쓸 수 있습니다. 그래서 transcript, terminal 출력, tool 이벤트 payload가 공간을 다 써서 완료된 결과에 미리보기만 남는 일이 없습니다. 라이브 세션이 참조하는 파일은 24시간 정리에서 보존됩니다. payload가 스필된 `tool_call_update`를 같은 tool call의 새 update가 대체하면, poll, 구독(live 또는 replay), 세션 `get`이 이미 그 경로를 내준 경우가 아니라면 이전 파일을 바로 지웁니다. 이미 내준 파일은 다른 파일과 함께 보존 기간이 지나면 정리됩니다. 동시 미응답 권한·질문 요청은 세션당 64개의 안전 상한을 따르며, 큰 설명 chunk는 32MB protocol frame 상한 안에서 그대로 처리합니다. 전송·세션·Main 단위 예산도 `setup().resourceLimits`에 함께 실립니다 — control 연결당 쓰기 큐 4MB와 10초 무진행 상한(worker stdin 쪽 큐는 동시 요청 상한에서 파생), prompt 1MB, 파일 읽기 500KB(바이트 기준, 초과분은 `_meta["acp-gateway/read"]`로 절단을 알림), terminal 출력 10MB, Main당 세션 64개와 처리 완료 inbox 이력 1000건.
 
 ## 세션과 데이터
 
 - 상태 파일(schema v5): `~/.acp-gateway/state.snapshot.json`(전체 상태) + `~/.acp-gateway/state.wal.ndjson`(control 전이 로그)
-- `~/.acp-gateway/state.json`은 v4 형식으로 계속 기록됩니다. 1.4 Gateway로 명시적으로 롤백할 수 있도록 현재 버전에서도 계속 기록합니다.
+- v1.8.0부터 `~/.acp-gateway/state.json`(v4 형식)은 더 이상 기록하지 않습니다. 남아 있는 파일은 시작할 때 계속 읽어 이전하고, 동기화된 v5 snapshot이 그 내용을 담은 뒤에 지웁니다. 롤백한 1.4~1.7 Gateway도 v5 파일을 읽지만, 큰 Task 결과는 미리보기만 제공합니다(`resultDegraded` 표시). 1.4보다 오래된 Gateway는 상태를 찾지 못하고 빈 상태로 시작합니다.
+- 상태가 바뀌는 동안 WAL이 켜져 있으면 전체 snapshot은 많아야 약 1초에 한 번 다시 쓰고, WAL 회전과 종료 때도 씁니다. WAL 레코드 자체는 전처럼 즉시 기록합니다.
 - idle resumable 세션은 기본 30분 후 unload
 - 결과와 이벤트는 기본 24시간 보존
 - session resume checkpoint는 기본 7일 보존, Task 핸들의 바이트는 기본 24시간 보존(`ACP_GATEWAY_TASK_RETENTION_MS`)
-- 장시간 유지가 필요한 세션은 `pin` 사용
-- 응답 본문, thought, 전체 이벤트 이력은 상태 파일에 영구 저장하지 않음
+- 장시간 유지가 필요한 세션은 `pin` 사용. pin은 세션이 열려 있는 동안만 보호하며, 닫힌 pin 세션은 다른 세션처럼 보존 기간이 지나면 정리됩니다.
+- 응답 본문, thought, 전체 이벤트 이력은 상태 파일에 영구 저장하지 않음. `ACP_GATEWAY_WAL_INLINE_RESULT_BYTES`보다 큰 Task 결과는 WAL과 같은 형태로 artifact 참조와 짧은 미리보기만 snapshot에 남기므로, 보존된 transcript가 늘어도 snapshot이 커지지 않습니다.
 - 인라인 상한을 넘은 결과와 terminal 출력은 `~/.acp-gateway/artifacts`에 임시 저장 후 결과 보존 기간에 맞춰 정리
+- control socket은 `ACP_GATEWAY_SOCKET`이고, 기본값은 OS 임시 디렉터리(macOS는 사용자별, 대부분의 Linux는 공유 `/tmp`)의 `acp-gateway-<uid>.sock`이며, 잠금 파일 `<socket>.lock`이 그 옆에 있습니다. daemon은 socket을 권한 `0600`으로 만들며, 그보다 넓은 권한인 순간은 없습니다. v1.8.0부터 client는 같은 사용자가 소유한 socket에만 연결하며, 그렇지 않으면 token을 포함해 아무것도 보내기 전에 `SOCKET_UNTRUSTED`로 실패합니다. 다른 사용자와 함께 쓰는 Linux 호스트에서는 그중 누군가가 기본 경로를 먼저 차지해 Gateway가 시작하지 못하게 할 수 있습니다. 이때는 `$XDG_RUNTIME_DIR/acp-gateway.sock`처럼 본인만 쓸 수 있는 디렉터리의 경로를 `ACP_GATEWAY_SOCKET`으로 지정하되, client가 실행되는 모든 곳(`agent-acp` MCP 항목의 env, 앱, `acp-gateway-admin`, installer)에 지정하세요.
+- 시작에 실패했을 때 운영자를 위해 따로 남겨 두는 손상된 상태 파일 사본(`state.wal.ndjson.corrupt-<time>`, `state.snapshot.json.downgraded-<time>` 등)은 파일과 이유별로 최신 3개까지만 남기고, 7일이 지나면 지웁니다. 비정상 종료한 writer가 상태·설정 파일 옆에 남긴 임시 파일은 다음 시작 때 지웁니다.
 
 ### 상태·중단·attention
 
@@ -184,25 +204,37 @@ v1.7.0부터 Gateway는 맡긴 작업이 어디까지 왔는지 알려 주므로
 - **상태 이유와 멈춤 힌트** — 세션 `get`/`list`에 `statusReason`·`statusChangedAt`·`lastWorkerActivityAt`이 나오고, 실행 중인 턴이 `stallHintMs` 동안 아무것도 보내지 않으면 `stallSuspected`가 붙습니다. `setup`은 `sessions_stall_suspected` 경고를 띄웁니다.
 - **중단** — Gateway가 끊은 작업에는 `interruption: {reason, executionOutcome, at}`이 붙고(`executionOutcome`은 `not_started` 또는 `unknown`), 결과에 `next` 단계가 담깁니다. v1.7.2부터 `not_started` 판정은 v1.7.2 이후에 만든 작업에만 나올 수 있고, 그 이전에 만든 작업은 이후에 중단되면 `unknown`입니다. 그런 작업에 v1.7.0이나 v1.7.1이 이미 기록한 `not_started`도 `unknown`으로 읽히며, `next`도 그에 맞게 다시 만들어집니다. `agent_acp_session {action: "check"}`는 provider를 띄우지 않고 세션이 `restorable`·`restorable_with_caveats`·`not_restorable`·`unknown` 중 어디에 해당하는지 알려 줍니다.
 - **attention** — `agent_acp_inbox {action: "attention"}`은 `needsMain`(대기 중 요청, `attentionStaleMs`가 지나면 `stale`)과 `updates`(작업을 시작한 Main에게 결과가 아직 닿지 않은 종료 작업)를 돌려줍니다. `{action: "ack", taskIds}`는 지정한 작업을 확인한 것으로 표시합니다.
-- **scope** — `agent_acp_session {action: "list"}`와 `task_list`에 `scope: "mine"`을 주면 호출한 Main의 기록만 남깁니다. 호출자 정보를 보내지 않는 프론트 도어(1.6 이전)는 `INVALID_ARGUMENT`를 받습니다.
+- **scope** — `agent_acp_session {action: "list"}`와 `task_list`에 `scope: "mine"`을 주면 호출한 Main의 기록만 남깁니다. 호출자 정보를 보내지 않는 프론트 도어(1.6 이전)는 `INVALID_ARGUMENT`를 받습니다. v1.8.0부터는 `scope` 없이도 Main의 목록에 다른 Main의 기록이 나오지 않으며(아래 참고), `scope: "mine"`은 기록된 Main이 없는 기록까지 뺍니다.
 - **격리** — 복구가 `maxConsecutiveRestoreFailures`번 연달아 실패하면 `prompt`·`task_prompt`·`run`·`config`는 provider에 연락하지 않고 `SESSION_QUARANTINED`로 실패합니다. `check`, `agent_acp_session_restore`(이 Main의 기존 기록을 그 자리에서 복구하며, provider가 꺼져 있어도 쓸 수 있고, 성공하면 격리가 풀림), `agent_acp_session_open`은 계속 쓸 수 있습니다.
+
+### Main별 분리와 재시작 뒤 복구
+
+v1.8.0부터 Control MCP로 호출하는 오케스트레이터(Main)는 자신이 연 세션과 그 작업·요청·결과, 그리고 기록된 Main이 없는 세션(1.6.0 이전에 열었거나, Main을 밝히지 않는 도구가 연 세션)에만 접근할 수 있습니다. 다른 Main의 세션은 `NOT_SESSION_OWNER`로(그 작업은 `NOT_TASK_OWNER`, 그 inbox 항목은 `NOT_INBOX_OWNER`로) 응답하고 목록에서도 빠지며, `clean`은 호출한 Main의 세션만 닫습니다. AgenLynk, `acp-gateway-admin`, installer의 health check처럼 Main을 밝히지 않는 client와 모든 observer는 여전히 Gateway 전체에 접근합니다. Main ID 단위로 세는 예산(`ACP_GATEWAY_MAX_SESSIONS_PER_ROOT`와 아래 표의 다른 `_PER_ROOT` 상한)은 그 ID를 쓰는 모든 Main이 함께 쓰며, 분리된다고 나뉘지 않습니다. 이 분리는 함께 일하는 에이전트끼리 서로의 작업을 건드리지 않게 하려는 것이며, Control token을 가진 프로세스를 막는 보안 경계는 아닙니다. 전체 계약은 [관리 API](management-api.md#per-main-isolation)(영어)에 있습니다.
+
+Main은 CLI 세션 단위입니다. Claude Code나 Grok 세션 하나, 또는 Codex thread 하나가 Main 하나입니다. 같은 CLI 세션 안에서 프론트 도어만 다시 시작하면 세션을 그대로 유지합니다. 새 대화는 새 Main이며, 세션 id를 보내지 않는 프론트 도어(Auggie, `CLAUDE_CODE_SESSION_ID`가 없는 Claude Code, thread 정보 없이 온 Codex 호출)를 다시 시작한 경우도 새 Main입니다. 이때 이전 세션은 목록에 나오지 않습니다. 중복 세션을 새로 열지 말고 하나씩 되찾으세요.
+
+1. 세션의 `provider`, `acpSessionId`, `cwd`를 찾습니다. `agent_acp_session_open`과 `agent_acp_session_restore` 응답에는 모두 이 값이 들어 있습니다. 없으면 AgenLynk처럼 Gateway의 모든 세션을 보여 주는 화면에서 읽거나, 공개 client로 `caller` 없이 `session {action: "list"}`를 호출하세요. `acp-gateway-admin`에는 세션 목록 기능이 없습니다.
+2. 새 Main에서 이 세 값을 그대로 넣어 `agent_acp_session_restore`를 호출합니다. 세션은 이 호출로만 넘어오며, list, get, poll, 구독으로는 넘어오지 않습니다.
+3. 복구가 세션을 넘겨받는 것은 이전 Main이 사라진 뒤뿐입니다. 즉 그 Main을 대신해 호출한 Control 연결이 하나도 열려 있지 않고, 그 Main의 구독도 살아 있지 않아야 합니다. daemon을 다시 시작하면 모든 연결이 끊깁니다. Codex 프로세스 하나는 모든 thread를 연결 하나로 처리하므로, 그 Codex 프로세스가 실행 중인 동안에는 한 thread가 다른 thread의 세션을 넘겨받을 수 없습니다. 이전 Main이 남아 있거나 `cwd`가 맞지 않으면 응답은 계속 `NOT_SESSION_OWNER`입니다.
+
+넘겨받은 세션에는 `openedBy`(새 Main)와 `adoptedFrom`(이전 Main)이 붙습니다. 그 작업과 대기 중인 요청도 함께 넘어오고, 이전 Main이 결과를 받지 못한 완료 작업은 새 Main이 회수할 몫이 되어 `agent_acp_inbox {action: "attention"}`에 나옵니다. 같은 복구를 반복해도 문제없습니다. 넘겨받은 사실은 다음 상태 snapshot에 기록되어 약 1초 안에 디스크에 닿으므로, 그 전에 장애가 나면 세션이 이전 Main에게 돌아갈 수 있고, 그때는 같은 복구로 다시 가져오면 됩니다. 넘겨받은 세션을 닫거나 세션 보존 정리가 지울 때는 이 사실을 먼저 저장하므로, 닫은 직후 장애가 나도 그 작업과 요청이 이전 Main에게 돌아가지 않습니다. `agent-delegator` skill도 Main에게 같은 절차를 안내합니다.
 
 ### 내구성과 복구
 
 Task 생성과 결과 확정은 응답을 반환하기 전에 WAL에 append + fsync합니다. 즉 Main이 받은 Task 핸들은 daemon이 죽어도 남아 있고, 재시작 후 미완 Task는 `failed`(재시작 메시지)로 확정됩니다. v1.7.0부터는 `interruption`도 함께 붙습니다(아래 참고). 나머지 전이(permission·질문 기록, 세션 등록/종료, 상태 변경)는 5ms group commit입니다. v1.7.2부터는 세션 복구 실패(실패 횟수, 격리, `lastRestore`)와 실패 연속을 끝내는 복구 성공도 응답을 반환하기 전에 fsync하므로, 장애가 나도 격리가 풀리거나 복구 성공으로 풀린 격리가 되살아나지 않습니다. 이 동기화 쓰기가 실패해도 복구 결과는 그대로지만 그 사실을 알립니다. persistence가 불건강 상태가 되고, `setup`에 `STATE_RESTORE_NOT_DURABLE` 경고가 나타나며(다음 write가 성공해도 사라지지 않음), 복구 응답에는 `durability: { persisted: false, errorCode: "PERSISTENCE_UNHEALTHY" }`가 붙습니다(복구가 실패했다면 오류의 `details.durability`에 붙음). macOS에서 Node는 `F_FULLFSYNC`를 노출하지 않으므로 `fsync(2)`만 사용합니다 — 프로세스 비정상 종료는 완전히 보호되고, 전원 손실은 group commit 창(기본 5ms)만 노출됩니다.
 
-상태 파일이 손상되면 daemon은 **빈 상태로 조용히 시작하지 않고** 중단합니다. 이때 `~/.acp-gateway/state.recovery-required`에 이유를 기록하고 exit 78로 종료하며, Control MCP 연결 실패 메시지에 그 내용이 표면화됩니다. 복구는 명시적으로 선택합니다.
+상태 파일이 손상되면 daemon은 **빈 상태로 조용히 시작하지 않고** 중단합니다. 이때 `~/.acp-gateway/state.recovery-required`에 이유를 기록하고 exit 78로 종료하며, Control MCP 연결 실패 메시지에 그 내용이 표면화됩니다. 손상된 파일의 사본은 그 옆에 남깁니다(위의 보존 상한 참고). 복구는 명시적으로 선택합니다.
 
 | 환경 변수 | 기본값 | 설명 |
 | --- | --- | --- |
-| `ACP_GATEWAY_WAL` | `on` | `off`면 WAL 없이 critical mutation마다 snapshot을 동기 기록(동일한 내구성 약속, 더 큰 쓰기 비용) |
+| `ACP_GATEWAY_WAL` | `on` | `off`면 WAL 없이 critical mutation마다 snapshot을 동기 기록(동일한 내구성 약속, 더 큰 쓰기 비용)하고, 그 밖의 변경은 약 50ms 뒤에 snapshot에 반영. WAL이 켜져 있으면 전체 snapshot은 많아야 약 1초에 한 번 다시 씀 |
 | `ACP_GATEWAY_WAL_GROUP_COMMIT_MS` | `5` | 비임계 전이의 group commit 간격 |
 | `ACP_GATEWAY_WAL_ROTATE_BYTES` / `_RECORDS` / `_INTERVAL_MS` | `4MiB` / `10000` / `15m` | WAL 회전 조건 |
-| `ACP_GATEWAY_WAL_INLINE_RESULT_BYTES` | `4096` | 이 크기를 넘는 Task 결과는 artifact로 분리하고 WAL은 참조 + preview만 기록 |
+| `ACP_GATEWAY_WAL_INLINE_RESULT_BYTES` | `4096` | 이 크기를 넘는 Task 결과는 artifact로 분리하고 WAL과 snapshot은 참조 + preview만 기록 |
 | `ACP_GATEWAY_FSYNC` | `normal` | `off`는 테스트·임시 볼륨 전용 |
-| `ACP_GATEWAY_STATE_RECOVERY` | (없음) | `truncate`: 손상 직전까지 WAL replay 후 시작 / `snapshot-drop`: snapshot 폐기 후 `state.json`에서 복구 / `cold`: 빈 상태로 시작 |
+| `ACP_GATEWAY_STATE_RECOVERY` | (없음) | `truncate`: 손상 직전까지 WAL replay 후 시작 / `snapshot-drop`: snapshot을 폐기하고 WAL만으로 복구, 남은 v4 `state.json`이 있으면 그것도 사용(v1.8.0부터 이 파일은 아무도 쓰지 않으므로, 정상 종료 뒤라면 WAL에 남은 것이 없음) / `cold`: 빈 상태로 시작 |
 | `ACP_GATEWAY_TASK_RETENTION_MS` | `24h` | Task 레코드와 결과 artifact의 디스크 생존 기간(세션 보존과 독립) |
-| `ACP_GATEWAY_MAX_QUEUE_BYTES` | `4000000` | control 연결당 OS+channel 합산 쓰기 예산. HIGH는 전체, NORMAL은 7/8, LOW는 1/2까지 사용 |
+| `ACP_GATEWAY_MAX_QUEUE_BYTES` | `4000000` | control 연결당 OS+channel 합산 쓰기 예산. HIGH는 전체, NORMAL은 7/8, LOW는 1/2까지 사용. v1.8.0부터 예산 전체보다 큰 응답 하나(`ACP_GATEWAY_MAX_FRAME_BYTES` 이하)도 기다리는 것이 없으면 연결을 닫지 않고 보내며, 그 뒤의 frame은 자기 예산을 그대로 씀. 첫 응답을 보내는 중에 그런 응답이 하나 더 오면 전처럼 연결을 닫음. `subscribe` replay는 이 예산의 절반으로 제한(관리 API 참고) |
 | `ACP_GATEWAY_WRITE_TIMEOUT_MS` | `10000` | 이 시간 동안 OS가 한 바이트도 받지 않으면 해당 연결·프로바이더를 종료 |
 | `ACP_GATEWAY_MAX_PROMPT_BYTES` | `1000000` | 초과 prompt는 턴을 만들기 전에 `PROMPT_TOO_LARGE`로 거부 |
 | `ACP_GATEWAY_MAX_FILE_READ_BYTES` | `500000` | worker의 `fs/read_text_file` 응답 바이트 상한(거부 대신 절단) |
@@ -211,7 +243,7 @@ Task 생성과 결과 확정은 응답을 반환하기 전에 WAL에 append + fs
 | `ACP_GATEWAY_MAX_INBOX_ITEM_BYTES` | `65536` | worker permission/elicitation 한 건의 보관 바이트 상한 |
 | `ACP_GATEWAY_MAX_PENDING_INBOX_BYTES_PER_SESSION` | `524288` | 세션당 pending inbox 합산 바이트 상한 |
 | `ACP_GATEWAY_MAX_PENDING_INBOX_BYTES_PER_ROOT` | `4194304` | Main당 pending inbox 합산 바이트 상한 |
-| `ACP_GATEWAY_MAX_INBOX_HISTORY_PER_ROOT` | `1000` | Main당 보관하는 처리 완료 inbox 건수(pending은 제거 대상 아님) |
+| `ACP_GATEWAY_MAX_INBOX_HISTORY_PER_ROOT` | `1000` | Main당 보관하는 처리 완료 inbox 건수. 처리될 때마다 적용(pending은 제거 대상 아님) |
 | `ACP_GATEWAY_STALL_HINT_MS` | `300000` | 설정 `stallHintMs`(최소 `10000`). 실행 중인 Worker가 이 시간 동안 아무것도 보내지 않으면 세션 조회에 `stallSuspected`가 붙음. 힌트일 뿐 |
 | `ACP_GATEWAY_ATTENTION_STALE_MS` | `600000` | 설정 `attentionStaleMs`(최소 `10000`). Worker 요청이 이 시간 넘게 기다리면 attention 조회와 `setup`이 stale로 표시. 표시일 뿐 |
 | `ACP_GATEWAY_MAX_CONSECUTIVE_RESTORE_FAILURES` | `3` | 설정 `maxConsecutiveRestoreFailures`(최소 `1`). 복구가 이 횟수만큼 연달아 실패하면 세션을 격리(`SESSION_QUARANTINED`). provider 시작이 같은 횟수만큼 실패하면 `provider_degraded` 경고 |

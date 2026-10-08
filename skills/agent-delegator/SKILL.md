@@ -41,6 +41,8 @@ Choose only what the task needs: `cwd` as the narrowest root holding the require
 
 `permission_policy_partial` in `relevantAlerts` lists in `scope` what the Gateway cannot enforce for that provider: Codex cannot be stopped from editing or shell-writing inside the roots or from reading anywhere, Grok's built-in grep can read outside the roots (never Gateway files). Treat everything in `scope` as possible. When edits must be impossible, open the session with `workspace: "snapshot"`: the worker edits a private copy, and you read the changes with `agent_acp_session {action: "workspace_diff"}` and apply them yourself. Reads outside the roots and of Gateway files are refused automatically for the other providers. A retry with the same `idempotencyKey` but a different prompt fails with `IDEMPOTENCY_CONFLICT`; use a new key for new work.
 
+Terminals the Gateway opens for a Worker run in a sandbox on macOS, where `ps` and `top` cannot start (exit 71). Elsewhere `auto_approve` still sends you every such terminal as a permission request with its full command, and on any OS a command naming `.acp-gateway` comes to you too. Answer them as in step 5.
+
 ## 3. Run the work
 
 `agent_acp_run` submits a prompt and waits. Its direct return is the same object as its MCP Task result, so there is one shape to handle.
@@ -71,6 +73,7 @@ Polling is for evidence and for sessions started with `agent_acp_prompt`; a plai
 
 - Use `agent_acp_permission` with the matching `requestId` and an actually offered `optionId`. For a worker question use `agent_acp_answer` with explicit `accept`, `decline`, or `cancel`, including schema-valid `content` only for `accept`.
 - `agent_acp_run` returns the pending record inline as `pending`; otherwise list it with `agent_acp_inbox`. If `optionsOmitted` is present, use `agent_acp_inbox get` for the complete list.
+- A Gateway terminal or file write waiting for you is titled `Run: <command line>` or `Write <path> (<n> bytes)`; `rawInput` holds the command, args, cwd and env names (never values), or the path and size. Approving a Worker's execute or edit request lets through only that command, or one write to each file it named, until the turn ends; anything else is asked again.
 - Keep going after one response: more may be pending. Never let a Worker self-approve an `ask` request. Only current `pending` items in a matching `waiting_*` session are answerable; the rest are audit records.
 - On unsafe or obsolete work call `agent_acp_cancel`, then poll until non-active. Cancelling stops the turn; letting a wait run out does not.
 

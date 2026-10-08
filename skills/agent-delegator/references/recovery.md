@@ -19,6 +19,9 @@ If the work is expensive to duplicate and you have no handle yet, pass `idempote
 | `status: "error"` / `unavailable` | the turn or the provider failed | read `error`, collect what exists, then restore or re-run |
 | `SESSION_QUARANTINED` | the session failed to restore `failures` times in a row; the Gateway stopped retrying it | pick from `details.next`: `check` it, retry once with `agent_acp_session_restore` (same provider, acpSessionId, cwd), or open a new session |
 | `NOT_SESSION_OWNER` | the session belongs to another Main, possibly your own from before a restart | if it was yours, take it back as in "After you come back as a new Main" below; otherwise leave it |
+| `WORKER_CONTROL_DENIED` | you are running inside a Gateway Worker; Workers never get the Control | do not retry; report back to the Main that gave you the work |
+| `SOCKET_UNTRUSTED` | the Gateway socket path holds something this user does not own; nothing was sent | surface it: the user removes a stale file there, or sets `ACP_GATEWAY_SOCKET` to a directory only they can write |
+| `DAEMON_IDENTITY_INVALID` | the daemon did not get its identity when it was started | retry the call once, which starts it again; if it recurs, surface it |
 | `disconnected` | the worker process is gone | collect retained results and inbox history, then reuse the session — prompt and config reconnect automatically for a resumable provider |
 
 ## Restore and inspect
@@ -42,7 +45,7 @@ Each Main reaches only the sessions it opened, and a Main is its CLI session (fo
 
 1. Get each session's `provider`, `acpSessionId` and `cwd`. Every `agent_acp_session_open` and `agent_acp_session_restore` answer in the earlier conversation carries them. Otherwise ask the user to read them from a management view that lists every session on the Gateway, such as AgenLynk (`acp-gateway-admin` has no session listing).
 2. Call `agent_acp_session_restore` with exactly those three. Nothing else hands a session over: not list, get, poll, or a subscription.
-3. It works once the earlier Main is gone, that is when its front door is no longer connected. While it is, the answer stays `NOT_SESSION_OWNER`: finish the work there or end that conversation, and do not retry in a loop.
+3. It works once the earlier Main is gone, that is when its front door is no longer connected. For Codex that front door serves every thread of the process, so another thread cannot take the session while that Codex process runs. While the earlier Main is there, the answer stays `NOT_SESSION_OWNER`: finish the work there or end that conversation, and do not retry in a loop.
 4. Read the answer. A restored session now carries `openedBy` (you) and `adoptedFrom` (the earlier Main). `INVALID_ARGUMENT` "already registered" with `details.sessionId` means its Worker was still connected: the session is yours now, under that id. `SESSION_ACTIVE` means a turn is still running: poll it.
 5. Its tasks and requests came with it. Call `agent_acp_inbox {action: "attention"}`: it lists the requests waiting on you and the finished runs whose result never reached you; collect each with `agent_acp_run {taskId}`.
 

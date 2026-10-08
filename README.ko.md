@@ -113,7 +113,11 @@ Grok 4.5에게 현재 설계의 보안 취약점을 red-team 검토시키고, pe
 | `ask` | 파일 변경이나 명령 실행 전에 오케스트레이터 승인 필요 |
 | `auto_approve` | 사용자가 허용한 세션 경계 안에서 자동 승인 |
 
-Control token, 오케스트레이터 식별자(Main ID)와 Gateway socket 경로는 ACP Worker 환경에서 제거되며, Worker 세션에 Control MCP를 다시 주입하는 것도 차단합니다. 그렇다고 모든 Worker가 토큰에 닿지 못하는 것은 아닙니다. 자기 도구로 Gateway를 거치지 않고 파일을 읽는 Worker(Codex는 `read_only`에서도 그렇게 읽는 것을 확인했습니다)는 프론트 도어의 MCP 설정에 저장된 Control token을 읽어 Main처럼 행동할 수 있습니다. 그러니 이런 Worker에게는 신뢰할 수 없는 자료(prompt injection이 숨어 있을 수 있는 저장소, 문서, 웹 페이지)를 맡기지 말고, 그런 작업에는 Gateway가 파일 읽기를 중개하거나 sandbox로 제한하는 provider를 쓰세요. 세션에서 Gateway가 강제하지 못하는 항목은 `permission_policy_partial` 경고에 나옵니다. 더 강한 격리는 이후 릴리스에서 제공할 예정입니다.
+Control token, 오케스트레이터 식별자(Main ID)와 Gateway socket 경로는 ACP Worker 환경에서 제거되며, Worker 세션에 Control MCP를 다시 주입하는 것도 이름, 설치 경로, 환경 변수에 든 식별 정보 중 무엇으로 하든 차단합니다. Codex Worker가 `~/.codex/config.toml`을 읽어 그러듯이 Worker 자신의 CLI가 사용자의 agent 설정에서 Control MCP를 띄우는 일도 막습니다. Control MCP는 Worker의 프로세스 트리 안에서는 실행을 거부하고, daemon은 자기 아래에서 실행 중인 호출자에게 Control을 내주지 않습니다(`WORKER_CONTROL_DENIED`). daemon은 시작할 때 자기 환경에서도 token과 Main ID를 지우므로, daemon이 띄우는 어떤 프로세스도(npm이나 uv로 하는 adapter 업데이트 포함) 이 값을 물려받지 않습니다. daemon 환경의 나머지는 daemon을 띄운 쪽(보통 프론트 도어나 installer)에서 온 것이며, API 키, 클라우드 자격 증명, `SSH_AUTH_SOCK`까지 포함해 Worker와 그 터미널에 그대로 전달됩니다. 그래서 환경 변수로 로그인하는 provider도 계속 동작합니다.
+
+Gateway가 Worker 대신 하는 파일 읽기·쓰기(ACP `fs/read_text_file`, `fs/write_text_file`)는 그 도중에 Worker가 symbolic link나 다른 디렉터리로 바꿔치기해도 세션 루트 안에 머물고 보호 경로에는 닿지 않습니다. 다만 Linux에서는 쓰기 도중의 바꿔치기로, 바꿔 넣은 링크가 가리키는 곳에 비어 있는 새 파일이 남을 수 있습니다. 쓰기는 거부되며 그 파일에는 아무것도 쓰지 않습니다. Control MCP를 포함한 Gateway client는 같은 사용자가 소유한 socket에만 token을 보냅니다. Gateway가 Worker에게 열어 주는 터미널은 macOS에서 보호 경로(`~/.acp-gateway`, 상태 디렉터리, socket)를 막는 sandbox 안에서 실행됩니다. 이 안에서는 `ps`, `top` 같은 setuid 프로그램을 실행할 수 없고, 실행하지 못한 명령은 상태 코드 71로 끝납니다. 이런 sandbox가 없는 환경에서는 `auto_approve`에서도 터미널마다 먼저 오케스트레이터에게 보냅니다. Worker의 명령이나 편집을 승인하면 그 명령이나 그 파일만 통과합니다. 그 밖의 터미널이나 쓰기는 명령, 인자, 작업 디렉터리, 환경 변수 이름(값은 보내지 않음), 또는 경로와 크기를 담아 오케스트레이터에게 갑니다.
+
+그렇다고 모든 Worker가 토큰에 닿지 못하는 것은 아닙니다. 자기 도구로 Gateway를 거치지 않고 파일을 읽는 Worker(Codex는 `read_only`에서도 그렇게 읽는 것을 확인했습니다)는 `~/.acp-gateway/install.json`에 있는 Control token이나, 1.8.0 이전 installer가 token을 써 넣은 agent 설정을 읽어 Main처럼 행동할 수 있습니다. 그러니 이런 Worker에게는 신뢰할 수 없는 자료(prompt injection이 숨어 있을 수 있는 저장소, 문서, 웹 페이지)를 맡기지 말고, 그런 작업에는 Gateway가 파일 읽기를 중개하거나 sandbox로 제한하는 provider를 쓰세요. 세션에서 Gateway가 강제하지 못하는 항목은 `permission_policy_partial` 경고에 나옵니다. 더 강한 격리는 이후 릴리스에서 제공할 예정입니다.
 
 ### 업데이트
 
@@ -170,6 +174,7 @@ Gateway는 맡긴 작업이 어디까지 왔는지도 알려 주므로, 재시�
 - **중단으로 모르게 된 것** — 재시작이나 Worker 유실로 끊긴 작업은 Worker가 이미 prompt를 받아 움직였을 수 있는지와 다음에 할 일을 알려 줍니다. `agent_acp_session {action: "check"}`는 아무것도 띄우지 않고 읽기만 해서 세션을 되살릴 수 있는지 알려 줍니다.
 - **attention inbox** — `agent_acp_inbox {action: "attention"}`은 오케스트레이터를 기다리는 요청과 아직 받지 못한 완료 결과를 모아 보여 줍니다. `ack`로 확인한 것으로 표시할 수 있습니다.
 - **작업 연결 선언** — run은 이어받는 작업(`parentTaskId`)과 결과를 활용한 작업(`inputTaskIds`)을 밝힐 수 있습니다. `scope: "mine"`을 주면 세션·작업 목록에 호출한 오케스트레이터의 작업만 나옵니다.
+- **오케스트레이터마다 자기 작업만** — 여러 오케스트레이터가 Gateway를 함께 쓸 때(Claude Code 대화 두 개, Codex thread 두 개 등) 각 오케스트레이터는 자신이 연 세션과 그 작업·요청·결과, 그리고 오케스트레이터를 밝히지 않는 도구가 연 세션만 보고 다룰 수 있습니다. AgenLynk처럼 오케스트레이터를 밝히지 않는 앱과 관리 도구는 지금처럼 전체를 봅니다. 새 대화로 돌아온 오케스트레이터는 이전 오케스트레이터의 연결이 끊긴 뒤 `agent_acp_session_restore`(provider, acpSessionId, cwd)를 명시적으로 호출해 이전 세션을 되찾습니다. 이는 함께 일하는 에이전트끼리 서로의 작업을 건드리지 않게 하려는 것이며, Control token을 가진 프로세스를 막는 보안 경계는 아닙니다. 자세한 내용은 [Per-Main isolation](docs/management-api.md#per-main-isolation)(영어)을 참고하세요.
 - **복구가 거듭 실패한 세션 격리** — 복구가 연달아 실패하면(기본 3회) Gateway가 더 이상 알아서 복구하지 않고, 남은 선택지와 함께 `SESSION_QUARANTINED`를 돌려줍니다. 명시적 복구에 성공하면 격리가 풀립니다.
 
 ## ACP와 MCP란?
@@ -215,7 +220,8 @@ ACP 규격에서 로컬 agent는 일반적으로 JSON-RPC over stdio로 실행�
 
 - **Gateway 패키지(npm 설치)** — `npm install -g`는 npm 전역 prefix 아래에 패키지를 설치합니다. 파일은 `$(npm root -g)/acp-gateway-daemon`에, `acp-gateway-*` 명령은 `$(npm prefix -g)/bin`에 들어가며, 아래에서 등록하는 MCP 서버도 여기서 실행됩니다. 소스에서 설치하면 `npm link`가 같은 위치에 checkout을 연결합니다.
 - **ACP agent/adapter 설치** — PATH, 일반 CLI 경로, 전역 npm 패키지에서 설치된 AI를 찾아 ACP 공식 registry와 대조하고, registry가 지정한 `npx`·`uvx` 패키지를 전역으로 설치하거나 갱신합니다(`npm install --global` 또는 `uv tool install --force`). registry에 등록되지 않은 AI는 자동 등록하지 않습니다.
-- **MCP 등록** — 각 CLI의 `mcp add` 명령(Auggie는 `mcp add-json`)으로 MCP 서버 두 개를 등록합니다. 오케스트레이터 전용 Control MCP `agent-acp`는 프론트 도어로 고른 CLI 하나에만(`--front-door`, 비대화형 설치에서는 Codex), 읽기 전용 Guide MCP `agent-acp-guide`는 발견된 지원 CLI(Codex, Claude, Grok, Auggie)에 등록합니다. Control MCP를 등록할 때 Control token과 Main ID가 서버 실행 환경 변수(`ACP_GATEWAY_CONTROL_TOKEN`, `ACP_GATEWAY_ROOT_ID`)로 함께 전달되므로, Control MCP는 신뢰하는 로컬 agent에만 설치하세요. installer가 만들지 않은 같은 이름의 항목이 이미 있으면 `--force` 없이는 덮어쓰지 않고 오류로 중단합니다.
+- **MCP 등록** — 각 CLI의 `mcp add` 명령(Auggie는 `mcp add-json`)으로 MCP 서버 두 개를 등록합니다. 오케스트레이터 전용 Control MCP `agent-acp`는 프론트 도어로 고른 CLI 하나에만(`--front-door`, 비대화형 설치에서는 Codex), 읽기 전용 Guide MCP `agent-acp-guide`는 발견된 지원 CLI(Codex, Claude, Grok, Auggie)에 등록합니다. Control MCP는 Control token과 Main ID 없이 등록하며, 서버가 시작할 때 `install.json`에서 읽습니다(항목의 환경 변수에 `ACP_GATEWAY_CONTROL_TOKEN`, `ACP_GATEWAY_ROOT_ID`가 있으면 여전히 그 값이 우선합니다). 그래서 agent CLI의 설정에도, 항목을 등록하는 명령줄에도 token이 남지 않습니다. `install.json`이 기본 경로에 있지 않을 때만 그 위치를 `ACP_GATEWAY_INSTALL_STATE`로 항목에 넣습니다. Control MCP는 Gateway 전체를 제어할 수 있으므로 신뢰하는 로컬 agent에만 설치하세요. installer가 만들지 않은 같은 이름의 항목이 이미 있으면 `--force` 없이는 덮어쓰지 않고 오류로 중단합니다.
+- **이전 설치에서 남은 token 정리** — 1.8.0 이전 installer는 Control MCP 항목의 환경 변수에 token과 Main ID를 넣었습니다. installer가 자신이 등록했다고 입증할 수 있는 항목([운영 가이드](docs/operations.ko.md#control-식별-정보와-token-교체)의 소유 확인 참고)은 이 값 없이 다시 등록하며, 더 오래된 Gateway를 실행하던 항목은 이때 이 설치본을 가리키도록 함께 옮깁니다. 그 밖에 아직 token을 가진 항목(1.7.2 이전에 등록한 항목, 그 뒤 환경 변수가 바뀐 항목, 다른 Gateway 설치본을 실행하는 항목)은 경고와 함께 그대로 두고, 그 설정 파일을 본인만 읽을 수 있게 바꿉니다(Grok CLI는 자기 설정을 0644로 씁니다). `--force`를 주면 token 없이 다시 등록합니다. agent CLI가 만들어 둔 설정 백업(`*.bak`)에는 이전 token이 남아 있을 수 있으므로, 항목을 옮긴 뒤 installer는 token을 폐기하라고 권합니다. 한가할 때 Gateway를 멈추고(`acp-gateway-admin shutdown_if_idle`), `acp-gateway-bootstrap --rotate-token`을 실행한 다음, 호스트 세션과 AgenLynk처럼 식별 정보를 보관하는 앱을 다시 연결하세요. 모두 시작할 때 한 번만 식별 정보를 읽습니다. installer가 알아서 token을 교체하지는 않습니다. `--rotate-token`은 `install.json`의 식별 정보만 바꾸며, token이 없는 항목은 다음에 시작할 때 새 값을 읽습니다. 항목 하나라도 갱신하지 못한 교체는 확정하지 않고 `install.json`에 이전 식별 정보를 그대로 둡니다. installer가 다시 쓴 항목은 쓰는 즉시 `install.json`에 기록합니다.
 - **`agent-delegator` skill 설치** — Gateway에 포함된 skill을 발견된 AI 각각의 skills 디렉터리에 복사합니다.
 
   | AI | 설치 경로 | 경로를 바꾸는 환경 변수 |
@@ -228,7 +234,7 @@ ACP 규격에서 로컬 agent는 일반적으로 JSON-RPC over stdio로 실행�
 
   같은 경로를 쓰는 provider가 여러 개면 skill 파일은 한 번만 복사합니다. skill은 최초 `--install-all`에서만 설치하며 `--update`는 건드리지 않습니다. installer가 관리하지 않는 같은 이름의 skill이 이미 있으면 `--force` 없이는 덮어쓰지 않고 오류로 중단합니다.
 - **상태 파일 `~/.acp-gateway/`** — 다음 파일을 만듭니다.
-  - `install.json`(권한 `0600`): Control token, Main ID, installer가 등록한 MCP·skill 기록, ACP agent 자동 업데이트·알림 설정
+  - `install.json`(권한 `0600`): Control token과 Main ID(installer가 보관하는 유일한 사본으로, Control MCP가 시작할 때 읽음), installer가 등록한 MCP·skill 기록, ACP agent 자동 업데이트·알림 설정
   - `registry.json`: ACP 공식 registry의 24시간 cache
   - `providers.json`: 발견된 provider의 실행 정의
 

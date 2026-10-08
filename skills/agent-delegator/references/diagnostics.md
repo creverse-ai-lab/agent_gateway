@@ -32,5 +32,6 @@ An unknown profile name is rejected with `INVALID_ARGUMENT`, so a typo cannot be
 - On an active-session error, poll until idle or cancel before changing config or starting another prompt.
 - On a model mismatch, distinguish provider default, session-scoped config, prompt-level selection, and process-scoped startup. Stop rather than falling back silently.
 - On a provider exit, inspect the existing session plus `pending` and `interrupted` inbox history before restoring or re-prompting. Do not open a duplicate immediately.
+- A Gateway terminal on macOS that exits with status 71 and prints `sandbox-exec: execvp() of '<command>' failed` ran a command that does not exist, or a setuid program such as `ps` or `top`, which the terminal sandbox cannot start. It is neither a Worker nor a Gateway fault; have the Worker do without that command.
 - On missing evidence, distinguish event-ring truncation (`cursorTruncated`), result-retention cleanup, Task TTL expiry, artifact rejection, and provider disconnection before retrying work.
 - `setup {mode: "summary"}` is the cheap health read: versions, response profiles, persistence health, alerts, providers, and live session count. Use full `setup` when you need `detected` install paths, `resourceLimits`, `lifecycle`, or `metrics`.
