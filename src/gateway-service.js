@@ -233,8 +233,14 @@ export class GatewayService {
     // What session check reads for "is the provider installed". Injectable so a
     // test does not depend on what this machine happens to have on PATH.
     providerDetector = detectProviders,
+    // (owner) => whether a live control connection speaks for that Main. The
+    // daemon passes its CallerPresence (access.js). Null, as in an embedded
+    // service, means nothing can tell a Main is gone, so every owner counts as
+    // live and no session_restore adopts another Main's session.
+    isOwnerLive = null,
     now = () => Date.now()
   } = {}) {
+    this.isOwnerLive = typeof isOwnerLive === "function" ? isOwnerLive : null;
     this.workspaceRoot = workspaceRoot;
     this.maxSnapshotTotalBytes = maxSnapshotTotalBytes;
     // What owner.json says in the copies this state makes: the canonical state
@@ -450,11 +456,18 @@ export class GatewayService {
     this.taskStore.recover(loaded.tasks, {
       next: (record, interruption) => this.#interruptionNext(record.sessionId, interruption)
     });
+    // An adoption (#adopt) is snapshot-only, but a restore outcome journals the
+    // whole session checkpoint, its owner included, so a session can come back
+    // newer than its tasks' bindings. While the session is here it decides.
+    for (const session of this.store.list()) {
+      if (session.adoptedFrom && session.openedBy) this.taskStore.bindOwner(session.id, session.openedBy);
+    }
     this.stateStore.retainResultRefs(new Set(this.taskStore.records.keys()));
     for (const record of loaded.inbox) {
-      // A row written before 1.8.0 learns its owner from its session while that
-      // is still here, so it stays that Main's once the session closes.
-      const owned = record.sessionOpenedBy ? record : { ...record, ...inboxOwnerCopy(this.store.get(record.sessionId)) };
+      // A row copies its session's owner while that is still here, so it stays
+      // that Main's once the session closes: a row written before 1.8.0 learns
+      // it, and one older than its session's adoption catches up.
+      const owned = { ...record, ...inboxOwnerCopy(this.store.get(record.sessionId)) };
       const item = compactRecoveredInbox(owned, this.resourceLimits.maxInboxItemBytes);
       // An ACP permission request is tied to the old worker process. It cannot
       // be answered after a daemon restart, but must remain visible to Main.
@@ -1181,21 +1194,77 @@ export class GatewayService {
     // A provider session this Main already holds is restored in place, never
     // registered twice. That is also how Main lifts a quarantine: its decision,
     // made explicitly, on the same record.
-    const known = this.#ownedRecordFor(provider, args.acpSessionId, context);
+    const known = await this.#ownedRecordFor(provider, args, context);
     if (known) return this.#restoreKnown(known, args, context);
     return this.withSessionAdmission(provider, context, () => this.restoreSession(args, context));
   }
 
   // The caller's own open record of this provider session, if any. Records of
   // another root, and closed ones, keep the registration path's answer. One of
-  // another Main on this root is refused as its other calls are: restoring it
-  // in place would take that Main's session over.
-  #ownedRecordFor(provider, acpSessionId, context) {
+  // another Main on this root is refused as its other calls are, since
+  // restoring it in place takes that Main's session over, unless the adopt
+  // rule hands it to this Main.
+  async #ownedRecordFor(provider, args, context) {
+    const { acpSessionId } = args;
     if (typeof acpSessionId !== "string" || !acpSessionId) return null;
     const root = requireRoot(context);
     const record = this.store.list().find((item) => item.provider === provider && item.acpSessionId === acpSessionId
       && item.ownerRootId === root && !CLOSED_STATUSES.has(item.status));
-    return record ? requireOwnedSession(record, context) : null;
+    if (!record) return null;
+    return isVisibleTo(record.openedBy, requesterOf(context)) ? record : this.#adoptIfOwnerGone(record, args, context);
+  }
+
+  // The adopt rule (1.8.0). A Main that comes back under another identity (a
+  // new CLI session, or a restarted front door that sends no session id) is
+  // another Main, so without this its earlier sessions would be out of its
+  // reach for good. This is the only place a session changes hands: an
+  // explicit restore naming the record exactly (provider, acpSessionId and its
+  // cwd), once no control connection or subscription speaks for the Main that
+  // holds it. Anything short of that is refused as before, with nothing more
+  // said. A session no Main is recorded for never gets here: it stays shared.
+  async #adoptIfOwnerGone(record, args, context) {
+    const named = await namesSessionCwd(args.cwd, record);
+    // After the await: the record may have closed or changed hands meanwhile,
+    // possibly to this very Main through a concurrent call of its own.
+    if (!named || !this.store.get(record.id) || CLOSED_STATUSES.has(record.status)) throw notSessionOwner();
+    if (isVisibleTo(record.openedBy, requesterOf(context))) return record;
+    if (this.#ownerIsLive(record.openedBy)) throw notSessionOwner();
+    // The caller is entitled to it now, so a mistake may be named, and it moves
+    // nothing: #restoreKnown would refuse it right after the adoption.
+    requireRestoreOptions(args);
+    this.#adopt(record, context);
+    return record;
+  }
+
+  // Whether the Main that holds a session may still be there: a live
+  // subscription of its own, or a live control connection the daemon knows of
+  // (isOwnerLive). Root presence does not count, since every Main shares the
+  // root. Without the daemon's word (an embedded service), every owner is.
+  #ownerIsLive(owner) {
+    if (!this.isOwnerLive) return true;
+    for (const subscription of this.subscriptions.values()) {
+      if (isSameCaller(owner, subscription.requester)) return true;
+    }
+    return this.isOwnerLive(owner) !== false;
+  }
+
+  // Hands a session to the requesting Main: the record (adoptedFrom keeps who
+  // held it), its inbox rows, and every task of it, also after the session is
+  // gone (boundOwner, #taskOwner). Persisted by the snapshot only: a log record
+  // type of its own would make a 1.7 Gateway refuse the log on a downgrade. A
+  // crash within the snapshot interval can lose it, and the Main's same
+  // explicit restore then takes the session again.
+  #adopt(session, context) {
+    const adopter = this.#attributed(context);
+    session.adoptedFrom = session.openedBy;
+    session.openedBy = adopter;
+    session.updatedAt = new Date(this.now()).toISOString();
+    for (const item of this.inbox.values()) {
+      if (item.sessionId === session.id) Object.assign(item, inboxOwnerCopy(session));
+    }
+    this.taskStore.bindOwner(session.id, adopter);
+    this.touchSessionOwner(session);
+    this.schedulePersist();
   }
 
   // Explicit agent_acp_session_restore of a record Main already has. The same
@@ -1211,10 +1280,8 @@ export class GatewayService {
     // Argument mistakes are refused here, before the attempt, so they never
     // count as the worker failing to come back. A snapshot session may be named
     // by its copy (its cwd) or by the directory it was copied from.
-    requireString(args.cwd, "cwd");
-    optionalString(args.model, "model");
-    if (args.permissionPolicy != null) requirePermissionPolicy(args.permissionPolicy);
-    if (!(await samePath(args.cwd, session.cwd)) && !(await samePath(args.cwd, session.workspace?.source))) {
+    requireRestoreOptions(args);
+    if (!(await namesSessionCwd(args.cwd, session))) {
       throw new GatewayError(
         ERROR_CODES.INVALID_ARGUMENT,
         `Session ${session.id} restores in its own cwd: ${session.cwd}`,
@@ -1448,8 +1515,8 @@ export class GatewayService {
       lastRestore: fields.restoredWith ? restoreRecord(this.now(), fields.restoredWith) : null,
       restoreCapabilities: restoreCapabilitiesOf(fields.client.initResult),
       ...(fields.workspace ? { workspace: fields.workspace } : {}),
-      // Set once, like ownerRootId: the Main that opened (or first restored)
-      // the session. A later restore by another Main does not rewrite history.
+      // The Main that opened (or first restored) the session. Only the adopt
+      // rule moves it (#adopt), keeping the previous one as adoptedFrom.
       ...(fields.openedBy ? { openedBy: fields.openedBy } : {})
     });
     fields.client.onSessionUpdate(fields.acpSessionId, (update) => this.handleUpdate(session, update));
@@ -2128,7 +2195,7 @@ export class GatewayService {
           // that was minted instead of failing work that has already started.
           const echo = started.promptedBy ? { promptedBy: started.promptedBy } : {};
           if (!this.taskStore.find(task.taskId)) {
-            return { ...this.publicTask({ ...task, turnId: started.turnId }), ...echo };
+            return { ...this.publicTask({ ...task, turnId: started.turnId }, requesterOf(context)), ...echo };
           }
           this.taskStore.attachTurn(task.taskId, started.turnId);
           const running = this.taskStore.transition(task.taskId, "working", "Prompt running");
@@ -2136,7 +2203,7 @@ export class GatewayService {
           // but no caller is holding a response for it.
           this.#appendTaskStatus(running);
           this.#publishTaskStatus(running);
-          return { ...this.publicTask(running), ...echo };
+          return { ...this.publicTask(running, requesterOf(context)), ...echo };
         });
       } catch (error) {
         if (session.activeTaskId === task.taskId) {
@@ -2172,7 +2239,7 @@ export class GatewayService {
   }
 
   async taskGet(args, context) {
-    return this.publicTask(this.#requireTask(args.taskId, context));
+    return this.publicTask(this.#requireTask(args.taskId, context), requesterOf(context));
   }
 
   // A task by id, when the request may see it: its root's, and for a front-door
@@ -2186,10 +2253,18 @@ export class GatewayService {
   }
 
   // Whose a task is: its session's while that record exists, then the Main
-  // recorded as its creator, since a handle outlives its session.
+  // that adopted the session (boundOwner), else the one recorded as its
+  // creator, since a handle outlives its session.
   #taskOwner(task) {
     const session = this.store.get(task.sessionId);
-    return session ? session.openedBy : task.caller;
+    return session ? session.openedBy : task.boundOwner ?? task.caller;
+  }
+
+  // Whom a task's result is for (delivery, attention updates, ack): the Main
+  // that created it, or the one that took its session over since. The Main it
+  // was adopted from is gone, so nobody else would ever receive it.
+  #resultOwner(task) {
+    return task.boundOwner ?? task.caller;
   }
 
   // An inbox row is its session's too. A row kept after its session closed
@@ -2217,7 +2292,7 @@ export class GatewayService {
         status: args.status,
         where
       }));
-      return { tasks: page.tasks.map((task) => this.publicTask(task)), nextCursor: page.nextCursor };
+      return { tasks: page.tasks.map((task) => this.publicTask(task, requester)), nextCursor: page.nextCursor };
     }
     // No arguments keeps the 1.3.2 public contract exactly: the full array for
     // this root, and no nextCursor key at all.
@@ -2227,7 +2302,7 @@ export class GatewayService {
     let cursor = null;
     do {
       const page = this.#storeCall(() => this.taskStore.listPage({ ownerRootId, cursor, limit: 200, where }));
-      for (const task of page.tasks) tasks.push(this.publicTask(task));
+      for (const task of page.tasks) tasks.push(this.publicTask(task, requester));
       cursor = page.nextCursor;
     } while (cursor);
     return { tasks };
@@ -2319,14 +2394,15 @@ export class GatewayService {
     return delivered;
   }
 
-  // A terminal result reaching the Main that started the task marks it seen.
-  // Anyone else who may read it (management, an observer, or another Main when
-  // the task's session is nobody's) leaves it unread for its creator.
+  // A terminal result reaching the Main that started the task (or took its
+  // session over since) marks it seen. Anyone else who may read it
+  // (management, an observer, or another Main when the task's session is
+  // nobody's) leaves it unread for that Main.
   #markDelivered(taskId, context) {
     if (context?.access === "observer") return;
     const task = this.taskStore.find(taskId);
     if (!task || task.seenAt || !TERMINAL_TASK_STATUSES.has(task.status)) return;
-    if (!isTaskCreator(task.caller, requesterOf(context))) return;
+    if (!isTaskCreator(this.#resultOwner(task), requesterOf(context))) return;
     this.#recordSeen(taskId);
   }
 
@@ -2371,7 +2447,7 @@ export class GatewayService {
     if (session?.activeTaskId === task.taskId) {
       session.activeTaskId = null;
     }
-    return this.publicTask(cancelled);
+    return this.publicTask(cancelled, requesterOf(context));
   }
 
   // TaskStore is dependency-free and raises plain Errors tagged with a code.
@@ -2509,7 +2585,7 @@ export class GatewayService {
       const reason = !task ? "unknown_task"
         : task.ownerRootId !== rootId || !isVisibleTo(this.#taskOwner(task), requester) ? "not_task_owner"
           : !TERMINAL_TASK_STATUSES.has(task.status) ? "not_terminal"
-            : !isTaskCreator(task.caller, requester) ? "not_creator"
+            : !isTaskCreator(this.#resultOwner(task), requester) ? "not_creator"
               : null;
       if (reason) {
         skipped.push({ taskId, reason });
@@ -2536,7 +2612,8 @@ export class GatewayService {
     return [...this.taskStore.records.values()]
       .filter((task) => (rootId == null || task.ownerRootId === rootId)
         && TERMINAL_TASK_STATUSES.has(task.status) && !task.seenAt
-        && (requester == null || (isTaskCreator(task.caller, requester) && isVisibleTo(this.#taskOwner(task), requester))))
+        && (requester == null
+          || (isTaskCreator(this.#resultOwner(task), requester) && isVisibleTo(this.#taskOwner(task), requester))))
       .sort((left, right) => compareAttentionKeys(updateKey(left), updateKey(right)));
   }
 
@@ -3302,7 +3379,11 @@ export class GatewayService {
     return this.taskStore.records;
   }
 
-  publicTask(task) {
+  // requester (requesterOf) decides which declared links it reads: a task a
+  // front-door Main can see (one on a session nobody is recorded for) may link
+  // a task it cannot, and that id is not its to learn.
+  publicTask(task, requester = null) {
+    const links = this.#readableLinks(task, requester);
     return {
       taskId: task.taskId,
       sessionId: task.sessionId,
@@ -3322,8 +3403,30 @@ export class GatewayService {
       // Additive (1.7.0): the Main that created the task, only when it said so.
       ...(task.caller ? { caller: { ...task.caller } } : {}),
       // Additive (1.7.0): links the creating Main declared, only when it did.
-      ...(task.parentTaskId ? { parentTaskId: task.parentTaskId } : {}),
-      ...(task.inputTaskIds?.length ? { inputTaskIds: [...task.inputTaskIds] } : {})
+      ...(links.parentTaskId ? { parentTaskId: links.parentTaskId } : {}),
+      ...(links.inputTaskIds.length ? { inputTaskIds: links.inputTaskIds } : {})
+    };
+  }
+
+  // The declared links a requester may read. Management and observers read
+  // them all; a front-door Main each one naming a task it can see. A link to a
+  // task that is gone says nothing about whose it was, so it stays readable
+  // only to the Main that declared it, which could see that task then.
+  #readableLinks(task, requester) {
+    const inputTaskIds = [...(task.inputTaskIds ?? [])];
+    if (requester == null) return { parentTaskId: task.parentTaskId ?? null, inputTaskIds };
+    const declaredByRequester = isSameCaller(task.caller, requester);
+    const readable = (taskId) => {
+      // The live record, not find(): no sweep and no copy per link of every
+      // listed task. Whatever read this task just swept the store.
+      const linked = this.taskStore.records.get(taskId);
+      return linked
+        ? linked.ownerRootId === task.ownerRootId && isVisibleTo(this.#taskOwner(linked), requester)
+        : declaredByRequester;
+    };
+    return {
+      parentTaskId: task.parentTaskId && readable(task.parentTaskId) ? task.parentTaskId : null,
+      inputTaskIds: inputTaskIds.filter(readable)
     };
   }
 
@@ -4470,9 +4573,15 @@ function sessionModelId(configOptions) {
 // Main's answers exactly as another root's does.
 function requireOwnedSession(session, context) {
   if (session.ownerRootId !== requireRoot(context) || !isVisibleTo(session.openedBy, requesterOf(context))) {
-    throw new GatewayError(ERROR_CODES.NOT_SESSION_OWNER, "Session belongs to another Main");
+    throw notSessionOwner();
   }
   return session;
+}
+
+// The whole answer about another root's or another Main's session, wherever it
+// is refused: no id, no owner, no reason a request could probe for.
+function notSessionOwner() {
+  return new GatewayError(ERROR_CODES.NOT_SESSION_OWNER, "Session belongs to another Main");
 }
 
 function requireRoot(context) {
@@ -4616,6 +4725,20 @@ async function samePath(a, b) {
   if (resolve(a) === resolve(b)) return true;
   const [left, right] = await Promise.all([realpath(a).catch(() => null), realpath(b).catch(() => null)]);
   return left != null && left === right;
+}
+
+// Whether a restore's cwd names this record: its own cwd, or for a snapshot
+// session the directory it was copied from.
+async function namesSessionCwd(cwd, session) {
+  return await samePath(cwd, session.cwd) || await samePath(cwd, session.workspace?.source);
+}
+
+// What an explicit restore of a known record may get wrong without the worker
+// being asked anything: checked before the attempt, and before an adoption.
+function requireRestoreOptions(args) {
+  requireString(args.cwd, "cwd");
+  optionalString(args.model, "model");
+  if (args.permissionPolicy != null) requirePermissionPolicy(args.permissionPolicy);
 }
 
 async function directoryExists(path) {

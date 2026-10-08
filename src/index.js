@@ -317,7 +317,7 @@ function controlTools() {
     },
     {
       name: "agent_acp_session_restore",
-      description: "Restore a worker session through ACP session/resume or session/load. Naming a session this Main already holds (same provider and acpSessionId, its cwd) restores that record in place; that is how a session refused with SESSION_QUARANTINED is retried.",
+      description: "Restore a worker session through ACP session/resume or session/load. Naming a session this Main already holds (same provider and acpSessionId, its cwd) restores that record in place; that is how a session refused with SESSION_QUARANTINED is retried. After you come back as a new Main (a new conversation, or a front door that sends no session id), the same call takes back a session your earlier Main opened, with its tasks and requests, once that Main is no longer connected; otherwise NOT_SESSION_OWNER.",
       inputSchema: {
         type: "object",
         properties: {
@@ -465,13 +465,13 @@ function controlTools() {
     },
     {
       name: "agent_acp_inbox",
-      description: "List or inspect durable worker permission requests and questions owned by this Main. attention (read-only) returns what needs you, oldest first: needsMain (pending requests in summary form, with ageMs and stale) and updates (finished tasks you started whose result has not reached you), with counts and nextCursor. A result you take with agent_acp_run, tasks/result or a terminal poll is marked seen; ack {taskIds} marks the rest.",
+      description: "List or inspect durable worker permission requests and questions owned by this Main. attention (read-only) returns what needs you, oldest first: needsMain (pending requests in summary form, with ageMs and stale) and updates (finished tasks you started, or took over with their session, whose result has not reached you), with counts and nextCursor. A result you take with agent_acp_run, tasks/result or a terminal poll is marked seen; ack {taskIds} marks the rest.",
       inputSchema: {
         type: "object",
         properties: {
           action: { type: "string", enum: ["list", "get", "attention", "ack"] },
           inboxId: { type: "string" },
-          taskIds: { type: "array", items: { type: "string", minLength: 1 }, minItems: 1, maxItems: 100, description: "ack only: the updates to mark seen. Only tasks you started (or that no Main is recorded for) are acked; the rest come back in skipped with a reason." },
+          taskIds: { type: "array", items: { type: "string", minLength: 1 }, minItems: 1, maxItems: 100, description: "ack only: the updates to mark seen. Only tasks you started or took over (or that no Main is recorded for) are acked; the rest come back in skipped with a reason." },
           status: { type: "string", enum: ["pending", "answered", "interrupted"] },
           sessionId: { type: "string", description: "List only rows belonging to one session." },
           type: { type: "string", enum: ["permission_request", "worker_question"], description: "List only one kind of request." },

@@ -497,6 +497,24 @@ export class TaskStore {
     return snapshot(record);
   }
 
+  // Ownership, not state (1.8.0): the Main every handle of a session answers to
+  // once that session is gone, after another Main adopted the session
+  // (gateway-service.js #adopt). Like turnId it moves no lastUpdatedAt, and it
+  // never touches the recorded creator (caller). Returns how many records changed.
+  bindOwner(sessionId, owner) {
+    requireNonEmptyString(sessionId, "sessionId");
+    const bound = sanitizeCaller(owner);
+    if (!bound) return 0;
+    let changed = 0;
+    for (const record of this.#tasks.values()) {
+      if (record.sessionId !== sessionId || JSON.stringify(record.boundOwner) === JSON.stringify(bound)) continue;
+      record.boundOwner = bound;
+      changed += 1;
+      this.#emit("updated", record);
+    }
+    return changed;
+  }
+
   // Delivery bookkeeping, not state: when the terminal outcome reached the Main
   // that asked for it. Set once, only on a terminal record whose outcome may be
   // handed out, and like turnId it carries no lastUpdatedAt bump, so a delivered
@@ -771,6 +789,7 @@ export class TaskStore {
     if (typeof createdAt !== "string" || !Number.isFinite(Date.parse(createdAt))) return null;
     const interruption = sanitizeInterruption(raw.interruption);
     const caller = sanitizeCaller(raw.caller);
+    const boundOwner = sanitizeCaller(raw.boundOwner);
     const links = sanitizeLinks(raw);
     return {
       taskId,
@@ -806,6 +825,8 @@ export class TaskStore {
       }),
       ...(interruption ? { interruption } : {}),
       ...(caller ? { caller } : {}),
+      // Internal (bindOwner), never on the wire: publicTask is an allowlist.
+      ...(boundOwner ? { boundOwner } : {}),
       ...links,
       // Kept only when it is exactly the marker: anything else (absent on a
       // 1.6.0 record, or unreadable) must not let a missing stamp read as not_started.

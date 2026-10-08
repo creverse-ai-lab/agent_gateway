@@ -18,12 +18,13 @@ If the work is expensive to duplicate and you have no handle yet, pass `idempote
 | `TASK_NOT_COMPLETE` | a result was read before the task ended | wait for terminal, honouring `pollInterval` |
 | `status: "error"` / `unavailable` | the turn or the provider failed | read `error`, collect what exists, then restore or re-run |
 | `SESSION_QUARANTINED` | the session failed to restore `failures` times in a row; the Gateway stopped retrying it | pick from `details.next`: `check` it, retry once with `agent_acp_session_restore` (same provider, acpSessionId, cwd), or open a new session |
+| `NOT_SESSION_OWNER` | the session belongs to another Main, possibly your own from before a restart | if it was yours, take it back as in "After you come back as a new Main" below; otherwise leave it |
 | `disconnected` | the worker process is gone | collect retained results and inbox history, then reuse the session — prompt and config reconnect automatically for a resumable provider |
 
 ## Restore and inspect
 
 - Reuse a relevant `sessionId` for follow-up work. Prompt and config attempt reconnect automatically for a resumable disconnected provider; a failed automatic restore leaves the session `unavailable`.
-- Use `agent_acp_session_restore` only to register or explicitly restore a known raw provider `acpSessionId`, preferring `method: "auto"`. Inspect existing Gateway sessions first; naming one you already hold restores that record in place instead of registering it twice.
+- Use `agent_acp_session_restore` only to register or explicitly restore a known raw provider `acpSessionId`, preferring `method: "auto"`. Inspect existing Gateway sessions first; naming one you already hold restores that record in place instead of registering it twice. The same call takes back a session your earlier Main held (see below).
 - `agent_acp_session {action: "list"| "get"}` before opening duplicates. Ask for `includeTranscript` or `includeEvents` only when needed; raw event `data` is omitted, and surviving `dataArtifact` pointers hold the complete payloads.
 - Pin only while retention must be suspended, then unpin.
 - Close a specific disposable non-active session after recovering evidence. Closing an active session also cancels it, so normally cancel and poll first.
@@ -34,6 +35,18 @@ If the work is expensive to duplicate and you have no handle yet, pass `idempote
 - In-flight tasks come back `failed` with a restart message; unresolved inbox items come back `interrupted`. Both are readable — they are the audit trail, not something to answer.
 - Terminal task handles and their results survive until their own TTL, so a completed run is still collectable across a restart.
 - Sessions come back `disconnected`. Restore or re-run; do not assume the Worker kept any context the ACP provider did not persist.
+
+## After you come back as a new Main
+
+Each Main reaches only the sessions it opened, and a Main is its CLI session (for Codex, its thread). A new conversation is a new Main, and so is a restarted front door that sends no session id (Auggie, Claude Code without `CLAUDE_CODE_SESSION_ID`, Codex calls without thread metadata). Your earlier sessions are then missing from `agent_acp_session {action: "list"}`, and naming one answers `NOT_SESSION_OWNER`. Do not open duplicates; take them back:
+
+1. Get each session's `provider`, `acpSessionId` and `cwd`. Every `agent_acp_session_open` and `agent_acp_session_restore` answer in the earlier conversation carries them. Otherwise ask the user to read them from a management view that lists every session on the Gateway, such as AgenLynk (`acp-gateway-admin` has no session listing).
+2. Call `agent_acp_session_restore` with exactly those three. Nothing else hands a session over: not list, get, poll, or a subscription.
+3. It works once the earlier Main is gone, that is when its front door is no longer connected. While it is, the answer stays `NOT_SESSION_OWNER`: finish the work there or end that conversation, and do not retry in a loop.
+4. Read the answer. A restored session now carries `openedBy` (you) and `adoptedFrom` (the earlier Main). `INVALID_ARGUMENT` "already registered" with `details.sessionId` means its Worker was still connected: the session is yours now, under that id. `SESSION_ACTIVE` means a turn is still running: poll it.
+5. Its tasks and requests came with it. Call `agent_acp_inbox {action: "attention"}`: it lists the requests waiting on you and the finished runs whose result never reached you; collect each with `agent_acp_run {taskId}`.
+
+Repeating the restore is harmless. If the Gateway crashed right after it, the session can be back with the earlier Main; the same restore takes it again.
 
 ## After a Gateway update
 

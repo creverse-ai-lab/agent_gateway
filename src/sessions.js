@@ -543,6 +543,9 @@ export class SessionStore {
       ...(session.workspace ? { workspace: session.workspace } : {}),
       // Additive: who opened the session and who started its latest turn.
       ...(session.openedBy ? { openedBy: session.openedBy } : {}),
+      // Additive (1.8.0): the Main the session was adopted from, when another
+      // Main took it over by an explicit restore; openedBy is the adopter then.
+      ...(session.adoptedFrom ? { adoptedFrom: session.adoptedFrom } : {}),
       ...(session.promptedBy ? { promptedBy: session.promptedBy } : {})
     }));
   }
@@ -678,7 +681,7 @@ function timeOrNone(value) {
 // default and compact polls never do (Quiet).
 export const POLL_OMITTED_SESSION_KEYS = Object.freeze([
   "statusReason", "statusChangedAt", "lastWorkerActivityAt", "stallSuspected", "generation", "lastRestore",
-  "restoreFailures", "quarantined", "attribution"
+  "restoreFailures", "quarantined", "attribution", "adoptedFrom"
 ]);
 
 export function publicSession(session, { now = Date.now(), stallHintMs = DEFAULT_STALL_HINT_MS } = {}) {
@@ -721,6 +724,9 @@ export function publicSession(session, { now = Date.now(), stallHintMs = DEFAULT
     // Only present when a caller identified itself (1.6.0+ control servers),
     // so the default shape is unchanged.
     ...(session.openedBy ? { openedBy: session.openedBy } : {}),
+    // Additive (1.8.0), only on a session another Main took over by an
+    // explicit restore: who held it before. Poll strips it (Quiet).
+    ...(session.adoptedFrom ? { adoptedFrom: session.adoptedFrom } : {}),
     ...(session.promptedBy ? { promptedBy: session.promptedBy } : {}),
     // The absence said out loud: opened by a front door that sent no caller
     // (pre-1.6, or restored from state written before 1.6), so no Main can

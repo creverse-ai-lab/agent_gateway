@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { authorizeCall, requireAccess } from "./access.js";
+import { authorizeCall, CallerPresence, requireAccess } from "./access.js";
 import { normalizeCaller } from "./caller.js";
 import { GatewaySettings } from "./settings.js";
 import { timingSafeEqual } from "node:crypto";
@@ -40,13 +40,18 @@ const statePath = gatewayStatePath();
 const settings = new GatewaySettings();
 const gatewayConfig = gatewayLifecycleConfig(settings.activeValues);
 const agentUpdateManager = new AgentUpdateManager({ ...gatewayAgentUpdateConfig(settings.activeValues), sourceChecker: checkGatewaySource });
+// Which Mains are connected now: a control connection speaks for every caller
+// it named until it closes. Only an explicit session_restore asks, before it
+// adopts another Main's session (GatewayService isOwnerLive).
+const callers = new CallerPresence();
 const service = new GatewayService({
   statePath,
   settings,
   agentUpdateManager,
   ...gatewayConfig,
   ...gatewayObservabilityConfig(settings.activeValues),
-  persistence: gatewayPersistenceConfig(settings.activeValues)
+  persistence: gatewayPersistenceConfig(settings.activeValues),
+  isOwnerLive: (owner) => callers.isLive(owner)
 });
 const clients = new Set();
 let shutdownPromise = null;
@@ -154,6 +159,10 @@ const server = createServer((socket) => {
               boundAccess = access;
               if (access === "control") service.attachRoot(boundRootId);
             }
+            // Beside root presence, per Main: the caller of every control
+            // request, its subscribe included, is live until this connection
+            // closes. An observer's claim is recorded nowhere, here neither.
+            if (access === "control" && caller) callers.bind(socket, caller);
           }
           if (request.method === "request_cancel") {
             const requestId = request.args?.requestId;
@@ -237,6 +246,7 @@ const server = createServer((socket) => {
     requestAborts.clear();
     sender.destroy();
     service.removeSubscriptions(subscriptions.keys());
+    callers.release(socket);
     if (boundRootId && boundAccess === "control") service.detachRoot(boundRootId);
   });
 });

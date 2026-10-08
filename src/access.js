@@ -1,6 +1,13 @@
-import { isTaskCreator } from "./attention.js";
+import { isSameCaller, isTaskCreator } from "./attention.js";
 import { normalizeCaller } from "./caller.js";
 import { ERROR_CODES, GatewayError } from "./errors.js";
+
+// How many distinct callers one control connection is tracked for. A Codex
+// front door names a caller per thread, so one connection can speak for many
+// Mains. Past this many it counts as speaking for anyone, which can only ever
+// refuse an adoption (CallerPresence), never allow one.
+const MAX_CALLERS_PER_CONNECTION = 1_024;
+const ANYONE = Symbol("anyone");
 
 export function requireAccess(access = "control") {
   if (!["control", "observer"].includes(access)) throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "access must be control or observer");
@@ -45,4 +52,49 @@ export function requesterOf(context) {
  */
 export function isVisibleTo(owner, requester) {
   return requester == null || isTaskCreator(owner, requester);
+}
+
+/**
+ * The Mains connected right now, for the one place another Main's session can
+ * change hands: an explicit session_restore that adopts it once its Main is
+ * gone (GatewayService isOwnerLive). A control connection that named a caller
+ * speaks for that Main until the connection closes; a caller matches as scope
+ * "mine" matches (isSameCaller). The daemon keeps this beside root presence,
+ * which does not count: every Main on a machine shares one root.
+ */
+export class CallerPresence {
+  // connection -> Map(identity key -> {sessionId, instanceId}), or ANYONE
+  #connections = new Map();
+
+  /** Records that `connection` spoke for `caller`; a malformed caller records nothing. */
+  bind(connection, caller) {
+    const normalized = normalizeCaller(caller);
+    if (!normalized) return;
+    const callers = this.#connections.get(connection) ?? new Map();
+    if (callers === ANYONE) return;
+    this.#connections.set(connection, callers);
+    const key = `${normalized.sessionId ?? ""}\u0000${normalized.instanceId}`;
+    if (callers.has(key)) return;
+    if (callers.size >= MAX_CALLERS_PER_CONNECTION) {
+      this.#connections.set(connection, ANYONE);
+      return;
+    }
+    callers.set(key, { sessionId: normalized.sessionId, instanceId: normalized.instanceId });
+  }
+
+  /** The connection closed: whoever it spoke for is gone unless another one still speaks for them. */
+  release(connection) {
+    this.#connections.delete(connection);
+  }
+
+  /** Whether a live connection speaks for `owner` (a recorded openedBy). */
+  isLive(owner) {
+    for (const callers of this.#connections.values()) {
+      if (callers === ANYONE) return true;
+      for (const caller of callers.values()) {
+        if (isSameCaller(owner, caller)) return true;
+      }
+    }
+    return false;
+  }
 }

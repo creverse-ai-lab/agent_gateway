@@ -104,7 +104,7 @@ The engine never applies the patch. The copy is deleted on close and by session 
 
 Since 1.6.0 a control request may carry `caller: {provider, sessionId, pid, instanceId}`. The control MCP server fills it once at startup from the agent CLI that spawned it: `provider` from the parent process name (`claude`, `codex`, `grok`, else `null`), `sessionId` from that CLI's exported id (`CLAUDE_CODE_SESSION_ID`, `GROK_SESSION_ID`, `CODEX_THREAD_ID`; Codex exports none to MCP servers, so `null`), `pid` of the parent, and a random `instanceId` per server process. Every Main on a machine shares one `rootId`; `caller` is what tells them apart.
 
-- `openedBy` is the caller of the `session_open` or first `session_restore` that registered the session. It is set once and never rewritten.
+- `openedBy` is the caller of the `session_open` or first `session_restore` that registered the session. Since 1.8.0 only an adoption rewrites it (see Per-Main isolation), keeping the previous value as `adoptedFrom`.
 - `promptedBy` is the caller of the latest `prompt`, `run` or `task_prompt`. The same value is on that turn's `turn_start` event, so each turn names the Main its reply is for.
 - Both appear on session responses, `session list`, and survive restarts. They are absent when the caller sent nothing (pre-1.6.0 control servers), so the old shapes are unchanged.
 - Only `control` connections are recorded. An `observer`'s `caller` is not recorded; its `pid` still counts for the Worker check below. A malformed `caller` drops attribution, never the call.
@@ -114,19 +114,28 @@ Since 1.6.0 a control request may carry `caller: {provider, sessionId, pid, inst
 
 Since 1.8.0 the Gateway enforces what `caller` tells apart. A control request that carries a `caller` comes from a front-door Main and reaches only:
 - sessions whose `openedBy` is that caller, by the `scope:"mine"` rule below (session ids decide when both sides have one, else `instanceId`);
-- the tasks and inbox rows of those sessions. A task follows its session while the session record exists, then its own `caller`, because a handle outlives its session. An inbox row keeps its session's owner after the session is closed;
+- the tasks and inbox rows of those sessions. A task follows its session while the session record exists, then the Main that adopted the session (see below), else its own `caller`, because a handle outlives its session. An inbox row keeps its session's owner after the session is closed;
 - records no Main is recorded for: sessions opened before 1.6.0 or by a client that sends no `caller`, with their tasks and inbox rows. Every Main shares these, as before.
 
 Another Main's record answers as another root's does:
-- `NOT_SESSION_OWNER` for every call that names its session: `session` get, check, workspace_diff, close, pin, unpin and clean, `config`, `poll`, `prompt`, `run`, `task_prompt`, `task_run`, `permission`, `answer`, `cancel`, and a `session_restore` that would reuse its record;
+- `NOT_SESSION_OWNER` for every call that names its session: `session` get, check, workspace_diff, close, pin, unpin and clean, `config`, `poll`, `prompt`, `run`, `task_prompt`, `task_run`, `permission`, `answer`, `cancel`, and a `session_restore` that would reuse its record (unless the adopt rule below hands the record over);
 - `NOT_TASK_OWNER` for `task_get`, `task_result`, `task_cancel` and a `run` attach (`{taskId}`), and `NOT_INBOX_OWNER` for `inbox get`;
-- a link to its task is an unknown id (`INVALID_ARGUMENT`), and `ack` skips its task as `not_task_owner`.
+- a link to its task is an unknown id (`INVALID_ARGUMENT`), and `ack` skips its task as `not_task_owner`;
+- a task the caller can read (one on a shared session) never names it: its id is left out of that task's `parentTaskId` and `inputTaskIds`, and a key with nothing left is absent. A link to a task that no longer exists stays readable only to the Main that declared it.
 
 Lists leave such records out and keep their shapes (an argument-free `task_list` stays unpaged): `session list`, `task_list`, `inbox list` and `attention`, setup's `sessions_stall_suspected` and attention alerts, and `subscribe` without `sessionIds`, which also never streams a session another Main opens later. `subscribe` with `sessionIds` needs every id to be reachable. `session clean` closes only the caller's own sessions, never the shared ones.
 
 Requests without a `caller` keep root-wide access, unchanged. These are management requests (AgenLynk and other public-client consumers, `acp-gateway-admin`, installer health checks) and pre-1.6.0 front doors. Every observer keeps it too. `setup`, `gateway_config`, `provider`, `retention_preview`, `shutdown_if_idle` and `daemon_shutdown` stay root-level for everyone.
 
-A Main is its CLI session. A front door restarted in the same CLI session (a new `instanceId`, the same `sessionId`) keeps its sessions. Each Codex thread is a Main of its own; a Codex front door that sends no thread id is one Main per process. A Main that comes back under another identity is another Main, for example a new CLI session or a restarted front door that sends no session id. Its earlier sessions stay with the old identity until retention removes them, and only a client that sends no `caller` can still reach them.
+A Main is its CLI session. A front door restarted in the same CLI session (a new `instanceId`, the same `sessionId`) keeps its sessions. Each Codex thread is a Main of its own; a Codex front door that sends no thread id is one Main per process. A Main that comes back under another identity is another Main, for example a new CLI session, or a restarted front door that sends no session id (Auggie, Claude Code without `CLAUDE_CODE_SESSION_ID`, Codex calls without thread metadata). It takes its earlier sessions back by the adopt rule:
+- Only `session_restore` adopts, and only a call that names an open record of its root exactly: `provider`, `acpSessionId` and the record's `cwd` (for a snapshot session, its copy or the directory it was copied from). `session list` and `get`, `poll`, `subscribe` and every other call keep answering as above.
+- Only once the Main that holds the record is gone: no live control connection that sent its `caller` (a connection speaks for every `caller` it sent until it closes) and no live subscription of its. Root presence does not count, since every Main shares the root. While that Main is present, and for a `cwd` that does not match, the restore answers `NOT_SESSION_OWNER` and says nothing more. A daemon restart drops every connection, so a Main whose front door has not called (or resubscribed) since then counts as gone.
+- A record no Main is recorded for is never adopted: it stays shared, and restoring it changes nothing about who may reach it.
+- Adopting moves `openedBy` to the caller and keeps the previous one as `adoptedFrom`, which session responses carry wherever they carry `openedBy`, except polls. The record's tasks and inbox rows go with it, also once the session is closed, and its finished tasks become the caller's to receive: `attention` lists the unseen ones, collecting one marks it seen, and `ack` takes them. Each task keeps its `caller`.
+- The restore then goes on as the owner's own would: a worker that is still connected answers `INVALID_ARGUMENT` (already registered, with `details.sessionId`), a busy session `SESSION_ACTIVE`, and otherwise the worker is restored.
+- Repeating the restore changes nothing. An adoption is written with the next state snapshot (within about a second), not to the write-ahead log, so a Gateway crash in that window can hand the record back to its previous owner; the same restore takes it again.
+
+Management clients reach every record already and never adopt. An embedded `GatewayService` (no daemon) cannot tell whether a Main is gone, so it treats every owner as present and adopts nothing unless it is given `isOwnerLive`.
 
 Like observer access, this is not a credential boundary: a process that holds the token can send any `caller`, or none. It keeps Mains that share a machine from reading, answering for, steering or cleaning up each other's work.
 
@@ -145,7 +154,7 @@ Like observer access, this is not a credential boundary: a process that holds th
 ## Task links and scope
 
 - `run`, `task_prompt` and `task_run` accept `parentTaskId` (the task this one follows up) and `inputTaskIds` (1 to 16 unique ids of tasks whose results went into the prompt). Every id must name a task the caller can see: on its root and, since 1.8.0 for a front-door Main, its own or one no Main is recorded for (see Per-Main isolation). Otherwise `INVALID_ARGUMENT` with `details.unknownTaskIds`, and nothing starts. The Gateway records them as declared and never infers links. `prompt` creates no task, so it refuses them, as does a `run` attach (`{taskId}`).
-- Task reads carry `parentTaskId`/`inputTaskIds` only when declared. They survive restarts.
+- Task reads carry `parentTaskId`/`inputTaskIds` only when declared. They survive restarts. Since 1.8.0 a front-door Main's reads leave out a link to a task it cannot see (see Per-Main isolation).
 - `task_list` filters `parentTaskId`, `callerSessionId`, `callerInstanceId` combine with `status` and paging. Any of them selects the paged response.
 - `scope:"mine"` on `session list` and `task_list` keeps records whose `openedBy`/`caller` is the requester: session ids decide when both sides have one, else `instanceId`. Records with no caller are nobody's. A Codex front door that sends no thread id matches by `instanceId`, so its threads are one Main. A request without a caller (observer, pre-1.6.0 front door) gets `INVALID_ARGUMENT`. Without `scope`, a front-door Main's lists hold its own records plus those no Main is recorded for (since 1.8.0), and management and observer lists hold the whole root.
 
