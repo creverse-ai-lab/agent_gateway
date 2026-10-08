@@ -1,7 +1,8 @@
 // 1.7.0 W6: links a Main declares between its tasks, and scope "mine". A new
 // run or task_prompt may name parentTaskId (the task it follows up) and
 // inputTaskIds (tasks whose results went into its prompt); the Gateway checks
-// they are visible on the root, records them durably and never infers any.
+// the declaring Main can see them (since 1.8.0 that is its own tasks and those
+// on sessions nobody is recorded for), records them durably and never infers any.
 // task_list filters on links and callers, and session list / task_list take an
 // opt-in scope "mine". Several Mains share one root here, including an old
 // Codex front door that sends no thread id. Every case drives an in-process fake
@@ -171,8 +172,9 @@ test("run, task_prompt and task_run record declared links; a task without them k
     assert.equal(got.parentTaskId, first);
     assert.deepEqual(got.inputTaskIds, [second, first], "as declared, order kept");
     assert.deepEqual(Object.keys(got).sort(), [...TASK_KEYS, "inputTaskIds", "parentTaskId"].sort());
-    // A task that declared links is still visible to other Mains on the root.
-    assert.equal((await service.call("task_get", { taskId: followUp }, B)).parentTaskId, first);
+    // Management reads the same links. Since 1.8.0 another Main reads nothing of A's.
+    assert.equal((await service.call("task_get", { taskId: followUp }, LEGACY)).parentTaskId, first);
+    await rejectsWith(service.call("task_get", { taskId: followUp }, B), "NOT_TASK_OWNER");
     clock.now += 1_000;
 
     // The Task-mode paths hand back the handle itself, links included.
@@ -364,35 +366,49 @@ test("task_list filters by parentTaskId, callerSessionId and callerInstanceId, c
     const a = await open(service, A);
     const b = await open(service, B);
     const c = await open(service, C);
+    // Since 1.8.0 a Main links only tasks it can see, so the task every Main
+    // follows up runs on a session nobody is recorded for (every Main's).
+    const shared = await open(service, LEGACY);
     const tick = () => { clock.now += 1_000; };
-    const a1 = await finished(service, a, A); tick();
+    const a1 = await finished(service, shared, A); tick();
     const a2 = await finished(service, a, A, { parentTaskId: a1 }); tick();
     const b1 = await finished(service, b, B, { parentTaskId: a1 }); tick();
     const c1 = await finished(service, c, C, { inputTaskIds: [a1] }); tick();
     const l1 = await finished(service, a, LEGACY, { parentTaskId: a1 }); tick();
 
-    // No arguments: the unpaged root-wide array, exactly as before.
-    const all = await service.call("task_list", {}, A);
+    // No arguments: the unpaged root-wide array, exactly as before, for
+    // management; a front-door Main gets its own and nobody's, in the same shape.
+    const all = await service.call("task_list", {}, LEGACY);
     assert.deepEqual(all.tasks.map((task) => task.taskId), [a1, a2, b1, c1, l1]);
     assert.equal(Object.hasOwn(all, "nextCursor"), false);
+    const own = await service.call("task_list", {}, A);
+    assert.deepEqual(own.tasks.map((task) => task.taskId), [a1, a2, l1]);
+    assert.equal(Object.hasOwn(own, "nextCursor"), false, "isolation is not a filter: still unpaged");
 
-    const byParent = await service.call("task_list", { parentTaskId: a1 }, A);
+    const byParent = await service.call("task_list", { parentTaskId: a1 }, LEGACY);
     assert.deepEqual(byParent.tasks.map((task) => task.taskId), [a2, b1, l1], "inputs are not children");
     assert.equal(byParent.nextCursor, null, "a filter answers paged");
+    assert.deepEqual(await listIds(service, A, { parentTaskId: a1 }), [a2, l1], "B's child is B's");
     assert.deepEqual(await listIds(service, A, { callerSessionId: claudeCaller.sessionId }), [a1, a2]);
-    assert.deepEqual(await listIds(service, A, { callerInstanceId: "mcp-c" }), [c1]);
-    assert.deepEqual(await listIds(service, A, { callerInstanceId: "mcp-b", parentTaskId: a1 }), [b1]);
-    assert.deepEqual(await listIds(service, A, { callerSessionId: claudeCaller.sessionId, callerInstanceId: "mcp-b" }), []);
+    assert.deepEqual(await listIds(service, LEGACY, { callerInstanceId: "mcp-c" }), [c1]);
+    assert.deepEqual(await listIds(service, A, { callerInstanceId: "mcp-c" }), []);
+    assert.deepEqual(await listIds(service, LEGACY, { callerInstanceId: "mcp-b", parentTaskId: a1 }), [b1]);
+    assert.deepEqual(await listIds(service, LEGACY, { callerSessionId: claudeCaller.sessionId, callerInstanceId: "mcp-b" }), []);
     // An observer may filter by caller: it just cannot say "mine".
     assert.deepEqual(await listIds(service, OBSERVER, { callerSessionId: codexCaller.sessionId }), [b1]);
     assert.deepEqual(await listIds(service, OTHER_ROOT, { parentTaskId: a1 }), [], "root scoping still applies");
 
     // With status and the keyset cursor.
-    const page1 = await service.call("task_list", { parentTaskId: a1, status: "completed", limit: 2 }, A);
+    const page1 = await service.call("task_list", { parentTaskId: a1, status: "completed", limit: 2 }, LEGACY);
     assert.deepEqual(page1.tasks.map((task) => task.taskId), [a2, b1]);
-    const page2 = await service.call("task_list", { parentTaskId: a1, status: "completed", limit: 2, cursor: page1.nextCursor }, A);
+    const page2 = await service.call("task_list", { parentTaskId: a1, status: "completed", limit: 2, cursor: page1.nextCursor }, LEGACY);
     assert.deepEqual(page2.tasks.map((task) => task.taskId), [l1]);
     assert.equal(page2.nextCursor, null);
+    // The same pages for a front-door Main skip what it may not see, and the
+    // cursor stays exact.
+    const ownPage = await service.call("task_list", { parentTaskId: a1, status: "completed", limit: 1 }, A);
+    assert.deepEqual(ownPage.tasks.map((task) => task.taskId), [a2]);
+    assert.deepEqual(await listIds(service, A, { parentTaskId: a1, status: "completed", limit: 1, cursor: ownPage.nextCursor }), [l1]);
 
     for (const bad of [{ parentTaskId: "" }, { callerSessionId: 7 }, { callerInstanceId: " " }]) {
       await rejectsWith(service.call("task_list", bad, A), "INVALID_ARGUMENT");
@@ -411,15 +427,17 @@ test("scope mine lists the sessions and tasks the requester started, by session 
     const legacy = await open(service, LEGACY);
     const tick = () => { clock.now += 1_000; };
     const a1 = await finished(service, a, A); tick();
-    // A different Main may prompt in A's session; the task is still B's.
-    const b1 = await finished(service, a, B); tick();
+    // A different Main may prompt in a session nobody is recorded for (since
+    // 1.8.0 not in A's); the task is still B's.
+    const b1 = await finished(service, legacy, B); tick();
     const c1 = await finished(service, c, C); tick();
     const l1 = await finished(service, legacy, LEGACY); tick();
     const b2 = await finished(service, b, B); tick();
 
     const everything = [a.session.id, b.session.id, c.session.id, legacy.session.id];
-    assert.deepEqual(await sessionIds(service, A), everything, "the default list is unchanged");
+    assert.deepEqual(await sessionIds(service, LEGACY), everything, "the default list is unchanged for management");
     assert.deepEqual(await sessionIds(service, OBSERVER), everything);
+    assert.deepEqual(await sessionIds(service, A), [a.session.id, legacy.session.id], "a Main's own and nobody's");
     assert.deepEqual(await sessionIds(service, A, { scope: "mine" }), [a.session.id]);
     assert.deepEqual(await sessionIds(service, B, { scope: "mine" }), [b.session.id]);
     assert.deepEqual(await sessionIds(service, C, { scope: "mine" }), [c.session.id]);
@@ -435,7 +453,10 @@ test("scope mine lists the sessions and tasks the requester started, by session 
     assert.deepEqual(await listIds(service, B, { scope: "mine" }), [b1, b2]);
     assert.deepEqual(await listIds(service, B, { scope: "mine", status: "completed", limit: 1 }), [b1]);
     assert.deepEqual(await listIds(service, B, { scope: "mine", callerInstanceId: "mcp-a" }), []);
-    assert.deepEqual((await service.call("task_list", {}, A)).tasks.map((task) => task.taskId), [a1, b1, c1, l1, b2]);
+    assert.deepEqual((await service.call("task_list", {}, LEGACY)).tasks.map((task) => task.taskId), [a1, b1, c1, l1, b2]);
+    // Without scope a Main also sees what runs on sessions nobody is recorded
+    // for, B's task there included; scope mine is still only its own.
+    assert.deepEqual((await service.call("task_list", {}, A)).tasks.map((task) => task.taskId), [a1, b1, l1]);
 
     // Nobody to match: refused, never an empty list that reads as "you have nothing".
     for (const context of [LEGACY, OBSERVER]) {
@@ -464,14 +485,16 @@ test("links, callers and scope mine survive a restart, from the snapshot and fro
       await before.service.init();
       const a = await open(before.service, A);
       const b = await open(before.service, B);
+      // Nobody's session: B's task there is one A may see and link (1.8.0).
+      const shared = await open(before.service, LEGACY);
       const root = await finished(before.service, a, A);
       before.clock.now += 1_000;
-      const input = await finished(before.service, b, B);
+      const input = await finished(before.service, shared, B);
       before.clock.now += 1_000;
       const child = await finished(before.service, a, A, { parentTaskId: root, inputTaskIds: [input, root] });
       before.clock.now += 1_000;
       // Still running at the restart: comes back failed, links intact.
-      const cut = await start(before.service, b.session, B, { parentTaskId: child });
+      const cut = await start(before.service, b.session, B, { parentTaskId: input });
       ids = { root, input, child, cut };
       sessions = { a: a.session.id, b: b.session.id };
       await before.service.flushPersist();
@@ -494,11 +517,14 @@ test("links, callers and scope mine survive a restart, from the snapshot and fro
         assert.deepEqual(child.inputTaskIds, [ids.input, ids.root], source);
         const cut = await after.service.call("task_get", { taskId: ids.cut }, B);
         assert.equal(cut.status, "failed", source);
-        assert.equal(cut.parentTaskId, ids.child, source);
+        assert.equal(cut.parentTaskId, ids.input, source);
         const root = await after.service.call("task_get", { taskId: ids.root }, A);
         assert.equal(Object.hasOwn(root, "parentTaskId") || Object.hasOwn(root, "inputTaskIds"), false, source);
         assert.deepEqual(await listIds(after.service, A, { parentTaskId: ids.root }), [ids.child], source);
-        assert.deepEqual(await listIds(after.service, A, { parentTaskId: ids.child }), [ids.cut], source);
+        assert.deepEqual(await listIds(after.service, B, { parentTaskId: ids.input }), [ids.cut], source);
+        // Isolation comes back with the records: each Main's stay its own.
+        assert.deepEqual(await listIds(after.service, A, { parentTaskId: ids.input }), [], source);
+        await rejectsWith(after.service.call("task_get", { taskId: ids.child }, B), "NOT_TASK_OWNER");
         assert.deepEqual(await listIds(after.service, B, { scope: "mine" }), [ids.input, ids.cut], source);
         assert.deepEqual(await sessionIds(after.service, A, { scope: "mine" }), [sessions.a], source);
         assert.deepEqual(await sessionIds(after.service, B, { scope: "mine" }), [sessions.b], source);

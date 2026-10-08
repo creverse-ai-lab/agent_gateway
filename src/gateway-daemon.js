@@ -170,7 +170,10 @@ const server = createServer((socket) => {
             return;
           }
           if (request.method === "subscribe") {
-            const result = service.subscribe(request.args, { rootId: request.rootId, access }, (event) => {
+            // A front-door Main's watch-all subscription covers only what it may
+            // see, so its caller rides along as on every other call.
+            const context = { rootId: request.rootId, access, ...(access === "control" ? { caller } : {}) };
+            const result = service.subscribe(request.args, context, (event) => {
               sendEvent(result.subscriptionId, event);
             });
             // Additive and opt-in: a client that says nothing keeps the old

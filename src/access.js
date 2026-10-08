@@ -1,3 +1,5 @@
+import { isTaskCreator } from "./attention.js";
+import { normalizeCaller } from "./caller.js";
 import { ERROR_CODES, GatewayError } from "./errors.js";
 
 export function requireAccess(access = "control") {
@@ -19,4 +21,28 @@ export function authorizeCall(method, args, context = {}) {
   if (requireAccess(context.access) === "observer" && !isReadOnlyCall(method, args)) {
     throw new GatewayError(ERROR_CODES.OBSERVER_ACCESS_DENIED, `Observer cannot call ${method}`);
   }
+}
+
+// Per-Main isolation (1.8.0). Every Main on a machine shares one rootId, so the
+// root alone cannot keep one Main out of another's sessions, tasks and inbox.
+// A control request that names its caller comes from a front-door Main and is
+// confined to that Main's records. One that names none (management: AgenLynk,
+// the admin CLI, installer health checks, and pre-1.6 front doors) and every
+// observer keep the whole root. Like observer access, this is not a credential
+// boundary: a process that holds the token can claim to be any caller.
+
+/** The front-door Main a request speaks for, or null when it keeps the whole root. */
+export function requesterOf(context) {
+  return context?.access === "observer" ? null : normalizeCaller(context?.caller);
+}
+
+/**
+ * Whether `requester` (requesterOf) may see and act on a record owned by
+ * `owner`: a session's openedBy, which its tasks and inbox rows follow. A
+ * record no Main is recorded for (written before 1.6, or opened by management)
+ * stays every Main's, which is the creator rule of attention.js; any other is
+ * its own Main's only.
+ */
+export function isVisibleTo(owner, requester) {
+  return requester == null || isTaskCreator(owner, requester);
 }

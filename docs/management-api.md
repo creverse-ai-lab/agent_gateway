@@ -110,6 +110,26 @@ Since 1.6.0 a control request may carry `caller: {provider, sessionId, pid, inst
 - Only `control` connections are recorded. An `observer`'s `caller` is not recorded; its `pid` still counts for the Worker check below. A malformed `caller` drops attribution, never the call.
 - `sessionId` can go stale when the CLI switches sessions (for example Claude `/clear`) while the MCP server keeps running; `pid` and `instanceId` stay valid.
 
+### Per-Main isolation
+
+Since 1.8.0 the Gateway enforces what `caller` tells apart. A control request that carries a `caller` comes from a front-door Main and reaches only:
+- sessions whose `openedBy` is that caller, by the `scope:"mine"` rule below (session ids decide when both sides have one, else `instanceId`);
+- the tasks and inbox rows of those sessions. A task follows its session while the session record exists, then its own `caller`, because a handle outlives its session. An inbox row keeps its session's owner after the session is closed;
+- records no Main is recorded for: sessions opened before 1.6.0 or by a client that sends no `caller`, with their tasks and inbox rows. Every Main shares these, as before.
+
+Another Main's record answers as another root's does:
+- `NOT_SESSION_OWNER` for every call that names its session: `session` get, check, workspace_diff, close, pin, unpin and clean, `config`, `poll`, `prompt`, `run`, `task_prompt`, `task_run`, `permission`, `answer`, `cancel`, and a `session_restore` that would reuse its record;
+- `NOT_TASK_OWNER` for `task_get`, `task_result`, `task_cancel` and a `run` attach (`{taskId}`), and `NOT_INBOX_OWNER` for `inbox get`;
+- a link to its task is an unknown id (`INVALID_ARGUMENT`), and `ack` skips its task as `not_task_owner`.
+
+Lists leave such records out and keep their shapes (an argument-free `task_list` stays unpaged): `session list`, `task_list`, `inbox list` and `attention`, setup's `sessions_stall_suspected` and attention alerts, and `subscribe` without `sessionIds`, which also never streams a session another Main opens later. `subscribe` with `sessionIds` needs every id to be reachable. `session clean` closes only the caller's own sessions, never the shared ones.
+
+Requests without a `caller` keep root-wide access, unchanged. These are management requests (AgenLynk and other public-client consumers, `acp-gateway-admin`, installer health checks) and pre-1.6.0 front doors. Every observer keeps it too. `setup`, `gateway_config`, `provider`, `retention_preview`, `shutdown_if_idle` and `daemon_shutdown` stay root-level for everyone.
+
+A Main is its CLI session. A front door restarted in the same CLI session (a new `instanceId`, the same `sessionId`) keeps its sessions. Each Codex thread is a Main of its own; a Codex front door that sends no thread id is one Main per process. A Main that comes back under another identity is another Main, for example a new CLI session or a restarted front door that sends no session id. Its earlier sessions stay with the old identity until retention removes them, and only a client that sends no `caller` can still reach them.
+
+Like observer access, this is not a credential boundary: a process that holds the token can send any `caller`, or none. It keeps Mains that share a machine from reading, answering for, steering or cleaning up each other's work.
+
 ## Workers never get the Control
 
 A Worker's own agent CLI can load the user's MCP configuration (Codex reads `~/.codex/config.toml` for the Workers the Gateway starts) and with it the Control MCP. Since 1.8.0 three checks keep the Control from a Worker:
@@ -124,10 +144,10 @@ Like observer access, this is not a credential boundary: a process that holds th
 
 ## Task links and scope
 
-- `run`, `task_prompt` and `task_run` accept `parentTaskId` (the task this one follows up) and `inputTaskIds` (1 to 16 unique ids of tasks whose results went into the prompt). Every id must name a task on the caller's root; otherwise `INVALID_ARGUMENT` with `details.unknownTaskIds`, and nothing starts. The Gateway records them as declared and never infers links. `prompt` creates no task, so it refuses them, as does a `run` attach (`{taskId}`).
+- `run`, `task_prompt` and `task_run` accept `parentTaskId` (the task this one follows up) and `inputTaskIds` (1 to 16 unique ids of tasks whose results went into the prompt). Every id must name a task the caller can see: on its root and, since 1.8.0 for a front-door Main, its own or one no Main is recorded for (see Per-Main isolation). Otherwise `INVALID_ARGUMENT` with `details.unknownTaskIds`, and nothing starts. The Gateway records them as declared and never infers links. `prompt` creates no task, so it refuses them, as does a `run` attach (`{taskId}`).
 - Task reads carry `parentTaskId`/`inputTaskIds` only when declared. They survive restarts.
 - `task_list` filters `parentTaskId`, `callerSessionId`, `callerInstanceId` combine with `status` and paging. Any of them selects the paged response.
-- `scope:"mine"` on `session list` and `task_list` keeps records whose `openedBy`/`caller` is the requester: session ids decide when both sides have one, else `instanceId`. Records with no caller are nobody's. A Codex front door that sends no thread id matches by `instanceId`, so its threads are one Main. A request without a caller (observer, pre-1.6.0 front door) gets `INVALID_ARGUMENT`. Without `scope` the lists are unchanged.
+- `scope:"mine"` on `session list` and `task_list` keeps records whose `openedBy`/`caller` is the requester: session ids decide when both sides have one, else `instanceId`. Records with no caller are nobody's. A Codex front door that sends no thread id matches by `instanceId`, so its threads are one Main. A request without a caller (observer, pre-1.6.0 front door) gets `INVALID_ARGUMENT`. Without `scope`, a front-door Main's lists hold its own records plus those no Main is recorded for (since 1.8.0), and management and observer lists hold the whole root.
 
 ## Idempotency and worker errors
 
@@ -145,7 +165,7 @@ When `ACP_GATEWAY_STATE` points outside `~/.acp-gateway` and `ACP_GATEWAY_PROVID
 
 `retention_preview {values:{sessionRetentionMs,taskRetentionMs,inboxRetentionMs,resultRetentionMs}}` accepts any subset of those keys; direct top-level names are also supported. No deletion occurs. Unsupported policies such as artifactSessionLimit are rejected.
 
-Response: `{ok,advisory:true,scope:"root",calculatedAt,configRevision,values,counts:{sessions,tasks,inbox,results},artifacts:{exact:false,reason}}`. Counts use the same predicates as GC and describe records owned by the caller at the supplied policy. Active work and pending input are protected; pinned records are excluded from age retention while their session is open (since 1.8.0 a closed pinned session, and the records hanging off it, age out like any other). Task TTL is a separate, explicit handle lifetime and can still expire independently of pinning.
+Response: `{ok,advisory:true,scope:"root",calculatedAt,configRevision,values,counts:{sessions,tasks,inbox,results},artifacts:{exact:false,reason}}`. Counts use the same predicates as GC and describe the records of the caller's root, every Main's included (retention is root-level), at the supplied policy. Active work and pending input are protected; pinned records are excluded from age retention while their session is open (since 1.8.0 a closed pinned session, and the records hanging off it, age out like any other). Task TTL is a separate, explicit handle lifetime and can still expire independently of pinning.
 
 Preview is advisory: time, new work, references and settings can change before a restart/GC. Do not show it as an immutable deletion plan or a count covering other roots. Artifact reference protection prevents an exact byte/count forecast from age alone. Consumers should not invent artifact counts. In the normal single-user daemon, one root owns the engine's work.
 

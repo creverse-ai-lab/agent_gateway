@@ -161,7 +161,10 @@ async function turnStart(service, sessionId, context) {
 test("a session records who opened it and each turn who started it, across a restart", async () => {
   const directory = await mkdtemp(join(tmpdir(), "acp-caller-"));
   const opener = { rootId: "main-a", caller: claudeCaller };
-  const prompter = { rootId: "main-a", caller: codexCaller };
+  // The same Claude session through a restarted front door: a new MCP server
+  // process (instance and pid) but the same CLI session id, so the same Main.
+  // Another Main could not prompt here at all since 1.8.0.
+  const prompter = { rootId: "main-a", caller: { ...claudeCaller, pid: 4343, instanceId: "mcp-a-restarted" } };
   let sessionId = null;
   try {
     const first = makeService(directory);
@@ -174,12 +177,12 @@ test("a session records who opened it and each turn who started it, across a res
 
       await first.call("prompt", { sessionId, prompt: "narrated-result" }, prompter);
       await waitForIdle(first, sessionId, opener);
-      assert.deepEqual((await turnStart(first, sessionId, opener)).promptedBy, codexCaller,
-        "the reply belongs to the Main that prompted");
+      assert.deepEqual((await turnStart(first, sessionId, opener)).promptedBy, prompter.caller,
+        "the reply belongs to the front door that prompted");
 
       const [listed] = (await first.call("session", { action: "list" }, opener)).sessions;
       assert.deepEqual(listed.openedBy, claudeCaller, "opening is history: a later prompter does not rewrite it");
-      assert.deepEqual(listed.promptedBy, codexCaller);
+      assert.deepEqual(listed.promptedBy, prompter.caller);
     } finally {
       await first.shutdown();
     }
@@ -190,7 +193,7 @@ test("a session records who opened it and each turn who started it, across a res
       const [restored] = (await second.call("session", { action: "list" }, { rootId: "main-a" })).sessions;
       assert.equal(restored.sessionId, sessionId);
       assert.deepEqual(restored.openedBy, claudeCaller);
-      assert.deepEqual(restored.promptedBy, codexCaller);
+      assert.deepEqual(restored.promptedBy, prompter.caller);
     } finally {
       await second.shutdown();
     }
@@ -295,22 +298,26 @@ test("a worker acting as a Main is marked viaSession while its session is open",
     assert.deepEqual(child.openedBy, { ...asWorker.caller, viaSession: worker.sessionId });
     const ack = await service.call("prompt", { sessionId: child.sessionId, prompt: "{}" }, asWorker);
     assert.equal(ack.promptedBy.viaSession, worker.sessionId);
-    await waitForIdle(service, child.sessionId, main);
-    const [listed] = (await service.call("session", { action: "list" }, main)).sessions.filter((item) => item.sessionId === child.sessionId);
+    await waitForIdle(service, child.sessionId, asWorker);
+    // The child is its opener's (1.8.0): the worker acting as a Main lists it, the Main does not.
+    const [listed] = (await service.call("session", { action: "list" }, asWorker)).sessions.filter((item) => item.sessionId === child.sessionId);
     assert.equal(listed.openedBy.viaSession, worker.sessionId, "recorded, not recomputed");
+    assert.equal((await service.call("session", { action: "list" }, main)).sessions.some((item) => item.sessionId === child.sessionId), false);
 
     const otherRoot = await service.call("session_open", { provider: "claude", cwd: tmpdir(), permissionPolicy: "read_only" },
       { rootId: "main-b", caller: asWorker.caller });
     assert.equal(Object.hasOwn(otherRoot.openedBy, "viaSession"), false, "another root's sessions are not looked at");
 
+    // The same front door in another CLI session is another Main, and not one of ours.
     const stranger = { rootId: "main-a", caller: { ...asWorker.caller, sessionId: "not-one-of-ours" } };
-    assert.equal(Object.hasOwn((await service.call("prompt", { sessionId: child.sessionId, prompt: "{}" }, stranger)).promptedBy, "viaSession"), false);
-    await waitForIdle(service, child.sessionId, main);
+    await assert.rejects(service.call("prompt", { sessionId: child.sessionId, prompt: "{}" }, stranger), { code: "NOT_SESSION_OWNER" });
+    const strangers = await service.call("session_open", { provider: "claude", cwd: tmpdir(), permissionPolicy: "read_only" }, stranger);
+    assert.equal(Object.hasOwn(strangers.openedBy, "viaSession"), false);
 
     await service.call("session", { action: "close", sessionId: worker.sessionId }, main);
     const after = await service.call("prompt", { sessionId: child.sessionId, prompt: "{}" }, asWorker);
     assert.equal(Object.hasOwn(after.promptedBy, "viaSession"), false, "a closed session is no longer anyone's worker");
-    await waitForIdle(service, child.sessionId, main);
+    await waitForIdle(service, child.sessionId, asWorker);
   } finally {
     await service.shutdown();
   }
@@ -446,11 +453,20 @@ test("through the real front door, a Codex call's _meta becomes that call's call
     );
     assert.equal(Object.hasOwn(got, "attribution"), false);
 
+    // Two threads of one Codex process are two Mains (1.8.0). Refused, so this
+    // call carried its own thread: the process caller (no thread) would have
+    // passed on the instance.
     const other = "019a4c7e-5a1b-7c2d-8e3f-0123456789ef";
-    const ack = await call("agent_acp_prompt", { sessionId: opened.sessionId, prompt: "narrated-result" }, codexMeta(other, "turn-2"));
+    const refused = await call("agent_acp_prompt", { sessionId: opened.sessionId, prompt: "narrated-result" }, codexMeta(other, "turn-2"));
+    assert.deepEqual([refused.ok, refused.errorCode], [false, "NOT_SESSION_OWNER"]);
+    // The mock worker has one ACP session id, so the first thread closes its
+    // session before the other opens one.
+    assert.equal((await call("agent_acp_session", { action: "close", sessionId: opened.sessionId }, codexMeta())).ok, true);
+    const own = await call("agent_acp_session_open", { provider: "mock", cwd: directory, permissionPolicy: "read_only" }, codexMeta(other, "turn-2"));
+    const ack = await call("agent_acp_prompt", { sessionId: own.sessionId, prompt: "narrated-result" }, codexMeta(other, "turn-3"));
     assert.deepEqual(
       [ack.promptedBy.provider, ack.promptedBy.sessionId, ack.promptedBy.turnId, ack.promptedBy.instanceId],
-      ["codex", other, "turn-2", instanceId],
+      ["codex", other, "turn-3", instanceId],
       "two threads of one Codex process, told apart per call"
     );
     assert.equal((await call("agent_acp_setup", { mode: "summary" })).legacyControlRequests, 0);
@@ -501,14 +517,20 @@ test("overlapping front-door calls from one Codex process each keep their own th
     });
     assert.equal(new Set(opened.map((session) => session.openedBy.instanceId)).size, 1, "one MCP process");
 
-    // Rotated, so a thread never lines up with the session it opened.
-    const acks = await Promise.all(opened.map((session, index) => {
+    // Rotated, so a thread never lines up with the session it opened. Each is
+    // another Main's (1.8.0), and refused: a caller taken from anything but the
+    // call itself would have been let through as that process's.
+    const rotated = await Promise.all(opened.map((session, index) => {
       const thread = threads[(index + 1) % threads.length];
       return call("agent_acp_prompt", { sessionId: session.sessionId, prompt: "{}" }, codexMeta(thread, `prompt-${index}`));
     }));
+    rotated.forEach((refused) => assert.deepEqual([refused.ok, refused.errorCode], [false, "NOT_SESSION_OWNER"]));
+    // Each thread in its own session, all at once, under turns the opens did not use.
+    const acks = await Promise.all(opened.map((session, index) =>
+      call("agent_acp_prompt", { sessionId: session.sessionId, prompt: "{}" }, codexMeta(threads[index], `prompt-${index}`))));
     acks.forEach((ack, index) => {
       assert.equal(ack.ok, true, JSON.stringify(ack));
-      assert.deepEqual([ack.promptedBy.sessionId, ack.promptedBy.turnId], [threads[(index + 1) % threads.length], `prompt-${index}`]);
+      assert.deepEqual([ack.promptedBy.sessionId, ack.promptedBy.turnId], [threads[index], `prompt-${index}`]);
     });
   } finally {
     await mcpClient?.close().catch(() => {});

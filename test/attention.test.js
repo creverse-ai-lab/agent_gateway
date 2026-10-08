@@ -176,9 +176,11 @@ test("run, task_result and a terminal poll mark seen for the creator only, and d
     const events = [];
     service.subscribe({}, A, (event) => events.push(event));
 
-    // agent_acp_run attach.
+    // agent_acp_run attach. Since 1.8.0 another Main cannot read A's task at all;
+    // management (no caller) and an observer can, and neither is a delivery.
     const attached = await finished(service, session, worker, A);
-    const toOther = await service.call("run", { taskId: attached }, B);
+    await assert.rejects(service.call("run", { taskId: attached }, B), { code: "NOT_TASK_OWNER" });
+    const toOther = await service.call("run", { taskId: attached }, LEGACY);
     const toObserver = await service.call("task_result", { taskId: attached }, OBSERVER);
     // None of the reads deliver the result to its Main.
     await service.call("task_get", { taskId: attached }, A);
@@ -191,7 +193,7 @@ test("run, task_result and a terminal poll mark seen for the creator only, and d
     await attention(service, A);
     await service.call("poll", { sessionId: session.id, cursor: 0 }, OBSERVER);
     assert.ok(events.length > 0, "the subscription saw the turn");
-    assert.equal(seenAt(service, attached), null, "another Main, an observer, reads and subscriptions never mark seen");
+    assert.equal(seenAt(service, attached), null, "management, an observer, reads and subscriptions never mark seen");
     clock.now += 1_000;
     const toCreator = await service.call("run", { taskId: attached }, A);
     assert.equal(seenAt(service, attached), iso(EPOCH + 1_000));
@@ -212,7 +214,7 @@ test("run, task_result and a terminal poll mark seen for the creator only, and d
     // tasks/result.
     const viaResult = (await service.call("task_prompt", { sessionId: session.id, prompt: "go" }, A)).taskId;
     await finish(service, worker, viaResult);
-    const first = await service.call("task_result", { taskId: viaResult }, B);
+    const first = await service.call("task_result", { taskId: viaResult }, LEGACY);
     assert.equal(seenAt(service, viaResult), null);
     const second = await service.call("task_result", { taskId: viaResult }, A);
     assert.ok(seenAt(service, viaResult));
@@ -220,7 +222,8 @@ test("run, task_result and a terminal poll mark seen for the creator only, and d
 
     // A poll that carries the terminal result of the session's last task.
     const viaPoll = await finished(service, session, worker, A);
-    const otherPoll = await service.call("poll", { sessionId: session.id, cursor: 0 }, B);
+    await assert.rejects(service.call("poll", { sessionId: session.id, cursor: 0 }, B), { code: "NOT_SESSION_OWNER" });
+    const otherPoll = await service.call("poll", { sessionId: session.id, cursor: 0 }, LEGACY);
     await service.call("poll", { sessionId: session.id, cursor: 0, includeResult: false }, A);
     assert.equal(seenAt(service, viaPoll), null, "no result, no delivery");
     const creatorPoll = await service.call("poll", { sessionId: session.id, cursor: 0 }, A);
@@ -297,8 +300,10 @@ test("two Mains on one root keep their own updates", async () => {
     assert.deepEqual(await updateIds(service, LEGACY), [aTask, bTask]);
     assert.deepEqual((await attention(service, OTHER_ROOT)).updates, [], "another root sees none of them");
 
-    // B collecting A's task (it may: same root) does not clear it for A.
-    await service.call("task_result", { taskId: aTask }, B);
+    // Since 1.8.0 B cannot collect A's task at all. Management can, and that does
+    // not clear it for A either.
+    await assert.rejects(service.call("task_result", { taskId: aTask }, B), { code: "NOT_TASK_OWNER" });
+    await service.call("task_result", { taskId: aTask }, LEGACY);
     assert.deepEqual(await updateIds(service, A), [aTask]);
     await service.call("run", { taskId: aTask }, A);
     assert.deepEqual(await updateIds(service, A), []);
@@ -308,7 +313,7 @@ test("two Mains on one root keep their own updates", async () => {
     // Another thread of B's own Codex process is a different Main.
     const otherThread = { rootId: ROOT, caller: { ...codexCaller, sessionId: "codex-thread-c" } };
     assert.deepEqual(await updateIds(service, otherThread), []);
-    await service.call("task_result", { taskId: bTask }, otherThread);
+    await assert.rejects(service.call("task_result", { taskId: bTask }, otherThread), { code: "NOT_TASK_OWNER" });
     assert.deepEqual(await updateIds(service, B), [bTask]);
   } finally {
     await service.shutdown().catch(() => {});
@@ -459,8 +464,10 @@ test("stale flips exactly at attentionStaleMs; setup raises both counts only whe
       assert.deepEqual([stale.level, stale.count], ["warning", 1]);
       assert.match(stale.message, /agent_acp_inbox/);
     }
-    // A request belongs to the root: every Main on it is asked. Another root is not.
-    assert.equal(alert(await service.call("setup", {}, B), "attention_stale_requests").count, 1);
+    // A request is its session's Main's. Since 1.8.0 another Main on the root
+    // cannot answer it, so it is not asked; management is. Another root is not.
+    assert.equal(alert(await service.call("setup", {}, B), "attention_stale_requests"), null);
+    assert.equal(alert(await service.call("setup", {}, LEGACY), "attention_stale_requests").count, 1);
     assert.equal(alert(await service.call("setup", {}, OTHER_ROOT), "attention_stale_requests"), null);
 
     await service.call("permission", { sessionId: session.id, requestId: 1, optionId: "allow-once" }, A);
@@ -500,6 +507,8 @@ test("ack marks only what the requester may take, says why it skipped the rest, 
     const aTask = await finished(service, first.session, first.worker, A);
     const bTask = await finished(service, second.session, second.worker, B);
     const legacy = await finished(service, legacySession.session, legacySession.worker, LEGACY);
+    // A session no Main is recorded for is every Main's, so B may run on it too.
+    const bOnShared = await finished(service, legacySession.session, legacySession.worker, B);
     const theirs = await finished(service, foreign.session, foreign.worker, OTHER_ROOT);
     const working = await start(service, first.session, A);
 
@@ -512,13 +521,16 @@ test("ack marks only what the requester may take, says why it skipped the rest, 
 
     clock.now += 1_000;
     const acked = await service.call("inbox", {
-      action: "ack", taskIds: [aTask, bTask, legacy, working, theirs, "task-missing", aTask]
+      action: "ack", taskIds: [aTask, bTask, legacy, bOnShared, working, theirs, "task-missing", aTask]
     }, A);
     assert.deepEqual(acked, {
       ok: true,
       acked: [aTask, legacy],
       skipped: [
-        { taskId: bTask, reason: "not_creator" },
+        // On B's own session: since 1.8.0 not A's to see at all, as if another root's.
+        { taskId: bTask, reason: "not_task_owner" },
+        // A can see it (the session is nobody's), but it is B's to clear.
+        { taskId: bOnShared, reason: "not_creator" },
         { taskId: working, reason: "not_terminal" },
         { taskId: theirs, reason: "not_task_owner" },
         { taskId: "task-missing", reason: "unknown_task" }
@@ -526,7 +538,8 @@ test("ack marks only what the requester may take, says why it skipped the rest, 
     });
     assert.equal(seenAt(service, aTask), iso(EPOCH + 1_000));
     assert.equal(seenAt(service, bTask), null);
-    assert.deepEqual(await updateIds(service, B), [bTask]);
+    assert.equal(seenAt(service, bOnShared), null);
+    assert.deepEqual((await updateIds(service, B)).sort(), [bTask, bOnShared].sort());
 
     clock.now += 1_000;
     assert.deepEqual((await service.call("inbox", { action: "ack", taskIds: [aTask] }, A)).acked, [aTask]);

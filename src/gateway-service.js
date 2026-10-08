@@ -30,7 +30,7 @@ import { crashAfter, StateStore, sweepStaleTemporaries, WAL_TYPES } from "./stat
 import { requireTaskLinks, taskInterruption, TaskStore, TERMINAL_TASK_STATUSES } from "./task-store.js";
 import { GATEWAY_API_VERSION, GATEWAY_VERSION, STATE_SCHEMA_VERSION } from "./version.js";
 
-import { authorizeCall, isReadOnlyCall } from "./access.js";
+import { authorizeCall, isReadOnlyCall, isVisibleTo, requesterOf } from "./access.js";
 import {
   ATTENTION_DEFAULT_LIMIT, ATTENTION_MAX_LIMIT, compareKeys as compareAttentionKeys, decodeAttentionCursor,
   DEFAULT_ATTENTION_STALE_MS, encodeAttentionCursor, isSameCaller, isTaskCreator, pageAfter, requestKey, requireAckTaskIds,
@@ -452,7 +452,10 @@ export class GatewayService {
     });
     this.stateStore.retainResultRefs(new Set(this.taskStore.records.keys()));
     for (const record of loaded.inbox) {
-      const item = compactRecoveredInbox(record, this.resourceLimits.maxInboxItemBytes);
+      // A row written before 1.8.0 learns its owner from its session while that
+      // is still here, so it stays that Main's once the session closes.
+      const owned = record.sessionOpenedBy ? record : { ...record, ...inboxOwnerCopy(this.store.get(record.sessionId)) };
+      const item = compactRecoveredInbox(owned, this.resourceLimits.maxInboxItemBytes);
       // An ACP permission request is tied to the old worker process. It cannot
       // be answered after a daemon restart, but must remain visible to Main.
       if (item.status === "pending") {
@@ -694,8 +697,9 @@ export class GatewayService {
     if (requested != null && !Array.isArray(requested)) {
       throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "sessionIds must be an array");
     }
+    const requester = requesterOf(context);
     const sessions = requested == null
-      ? this.store.list().filter((session) => session.ownerRootId === rootId)
+      ? this.store.list().filter((session) => session.ownerRootId === rootId && isVisibleTo(session.openedBy, requester))
       : requested.map((id) => requireOwnedSession(this.requireSession(id), context));
     if (context.access !== "observer") for (const session of sessions) this.touchSessionOwner(session);
     const cursors = args.cursors ?? {};
@@ -706,6 +710,9 @@ export class GatewayService {
     const subscription = {
       subscriptionId,
       rootId,
+      // Who a watch-all subscription watches for: a session another Main opens
+      // later must not start streaming to it (publishEvent).
+      requester,
       watchAll: requested == null,
       sessionIds: new Set(sessions.map((session) => session.id)),
       includeThoughts: args.includeThoughts === true,
@@ -777,7 +784,8 @@ export class GatewayService {
   publishEvent(session, event) {
     for (const subscription of this.subscriptions.values()) {
       const watchesSession = subscription.sessionIds.has(session.id)
-        || (subscription.watchAll && subscription.rootId === session.ownerRootId);
+        || (subscription.watchAll && subscription.rootId === session.ownerRootId
+          && isVisibleTo(session.openedBy, subscription.requester));
       if (!watchesSession || !shouldDeliverEvent(subscription, event)) continue;
       // Before the emit: a frame the transport queues or sheds may still have
       // reached the peer, so handing it over is what counts.
@@ -809,7 +817,7 @@ export class GatewayService {
     const names = provider ? [requireProvider(provider)] : [];
     const agentUpdates = this.agentUpdateManager?.snapshot() ?? null;
     const alerts = [
-      ...(agentUpdates?.alerts ?? []), ...this.stateAlerts, ...this.#legacyAlerts(), ...this.#stallAlerts(context.rootId),
+      ...(agentUpdates?.alerts ?? []), ...this.stateAlerts, ...this.#legacyAlerts(), ...this.#stallAlerts(context),
       ...this.#attentionAlerts(context), ...this.#providerAlerts()
     ];
     const liveSessions = this.store.list().filter((session) => session.client?.alive).length;
@@ -915,11 +923,13 @@ export class GatewayService {
   // A hint about this Main's own sessions, so the ids are ones it can act on.
   // Only raised when there is something to say; the Gateway itself does nothing
   // about a quiet worker.
-  #stallAlerts(rootId) {
+  #stallAlerts(context) {
+    const rootId = context?.rootId ?? null;
+    const requester = requesterOf(context);
     const now = this.now();
     const { stallHintMs } = this.observability;
     const stalled = this.store.list().filter((session) => (rootId == null || session.ownerRootId === rootId)
-      && workerSilence(session, now, stallHintMs).stallSuspected);
+      && isVisibleTo(session.openedBy, requester) && workerSilence(session, now, stallHintMs).stallSuspected);
     if (!stalled.length) return [];
     return [{
       level: "info",
@@ -932,15 +942,16 @@ export class GatewayService {
     }];
   }
 
-  // What agent_acp_inbox attention would say, as counts, for the same Main: its
-  // root's worker requests that have waited past attentionStaleMs, and the
-  // finished tasks it started but has not received. Only when non-zero.
+  // What agent_acp_inbox attention would say, as counts, for the same Main: the
+  // worker requests it can answer that have waited past attentionStaleMs, and
+  // the finished tasks it started but has not received. Only when non-zero.
   #attentionAlerts(context) {
     const rootId = context?.rootId ?? null;
+    const requester = requesterOf(context);
     const now = this.now();
     const { attentionStaleMs } = this.observability;
-    const stale = this.#attentionRequests(rootId).filter((item) => this.#requestAgeMs(item, now) >= attentionStaleMs).length;
-    const unseen = this.#attentionUpdates(rootId, this.#requester(context)).length;
+    const stale = this.#attentionRequests(rootId, requester).filter((item) => this.#requestAgeMs(item, now) >= attentionStaleMs).length;
+    const unseen = this.#attentionUpdates(rootId, requester).length;
     return [
       ...(stale ? [{
         level: "warning",
@@ -1176,12 +1187,15 @@ export class GatewayService {
   }
 
   // The caller's own open record of this provider session, if any. Records of
-  // another Main, and closed ones, keep the registration path's answer.
+  // another root, and closed ones, keep the registration path's answer. One of
+  // another Main on this root is refused as its other calls are: restoring it
+  // in place would take that Main's session over.
   #ownedRecordFor(provider, acpSessionId, context) {
     if (typeof acpSessionId !== "string" || !acpSessionId) return null;
     const root = requireRoot(context);
-    return this.store.list().find((item) => item.provider === provider && item.acpSessionId === acpSessionId
-      && item.ownerRootId === root && !CLOSED_STATUSES.has(item.status)) ?? null;
+    const record = this.store.list().find((item) => item.provider === provider && item.acpSessionId === acpSessionId
+      && item.ownerRootId === root && !CLOSED_STATUSES.has(item.status));
+    return record ? requireOwnedSession(record, context) : null;
   }
 
   // Explicit agent_acp_session_restore of a record Main already has. The same
@@ -1786,7 +1800,7 @@ export class GatewayService {
     // promptedBy only when this call started the turn: an attach, or an
     // idempotent retry that found its run, started nothing.
     const { taskId, promptedBy } = attaching
-      ? { taskId: this.#storeCall(() => this.taskStore.get(args.taskId, { ownerRootId })).taskId }
+      ? { taskId: this.#requireTask(args.taskId, context).taskId }
       : await this.#startRunTask(args, context);
     if (waitMs === 0) return this.#runHandoff(taskId, context, { promptedBy });
     let record;
@@ -1849,8 +1863,7 @@ export class GatewayService {
   // to call next. Reporting isError here would make it retry the whole call —
   // which is exactly how one prompt becomes two.
   #runHandoff(taskId, context, { timedOut = false, promptedBy = null } = {}) {
-    const ownerRootId = requireRoot(context);
-    const task = this.#storeCall(() => this.taskStore.get(taskId, { ownerRootId }));
+    const task = this.#requireTask(taskId, context);
     // The terminal envelope is never touched: it is the same object tasks/result
     // returns. Only a handoff echoes who started the run.
     if (TERMINAL_TASK_STATUSES.has(task.status)) return this.taskResult({ taskId }, context);
@@ -2159,15 +2172,43 @@ export class GatewayService {
   }
 
   async taskGet(args, context) {
-    const ownerRootId = requireRoot(context);
-    return this.publicTask(this.#storeCall(() => this.taskStore.get(args.taskId, { ownerRootId })));
+    return this.publicTask(this.#requireTask(args.taskId, context));
+  }
+
+  // A task by id, when the request may see it: its root's, and for a front-door
+  // Main its own or nobody's. Another Main's answers as another root's does.
+  #requireTask(taskId, context) {
+    const task = this.#storeCall(() => this.taskStore.get(taskId, { ownerRootId: requireRoot(context) }));
+    if (!isVisibleTo(this.#taskOwner(task), requesterOf(context))) {
+      throw new GatewayError(ERROR_CODES.NOT_TASK_OWNER, "Task belongs to another Main");
+    }
+    return task;
+  }
+
+  // Whose a task is: its session's while that record exists, then the Main
+  // recorded as its creator, since a handle outlives its session.
+  #taskOwner(task) {
+    const session = this.store.get(task.sessionId);
+    return session ? session.openedBy : task.caller;
+  }
+
+  // An inbox row is its session's too. A row kept after its session closed
+  // carries a copy of that session's owner (sessionOpenedBy).
+  #inboxOwner(item) {
+    const session = this.store.get(item.sessionId);
+    return session ? session.openedBy : item.sessionOpenedBy;
   }
 
   async taskList(args = {}, context = {}) {
     const ownerRootId = requireRoot(context);
-    const where = this.#taskListFilter(args ?? {}, context);
-    // A filter is a new-style request, like status: it answers paged.
-    const paged = args?.cursor != null || args?.limit != null || args?.status != null || where != null;
+    const filter = this.#taskListFilter(args ?? {}, context);
+    // A filter is a new-style request, like status: it answers paged. Isolation
+    // is not a filter the caller asked for, so it never changes the shape.
+    const paged = args?.cursor != null || args?.limit != null || args?.status != null || filter != null;
+    const requester = requesterOf(context);
+    const where = requester
+      ? (task) => isVisibleTo(this.#taskOwner(task), requester) && (!filter || filter(task))
+      : filter;
     if (paged) {
       const page = this.#storeCall(() => this.taskStore.listPage({
         ownerRootId,
@@ -2185,7 +2226,7 @@ export class GatewayService {
     const tasks = [];
     let cursor = null;
     do {
-      const page = this.#storeCall(() => this.taskStore.listPage({ ownerRootId, cursor, limit: 200 }));
+      const page = this.#storeCall(() => this.taskStore.listPage({ ownerRootId, cursor, limit: 200, where }));
       for (const task of page.tasks) tasks.push(this.publicTask(task));
       cursor = page.nextCursor;
     } while (cursor);
@@ -2215,7 +2256,7 @@ export class GatewayService {
   #scopeMine(scope, context) {
     if (scope == null) return null;
     if (scope !== "mine") throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "scope must be \"mine\"");
-    const requester = this.#requester(context);
+    const requester = requesterOf(context);
     if (!requester) {
       throw new GatewayError(
         ERROR_CODES.INVALID_ARGUMENT,
@@ -2225,13 +2266,18 @@ export class GatewayService {
     return requester;
   }
 
-  // The links a new task declares, each id checked against this root. Every
-  // unknown id is named at once; another root's task counts as unknown.
+  // The links a new task declares, each id checked against what this Main can
+  // see. Every unknown id is named at once; another root's task, or another
+  // Main's, counts as unknown.
   #visibleTaskLinks(args, context) {
     const links = this.#storeCall(() => requireTaskLinks(args));
     const rootId = requireRoot(context);
+    const requester = requesterOf(context);
     const ids = [...new Set([links.parentTaskId, ...(links.inputTaskIds ?? [])].filter(Boolean))];
-    const unknown = ids.filter((taskId) => this.taskStore.find(taskId)?.ownerRootId !== rootId);
+    const unknown = ids.filter((taskId) => {
+      const task = this.taskStore.find(taskId);
+      return task?.ownerRootId !== rootId || !isVisibleTo(this.#taskOwner(task), requester);
+    });
     if (unknown.length) {
       throw new GatewayError(
         ERROR_CODES.INVALID_ARGUMENT,
@@ -2244,11 +2290,15 @@ export class GatewayService {
 
   async taskResult(args, context) {
     const ownerRootId = requireRoot(context);
+    this.#requireTask(args.taskId, context);
     const task = await this.#storeCallAsync(() => this.taskStore.waitForTerminal(args.taskId, {
       ownerRootId,
       timeoutMs: args.waitMs ?? 120_000,
       signal: context?.signal
     }));
+    // Again after the wait: a task whose session record went away meanwhile
+    // now answers to the Main that created it.
+    this.#requireTask(task.taskId, context);
     const delivered = this.#storeCall(() => {
       // The store hands back the stored payload as-is, possibly null, so it never
       // invents an envelope. The legacy fallback is the caller's, and it stays
@@ -2269,20 +2319,14 @@ export class GatewayService {
     return delivered;
   }
 
-  // The requester a delivery or an attention read is judged for. Observers are
-  // nobody's Main: they never mark anything seen and see the whole root.
-  #requester(context) {
-    return context?.access === "observer" ? null : normalizeCaller(context?.caller);
-  }
-
   // A terminal result reaching the Main that started the task marks it seen.
-  // Any other Main on the root (they all share it) leaves it unread for its
-  // owner; an observer never counts.
+  // Anyone else who may read it (management, an observer, or another Main when
+  // the task's session is nobody's) leaves it unread for its creator.
   #markDelivered(taskId, context) {
     if (context?.access === "observer") return;
     const task = this.taskStore.find(taskId);
     if (!task || task.seenAt || !TERMINAL_TASK_STATUSES.has(task.status)) return;
-    if (!isTaskCreator(task.caller, this.#requester(context))) return;
+    if (!isTaskCreator(task.caller, requesterOf(context))) return;
     this.#recordSeen(taskId);
   }
 
@@ -2308,8 +2352,7 @@ export class GatewayService {
   }
 
   async taskCancel(args, context) {
-    const ownerRootId = requireRoot(context);
-    const task = this.#storeCall(() => this.taskStore.get(args.taskId, { ownerRootId }));
+    const task = this.#requireTask(args.taskId, context);
     if (TERMINAL_TASK_STATUSES.has(task.status)) {
       throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `Cannot cancel task in terminal status: ${task.status}`);
     }
@@ -2374,8 +2417,9 @@ export class GatewayService {
       const limit = args.limit == null
         ? 50
         : Math.min(100, Math.max(1, requireNonNegativeNumber(args.limit, "limit")));
+      const requester = requesterOf(context);
       const matching = [...this.inbox.values()]
-        .filter((item) => item.ownerRootId === rootId
+        .filter((item) => item.ownerRootId === rootId && isVisibleTo(this.#inboxOwner(item), requester)
           && (!status || item.status === status)
           && (args.sessionId == null || item.sessionId === args.sessionId)
           && (args.type == null || item.type === args.type))
@@ -2397,7 +2441,7 @@ export class GatewayService {
       requireString(args.inboxId, "inboxId");
       const item = this.inbox.get(args.inboxId);
       if (!item) throw new GatewayError(ERROR_CODES.UNKNOWN_INBOX, `Unknown inboxId: ${args.inboxId}`);
-      if (item.ownerRootId !== rootId) {
+      if (item.ownerRootId !== rootId || !isVisibleTo(this.#inboxOwner(item), requesterOf(context))) {
         throw new GatewayError(ERROR_CODES.NOT_INBOX_OWNER, "Inbox item belongs to another Main");
       }
       return { ok: true, item: publicInboxItem(item) };
@@ -2406,9 +2450,10 @@ export class GatewayService {
   }
 
   // Read-only. Two lists, each oldest first and paged by the same cursor: the
-  // worker requests blocked on a Main (the whole root: a request is the root's,
-  // not one caller's), and the finished tasks this requester started but never
-  // received. Counts are always of the full sets.
+  // worker requests blocked on a Main (those of the sessions this requester can
+  // answer for; the whole root for management and observers), and the finished
+  // tasks this requester started but never received. Counts are always of the
+  // full sets.
   #attentionView(args, context) {
     const rootId = requireRoot(context);
     const limit = args.limit == null
@@ -2417,8 +2462,9 @@ export class GatewayService {
     const cursor = args.cursor == null ? null : decodeAttentionCursor(args.cursor);
     const now = this.now();
     const { attentionStaleMs } = this.observability;
-    const requests = this.#attentionRequests(rootId);
-    const updates = this.#attentionUpdates(rootId, this.#requester(context));
+    const requester = requesterOf(context);
+    const requests = this.#attentionRequests(rootId, requester);
+    const updates = this.#attentionUpdates(rootId, requester);
     const requestPage = pageAfter(requests, requestKey, cursor?.needsMain, limit);
     const updatePage = pageAfter(updates, updateKey, cursor?.updates, limit);
     const requestRow = (item) => {
@@ -2450,17 +2496,18 @@ export class GatewayService {
 
   // Explicit "I have this": the same creator rule as a delivery, so one Main
   // cannot clear another's updates. Idempotent; each id is either acked or
-  // skipped with a reason from ACK_SKIP_REASONS.
+  // skipped with a reason from ACK_SKIP_REASONS. A task this Main may not see
+  // is skipped as another root's is.
   #ackTasks(args, context) {
     const rootId = requireRoot(context);
     const taskIds = requireAckTaskIds(args.taskIds);
-    const requester = this.#requester(context);
+    const requester = requesterOf(context);
     const acked = [];
     const skipped = [];
     for (const taskId of taskIds) {
       const task = this.taskStore.find(taskId);
       const reason = !task ? "unknown_task"
-        : task.ownerRootId !== rootId ? "not_task_owner"
+        : task.ownerRootId !== rootId || !isVisibleTo(this.#taskOwner(task), requester) ? "not_task_owner"
           : !TERMINAL_TASK_STATUSES.has(task.status) ? "not_terminal"
             : !isTaskCreator(task.caller, requester) ? "not_creator"
               : null;
@@ -2475,10 +2522,11 @@ export class GatewayService {
   }
 
   // rootId null (an embedded setup with no root) means every root, as the
-  // stall alert does.
-  #attentionRequests(rootId) {
+  // stall alert does. requester null (management, observer) means all of them.
+  #attentionRequests(rootId, requester) {
     return [...this.inbox.values()]
-      .filter((item) => item.status === "pending" && (rootId == null || item.ownerRootId === rootId))
+      .filter((item) => item.status === "pending" && (rootId == null || item.ownerRootId === rootId)
+        && isVisibleTo(this.#inboxOwner(item), requester))
       .sort((left, right) => compareAttentionKeys(requestKey(left), requestKey(right)));
   }
 
@@ -2488,7 +2536,7 @@ export class GatewayService {
     return [...this.taskStore.records.values()]
       .filter((task) => (rootId == null || task.ownerRootId === rootId)
         && TERMINAL_TASK_STATUSES.has(task.status) && !task.seenAt
-        && (requester == null || isTaskCreator(task.caller, requester)))
+        && (requester == null || (isTaskCreator(task.caller, requester) && isVisibleTo(this.#taskOwner(task), requester))))
       .sort((left, right) => compareAttentionKeys(updateKey(left), updateKey(right)));
   }
 
@@ -2766,12 +2814,14 @@ export class GatewayService {
 
   async sessionManage(args, context) {
     const root = requireRoot(context);
+    const requester = requesterOf(context);
     if (args.action === "list") {
       const mine = this.#scopeMine(args.scope, context);
       return {
         ok: true,
         sessions: this.store.list()
-          .filter((item) => item.ownerRootId === root && (!mine || isSameCaller(item.openedBy, mine)))
+          .filter((item) => item.ownerRootId === root && isVisibleTo(item.openedBy, requester)
+            && (!mine || isSameCaller(item.openedBy, mine)))
           .map((item) => this.#publicSession(item))
       };
     }
@@ -2834,7 +2884,11 @@ export class GatewayService {
     }
     if (args.action === "clean") {
       const closed = [];
-      for (const item of this.store.list().filter((candidate) => candidate.ownerRootId === root)) {
+      // A front-door Main cleans up only what it opened: a session nobody is
+      // recorded for may be management's (an app's), and not this Main's to close.
+      const cleanable = (candidate) => candidate.ownerRootId === root
+        && (requester == null || isSameCaller(candidate.openedBy, requester));
+      for (const item of this.store.list().filter(cleanable)) {
         // The list was a snapshot; by the time the n-th session is reached the
         // earlier awaits have let it start a turn or disappear entirely.
         if (!this.store.get(item.id) || ACTIVE_STATUSES.has(item.status) || item.status === "idle") continue;
@@ -3577,6 +3631,7 @@ export class GatewayService {
     const item = {
       inboxId,
       ownerRootId: session.ownerRootId,
+      ...inboxOwnerCopy(session),
       sessionId: session.id,
       turnId: session.turnId,
       type: "permission_request",
@@ -3623,6 +3678,7 @@ export class GatewayService {
     const item = {
       inboxId,
       ownerRootId: session.ownerRootId,
+      ...inboxOwnerCopy(session),
       sessionId: session.id,
       turnId: session.turnId,
       type: "worker_question",
@@ -3775,7 +3831,8 @@ export class GatewayService {
       const task = this.taskStore.find(args.taskId);
       session = task ? this.store.get(task.sessionId) : null;
     }
-    if (session?.ownerRootId === rootId) this.touchSessionOwner(session);
+    // Naming another Main's session (refused right after) must not keep it alive.
+    if (session?.ownerRootId === rootId && isVisibleTo(session.openedBy, requesterOf(context))) this.touchSessionOwner(session);
   }
 
   touchSessionOwner(session) {
@@ -4408,8 +4465,11 @@ function sessionModelId(configOptions) {
   return typeof option?.currentValue === "string" ? option.currentValue : null;
 }
 
+// Every call that names a session goes through here: it must be the caller's
+// root's and, for a front-door Main, its own or nobody's (access.js). Another
+// Main's answers exactly as another root's does.
 function requireOwnedSession(session, context) {
-  if (session.ownerRootId !== requireRoot(context)) {
+  if (session.ownerRootId !== requireRoot(context) || !isVisibleTo(session.openedBy, requesterOf(context))) {
     throw new GatewayError(ERROR_CODES.NOT_SESSION_OWNER, "Session belongs to another Main");
   }
   return session;
@@ -4641,6 +4701,14 @@ function inboxAge(item) {
   return item.resolvedAt ?? item.createdAt;
 }
 
+// Whose Main an inbox row is, kept on the row: closing a session keeps its rows
+// as history, and after that the session record cannot say (#inboxOwner).
+// Internal, never on the wire (publicInboxItem is an allowlist), and absent for
+// a session no Main is recorded for.
+function inboxOwnerCopy(session) {
+  return session?.openedBy ? { sessionOpenedBy: session.openedBy } : {};
+}
+
 // Enough of an oversized tool call to recognize and answer it. The rest is in the
 // artifact both the event and the inbox row point at.
 function toolCallHead(toolCall) {
@@ -4677,6 +4745,8 @@ function compactRecoveredInbox(record, maxBytes) {
   const compact = {
     inboxId: item.inboxId,
     ownerRootId: item.ownerRootId,
+    // Compacting drops payload, never whose the row is.
+    ...(item.sessionOpenedBy ? { sessionOpenedBy: item.sessionOpenedBy } : {}),
     sessionId: item.sessionId,
     turnId: item.turnId,
     type: item.type,
