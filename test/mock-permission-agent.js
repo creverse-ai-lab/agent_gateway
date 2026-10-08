@@ -11,15 +11,19 @@ import { createInterface } from "node:readline";
 // "cancelled", "read-ok" or "read-error"), so a test asserts on the outcome.
 //   {"steps": [step, ...]} runs each step in turn and reports every outcome as
 //   a JSON array in stopReason. A step is one of:
-//     {"permission": {...}}  as above (a "command" may also be an array)
-//     {"terminal": {..., "cwd"?, "hold"?, "release"?, "kill"?}}
+//     {"permission": {..., "cwd"?, "env"?}}  as above (a "command" may also be an
+//                                           array; cwd/env ride rawInput so a
+//                                           grant is bound to them)
+//     {"terminal": {..., "cwd"?, "env"?, "outputByteLimit"?, "pad"?, "hold"?,
+//                   "release"?, "kill"?}}
 //                                        -> {output, exitStatus}, or
 //                                           "terminal-error: <message>";
 //                                           hold: "terminal-held" without waiting;
 //                                           release: terminal/release without
 //                                           waiting, "terminal-released";
-//                                           kill: terminal/kill before the wait
-//     {"write": {"path", "content" | "bytes"}} -> "write-ok" | "write-error: <message>"
+//                                           kill: terminal/kill before the wait;
+//                                           pad: an unused field of N bytes
+//     {"write": {"path", "content" | "bytes", "pad"?}} -> "write-ok" | "write-error: <message>"
 //     {"parallel": [step, ...]}             -> the steps at once, their outcomes
 // ACP_MOCK_PARAMS_LOG records every session/new|resume params object.
 // ACP_MOCK_ENV_LOG receives the environment this worker was started with.
@@ -54,7 +58,13 @@ async function askPermission(sessionId, permission) {
       kind: permission.kind,
       title: `${permission.kind} ${permission.path ?? permission.command}`,
       ...(permission.path ? { locations: [{ path: permission.path }] } : {}),
-      ...(permission.command ? { rawInput: { command: permission.command } } : {})
+      ...(permission.command ? {
+        rawInput: {
+          command: permission.command,
+          ...(permission.cwd ? { cwd: permission.cwd } : {}),
+          ...(permission.env ? { env: permission.env } : {})
+        }
+      } : {})
     },
     options: permission.options ?? [
       { optionId: "allow", name: "Allow", kind: "allow_once" },
@@ -70,7 +80,13 @@ async function runStep(sessionId, step) {
   if (step.parallel) return Promise.all(step.parallel.map((inner) => runStep(sessionId, inner)));
   if (step.write) {
     const content = step.write.content ?? "x".repeat(step.write.bytes ?? 0);
-    const response = await request("fs/write_text_file", { sessionId, path: step.write.path, content });
+    const response = await request("fs/write_text_file", {
+      sessionId,
+      path: step.write.path,
+      content,
+      // An unused field the Gateway ignores but the pending closure would retain.
+      ...(step.write.pad ? { pad: "p".repeat(step.write.pad) } : {})
+    });
     return response.error ? `write-error: ${response.error.message}` : "write-ok";
   }
   if (step.terminal) {
@@ -79,7 +95,9 @@ async function runStep(sessionId, step) {
       command: step.terminal.command,
       args: step.terminal.args ?? [],
       ...(step.terminal.cwd ? { cwd: step.terminal.cwd } : {}),
-      ...(step.terminal.env ? { env: step.terminal.env } : {})
+      ...(step.terminal.env ? { env: step.terminal.env } : {}),
+      ...(step.terminal.outputByteLimit !== undefined ? { outputByteLimit: step.terminal.outputByteLimit } : {}),
+      ...(step.terminal.pad ? { pad: "p".repeat(step.terminal.pad) } : {})
     });
     if (created.error) return `terminal-error: ${created.error.message}`;
     const { terminalId } = created.result;

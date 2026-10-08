@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { realpathSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -133,10 +133,9 @@ export class AcpClient {
     this.rl = readNdjson(this.proc.stdout, {
       maxLineBytes: this.maxFrameBytes,
       onLine: (line) => this.#onLine(line),
-      onOverflow: (error) => {
-        this.proc?.kill("SIGTERM");
-        this.#fail(error);
-      }
+      // #fail runs the bounded SIGTERM -> SIGKILL teardown; a second SIGTERM
+      // here would only race it.
+      onOverflow: (error) => this.#fail(error)
     });
     // The write side of the same stdio. A child that stops reading its stdin can
     // no longer make the gateway grow without bound, and ten seconds of no write
@@ -145,10 +144,8 @@ export class AcpClient {
       maxFrameBytes: this.maxFrameBytes,
       maxQueueBytes: this.maxQueueBytes,
       writeTimeoutMs: this.writeTimeoutMs,
-      onFatal: (error) => {
-        this.proc?.kill("SIGTERM");
-        this.#fail(error);
-      }
+      // Same as onOverflow: #fail escalates the provider on its own.
+      onFatal: (error) => this.#fail(error)
     });
 
     this.initResult = await this.request(
@@ -503,11 +500,11 @@ export class AcpClient {
         return;
       }
       if (method === "fs/write_text_file") {
-        await this.#runProtectedOperation(id, method, params, () => this.#writeTextFile(params));
+        await this.#runProtectedOperation(id, method, params);
         return;
       }
       if (method === "terminal/create") {
-        await this.#runProtectedOperation(id, method, params, () => this.#createTerminal(params));
+        await this.#runProtectedOperation(id, method, params);
         return;
       }
       if (method === "terminal/output") {
@@ -628,7 +625,12 @@ export class AcpClient {
     const kind = grantKindForTool(params.toolCall?.kind);
     if (kind === "terminal") {
       const command = approvedCommand(params.toolCall?.rawInput);
-      return command ? { kind, command } : null;
+      if (!command) return null;
+      // Bound to the cwd and env Main approved, not the command alone: the same
+      // argv in another directory, or with PATH/LD_PRELOAD/an interpolated
+      // variable changed, runs something Main did not see, so it is asked anew.
+      const roots = this.sessionRoots.get(params.sessionId) ?? [];
+      return { kind, command, cwd: grantCwd(params.toolCall?.rawInput?.cwd, roots), env: envMap(params.toolCall?.rawInput?.env) };
     }
     if (kind === "write") {
       const root = this.sessionRoots.get(params.sessionId)?.[0] ?? "";
@@ -676,9 +678,31 @@ export class AcpClient {
     }
   }
 
-  async #writeTextFile(params) {
-    const handle = await this.#openWorkerFile(params.sessionId, params.path, true);
+  // Bound to the file Main approved (approvedPath, the canonical target the
+  // operation was shown as), not to params.path again: a worker that repoints a
+  // symlink in params.path while the approval waits must not redirect the write
+  // to another in-root file. The write opens the approved path directly and
+  // refuses if params.path no longer resolves to it; the worker can re-request.
+  async #writeTextFile(params, approvedPath, approvedTarget) {
+    let current;
     try {
+      current = workerFilePathSync(params.path, { allowMissing: true });
+    } catch {
+      throw new Error(`Write target no longer resolves since it was approved: ${approvedPath}`);
+    }
+    if (current !== approvedPath) {
+      throw new Error(`Write target changed since it was approved: ${approvedPath} is now ${current}`);
+    }
+    const handle = await this.#openWorkerFile(params.sessionId, approvedPath, true);
+    try {
+      // A target that already existed when Main saw it must still be the same
+      // file, not a new inode swapped onto the approved path in the meantime.
+      if (approvedTarget) {
+        const opened = await handle.stat({ bigint: true });
+        if (opened.dev !== approvedTarget.dev || opened.ino !== approvedTarget.ino) {
+          throw new Error(`Write target changed since it was approved: ${approvedPath}`);
+        }
+      }
       // Emptied only now, once the descriptor passed the check: an open that
       // truncated would already have cut whatever a swapped path led to.
       await handle.truncate(0);
@@ -704,6 +728,16 @@ export class AcpClient {
     const env = params.env ?? [];
     if (!Array.isArray(env) || env.some((entry) => typeof entry?.name !== "string")) {
       throw new Error("Terminal env must be an array of {name, value}");
+    }
+    // A present-but-invalid outputByteLimit is refused here, before the spawn:
+    // a non-finite one would otherwise reach BoundedUtf8Text as NaN and throw in
+    // the stdout "data" callback, outside this request's try/catch. Absent uses
+    // the default (#createTerminal).
+    if (params.outputByteLimit != null) {
+      const requested = Number(params.outputByteLimit);
+      if (!Number.isFinite(requested) || requested < 1) {
+        throw new Error("Terminal outputByteLimit must be a finite number of at least 1");
+      }
     }
     if (this.#namesProtectedPath([params.command, ...args].join(" "), cwd)) {
       throw new Error("Terminal command names a path protected by the Gateway");
@@ -733,7 +767,9 @@ export class AcpClient {
       throw new Error(`ACP session terminal limit exceeded: ${this.maxTerminalsPerSession}`);
     }
     const terminalId = `terminal-${this.nextId++}`;
-    const limit = Math.min(Math.max(Number(params.outputByteLimit ?? 1_000_000), 1), this.maxTerminalOutputBytes);
+    // #terminalRequest already refused a present-but-invalid limit, so Number()
+    // is finite here; floor keeps it the integer BoundedUtf8Text requires.
+    const limit = Math.min(Math.max(Math.floor(Number(params.outputByteLimit ?? 1_000_000)), 1), this.maxTerminalOutputBytes);
     const launch = sandbox ? sandbox.wrap(request.command, request.args, this.protectedPaths) : request;
     // Same scrub and marker as the worker's own env. What the worker asks for
     // explicitly is its own identity, not the Main's, and is kept; the marker
@@ -840,7 +876,7 @@ export class AcpClient {
     });
   }
 
-  async #runProtectedOperation(id, method, params, run) {
+  async #runProtectedOperation(id, method, params) {
     const policy = this.sessionPolicies.get(params.sessionId) ?? this.permissionPolicy;
     if (policy === "read_only") throw new Error("Session permission policy is read_only");
     // Checked before anything is decided: what cannot run is refused here and
@@ -848,6 +884,11 @@ export class AcpClient {
     const operation = method === "fs/write_text_file"
       ? this.#writeOperation(id, params)
       : this.#terminalOperation(id, params);
+    // Built from the operation, so the write carries the canonical target Main
+    // approved (operation.path) and the inode it had then (operation.target).
+    const run = operation.kind === "write"
+      ? () => this.#writeTextFile(params, operation.path, operation.target)
+      : () => this.#createTerminal(params);
     // auto_approve runs a write, and a terminal the OS keeps off the protected
     // paths (or when nothing is protected). Without that, all that stands
     // between a terminal and install.json is its command line, which a shell
@@ -896,33 +937,54 @@ export class AcpClient {
       roots: this.sessionRoots.get(params.sessionId) ?? [],
       protectedPaths: this.protectedPaths
     });
-    const bytes = Buffer.byteLength(String(params.content ?? ""), "utf8");
+    // The inode of the target as it is now, when Main is shown this path, so the
+    // write can tell an unchanged file apart from one swapped onto the path
+    // later. A path with nothing at it yet (a new file) binds to the path alone.
+    let target = null;
+    try {
+      const info = statSync(path, { bigint: true });
+      if (info.isFile()) target = { dev: info.dev, ino: info.ino };
+    } catch {
+      // No pre-existing target.
+    }
+    const contentBytes = Buffer.byteLength(String(params.content ?? ""), "utf8");
     return {
       kind: "write",
       path,
-      // What waiting for Main holds: the content, and the path.
-      bytes: bytes + Buffer.byteLength(path),
+      target,
+      // What waiting for Main actually holds is the whole retained request, so a
+      // worker cannot pad it with an unused field it does not pay the budget for.
+      bytes: Buffer.byteLength(JSON.stringify(params)),
       toolCall: {
         toolCallId: `client-${id}`,
-        title: `Write ${displayText(path)} (${bytes} ${bytes === 1 ? "byte" : "bytes"})`,
+        title: `Write ${displayText(path)} (${contentBytes} ${contentBytes === 1 ? "byte" : "bytes"})`,
         kind: "edit",
         locations: [{ path }],
-        rawInput: { path, bytes }
+        rawInput: { path, bytes: contentBytes }
       }
     };
   }
 
   // A terminal/create as Main is asked about it: the command, its args, the
-  // working directory and the names of the env vars it sets, never their
-  // values, which can be a credential the worker passes along.
+  // working directory, and the env it sets. The values of env that decide what
+  // runs — the loader names (PATH/LD_PRELOAD/DYLD_*/...) and any the command line
+  // interpolates — are shown, because hiding them would let an approval cover a
+  // command whose behaviour Main never saw; every other value stays hidden, as a
+  // worker-supplied credential should. cwd and env also ride the operation, so a
+  // grant is spent only by a request with the same ones.
   #terminalOperation(id, params) {
     const request = this.#terminalRequest(params);
+    const commandLine = [request.command, ...request.args].join(" ");
+    const decisive = interpolatedEnvNames(commandLine);
     return {
       kind: "terminal",
       command: argvCommand([request.command, ...request.args]),
-      namesGatewayDirectory: this.#namesGatewayDirectory([request.command, ...request.args].join(" ")),
-      // What waiting for Main holds: the whole request, env values included.
-      bytes: Buffer.byteLength(JSON.stringify({ command: request.command, args: request.args, cwd: request.cwd, env: request.env })),
+      cwd: request.cwd,
+      env: envMap(request.env),
+      namesGatewayDirectory: this.#namesGatewayDirectory(commandLine),
+      // What waiting for Main actually holds is the whole retained request, so a
+      // worker cannot pad it with an unused field it does not pay the budget for.
+      bytes: Buffer.byteLength(JSON.stringify(params)),
       toolCall: {
         toolCallId: `client-${id}`,
         title: `Run: ${displayText(displayCommand(request.command, request.args), TITLE_COMMAND_CHARS)}`,
@@ -931,7 +993,11 @@ export class AcpClient {
           command: request.command,
           args: request.args,
           cwd: request.cwd,
-          env: request.env.map((entry) => entry.name)
+          env: request.env.map((entry) => (
+            isExecutionEnvName(entry.name) || decisive.has(entry.name)
+              ? { name: entry.name, value: entry.value }
+              : { name: entry.name }
+          ))
         }
       }
     };
@@ -972,9 +1038,16 @@ export class AcpClient {
   // approved file once, the command once. Anything else is asked about anew.
   #consumeGrant(sessionId, operation) {
     const grants = this.sessionOperationGrants.get(sessionId);
-    const index = grants?.findIndex((grant) => grant.kind === operation.kind && (operation.kind === "write"
-      ? grant.paths.has(operation.path)
-      : grant.command === operation.command)) ?? -1;
+    const index = grants?.findIndex((grant) => {
+      if (grant.kind !== operation.kind) return false;
+      if (operation.kind === "write") return grant.paths.has(operation.path);
+      // A terminal grant covers the operation only with the same command, the
+      // same cwd, and the same values for the execution-affecting env of that
+      // command (which also rejects a request that adds one not approved).
+      return grant.command === operation.command
+        && grant.cwd === operation.cwd
+        && sameEnv(executionEnv(operation.command, grant.env), executionEnv(operation.command, operation.env));
+    }) ?? -1;
     if (index === -1) return false;
     const grant = grants[index];
     if (operation.kind === "write" && grant.paths.size > 1) grant.paths.delete(operation.path);
@@ -1074,7 +1147,15 @@ export class AcpClient {
     this.sessionOperationGrants.clear();
     for (const terminal of this.terminals.values()) this.#terminate(terminal);
     this.terminals.clear();
+    // The same bounded SIGTERM -> SIGKILL teardown stop() uses, so a provider
+    // that ignores SIGTERM on a fatal error is still escalated to SIGKILL rather
+    // than leaked: the handle is captured first and dropped only after
+    // endProvider has had it, never signalled only once and forgotten. The
+    // synchronous rejections above are unchanged — the turn fails now, the reap
+    // runs on its own.
+    const proc = this.proc;
     this.proc = null;
+    if (proc) void endProvider(proc, this.killGraceMs);
     if (wasAlive) this.onExit?.(error);
   }
 }
@@ -1381,6 +1462,66 @@ function grantPath(path) {
   } catch {
     return resolve(path);
   }
+}
+
+// The cwd an execute approval was given for, canonical, the way #terminalRequest
+// resolves a terminal's cwd, so the two compare: the request's own cwd, or the
+// session root when it named none.
+function grantCwd(rawCwd, roots) {
+  const base = rawCwd != null && rawCwd !== "" ? String(rawCwd) : (roots[0] ?? process.cwd());
+  try {
+    return realpathSync(resolve(base));
+  } catch {
+    return resolve(base);
+  }
+}
+
+// Env vars that change which program runs or how it is loaded, not data a
+// command reads: a grant is bound to their values and Main is shown them. DYLD_*
+// is a family (the macOS dynamic linker), so it is matched by prefix.
+const EXECUTION_ENV_NAMES = new Set(["PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "NODE_OPTIONS", "BASH_ENV"]);
+
+function isExecutionEnvName(name) {
+  return EXECUTION_ENV_NAMES.has(name) || name.startsWith("DYLD_");
+}
+
+// The names a command line interpolates ($NAME or ${NAME}). Their values are
+// part of what runs, so they are treated like the execution-affecting names.
+function interpolatedEnvNames(commandLine) {
+  const names = new Set();
+  const pattern = /\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g;
+  let match;
+  while ((match = pattern.exec(commandLine)) !== null) names.add(match[1]);
+  return names;
+}
+
+// A worker-set env, as an ACP [{name, value}] array or a plain object, as a
+// name -> value map.
+function envMap(env) {
+  const map = new Map();
+  if (Array.isArray(env)) {
+    for (const entry of env) if (typeof entry?.name === "string") map.set(entry.name, String(entry.value ?? ""));
+  } else if (env && typeof env === "object") {
+    for (const [name, value] of Object.entries(env)) map.set(name, String(value ?? ""));
+  }
+  return map;
+}
+
+// The execution-affecting slice of an env map for a command line: the loader
+// names plus whatever the line interpolates. The rest is data a grant ignores.
+function executionEnv(commandLine, env) {
+  const decisive = interpolatedEnvNames(commandLine);
+  const result = new Map();
+  for (const [name, value] of env) {
+    if (isExecutionEnvName(name) || decisive.has(name)) result.set(name, value);
+  }
+  return result;
+}
+
+function sameEnv(a, b) {
+  if (a.size !== b.size) return false;
+  for (const [name, value] of a) if (b.get(name) !== value) return false;
+  return true;
 }
 
 // What Main reads in a pending terminal's title: argv as a shell would spell

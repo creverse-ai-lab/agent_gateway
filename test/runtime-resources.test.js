@@ -158,7 +158,11 @@ test("BoundedUtf8Text returns, counts and evicts exactly what the 1.7 accumulato
     "é".repeat(700), "z".repeat(5_000), "😀".repeat(1_500), "q".repeat(20_000)
   ];
   for (let trial = 0; trial < 300; trial += 1) {
-    const maxBytes = pick([0, 1, 3, 4, 9, 32, 255, 4_096, 8_192, 20_000, 70_000]);
+    // 0 is no longer seeded here: the constructor now rejects a bound below 1
+    // (F3), and the reference accumulator does not, so the two cannot be built
+    // alike with it. Production never built one with 0; 1 exercises the same
+    // evict-everything path.
+    const maxBytes = pick([1, 3, 4, 9, 32, 255, 4_096, 8_192, 20_000, 70_000]);
     const expectedTrim = [];
     const actualTrim = [];
     const expected = new ReferenceText(maxBytes, { onTrim: (bytes) => expectedTrim.push(Buffer.from(bytes)) });
@@ -188,6 +192,17 @@ test("BoundedUtf8Text returns, counts and evicts exactly what the 1.7 accumulato
     assert.equal(actual.toString(), expected.toString(), `trial ${trial}`);
     assert.deepEqual(Buffer.concat(actualTrim), Buffer.concat(expectedTrim), `evicted bytes, trial ${trial}`);
   }
+});
+
+test("F3: BoundedUtf8Text refuses a non-positive-integer bound at construction, before any append", () => {
+  // A NaN bound (Number("x")) used to be stored and only throw later, inside an
+  // append's Buffer.alloc — on the terminal path a stdout "data" callback with
+  // no try/catch around it, which took the whole daemon down.
+  for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 0, -1, 1.5, "100"]) {
+    assert.throws(() => new BoundedUtf8Text(bad), /positive integer/, `maxBytes ${String(bad)}`);
+  }
+  assert.doesNotThrow(() => new BoundedUtf8Text(1));
+  assert.equal(new BoundedUtf8Text(8).maxBytes, 8);
 });
 
 test("a 1MB tail fed 64KiB terminal chunks keeps about 1MB alive, not every chunk it evicted", () => {

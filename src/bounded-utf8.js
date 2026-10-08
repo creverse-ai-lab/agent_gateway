@@ -198,6 +198,14 @@ const COMPACT_AFTER_SLOTS = 32;
 // staying pinned by a view of it.
 export class BoundedUtf8Text {
   constructor(maxBytes, { onTrim = null } = {}) {
+    // A finite positive integer, checked here so a bad bound fails at
+    // construction rather than later inside an append's Buffer.alloc. On the
+    // terminal-output path that append runs in a child's stdout "data" callback,
+    // outside any request try/catch, so a NaN bound from a non-numeric
+    // outputByteLimit would otherwise take the whole daemon down.
+    if (!Number.isInteger(maxBytes) || maxBytes < 1) {
+      throw new RangeError(`BoundedUtf8Text maxBytes must be a positive integer: ${maxBytes}`);
+    }
     this.maxBytes = maxBytes;
     this.onTrim = onTrim;
     this.reset();

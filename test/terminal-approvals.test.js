@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -77,20 +77,48 @@ async function request(requests, count) {
 
 // ------------------------------------------------------------------ W4: display
 
-test("W4: a terminal waiting for Main names its command, args, cwd and env names, never an env value", async () => {
+// F1: an approval binds to what a command does. The values of the env that
+// decide that — the loader names and whatever the command line interpolates —
+// are shown to Main; every other value stays hidden, as before. (This replaces
+// the earlier assertion that *no* env value was ever shown: hiding the value of
+// a variable the command interpolates was exactly how an approval could cover a
+// command Main never saw.)
+test("W4/F1: a terminal waiting for Main shows the env values that decide what runs and hides the rest", async () => {
   await withTemp("acp-w4-terminal-", (directory) => withClient({ cwd: directory, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
     const script = 'printf %s "$WORKER_TOKEN"';
     const turn = run([{
-      terminal: { command: "/bin/sh", args: ["-c", script], env: [{ name: "WORKER_TOKEN", value: "s3cret-value" }] }
+      terminal: {
+        command: "/bin/sh",
+        args: ["-c", script],
+        env: [
+          // Interpolated by the command: its value is part of what runs, so shown.
+          { name: "WORKER_TOKEN", value: "s3cret-value" },
+          // A loader variable: shown.
+          { name: "PATH", value: "/custom/bin:/usr/bin" },
+          // Neither: a worker-supplied value Main does not decide on, hidden.
+          { name: "API_KEY", value: "hidden-key" }
+        ]
+      }
     }]);
     const asked = await request(requests, 1);
     assert.deepEqual(asked.toolCall, {
       toolCallId: `client-${asked.requestId}`,
       title: `Run: /bin/sh -c '${script}'`,
       kind: "execute",
-      rawInput: { command: "/bin/sh", args: ["-c", script], cwd: directory, env: ["WORKER_TOKEN"] }
+      rawInput: {
+        command: "/bin/sh",
+        args: ["-c", script],
+        cwd: directory,
+        env: [
+          { name: "WORKER_TOKEN", value: "s3cret-value" },
+          { name: "PATH", value: "/custom/bin:/usr/bin" },
+          { name: "API_KEY" }
+        ]
+      }
     });
-    assert.doesNotMatch(JSON.stringify(asked), /s3cret-value/);
+    assert.match(JSON.stringify(asked), /s3cret-value/, "the interpolated value is shown");
+    assert.match(JSON.stringify(asked), /custom\/bin/, "the loader value is shown");
+    assert.doesNotMatch(JSON.stringify(asked), /hidden-key/, "an opaque value is not");
     await client.respondPermission(asked.requestId, "allow-once", sessionId);
     const [ran] = await turn;
     assert.equal(ran.output, "s3cret-value", "the value still reaches the terminal");
@@ -152,7 +180,9 @@ test("W4: Main's inbox shows the operation, in full and in the summary", async (
       }, context);
       assert.equal(pending.status, "input_required");
       const [full] = (await service.call("inbox", { action: "list" }, context)).items;
-      assert.deepEqual(full.toolCall.rawInput, { command: "git", args: ["status", "--short"], cwd: directory, env: ["GIT_DIR"] });
+      // GIT_DIR is neither a loader variable nor interpolated by the command, so
+      // its value stays hidden; the env entry is now {name} rather than a bare name.
+      assert.deepEqual(full.toolCall.rawInput, { command: "git", args: ["status", "--short"], cwd: directory, env: [{ name: "GIT_DIR" }] });
       const [summary] = (await service.call("inbox", { action: "list", detail: "summary" }, context)).items;
       assert.equal(summary.toolCall.title, "Run: git status --short", "the summary keeps only the title, so it names the command");
       assert.doesNotMatch(JSON.stringify(full), /elsewhere/);
@@ -685,4 +715,159 @@ test("P2: a terminal's group that keeps a member through the grace still gets th
       await until(() => processGone(group), "the terminal to end");
     });
   });
+});
+
+// ============================================================================
+// 1.8.0 final-review regressions (F1, F2, F3, F8, F9)
+// ============================================================================
+
+// ---------------------------------------------------------------- F1: grant env/cwd
+
+test("F1: an execute approval is bound to its cwd; the same command in another directory is asked anew", async () => {
+  await withTemp("acp-f1-cwd-", (directory) => withClient({ cwd: directory, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
+    await mkdir(join(directory, "sub"));
+    const turn = run([
+      { permission: { kind: "execute", command: "/bin/echo hi" } },
+      // Same argv and env, but a different working directory: not the one approved.
+      { terminal: { command: "/bin/echo", args: ["hi"], cwd: join(directory, "sub") } },
+      // The approved cwd still runs on the one approval.
+      { terminal: { command: "/bin/echo", args: ["hi"] } }
+    ]);
+    client.respondPermission((await request(requests, 1)).requestId, "allow", sessionId);
+    const moved = await request(requests, 2);
+    assert.equal(moved.toolCall.rawInput.cwd, join(directory, "sub"));
+    await client.respondPermission(moved.requestId, "reject-once", sessionId);
+    assert.deepEqual(await turn, [
+      "allow",
+      "terminal-error: Main rejected ACP operation",
+      { output: "hi\n", exitStatus: { exitCode: 0, signal: null } }
+    ]);
+    assert.equal(requests.length, 2, "only the moved command went back to Main");
+  }));
+});
+
+test("F1: an execute approval is bound to its execution-affecting env; a changed or added one is asked anew", async () => {
+  await withTemp("acp-f1-env-", (directory) => withClient({ cwd: directory, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
+    const turn = run([
+      { permission: { kind: "execute", command: "/bin/echo hi", env: [{ name: "PATH", value: "/safe/bin" }] } },
+      // PATH swapped: not the environment the approval named.
+      { terminal: { command: "/bin/echo", args: ["hi"], env: [{ name: "PATH", value: "/evil/bin" }] } },
+      // LD_PRELOAD added, which the approval never carried.
+      { terminal: { command: "/bin/echo", args: ["hi"], env: [{ name: "PATH", value: "/safe/bin" }, { name: "LD_PRELOAD", value: "/x.so" }] } },
+      // The approved PATH plus a non-execution-affecting var: still the one approval.
+      { terminal: { command: "/bin/echo", args: ["hi"], env: [{ name: "PATH", value: "/safe/bin" }, { name: "NOTE", value: "fyi" }] } }
+    ]);
+    client.respondPermission((await request(requests, 1)).requestId, "allow", sessionId);
+    await client.respondPermission((await request(requests, 2)).requestId, "reject-once", sessionId);
+    await client.respondPermission((await request(requests, 3)).requestId, "reject-once", sessionId);
+    assert.deepEqual(await turn, [
+      "allow",
+      "terminal-error: Main rejected ACP operation",
+      "terminal-error: Main rejected ACP operation",
+      { output: "hi\n", exitStatus: { exitCode: 0, signal: null } }
+    ]);
+    assert.equal(requests.length, 3, "both the swapped and the added env went back to Main");
+  }));
+});
+
+// ---------------------------------------------------------------- F2: write target binding
+
+test("F2: a write whose symlink is repointed after approval is refused, and both files are untouched", async () => {
+  await withTemp("acp-f2-retarget-", (directory) => withClient({ cwd: directory, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
+    const approved = join(directory, "approved.txt");
+    const other = join(directory, "other.txt");
+    const link = join(directory, "link");
+    await writeFile(approved, "APPROVED");
+    await writeFile(other, "OTHER");
+    await symlink(approved, link);
+    const turn = run([{ write: { path: link, content: "PWNED" } }]);
+    const asked = await request(requests, 1);
+    // Main is shown the target the link resolves to now.
+    assert.deepEqual(asked.toolCall.locations, [{ path: approved }]);
+    // While the approval waits, the worker repoints the link at another in-root file.
+    await rm(link);
+    await symlink(other, link);
+    await client.respondPermission(asked.requestId, "allow-once", sessionId);
+    const [outcome] = await turn;
+    assert.match(outcome, /^write-error: Write target changed since it was approved/);
+    assert.equal(await readFile(other, "utf8"), "OTHER", "the retargeted file is untouched");
+    assert.equal(await readFile(approved, "utf8"), "APPROVED", "and so is the approved one");
+  }));
+});
+
+test("F2: a write to an unchanged target still goes through", async () => {
+  await withTemp("acp-f2-unchanged-", (directory) => withClient({ cwd: directory, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
+    const approved = join(directory, "approved.txt");
+    const link = join(directory, "link");
+    await writeFile(approved, "OLD");
+    await symlink(approved, link);
+    const turn = run([{ write: { path: link, content: "NEW" } }]);
+    const asked = await request(requests, 1);
+    assert.deepEqual(asked.toolCall.locations, [{ path: approved }]);
+    await client.respondPermission(asked.requestId, "allow-once", sessionId);
+    assert.deepEqual(await turn, ["write-ok"]);
+    assert.equal(await readFile(approved, "utf8"), "NEW");
+  }));
+});
+
+// ---------------------------------------------------------------- F3: output byte limit
+
+test("F3: an invalid outputByteLimit is refused without crashing the daemon; a valid one still works", async () => {
+  await withTemp("acp-f3-", (directory) => withClient({ cwd: directory, policy: "auto_approve", protectedPaths: [] }, async ({ requests, run }) => {
+    const [bad, zero, negative, ok, defaulted] = await run([
+      { terminal: { command: "echo", args: ["x"], outputByteLimit: "not-a-number" } },
+      { terminal: { command: "echo", args: ["x"], outputByteLimit: 0 } },
+      { terminal: { command: "echo", args: ["x"], outputByteLimit: -5 } },
+      // A small valid limit truncates but runs, proving the daemon is still alive.
+      { terminal: { command: "echo", args: ["ok"], outputByteLimit: 4 } },
+      { terminal: { command: "echo", args: ["fine"] } }
+    ]);
+    const invalid = /^terminal-error: Terminal outputByteLimit must be a finite number of at least 1$/;
+    assert.match(bad, invalid);
+    assert.match(zero, invalid);
+    assert.match(negative, invalid);
+    assert.equal(ok.exitStatus.exitCode, 0);
+    assert.equal(ok.output, "ok\n");
+    assert.equal(defaulted.output, "fine\n", "the daemon kept running after the invalid requests");
+    assert.equal(requests.length, 0);
+  }));
+});
+
+// ---------------------------------------------------------------- F8: pending byte budget
+
+test("F8: a pending operation holds its whole payload against the budget, not only the fields it uses", async () => {
+  await withTemp("acp-f8-", (directory) => withClient({
+    cwd: directory, protectedPaths: [], maxPendingInputBytesPerSession: 4096
+  }, async ({ requests, run }) => {
+    const path = join(directory, "small.txt");
+    // Small content, but a large unused field the pending closure would retain.
+    const [outcome] = await run([{ write: { path, content: "hi", pad: 8192 } }]);
+    assert.match(outcome, /byte budget exceeded \(\d+\/4096\)$/);
+    assert.equal(requests.length, 0, "refused before Main is asked");
+  }));
+});
+
+// ---------------------------------------------------------------- F9: fatal provider teardown
+
+test("F9: a provider that ignores SIGTERM is SIGKILLed on a fatal error, and the handle is released", async () => {
+  const client = new AcpClient(
+    { provider: "mock", command: process.execPath, args: [permissionAgent], env: { ACP_MOCK_IGNORE_SIGTERM: "1" }, permissionPolicy: "auto_approve" },
+    { maxFrameBytes: 4096, killGraceMs: 300 }
+  );
+  let providerPid = null;
+  try {
+    await client.start();
+    providerPid = client.proc.pid;
+    assert.equal(processGone(providerPid), false);
+    // A frame from the provider larger than maxFrameBytes is a fatal read
+    // overflow: it tears the client down through #fail while the provider is
+    // still alive and, here, deaf to SIGTERM.
+    client.proc.stdout.emit("data", Buffer.alloc(5_000, 0x78));
+    await until(() => !client.alive, "the fatal transport error");
+    await until(() => processGone(providerPid), "the provider to be SIGKILLed after it ignored SIGTERM");
+    assert.equal(client.proc, null, "the kill handle is released only after the bounded teardown");
+  } finally {
+    await client.stop().catch(() => {});
+    if (providerPid && !processGone(providerPid)) process.kill(providerPid, "SIGKILL");
+  }
 });
