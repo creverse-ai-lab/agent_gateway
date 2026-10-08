@@ -186,7 +186,7 @@ v1.3.0부터 poll 기본값이 절약형입니다. 턴이 진행 중일 때 `res
 ## 세션과 데이터
 
 - 상태 파일(schema v5): `~/.acp-gateway/state.snapshot.json`(전체 상태) + `~/.acp-gateway/state.wal.ndjson`(control 전이 로그)
-- v1.8.0부터 `~/.acp-gateway/state.json`(v4 형식)은 더 이상 기록하지 않습니다. 남아 있는 파일은 시작할 때 계속 읽어 이전하고, 동기화된 v5 snapshot이 그 내용을 담은 뒤에 지웁니다. 롤백한 1.4~1.7 Gateway도 v5 파일을 읽지만, 큰 Task 결과는 미리보기만 제공합니다(`resultDegraded` 표시). 1.4보다 오래된 Gateway는 상태를 찾지 못하고 빈 상태로 시작합니다.
+- v1.8.0부터 `~/.acp-gateway/state.json`(v4 형식)은 더 이상 기록하지 않습니다. 남아 있는 파일은 시작할 때 계속 읽어 이전하고, 동기화된 v5 snapshot이 그 내용을 담은 뒤에 지웁니다. 롤백한 1.4~1.7 Gateway도 v5 파일을 읽지만, 큰 Task 결과는 미리보기만 제공합니다(`resultDegraded` 표시). 1.4보다 오래된 Gateway는 상태를 찾지 못하고 빈 상태로 시작합니다. v5 파일은 따로 변환할 필요가 없지만, Control MCP 항목은 다시 등록해야 할 수 있습니다. 1.8 installer가 등록했거나 다시 쓴 항목에는 token이 없고, 1.7.x 프론트 도어는 token을 항목의 환경 변수에서만 읽으므로 그런 항목으로는 시작하지 못합니다. 설치된 패키지를 1.7.x로 되돌린 뒤, 그런 항목을 가진 호스트마다 그 버전의 `acp-gateway-bootstrap --install-control --target <host> --force`를 실행하고 해당 호스트 세션을 다시 연결하세요([호스트 재연결 절차](#호스트-재연결-절차)의 3번). 1.8 installer로는 이 작업을 할 수 없습니다. `--force`를 주어도 token을 다시 넣지 않기 때문입니다. `--force` 없이는 1.7.x installer도 여전히 올바른 스크립트를 실행하는 항목은 그대로 둡니다.
 - 상태가 바뀌는 동안 WAL이 켜져 있으면 전체 snapshot은 많아야 약 1초에 한 번 다시 쓰고, WAL 회전과 종료 때도 씁니다. WAL 레코드 자체는 전처럼 즉시 기록합니다.
 - idle resumable 세션은 기본 30분 후 unload
 - 결과와 이벤트는 기본 24시간 보존
