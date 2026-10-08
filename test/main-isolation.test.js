@@ -790,6 +790,74 @@ test("an adoption survives a restart through the snapshot; one a crash took back
   }
 });
 
+// A close is in the log at once, and no log record says who owns what: the
+// startup re-binding works from the session row, which the close took away.
+// So closing an adopted session, by Main or by session retention, first puts
+// the adoption in a snapshot. Without that, a crash before the next one hands
+// the session's tasks and inbox rows back to the Main it was taken from.
+test("an adopted session closed or retired just before a crash leaves its tasks and inbox with the adopter", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-isolation-adopt-close-"));
+  try {
+    for (const ending of ["close", "retention"]) {
+      const statePath = join(directory, ending, "state.json");
+      const paths = statePaths(statePath);
+      // The long snapshot interval keeps the debounced writer quiet from the
+      // adoption to the copy of the files below: that gap is the crash window.
+      // Retention takes the session after a minute, its tasks after a day.
+      const options = { statePath, isOwnerLive: () => false, snapshotIntervalMs: 60_000, sessionRetentionMs: 60_000 };
+      let ids = null;
+      let crashed = null;
+      const first = harness(options);
+      try {
+        await first.service.init();
+        const a = await open(first.service, A);
+        const done = await finished(first.service, a, A);
+        const answered = await start(first.service, a.session, A);
+        permission(a.worker, a.session, 1);
+        await until(() => first.service.inbox.size === 1, "permission row");
+        const [row] = first.service.inbox.values();
+        await first.service.call("permission", { sessionId: a.session.id, requestId: 1, optionId: "allow-once" }, A);
+        await until(() => a.session.status === "running", "answered");
+        await finish(first.service, a.worker, answered);
+        // On disk from here: the session, its tasks and its row, all A's.
+        await first.service.flushPersist();
+        ids = { session: a.session.id, done, answered, row: row.inboxId };
+        await restoresInPlace(first.service, a.session, A2);
+        assert.deepEqual(a.session.openedBy, claudeCallerNew);
+        if (ending === "close") {
+          await first.service.call("session", { action: "close", sessionId: ids.session }, A2);
+        } else {
+          first.clock.now += 2 * 60_000;
+          await first.service.runMaintenance();
+        }
+        assert.equal(first.service.store.get(ids.session), undefined, `${ending}: the session is gone`);
+        // What a crash right now would leave: no snapshot written after this point.
+        crashed = { snapshot: await readFile(paths.snapshot), wal: await readFile(paths.wal) };
+      } finally {
+        await first.service.shutdown();
+      }
+      await writeFile(paths.snapshot, crashed.snapshot, { mode: 0o600 });
+      await writeFile(paths.wal, crashed.wal, { mode: 0o600 });
+      await rm(paths.rotating, { force: true });
+
+      const recovered = harness(options);
+      try {
+        await recovered.service.init();
+        assert.equal(recovered.service.store.get(ids.session), undefined, `${ending}: the session stays gone`);
+        assert.deepEqual(await taskIds(recovered.service, A2), sorted(ids.done, ids.answered), `${ending}: the adopter keeps the tasks`);
+        assert.deepEqual(await taskIds(recovered.service, A), [], `${ending}: nothing went back to A`);
+        // Retention takes a session's inbox rows with it; a close keeps them.
+        assert.deepEqual(await inboxIds(recovered.service, A2), ending === "close" ? [ids.row] : [], `${ending}: the adopter's rows`);
+        assert.deepEqual(await inboxIds(recovered.service, A), [], `${ending}: no row went back to A`);
+      } finally {
+        await recovered.service.shutdown();
+      }
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("a session the log brings back newer than its tasks' snapshot still takes them along", async () => {
   const directory = await mkdtemp(join(tmpdir(), "acp-isolation-adopt-wal-"));
   const statePath = join(directory, "state.json");

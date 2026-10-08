@@ -1257,7 +1257,8 @@ export class GatewayService {
   // gone (boundOwner, #taskOwner). Persisted by the snapshot only: a log record
   // type of its own would make a 1.7 Gateway refuse the log on a downgrade. A
   // crash within the snapshot interval can lose it, and the Main's same
-  // explicit restore then takes the session again.
+  // explicit restore then takes the session again, while the session is there
+  // to take (#persistAdoption covers its close).
   #adopt(session, context) {
     const adopter = this.#attributed(context);
     session.adoptedFrom = session.openedBy;
@@ -1269,6 +1270,28 @@ export class GatewayService {
     this.taskStore.bindOwner(session.id, adopter);
     this.touchSessionOwner(session);
     this.schedulePersist();
+  }
+
+  // Called with the session already out of the store, right before its
+  // SESSION_CLOSED is appended. That record is in the log at once, and no log
+  // record says who owns a task or an inbox row: the startup re-binding works
+  // from the session row, which the close takes away. A crash before the next
+  // snapshot would then hand the session's tasks and rows back to the Main it
+  // was adopted from, with no session left to adopt again. So while the
+  // snapshot may not hold the adoption yet (changes not written, or the last
+  // write failed), it is written now, and synced, ahead of the record that
+  // depends on it. Without the WAL nothing is appended, and the next snapshot
+  // carries the close and the adoption together.
+  #persistAdoption(session) {
+    if (!session.adoptedFrom || this.stateStore?.mode !== "wal") return;
+    if (!this.persistDirty && this.persistError == null) return;
+    try {
+      this.stateStore.writeSnapshot({ sync: true });
+    } catch (error) {
+      // The close goes on regardless: a failed write costs no more than the
+      // crash window did before.
+      this.persistError = error?.message ?? String(error);
+    }
   }
 
   // Explicit agent_acp_session_restore of a record Main already has. The same
@@ -3066,6 +3089,7 @@ export class GatewayService {
     session.client = null;
     this.store.push(session, { type: "session_closed" });
     this.store.delete(session.id);
+    this.#persistAdoption(session);
     // Replay must not resurrect a session Main was told is gone, even when the
     // registration record is still in the log ahead of this one.
     this.stateStore?.append(WAL_TYPES.SESSION_CLOSED, session.id, {});
@@ -4121,6 +4145,7 @@ export class GatewayService {
           session.client = null;
         }
         this.store.delete(session.id);
+        this.#persistAdoption(session);
         this.stateStore?.append(WAL_TYPES.SESSION_CLOSED, session.id, {});
         if (session.workspace) await this.#removeWorkspace(session.workspace);
         // Task handles deliberately survive their session now: a Task's lifetime
