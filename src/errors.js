@@ -44,9 +44,10 @@ export const ERROR_CODES = Object.freeze({
   // The caller's pid is the daemon or runs under it: the agent CLI behind this
   // connection is a worker, or something a worker or its terminal started.
   // Workers never get the Control, whatever token they present. Refused before
-  // the connection binds or anything runs, and the verdict holds for the
-  // connection; one that never names a caller pid (management clients) is
-  // never refused for this.
+  // the connection binds or anything runs. The verdict is reused only while
+  // the connection's caller pid stays the same; a request that names another
+  // pid is checked on its own. A connection that never names a caller pid
+  // (management clients) is never refused for this.
   WORKER_CONTROL_DENIED: "WORKER_CONTROL_DENIED",
   // The fail-closed persistence path: a Task handle is a durability promise, so
   // it is refused rather than issued while the state store cannot keep it.

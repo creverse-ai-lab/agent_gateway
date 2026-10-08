@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { AcpClient, PERMISSION_POLICIES, requirePermissionPolicy } from "./acp-client.js";
@@ -130,7 +130,8 @@ const CONTROL_SERVER_PATTERN = /(?:acp-gateway-control|acp-mcp-bridge|gateway-da
 // server has no use for either unless it is a Control front door.
 const CONTROL_ENV = new Set([...CONTROL_IDENTITY_ENV, "ACP_GATEWAY_INSTALL_STATE"]);
 // The bins that run the Control front door (package.json). Matched by name: a
-// bare command is looked up on the worker's PATH, not here.
+// bare command is looked up on the worker's PATH, not here, and a directory of
+// that name is no bin (commandWord).
 const CONTROL_BINS = new Set(["acp-gateway", "acp-gateway-control", "acp-mcp-bridge"]);
 // The debounced state writer. With the WAL off the snapshot is the only file,
 // so it keeps the short debounce. With the WAL on, every fact a restart must
@@ -4246,11 +4247,11 @@ function sanitizeWorkerMcpServers(servers) {
     throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "mcpServers must be an array");
   }
   return servers.map((server) => {
-    const serialized = JSON.stringify(server);
     const name = String(server?.name ?? server?.id ?? "");
-    if (/^(?:agent-acp|agent-acp-control)$/i.test(name) || CONTROL_SERVER_PATTERN.test(serialized)
+    const words = commandWords(server);
+    if (/^(?:agent-acp|agent-acp-control)$/i.test(name) || CONTROL_SERVER_PATTERN.test(mentions(server, words))
       || envNames(server?.env).some((key) => CONTROL_ENV.has(key))
-      || commandWords(server).some(runsControlEntry)) {
+      || words.some(runsControlEntry)) {
       throw new GatewayError(
         ERROR_CODES.INVALID_ARGUMENT,
         "Control MCP/Gateway cannot be injected into a worker session"
@@ -4267,32 +4268,65 @@ function envNames(env) {
 }
 
 // Every word of a server's command and args, so a script behind `sh -c` or an
-// `--option=path` is seen too.
+// `--option=path` is seen too, each as the names it is judged by (commandWord).
 function commandWords(server) {
   return [server?.command, ...(Array.isArray(server?.args) ? server.args : [])]
-    .filter((value) => typeof value === "string")
-    .flatMap((value) => value.split(/[\s=]+/))
-    .map((word) => word.replace(/^["']+|["']+$/g, ""))
-    .filter(Boolean);
+    .flatMap((value, index) => (typeof value === "string"
+      ? value.split(/[\s=]+/)
+        .map((word) => word.replace(/^["']+|["']+$/g, ""))
+        .filter(Boolean)
+        .map((word, at) => commandWord(word, index === 0 && at === 0))
+      : []));
 }
 
-// A Control bin by name, or a file that resolves to a Gateway's Control entry:
-// an index.js beside gateway-daemon.js, that is src/index.js of this package or
-// of any other install, such as ~/.acp-gateway/runtime/current/gateway/src/index.js
-// (a path no name pattern catches). Through a symlink too, as a bin is.
-function runsControlEntry(word) {
-  if (CONTROL_BINS.has(basename(word))) return true;
-  // What a shell behind `sh -c` would expand.
+// A word of a command line, as {names, real}: the names it is judged by, and
+// for a file the path it resolves to. A bare word is its own name. A path is
+// judged by what is there, when the daemon can look (absolute, or under ~ as a
+// shell behind `sh -c` would expand it): a directory by no name at all, since
+// its name is the user's (a checkout called acp-gateway, a filesystem server's
+// root), and a file by its own name and the one it resolves to, not by the
+// directories it sits in. A path the daemon cannot look at, one that is not
+// there or a relative one (the MCP server's cwd is not the daemon's to know),
+// is judged by its last name only as the command, which is never a directory;
+// as an argument it may be one, gone since the session opened, made by the
+// server, or beside its cwd. A relative path still reads whole for the name
+// pattern, as it always has.
+function commandWord(word, isCommand) {
+  if (!/[\\/]/.test(word)) return { names: [word] };
   const home = /^(?:~|\$HOME|\$\{HOME\})\//.exec(word);
   const path = home ? join(homedir(), word.slice(home[0].length)) : word;
-  if (!isAbsolute(path)) return false;
-  let real;
+  if (!isAbsolute(path)) return { names: isCommand ? [word, basename(word)] : [word] };
   try {
-    real = realpathSync(path);
+    const real = realpathSync(path);
+    return statSync(real).isDirectory() ? { names: [] } : { names: [basename(path), basename(real)], real };
   } catch {
-    return false;
+    return { names: isCommand ? [basename(path)] : [] };
   }
-  return basename(real) === "index.js" && existsSync(join(dirname(real), "gateway-daemon.js"));
+}
+
+// What the name pattern reads: the entry as JSON, with its command line read
+// as the names its words are judged by (commandWord), so a filesystem server
+// rooted at ~/src/acp-mcp-bridge is kept and gateway-daemon.js is caught
+// wherever it is installed.
+function mentions(server, words) {
+  const args = Array.isArray(server?.args) ? server.args : null;
+  const rest = JSON.stringify(server, function withoutCommandLine(key, value) {
+    const commandLine = (this === server && key === "command") || (args !== null && this === args);
+    return commandLine && typeof value === "string" ? undefined : value;
+  });
+  return [rest, ...words.flatMap((word) => word.names)].join("\n");
+}
+
+// A Control bin by name, or a file that resolves to a Gateway's Control entry.
+// A bin by name is a bare word (the command, or an argument that names it, as
+// for npx or sh -c), or a file of that name: the bin, a shim of it, or a link
+// to either. The entry is an index.js beside gateway-daemon.js, that is
+// src/index.js of this package or of any other install, such as
+// ~/.acp-gateway/runtime/current/gateway/src/index.js (a path no name pattern
+// catches), reached through a symlink too, as a bin is.
+function runsControlEntry({ names, real }) {
+  return names.some((name) => CONTROL_BINS.has(name))
+    || (real !== undefined && basename(real) === "index.js" && existsSync(join(dirname(real), "gateway-daemon.js")));
 }
 
 function optionalString(value, name) {

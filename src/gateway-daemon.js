@@ -75,7 +75,9 @@ const server = createServer((socket) => {
   let boundAccess = null;
   let inflight = 0;
   // Whether the caller on this connection runs under this daemon: looked up
-  // on the first request that names a caller pid, then kept (worker-tree.js).
+  // on the first request that names a caller pid and reused while the pid
+  // stays the same; a request that names another pid is looked up on its own
+  // (worker-tree.js).
   const callerVerdict = callerVerdicts();
   const requireBinding = (rootId, access) => {
     if (boundRootId && rootId !== boundRootId) {
@@ -129,8 +131,9 @@ const server = createServer((socket) => {
             // A Main's front door never runs under this daemon, so a caller
             // that does is a worker's, whatever it holds. Checked before the
             // connection binds, so a refused one never counts as its Main being
-            // present. Only a connection that named a caller pid waits here, and
-            // every later request on it waits on the same lookup, in order.
+            // present. Only a connection that named a caller pid waits here,
+            // and a later request on it that names the same pid, or none, waits
+            // on the same lookup, in order.
             const verdict = callerVerdict(caller?.pid);
             if (verdict) {
               if (await verdict.denied) {

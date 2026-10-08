@@ -82,31 +82,38 @@ export function runsGatewayDaemon(command) {
 /**
  * The first process, starting at pid and going up through its parents, that
  * is one of pids or whose command line matches, as {pid, command} (command
- * null for a pid match, which needs no read); null when none is within
- * maxDepth or the chain cannot be read. Never throws: a lookup that fails is
- * no evidence either way, and callers treat it as none. pid 1 is compared but
- * never read: it is the top of the chain.
+ * null when it was not read); null when none is within maxDepth or the chain
+ * cannot be read. A pid match needs no read, unless verifyPids: then a listed
+ * process whose command line can be read must match too, and one that does
+ * not has taken the pid of one that is gone (a stale lock), so the walk goes
+ * on past it; one whose command line cannot be read still matches. Never
+ * throws: a lookup that fails is no evidence either way, and callers treat it
+ * as none. pid 1 ends the walk, neither matched nor read: it is the top of
+ * every chain, so being under it says nothing. A daemon that is pid 1 (a
+ * container's entrypoint) cannot be told apart this way, only by the worker
+ * marker.
  */
 export async function findAncestor(pid, {
   pids = [],
   commandMatches = () => false,
+  verifyPids = false,
   readProcess = readProcessInfo,
   maxDepth = MAX_ANCESTRY_DEPTH
 } = {}) {
   const seen = new Set();
   for (let depth = 0; depth < maxDepth; depth += 1) {
-    if (!Number.isInteger(pid) || pid < 1 || seen.has(pid)) return null;
+    if (!Number.isInteger(pid) || pid <= 1 || seen.has(pid)) return null;
     seen.add(pid);
-    if (pids.includes(pid)) return { pid, command: null };
-    if (pid === 1) return null;
-    let info;
+    const listed = pids.includes(pid);
+    if (listed && !verifyPids) return { pid, command: null };
+    let info = null;
     try {
       info = await readProcess(pid);
-    } catch {
-      return null;
-    }
+    } catch {}
+    const command = typeof info?.command === "string" && info.command.trim() ? info.command : null;
+    if (listed && (command === null || commandMatches(command))) return { pid, command };
     if (!info) return null;
-    if (commandMatches(info.command ?? "")) return { pid, command: info.command };
+    if (command !== null && commandMatches(command)) return { pid, command };
     pid = info.ppid;
   }
   return null;
@@ -129,7 +136,10 @@ export function daemonLockPid(socketPath = gatewaySocketPath()) {
  * does not), or when an ancestor is the daemon: the pid in the lock of the
  * socket this front door would use, or a command line that runs
  * gateway-daemon.js (a daemon on another socket, or a CLI that changed TMPDIR
- * on the way). Run once, at startup.
+ * on the way). The lock outlives a daemon that dies without removing it, and
+ * its pid may since belong to the Main's own CLI or another ancestor, which
+ * would then refuse the Main; so the lock pid counts only when its command
+ * line runs the daemon, or cannot be read. Run once, at startup.
  */
 export async function workerTreeReason({
   env = process.env,
@@ -142,17 +152,21 @@ export async function workerTreeReason({
   const lockPid = daemonLockPid(socketPath);
   const daemon = await findAncestor(ppid, {
     pids: lockPid ? [lockPid] : [],
+    verifyPids: true,
     commandMatches: runsGatewayDaemon,
     readProcess,
     maxDepth
   });
   if (!daemon) return null;
-  return daemon.command === null
+  return daemon.pid === lockPid
     ? `ancestor process ${daemon.pid} holds the Gateway daemon lock ${socketPath}.lock`
     : `ancestor process ${daemon.pid} runs the Gateway daemon: ${daemon.command.slice(0, 200)}`;
 }
 
-/** Whether pid is daemonPid or runs under it. False when that cannot be told. */
+/**
+ * Whether pid is daemonPid or runs under it. False when that cannot be told,
+ * as when the daemon is pid 1.
+ */
 export async function runsUnder(pid, daemonPid, { readProcess = readProcessInfo, maxDepth = MAX_ANCESTRY_DEPTH } = {}) {
   return (await findAncestor(pid, { pids: [daemonPid], readProcess, maxDepth })) !== null;
 }
@@ -162,9 +176,10 @@ export async function runsUnder(pid, daemonPid, { readProcess = readProcessInfo,
  * caller pid, it returns null while the connection has named none, else
  * {pid, denied}: denied a promise of whether that pid runs under the daemon.
  * The verdict is computed for the first pid and reused while the pid stays the
- * same, which it does for a front door, so a connection pays for one lookup.
- * A request with no pid gets the connection's verdict, so it waits behind a
- * lookup in flight instead of overtaking the requests before it.
+ * same, which it does for a front door, so a connection pays for one lookup;
+ * a request that names another pid gets a lookup, and a verdict, of its own.
+ * A request with no pid gets the connection's latest verdict, so it waits
+ * behind a lookup in flight instead of overtaking the requests before it.
  */
 export function callerVerdicts({ daemonPid = process.pid, ...options } = {}) {
   let verdict = null;

@@ -4,7 +4,7 @@ import { once } from "node:events";
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { GATEWAY_WORKER_ENV, withoutSessionMarkers, workerEnv } from "../src/caller.js";
@@ -80,11 +80,75 @@ test("W1: an ancestor holding the daemon lock refuses the front door", async () 
   await withTemp("acp-worker-tree-lock-", async (directory) => {
     const socketPath = join(directory, "gateway.sock");
     await writeFile(`${socketPath}.lock`, "40\n");
-    // A daemon run by a binary whose command line names nothing: only the lock says what it is.
-    const { readProcess, reads } = processTable({ ...WORKER_CHAIN, 40: [1, "/Applications/Some App.app/Contents/MacOS/Some App"] });
-    const reason = await workerTreeReason({ env: {}, ppid: 100, socketPath, readProcess });
-    assert.equal(reason, `ancestor process 40 holds the Gateway daemon lock ${socketPath}.lock`);
-    assert.deepEqual(reads, [100, 50, 45], "the lock pid is matched without reading it");
+    const held = `ancestor process 40 holds the Gateway daemon lock ${socketPath}.lock`;
+    // The lock's pid is read, and its command line runs the daemon.
+    const { readProcess, reads } = processTable(WORKER_CHAIN);
+    assert.equal(await workerTreeReason({ env: {}, ppid: 100, socketPath, readProcess }), held);
+    assert.deepEqual(reads, [100, 50, 45, 40]);
+    // One whose command line cannot be read still counts: gone from the table,
+    // a read that fails, or an empty command line.
+    const unlisted = { ...WORKER_CHAIN };
+    delete unlisted[40];
+    for (const unreadable of [
+      processTable(unlisted).readProcess,
+      async (pid) => {
+        if (pid === 40) throw new Error("ps failed");
+        return processTable(WORKER_CHAIN).readProcess(pid);
+      },
+      processTable({ ...WORKER_CHAIN, 40: [1, " "] }).readProcess
+    ]) assert.equal(await workerTreeReason({ env: {}, ppid: 100, socketPath, readProcess: unreadable }), held);
+  });
+});
+
+// Review: a daemon that dies without removing its lock leaves its pid there, and
+// once the Main's own CLI or another of its ancestors takes that pid, every
+// front door that Main starts would refuse, and nothing would start the daemon
+// that rewrites the lock.
+test("W1: a lock whose pid now runs something else is stale, and the walk goes on past it", async () => {
+  await withTemp("acp-worker-tree-stale-", async (directory) => {
+    const socketPath = join(directory, "gateway.sock");
+    const mainChain = {
+      100: [90, "/Users/me/.local/bin/claude"],
+      90: [80, "-zsh"],
+      80: [1, "/Applications/iTerm.app/Contents/MacOS/iTerm2"]
+    };
+    for (const stale of [100, 90, 80]) {
+      await writeFile(`${socketPath}.lock`, `${stale}\n`);
+      const { readProcess, reads } = processTable(mainChain);
+      assert.equal(await workerTreeReason({ env: {}, ppid: 100, socketPath, readProcess }), null, `lock ${stale}`);
+      assert.deepEqual(reads, [100, 90, 80], "read, found not to be the daemon, and walked past");
+    }
+    // Past a stale lock pid, a daemon further up is still found by its command line.
+    await writeFile(`${socketPath}.lock`, "50\n");
+    assert.match(
+      await workerTreeReason({ env: {}, ppid: 100, socketPath, readProcess: processTable(WORKER_CHAIN).readProcess }),
+      /^ancestor process 40 runs the Gateway daemon: /
+    );
+    // A daemon whose command line names no daemon entry (an app hosting it)
+    // reads the same as a reused pid, so its lock no longer refuses on its own.
+    // Its workers still carry the marker, and the daemon refuses them as callers.
+    await writeFile(`${socketPath}.lock`, "40\n");
+    const hosted = processTable({ ...WORKER_CHAIN, 40: [1, "/Applications/Some App.app/Contents/MacOS/Some App"] });
+    assert.equal(await workerTreeReason({ env: {}, ppid: 100, socketPath, readProcess: hosted.readProcess }), null);
+    assert.equal(await runsUnder(100, 40, { readProcess: hosted.readProcess }), true);
+  });
+});
+
+// Review: a daemon that is pid 1 (a container entrypoint with no init) writes 1
+// into its lock, and every chain ends at pid 1.
+test("W1: pid 1 is the top of every chain, never the daemon, even when the lock names it", async () => {
+  await withTemp("acp-worker-tree-init-", async (directory) => {
+    const socketPath = join(directory, "gateway.sock");
+    await writeFile(`${socketPath}.lock`, "1\n");
+    const { readProcess, reads } = processTable({ 100: [90, "/usr/local/bin/claude"], 90: [1, "/bin/sh -c claude"] });
+    assert.equal(await workerTreeReason({ env: {}, ppid: 100, socketPath, readProcess }), null);
+    assert.deepEqual(reads, [100, 90], "pid 1 is neither matched nor read");
+    assert.equal(await findAncestor(1, { pids: [1], readProcess: () => assert.fail("pid 1 is never read") }), null);
+    // The daemon's side: everything runs under it, so ancestry refuses nobody.
+    assert.equal(await runsUnder(100, 1, { readProcess }), false);
+    assert.equal(await callerVerdicts({ daemonPid: 1, readProcess })(100).denied, false);
+    // There the marker alone tells its workers apart.
+    assert.equal(await workerTreeReason({ env: { [GATEWAY_WORKER_ENV]: "1" }, ppid: 100, socketPath, readProcess }), "ACP_GATEWAY_WORKER=1 is set");
   });
 });
 
@@ -176,7 +240,7 @@ test("W1: the daemon lock yields a pid only when it holds one", async () => {
   });
 });
 
-test("W1: a connection's caller is looked up once, and a pid-less request shares its verdict", async () => {
+test("W1: a connection's caller is looked up once per pid, and a pid-less request shares its verdict", async () => {
   const { readProcess, reads } = processTable({ ...WORKER_CHAIN, 300: [1, "/Users/me/.local/bin/claude"] });
   const verdictFor = callerVerdicts({ daemonPid: 40, readProcess });
   assert.equal(verdictFor(undefined), null, "no pid named yet: nothing to wait for");
@@ -186,8 +250,9 @@ test("W1: a connection's caller is looked up once, and a pid-less request shares
   assert.equal(await first.denied, true);
   assert.equal(verdictFor(100), first);
   assert.equal(verdictFor(null), first);
-  assert.deepEqual(reads, [100, 50, 45], "one lookup for the connection");
-  // Another pid on the connection is another lookup; this one is not under the daemon.
+  assert.deepEqual(reads, [100, 50, 45], "one lookup while the pid stays the same");
+  // Another pid on the connection is checked on its own, and this one is not
+  // under the daemon: a denial is not kept for the connection.
   const second = verdictFor(300);
   assert.notEqual(second, first);
   assert.equal(await second.denied, false);
@@ -206,8 +271,10 @@ test("W1: the process reader reads this platform's processes", { skip: !unix }, 
   assert.equal(await runsUnder(process.ppid, process.pid), false, "a parent never runs under its child");
 });
 
-// A daemon-like parent: it records its pid in the socket's lock, as the daemon
-// does, then starts the real front door (CommonJS, so any file name works).
+// A parent that records its pid in the socket's lock, as the daemon does, then
+// starts the real front door (CommonJS, so any file name works). Saved as
+// gateway-daemon.js it is daemon-like; under another name it is a process that
+// took a dead daemon's pid.
 const DAEMON_LIKE_PARENT = `
 const { spawn } = require("node:child_process");
 const { writeFileSync } = require("node:fs");
@@ -225,7 +292,7 @@ const INITIALIZE = mcpFrame({
 const INITIALIZED = mcpFrame({ method: "notifications/initialized" });
 const SETUP_CALL = mcpFrame({ id: 2, method: "tools/call", params: { name: "agent_acp_setup", arguments: { mode: "summary" } } });
 
-test("W1: a front door under a daemon-like parent refuses before it serves or connects", { skip: !unix, timeout: 60_000 }, async () => {
+test("W1: a front door under a daemon-like parent refuses before it serves or connects, and a stale lock stops none", { skip: !unix, timeout: 60_000 }, async () => {
   // Short names: the socket path must fit sun_path (104 bytes on macOS).
   await withTemp("acp-wt-parent-", async (directory) => {
     const socketPath = join(directory, "gateway.sock");
@@ -240,8 +307,9 @@ test("W1: a front door under a daemon-like parent refuses before it serves or co
       });
     });
     await new Promise((resolve) => server.listen(socketPath, resolve));
-    const parent = join(directory, "parent.js");
-    await writeFile(parent, DAEMON_LIKE_PARENT);
+    const daemonLike = join(directory, "gateway-daemon.js");
+    const reused = join(directory, "parent.js");
+    for (const file of [daemonLike, reused]) await writeFile(file, DAEMON_LIKE_PARENT);
     const env = {
       ...withoutSessionMarkers(process.env),
       ACP_GATEWAY_SOCKET: socketPath,
@@ -255,7 +323,7 @@ test("W1: a front door under a daemon-like parent refuses before it serves or co
     delete env[GATEWAY_WORKER_ENV];
     // Its own process group, so a front door that outlives a failed test can be
     // ended with its parent.
-    const startParent = (extra = {}) => {
+    const startParent = (parent, extra = {}) => {
       const child = spawn(process.execPath, [parent], { stdio: ["pipe", "pipe", "pipe"], env: { ...env, ...extra }, detached: true });
       const output = { stdout: "", stderr: "" };
       child.stdin.on("error", () => {});
@@ -278,7 +346,7 @@ test("W1: a front door under a daemon-like parent refuses before it serves or co
       return { child, output, exited, stop };
     };
     try {
-      const refused = startParent({ ACP_TEST_PARENT_LOCK: `${socketPath}.lock` });
+      const refused = startParent(daemonLike, { ACP_TEST_PARENT_LOCK: `${socketPath}.lock` });
       try {
         refused.child.stdin.write(INITIALIZE + INITIALIZED + SETUP_CALL);
         const [code] = await within(refused.exited, 15_000, () => `the front door kept running: ${refused.output.stdout}`);
@@ -293,10 +361,10 @@ test("W1: a front door under a daemon-like parent refuses before it serves or co
         await refused.stop();
       }
 
-      // The same parent without the lock is an ordinary process: the same front
-      // door serves, and its tool call reaches the socket.
-      await rm(`${socketPath}.lock`);
-      const served = startParent();
+      // A parent whose pid is in the lock but whose command line is not the
+      // daemon's took a dead daemon's pid: the same front door serves, and its
+      // tool call reaches the socket.
+      const served = startParent(reused, { ACP_TEST_PARENT_LOCK: `${socketPath}.lock` });
       try {
         served.child.stdin.write(INITIALIZE);
         await waitFor(() => served.output.stdout.includes("\"id\":1"), () => served.output.stderr);
@@ -383,19 +451,20 @@ test("W1: a front door a real worker's CLI starts is refused, and so is that wor
 
 // ---------------------------------------------------------------------- W12
 
+const assertRefused = (server) => assert.throws(
+  () => sanitizeWorkerMcpServers([server]),
+  (error) => error.code === ERROR_CODES.INVALID_ARGUMENT && /cannot be injected/.test(error.message),
+  JSON.stringify(server)
+);
+
 test("W12: a worker session refuses the Control MCP however it is named, launched or configured", async () => {
   await withTemp("acp-w12-", async (directory) => {
-    const refused = (server) => assert.throws(
-      () => sanitizeWorkerMcpServers([server]),
-      (error) => error.code === ERROR_CODES.INVALID_ARGUMENT && /cannot be injected/.test(error.message),
-      JSON.stringify(server)
-    );
     const plain = { name: "tools", command: "node", args: ["/opt/tools/server.js"] };
     // The identity, or where it is kept, in the env: ACP's [{name, value}] or an object.
-    refused({ ...plain, env: { ACP_GATEWAY_CONTROL_TOKEN: "w12-control-token-at-least-24-chars" } });
-    refused({ ...plain, env: [{ name: "ACP_GATEWAY_CONTROL_TOKEN", value: "w12-control-token-at-least-24-chars" }] });
-    refused({ ...plain, env: [{ name: "PATH", value: "/bin" }, { name: "ACP_GATEWAY_ROOT_ID", value: "main-a" }] });
-    refused({ ...plain, env: { ACP_GATEWAY_INSTALL_STATE: "/elsewhere/install.json" } });
+    assertRefused({ ...plain, env: { ACP_GATEWAY_CONTROL_TOKEN: "w12-control-token-at-least-24-chars" } });
+    assertRefused({ ...plain, env: [{ name: "ACP_GATEWAY_CONTROL_TOKEN", value: "w12-control-token-at-least-24-chars" }] });
+    assertRefused({ ...plain, env: [{ name: "PATH", value: "/bin" }, { name: "ACP_GATEWAY_ROOT_ID", value: "main-a" }] });
+    assertRefused({ ...plain, env: { ACP_GATEWAY_INSTALL_STATE: "/elsewhere/install.json" } });
 
     // An installed runtime's entry, which no name pattern catches: the layout
     // ~/.acp-gateway/runtime/current/gateway/src/ has, here in a temp dir.
@@ -403,26 +472,26 @@ test("W12: a worker session refuses the Control MCP however it is named, launche
     await mkdir(runtime, { recursive: true });
     for (const file of ["index.js", "gateway-daemon.js", "guide.js"]) await writeFile(join(runtime, file), "");
     const entry = join(runtime, "index.js");
-    refused({ name: "tools", command: process.execPath, args: [entry] });
-    refused({ name: "tools", command: process.execPath, args: ["--no-warnings", `--entry=${entry}`] });
-    refused({ name: "tools", command: "/bin/sh", args: ["-c", `exec node '${entry}'`] });
+    assertRefused({ name: "tools", command: process.execPath, args: [entry] });
+    assertRefused({ name: "tools", command: process.execPath, args: ["--no-warnings", `--entry=${entry}`] });
+    assertRefused({ name: "tools", command: "/bin/sh", args: ["-c", `exec node '${entry}'`] });
     // Through a symlink, as a bin is.
     await mkdir(join(directory, "bin"));
     await symlink(entry, join(directory, "bin", "team-tools"));
-    refused({ name: "tools", command: join(directory, "bin", "team-tools") });
+    assertRefused({ name: "tools", command: join(directory, "bin", "team-tools") });
     // What a shell would expand.
     const home = process.env.HOME;
     process.env.HOME = directory;
     try {
-      refused({ name: "tools", command: "/bin/sh", args: ["-c", "node ~/runtime/current/gateway/src/index.js"] });
-      refused({ name: "tools", command: "/bin/sh", args: ["-c", "exec node \"$HOME/runtime/current/gateway/src/index.js\""] });
+      assertRefused({ name: "tools", command: "/bin/sh", args: ["-c", "node ~/runtime/current/gateway/src/index.js"] });
+      assertRefused({ name: "tools", command: "/bin/sh", args: ["-c", "exec node \"$HOME/runtime/current/gateway/src/index.js\""] });
     } finally {
       process.env.HOME = home;
     }
     // This package's own entry, and its bins by name.
-    refused({ name: "tools", command: process.execPath, args: [frontDoor] });
-    for (const bin of ["acp-gateway", "acp-gateway-control", "acp-mcp-bridge", "/usr/local/bin/acp-gateway"]) refused({ name: "tools", command: bin });
-    refused({ name: "tools", command: "npx", args: ["--yes", "--package", "some-gateway-fork", "acp-gateway"] });
+    assertRefused({ name: "tools", command: process.execPath, args: [frontDoor] });
+    for (const bin of ["acp-gateway", "acp-gateway-control", "acp-mcp-bridge", "/usr/local/bin/acp-gateway"]) assertRefused({ name: "tools", command: bin });
+    assertRefused({ name: "tools", command: "npx", args: ["--yes", "--package", "some-gateway-fork", "acp-gateway"] });
 
     // Servers that only look alike are kept as they are.
     const other = join(directory, "other");
@@ -439,6 +508,63 @@ test("W12: a worker session refuses the Control MCP however it is named, launche
       { type: "http", name: "web", url: "https://example.com/mcp", headers: [{ name: "Authorization", value: "Bearer t" }] }
     ];
     assert.deepEqual(sanitizeWorkerMcpServers(structuredClone(allowed)), allowed);
+  });
+});
+
+// Review: a word was refused for its last name alone, so a filesystem server
+// rooted at a checkout called acp-gateway never opened. A path now counts by
+// what is there.
+test("W12: a directory is never refused for its name, and what runs the Control still is", async () => {
+  await withTemp("acp-w12-paths-", async (directory) => {
+    const checkout = join(directory, "src", "acp-gateway");
+    const bridge = join(directory, "src", "acp-mcp-bridge");
+    const tool = join(bridge, "tools", "server.js");
+    await mkdir(checkout, { recursive: true });
+    await mkdir(dirname(tool), { recursive: true });
+    await writeFile(tool, "");
+    const filesystem = (root) => ({ name: "fs", command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem", root] });
+    const kept = [
+      // Project roots named like a Control bin, or mentioning one.
+      filesystem(checkout),
+      filesystem(`${checkout}/`),
+      filesystem(bridge),
+      // As an argument, a path not there (moved, or yet to be made) or one
+      // relative to a cwd the daemon does not know is no bin by its name.
+      filesystem("/Users/me/src/acp-gateway"),
+      filesystem("../acp-gateway"),
+      // A file counts by its own name, not by the directories it sits in.
+      { name: "tools", command: process.execPath, args: [tool, `--root=${bridge}`] },
+      { name: "tools", command: "/bin/sh", args: ["-c", `cd '${checkout}' && exec node '${tool}'`] }
+    ];
+    assert.deepEqual(sanitizeWorkerMcpServers(structuredClone(kept)), kept);
+    const home = process.env.HOME;
+    process.env.HOME = directory;
+    try {
+      const underHome = [filesystem("~/src/acp-gateway"), filesystem("$HOME/src/acp-mcp-bridge")];
+      assert.deepEqual(sanitizeWorkerMcpServers(structuredClone(underHome)), underHome);
+    } finally {
+      process.env.HOME = home;
+    }
+
+    // A Gateway checked out as acp-mcp-bridge: its Control entry, and its daemon by the file's name.
+    const source = join(bridge, "src");
+    await mkdir(source);
+    for (const file of ["index.js", "gateway-daemon.js"]) await writeFile(join(source, file), "");
+    assertRefused({ name: "tools", command: process.execPath, args: [join(source, "index.js")] });
+    assertRefused({ name: "tools", command: process.execPath, args: [join(source, "gateway-daemon.js")] });
+    // A bin installed as a shim (pnpm, Volta) rather than a link to the entry:
+    // a file of the bin's name, run directly, from a script, or through a link.
+    const shims = join(directory, "shims");
+    await mkdir(shims);
+    await writeFile(join(shims, "acp-gateway"), "#!/bin/sh\nexec node /elsewhere/src/index.js \"$@\"\n");
+    await symlink(join(shims, "acp-gateway"), join(shims, "team-tools"));
+    assertRefused({ name: "tools", command: join(shims, "acp-gateway") });
+    assertRefused({ name: "tools", command: "/bin/sh", args: ["-c", `exec '${join(shims, "acp-gateway")}' --verbose`] });
+    assertRefused({ name: "tools", command: join(shims, "team-tools") });
+    // The command is never a directory: one named like a bin that is not there,
+    // or relative, is that bin.
+    assertRefused({ name: "tools", command: join(directory, "gone", "acp-gateway") });
+    assertRefused({ name: "tools", command: "./node_modules/.bin/acp-gateway" });
   });
 });
 
