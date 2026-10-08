@@ -18,6 +18,7 @@ import { readNdjson } from "./ndjson.js";
 import { createSocketSender } from "./socket-flow.js";
 import { statePaths } from "./state-store.js";
 import { GATEWAY_VERSION } from "./version.js";
+import { callerVerdicts } from "./worker-tree.js";
 
 // A start that dies in init() is invisible: autostart spawns this process with
 // stdio ignored, so the only thing a Main ever sees is a socket that never
@@ -73,6 +74,15 @@ const server = createServer((socket) => {
   let boundRootId = null;
   let boundAccess = null;
   let inflight = 0;
+  // Whether the caller on this connection runs under this daemon: looked up
+  // on the first request that names a caller pid, then kept (worker-tree.js).
+  const callerVerdict = callerVerdicts();
+  const requireBinding = (rootId, access) => {
+    if (boundRootId && rootId !== boundRootId) {
+      throw new GatewayError(ERROR_CODES.SOCKET_ALREADY_BOUND, "Socket is already bound to another Main");
+    }
+    if (boundAccess && boundAccess !== access) throw new GatewayError(ERROR_CODES.SOCKET_ALREADY_BOUND, "Socket access role cannot change");
+  };
   const sender = createSocketSender(socket, {
     subscriptions,
     unsubscribe: (subscriptionId) => service.unsubscribe(subscriptionId, { rootId: boundRootId }),
@@ -91,6 +101,7 @@ const server = createServer((socket) => {
         request = JSON.parse(line);
         const isGuide = request.method === "guide";
         const access = requireAccess(request.access);
+        const caller = normalizeCaller(request.caller);
         if (!isGuide) {
           if (!tokenMatches(request.token, expectedToken)) {
             throw new GatewayError(ERROR_CODES.CONTROL_ACCESS_DENIED, "Control access denied");
@@ -101,16 +112,8 @@ const server = createServer((socket) => {
           if (expectedRootId && request.rootId !== expectedRootId) {
             throw new GatewayError(ERROR_CODES.ROOT_MISMATCH, "Control root identity mismatch");
           }
-          if (boundRootId && request.rootId !== boundRootId) {
-            throw new GatewayError(ERROR_CODES.SOCKET_ALREADY_BOUND, "Socket is already bound to another Main");
-          }
-          if (boundAccess && boundAccess !== access) throw new GatewayError(ERROR_CODES.SOCKET_ALREADY_BOUND, "Socket access role cannot change");
+          requireBinding(request.rootId, access);
           authorizeCall(request.method, request.args ?? {}, { access });
-          if (!boundRootId) {
-            boundRootId = request.rootId;
-            boundAccess = access;
-            if (access === "control") service.attachRoot(boundRootId);
-          }
         }
         // Refused before dispatch, so an over-limit request costs the round trip
         // and nothing else.
@@ -122,6 +125,32 @@ const server = createServer((socket) => {
         }
         inflight += 1;
         try {
+          if (!isGuide) {
+            // A Main's front door never runs under this daemon, so a caller
+            // that does is a worker's, whatever it holds. Checked before the
+            // connection binds, so a refused one never counts as its Main being
+            // present. Only a connection that named a caller pid waits here, and
+            // every later request on it waits on the same lookup, in order.
+            const verdict = callerVerdict(caller?.pid);
+            if (verdict) {
+              if (await verdict.denied) {
+                throw new GatewayError(
+                  ERROR_CODES.WORKER_CONTROL_DENIED,
+                  `Control access denied: caller process ${verdict.pid} runs inside a Gateway worker`
+                );
+              }
+              // While it waited the connection may have closed, and its close
+              // handler already ran: binding or subscribing now would never be
+              // undone. Or another request may have bound it.
+              if (socket.destroyed) return;
+              requireBinding(request.rootId, access);
+            }
+            if (!boundRootId) {
+              boundRootId = request.rootId;
+              boundAccess = access;
+              if (access === "control") service.attachRoot(boundRootId);
+            }
+          }
           if (request.method === "request_cancel") {
             const requestId = request.args?.requestId;
             if (typeof requestId !== "string" || !requestId) {
@@ -163,7 +192,7 @@ const server = createServer((socket) => {
                 access,
                 signal: controller.signal,
                 // Only a Main opens and prompts; an observer's claim is not recorded.
-                ...(access === "control" ? { caller: normalizeCaller(request.caller) } : {})
+                ...(access === "control" ? { caller } : {})
               });
             send({ id: request.id, ok: true, result });
           } finally {

@@ -7,7 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { AcpClient, acpRequestError } from "../src/acp-client.js";
 import { defaultProviderRegistryPath, providerRegistryReadPath } from "../src/acp-registry.js";
-import { childEnv, GATEWAY_ACCESS_ENV, SESSION_MARKER_ENV, withoutSessionMarkers } from "../src/caller.js";
+import { childEnv, GATEWAY_ACCESS_ENV, GATEWAY_WORKER_ENV, SESSION_MARKER_ENV, withoutSessionMarkers } from "../src/caller.js";
 import { controlIdentity, gatewayProtectedPaths, takeDaemonIdentity } from "../src/config.js";
 import { ERROR_CODES } from "../src/errors.js";
 import { GatewayService } from "../src/gateway-service.js";
@@ -725,6 +725,33 @@ test("W1: workers and their terminals never inherit the Main's session markers",
         await service.shutdown();
       }
     });
+  });
+});
+
+// 1.8.0: a Control front door started anywhere under a worker refuses to run
+// when it sees this marker (worker-tree.js), so the worker, each terminal it
+// opens, and whatever those start inherit it, and a worker cannot ask it away.
+test("W1: workers and their terminals carry the worker marker, which a worker cannot drop", async () => {
+  await withTemp("acp-worker-marker-", async (directory) => {
+    const envLog = join(directory, "worker-env.json");
+    const service = new GatewayService({ createClient: permissionClientFactory({ ACP_MOCK_ENV_LOG: envLog }) });
+    try {
+      await service.init();
+      const { sessionId } = await service.call("session_open", { provider: "claude", cwd: directory, permissionPolicy: "auto_approve" }, context);
+      assert.equal(JSON.parse(await readFile(envLog, "utf8"))[GATEWAY_WORKER_ENV], "1");
+      const seen = join(directory, "terminal-marker.txt");
+      const ran = await runPrompt(service, sessionId, {
+        terminal: {
+          command: "/bin/sh",
+          args: ["-c", `printf %s "$${GATEWAY_WORKER_ENV}" > "${seen}"`],
+          env: [{ name: GATEWAY_WORKER_ENV, value: "0" }]
+        }
+      });
+      assert.equal(ran.result?.stopReason, "terminal-ok");
+      assert.equal(await readFile(seen, "utf8"), "1");
+    } finally {
+      await service.shutdown();
+    }
   });
 });
 

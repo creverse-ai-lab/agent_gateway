@@ -104,8 +104,20 @@ Since 1.6.0 a control request may carry `caller: {provider, sessionId, pid, inst
 - `openedBy` is the caller of the `session_open` or first `session_restore` that registered the session. It is set once and never rewritten.
 - `promptedBy` is the caller of the latest `prompt`, `run` or `task_prompt`. The same value is on that turn's `turn_start` event, so each turn names the Main its reply is for.
 - Both appear on session responses, `session list`, and survive restarts. They are absent when the caller sent nothing (pre-1.6.0 control servers), so the old shapes are unchanged.
-- Only `control` connections are recorded. An `observer`'s `caller` is ignored. A malformed `caller` drops attribution, never the call.
+- Only `control` connections are recorded. An `observer`'s `caller` is not recorded; its `pid` still counts for the Worker check below. A malformed `caller` drops attribution, never the call.
 - `sessionId` can go stale when the CLI switches sessions (for example Claude `/clear`) while the MCP server keeps running; `pid` and `instanceId` stay valid.
+
+## Workers never get the Control
+
+A Worker's own agent CLI can load the user's MCP configuration (Codex reads `~/.codex/config.toml` for the Workers the Gateway starts) and with it the Control MCP. Since 1.8.0 three checks keep the Control from a Worker:
+
+- The Gateway sets `ACP_GATEWAY_WORKER=1` on every process it starts for a Worker: the provider process and each terminal it opens. A Worker cannot remove it from a terminal's env.
+- The Control MCP server refuses to start inside a Worker's process tree: when that variable is set, or when an ancestor process is the daemon (it holds the daemon lock `<socket>.lock`, or its command line runs `gateway-daemon.js`). It exits with status 77 and a one-line reason on stderr, before it reads the identity or touches the socket. A Main's own server is never under the daemon, which is a detached child of the front door that started it.
+- The daemon refuses a request whose `caller.pid` is the daemon or runs under it with `WORKER_CONTROL_DENIED`, before the connection binds or anything runs, `daemon_shutdown` included. The ancestry is looked up once per connection, on the first request that names a pid, and the verdict holds for that connection. A connection that never names a `caller.pid` (management clients: AgenLynk, the admin CLI, installer health checks) is never refused for this. A lookup that cannot read the process tree (neither `/proc` nor `ps`, as on Windows) refuses nothing.
+
+`session_open` and `session_restore` refuse, with `INVALID_ARGUMENT`, a Worker `mcpServers` entry named `agent-acp` or `agent-acp-control`, or that mentions `acp-gateway-control`, `acp-mcp-bridge`, `gateway-daemon` or `control-mcp` anywhere; one whose env sets `ACP_GATEWAY_CONTROL_TOKEN`, `ACP_GATEWAY_ROOT_ID` or `ACP_GATEWAY_INSTALL_STATE` (ACP's `[{name,value}]` or an object); one whose command or arguments run a Control bin (`acp-gateway`, `acp-gateway-control`, `acp-mcp-bridge`) or a file that resolves to a Gateway's `src/index.js`, such as `~/.acp-gateway/runtime/current/gateway/src/index.js`.
+
+Like observer access, this is not a credential boundary: a process that holds the token and can start processes outside the daemon's tree is not stopped by it.
 
 ## Task links and scope
 

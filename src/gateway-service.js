@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import { AcpClient, PERMISSION_POLICIES, requirePermissionPolicy } from "./acp-client.js";
 import { ArtifactStore, defaultArtifactRoot } from "./artifacts.js";
 import { utf8ByteHead } from "./bounded-utf8.js";
@@ -34,7 +36,7 @@ import {
   DEFAULT_ATTENTION_STALE_MS, encodeAttentionCursor, isSameCaller, isTaskCreator, pageAfter, requestKey, requireAckTaskIds,
   updateKey
 } from "./attention.js";
-import { normalizeCaller } from "./caller.js";
+import { CONTROL_IDENTITY_ENV, normalizeCaller } from "./caller.js";
 import { MANAGEMENT_CAPABILITIES, RUNTIME_IDENTITY } from "./runtime-identity.js";
 import { validateSetting } from "./settings.js";
 
@@ -124,6 +126,12 @@ const DEFAULT_MAX_CONSECUTIVE_RESTORE_FAILURES = 3;
 // persistence error in STATE_RESTORE_NOT_DURABLE.
 const PROVIDER_ALERT_ERROR_BYTES = 300;
 const CONTROL_SERVER_PATTERN = /(?:acp-gateway-control|acp-mcp-bridge|gateway-daemon|control-mcp)/i;
+// Env that carries the Control identity or says where it is kept: a worker MCP
+// server has no use for either unless it is a Control front door.
+const CONTROL_ENV = new Set([...CONTROL_IDENTITY_ENV, "ACP_GATEWAY_INSTALL_STATE"]);
+// The bins that run the Control front door (package.json). Matched by name: a
+// bare command is looked up on the worker's PATH, not here.
+const CONTROL_BINS = new Set(["acp-gateway", "acp-gateway-control", "acp-mcp-bridge"]);
 // The debounced state writer. With the WAL off the snapshot is the only file,
 // so it keeps the short debounce. With the WAL on, every fact a restart must
 // not lose is already in the log, so the full snapshot (whose cost grows with
@@ -4240,7 +4248,9 @@ function sanitizeWorkerMcpServers(servers) {
   return servers.map((server) => {
     const serialized = JSON.stringify(server);
     const name = String(server?.name ?? server?.id ?? "");
-    if (/^(?:agent-acp|agent-acp-control)$/i.test(name) || CONTROL_SERVER_PATTERN.test(serialized)) {
+    if (/^(?:agent-acp|agent-acp-control)$/i.test(name) || CONTROL_SERVER_PATTERN.test(serialized)
+      || envNames(server?.env).some((key) => CONTROL_ENV.has(key))
+      || commandWords(server).some(runsControlEntry)) {
       throw new GatewayError(
         ERROR_CODES.INVALID_ARGUMENT,
         "Control MCP/Gateway cannot be injected into a worker session"
@@ -4248,6 +4258,41 @@ function sanitizeWorkerMcpServers(servers) {
     }
     return server;
   });
+}
+
+// An MCP server's env names: ACP's [{name, value}], or an object.
+function envNames(env) {
+  if (Array.isArray(env)) return env.map((entry) => entry?.name).filter((key) => typeof key === "string");
+  return env && typeof env === "object" ? Object.keys(env) : [];
+}
+
+// Every word of a server's command and args, so a script behind `sh -c` or an
+// `--option=path` is seen too.
+function commandWords(server) {
+  return [server?.command, ...(Array.isArray(server?.args) ? server.args : [])]
+    .filter((value) => typeof value === "string")
+    .flatMap((value) => value.split(/[\s=]+/))
+    .map((word) => word.replace(/^["']+|["']+$/g, ""))
+    .filter(Boolean);
+}
+
+// A Control bin by name, or a file that resolves to a Gateway's Control entry:
+// an index.js beside gateway-daemon.js, that is src/index.js of this package or
+// of any other install, such as ~/.acp-gateway/runtime/current/gateway/src/index.js
+// (a path no name pattern catches). Through a symlink too, as a bin is.
+function runsControlEntry(word) {
+  if (CONTROL_BINS.has(basename(word))) return true;
+  // What a shell behind `sh -c` would expand.
+  const home = /^(?:~|\$HOME|\$\{HOME\})\//.exec(word);
+  const path = home ? join(homedir(), word.slice(home[0].length)) : word;
+  if (!isAbsolute(path)) return false;
+  let real;
+  try {
+    real = realpathSync(path);
+  } catch {
+    return false;
+  }
+  return basename(real) === "index.js" && existsSync(join(dirname(real), "gateway-daemon.js"));
 }
 
 function optionalString(value, name) {

@@ -57,6 +57,20 @@ export function childEnv(explicit = {}, inherited = process.env) {
   return env;
 }
 
+// Marks a process the Gateway starts for a worker (the provider process and its
+// terminals), and so everything under it that inherits the env: a Control front
+// door started there refuses to run (worker-tree.js). It grants nothing, so it
+// is not access env.
+export const GATEWAY_WORKER_ENV = "ACP_GATEWAY_WORKER";
+
+/**
+ * childEnv for a worker or a terminal it opens, plus the worker marker. The
+ * marker goes on last: a worker cannot ask for a terminal without it.
+ */
+export function workerEnv(explicit = {}, inherited = process.env) {
+  return childEnv({ ...explicit, [GATEWAY_WORKER_ENV]: "1" }, inherited);
+}
+
 /**
  * The agent CLI a process name belongs to, or null. Whole name tokens only, and
  * an ambiguous name (two providers) is nobody's: "grok-codex-bridge" must not

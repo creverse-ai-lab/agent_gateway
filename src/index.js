@@ -18,6 +18,19 @@ import { staleFrontDoorNotice } from "./front-door.js";
 import { GatewayRpcClient } from "./socket-rpc.js";
 import { PERMISSION_POLICIES } from "./acp-client.js";
 import { GATEWAY_VERSION } from "./version.js";
+import { WORKER_TREE_EXIT_CODE, workerTreeReason } from "./worker-tree.js";
+
+// Workers never get the Control, and a worker's own agent CLI may start this
+// server from the user's MCP config (worker-tree.js). Decided first, before the
+// identity is read or the socket touched.
+const workerTree = await workerTreeReason();
+if (workerTree) {
+  process.stderr.write(
+    `acp-gateway-control: refusing to start inside a Gateway worker (${workerTree}). `
+    + "Only a Main's agent CLI may run the Control MCP; workers never get it.\n"
+  );
+  process.exit(WORKER_TREE_EXIT_CODE);
+}
 
 const processCaller = callerFromProcess();
 // The installer registers this server without the token: it comes from
