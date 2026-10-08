@@ -17,6 +17,7 @@ import { decodeRecord, encodeRecord, statePaths, WAL_TYPES } from "../src/state-
 import { EXECUTION_OUTCOMES, INTERRUPTION_REASONS } from "../src/task-store.js";
 import { createSnapshot } from "../src/workspace.js";
 import { readSnapshotBody } from "./helpers/state-files.js";
+import { until } from "./helpers/fake-worker.js";
 
 const MAIN = { rootId: "main-a" };
 const EPOCH = Date.parse("2026-01-01T00:00:00.000Z");
@@ -106,14 +107,6 @@ async function open(service, args = {}) {
   );
   const session = service.requireSession(opened.sessionId);
   return { opened, session, worker: session.client };
-}
-
-async function until(predicate, description) {
-  for (let attempt = 0; attempt < 500; attempt += 1) {
-    if (predicate()) return;
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-  throw new Error(`Timed out waiting for ${description}`);
 }
 
 async function withDirectory(run) {

@@ -3,9 +3,10 @@ import { randomUUID } from "node:crypto";
 import { constants, lstatSync } from "node:fs";
 import { cp, lstat, mkdir, readdir, readFile, readlink, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { childEnv } from "./caller.js";
 import { ERROR_CODES, GatewayError } from "./errors.js";
+import { isWithin } from "./worker-files.js";
 
 // A snapshot workspace is a private copy of the session cwd. The worker edits the
 // copy; Main reads the difference with session {action:"workspace_diff"} and
@@ -270,11 +271,6 @@ async function measureTree(root, excluded = []) {
     }
   }
   return { bytes, entries };
-}
-
-function isWithin(root, path) {
-  const rel = relative(root, path);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
 // Bounded: past maxBytes the child is killed and the result says so, rather than

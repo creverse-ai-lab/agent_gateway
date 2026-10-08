@@ -18,7 +18,7 @@ import { GatewayService } from "./gateway-service.js";
 import { readNdjson } from "./ndjson.js";
 import { listenPrivately } from "./private-socket.js";
 import { createSocketSender } from "./socket-flow.js";
-import { statePaths } from "./state-store.js";
+import { processIsAlive, statePaths } from "./state-store.js";
 import { GATEWAY_VERSION } from "./version.js";
 import { callerVerdicts } from "./worker-tree.js";
 
@@ -351,13 +351,4 @@ async function releaseDaemonLock(lock) {
   await lock.handle.close().catch(() => {});
   const ownerPid = Number((await readFile(lock.path, "utf8").catch(() => "")).trim());
   if (ownerPid === lock.pid) await unlink(lock.path).catch(() => {});
-}
-
-function processIsAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === "EPERM";
-  }
 }

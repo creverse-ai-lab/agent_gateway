@@ -14,15 +14,13 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { CallerPresence, isVisibleTo, requesterOf } from "../src/access.js";
-import { GatewayService } from "../src/gateway-service.js";
 import { GatewayRpcClient } from "../src/socket-rpc.js";
 import { statePaths } from "../src/state-store.js";
-import { startDaemon } from "./helpers/daemon-harness.js";
+import { startDaemon, writeMockProviders } from "./helpers/daemon-harness.js";
+import { FakeWorker, finish, harness, permission, start, TERMINAL, until } from "./helpers/fake-worker.js";
 
 const permissionAgent = fileURLToPath(new URL("./mock-permission-agent.js", import.meta.url));
 const ROOT = "main-root";
-const EPOCH = Date.parse("2026-01-01T00:00:00.000Z");
-const TERMINAL = ["completed", "failed", "cancelled"];
 const claudeCaller = { provider: "claude", sessionId: "claude-session-a", pid: 4242, instanceId: "mcp-a" };
 // One Codex app process hosting two threads. Its front door names the thread
 // per call (callerForCall), so each thread is a Main of its own.
@@ -34,67 +32,10 @@ const C = { rootId: ROOT, caller: codexThreadC };
 const MANAGEMENT = { rootId: ROOT };
 const OBSERVER = { rootId: ROOT, access: "observer" };
 
-// The smallest worker the service accepts. Turns resolve only when told to.
-class FakeWorker {
-  constructor(options) {
-    this.options = options;
-    this.config = { modelScope: "session" };
-    this.alive = false;
-    this.initResult = null;
-    this.stderr = "";
-    this.handlers = new Map();
-    this.turns = [];
-  }
-
-  async start() {
-    this.alive = true;
-    this.initResult = { protocolVersion: 1, agentCapabilities: { sessionCapabilities: { resume: {}, close: {} } } };
-    return this.initResult;
-  }
-
-  async sessionNew() {
-    FakeWorker.opened += 1;
-    return { sessionId: `fake-${FakeWorker.opened}`, configOptions: [] };
-  }
-
-  async sessionRestore({ sessionId }) { return { sessionId, configOptions: [] }; }
-  onSessionUpdate(sessionId, handler) { this.handlers.set(sessionId, handler); }
-  clearSession(sessionId) { this.handlers.delete(sessionId); }
-  emit(sessionId, update) { this.handlers.get(sessionId)?.(update); }
-  sessionPrompt() { return new Promise((resolve, reject) => this.turns.push({ resolve, reject })); }
-  cancelSession() {}
-  pendingSessionInput() { return { permissions: 0, elicitations: 0 }; }
-  async respondPermission() {}
-  respondElicitation() {}
-  async setSessionConfigOption() { return { configOptions: [] }; }
-  async request() { return {}; }
-  async stop() { this.alive = false; }
-}
-FakeWorker.opened = 0;
-
-function harness(options = {}) {
-  const clock = { now: EPOCH };
-  const service = new GatewayService({
-    gcIntervalMs: 0,
-    now: () => clock.now,
-    createClient: (_provider, clientOptions) => new FakeWorker(clientOptions),
-    ...options
-  });
-  return { service, clock };
-}
-
 async function open(service, context) {
   const opened = await service.call("session_open", { provider: "claude", cwd: process.cwd(), permissionPolicy: "ask" }, context);
   const session = service.requireSession(opened.sessionId);
   return { session, worker: session.client };
-}
-
-async function until(predicate, description) {
-  for (let attempt = 0; attempt < 500; attempt += 1) {
-    if (predicate()) return;
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-  throw new Error(`Timed out waiting for ${description}`);
 }
 
 // For what crosses a real socket: polls on the timer, not on the event loop.
@@ -106,29 +47,10 @@ async function eventually(predicate, description, timeoutMs = 10_000) {
   }
 }
 
-async function start(service, session, context, extra = {}) {
-  const ack = await service.call("run", { sessionId: session.id, prompt: "go", waitMs: 0, ...extra }, context);
-  assert.equal(ack.status, "working");
-  return ack.taskId;
-}
-
-async function finish(service, worker, taskId) {
-  worker.turns.at(-1).resolve({ stopReason: "end_turn" });
-  await until(() => TERMINAL.includes(service.taskStore.find(taskId)?.status), `task ${taskId} terminal`);
-}
-
 async function finished(service, { session, worker }, context, extra = {}) {
   const taskId = await start(service, session, context, extra);
   await finish(service, worker, taskId);
   return taskId;
-}
-
-function permission(worker, session, requestId) {
-  worker.emit(session.acpSessionId, {
-    sessionUpdate: "permission_request", requestId,
-    toolCall: { toolCallId: `t${requestId}`, title: "Edit", kind: "edit" },
-    options: [{ optionId: "allow-once", name: "Allow", kind: "allow_once" }]
-  });
 }
 
 const sessionIds = async (service, context, args = {}) =>
@@ -461,26 +383,32 @@ test("an inbox row keeps its Main across restarts, and a row written before 1.8.
   }
 });
 
+// A real daemon whose one provider is the permission mock, which mints a
+// distinct ACP session id per session/new, and connect(): a client of it, kept
+// in clients for the test to close.
+async function mockpermDaemon(directory, clients) {
+  const daemon = await startDaemon({
+    directory,
+    env: await writeMockProviders(directory, { provider: "mockperm", agent: permissionAgent })
+  });
+  const connect = (options = {}) => {
+    const client = new GatewayRpcClient({
+      socketPath: daemon.socketPath, token: daemon.token, rootId: daemon.rootId, statePath: daemon.statePath,
+      autoStart: false, ...options
+    });
+    clients.push(client);
+    return client;
+  };
+  return { daemon, connect };
+}
+
 test("over the control socket each front door's caller confines its calls and its subscriptions", async () => {
   const directory = await mkdtemp(join(tmpdir(), "acp-isolation-daemon-"));
   let daemon = null;
   const clients = [];
   try {
-    // The permission mock mints a distinct ACP session id per session/new.
-    const providersPath = join(directory, "providers.json");
-    await writeFile(providersPath, JSON.stringify({
-      version: 1,
-      providers: { mockperm: { command: process.execPath, args: [permissionAgent], permissionPolicy: "read_only" } }
-    }));
-    daemon = await startDaemon({ directory, env: { ACP_GATEWAY_PROVIDERS: providersPath } });
-    const connect = (options = {}) => {
-      const client = new GatewayRpcClient({
-        socketPath: daemon.socketPath, token: daemon.token, rootId: daemon.rootId, statePath: daemon.statePath,
-        autoStart: false, ...options
-      });
-      clients.push(client);
-      return client;
-    };
+    let connect;
+    ({ daemon, connect } = await mockpermDaemon(directory, clients));
     // No pid: the Worker ancestry check is not what this is about.
     const mainA = connect({ caller: { provider: "claude", sessionId: "claude-session-a", instanceId: "mcp-a" } });
     const mainB = connect({ caller: { provider: "codex", sessionId: "codex-thread-b", instanceId: "mcp-b" } });
@@ -974,20 +902,8 @@ test("over the control socket a Main's connections and subscriptions keep its se
   let daemon = null;
   const clients = [];
   try {
-    const providersPath = join(directory, "providers.json");
-    await writeFile(providersPath, JSON.stringify({
-      version: 1,
-      providers: { mockperm: { command: process.execPath, args: [permissionAgent], permissionPolicy: "read_only" } }
-    }));
-    daemon = await startDaemon({ directory, env: { ACP_GATEWAY_PROVIDERS: providersPath } });
-    const connect = (options = {}) => {
-      const client = new GatewayRpcClient({
-        socketPath: daemon.socketPath, token: daemon.token, rootId: daemon.rootId, statePath: daemon.statePath,
-        autoStart: false, ...options
-      });
-      clients.push(client);
-      return client;
-    };
+    let connect;
+    ({ daemon, connect } = await mockpermDaemon(directory, clients));
     // No pid: the Worker ancestry check is not what this is about.
     const callerA = { provider: "claude", sessionId: "claude-session-a", instanceId: "mcp-a" };
     const callerA2 = { provider: "claude", sessionId: "claude-session-a2", instanceId: "mcp-a2" };

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -17,7 +17,8 @@ import { prepareGrokSandbox } from "../src/grok-sandbox.js";
 import { GatewayRpcClient } from "../src/socket-rpc.js";
 import { runSourceCommand } from "../src/source-update.js";
 import { createSnapshot, removeSnapshot, snapshotDiff } from "../src/workspace.js";
-import { startDaemon } from "./helpers/daemon-harness.js";
+import { startDaemon, writeMockProviders } from "./helpers/daemon-harness.js";
+import { withEnv, withTemp } from "./helpers/scratch.js";
 import { terminalSandboxOrStandIn } from "./helpers/terminal-sandbox.js";
 
 // v1.5.2 hardening: every case below reproduces a defect found by running the
@@ -32,31 +33,6 @@ function permissionClientFactory(env = {}) {
     { provider: "mock", command: process.execPath, args: [permissionAgent], env, permissionPolicy: "ask" },
     options
   );
-}
-
-async function withTemp(prefix, body) {
-  const directory = await realpath(await mkdtemp(join(tmpdir(), prefix)));
-  try {
-    return await body(directory);
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-}
-
-async function withEnv(values, body) {
-  const previous = Object.fromEntries(Object.keys(values).map((key) => [key, process.env[key]]));
-  for (const [key, value] of Object.entries(values)) {
-    if (value == null) delete process.env[key];
-    else process.env[key] = value;
-  }
-  try {
-    return await body();
-  } finally {
-    for (const [key, value] of Object.entries(previous)) {
-      if (value == null) delete process.env[key];
-      else process.env[key] = value;
-    }
-  }
 }
 
 async function runPrompt(service, sessionId, prompt) {
@@ -843,17 +819,13 @@ test("W2: the daemon takes its identity once and leaves it out of its own env", 
 test("W2: a daemon child cannot inherit the token, even through a spawn that forgets to scrub its env", async () => {
   await withTemp("acp-daemon-child-env-", async (directory) => {
     const envLog = join(directory, "worker-env.json");
-    const providersPath = join(directory, "providers.json");
-    await writeFile(providersPath, JSON.stringify({
-      version: 1,
-      providers: { mockenv: { command: process.execPath, args: [permissionAgent], permissionPolicy: "read_only" } }
-    }));
+    const providers = await writeMockProviders(directory, { provider: "mockenv", agent: permissionAgent });
     const daemon = await startDaemon({
       directory,
       // Every spawn in this daemon drops the env it builds: the worker gets process.env as it is.
       execArgv: ["--import", fileURLToPath(new URL("./helpers/forgetful-spawn.js", import.meta.url))],
       // Only the daemon's own env names the log, so a worker that writes it inherited that env.
-      env: { ACP_GATEWAY_PROVIDERS: providersPath, ACP_MOCK_ENV_LOG: envLog }
+      env: { ...providers, ACP_MOCK_ENV_LOG: envLog }
     });
     const client = new GatewayRpcClient({
       socketPath: daemon.socketPath,

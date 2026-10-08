@@ -200,19 +200,7 @@ export class BoundedUtf8Text {
   constructor(maxBytes, { onTrim = null } = {}) {
     this.maxBytes = maxBytes;
     this.onTrim = onTrim;
-    // Sealed chunks, oldest first; slots before head are released (undefined).
-    this.chunks = [];
-    this.head = 0;
-    // The open tail block small appends are copied into. Its bytes from
-    // blockStart to blockEnd are live and come after every sealed chunk.
-    this.block = null;
-    this.blockStart = 0;
-    this.blockEnd = 0;
-    this.nextBlockBytes = MIN_BLOCK_BYTES;
-    this.totalBytes = 0;
-    this.trimmedBytes = 0;
-    this.pendingHighSurrogate = "";
-    this.pendingBytes = 0;
+    this.reset();
   }
 
   append(text) {
@@ -245,8 +233,11 @@ export class BoundedUtf8Text {
   }
 
   reset(text = "") {
+    // Sealed chunks, oldest first; slots before head are released (undefined).
     this.chunks = [];
     this.head = 0;
+    // The open tail block small appends are copied into. Its bytes from
+    // blockStart to blockEnd are live and come after every sealed chunk.
     this.block = null;
     this.blockStart = 0;
     this.blockEnd = 0;

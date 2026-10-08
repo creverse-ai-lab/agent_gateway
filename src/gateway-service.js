@@ -2484,11 +2484,7 @@ export class GatewayService {
     try {
       return operation();
     } catch (error) {
-      if (error instanceof GatewayError) throw error;
-      const code = typeof error?.code === "string" && ERROR_CODES[error.code]
-        ? ERROR_CODES[error.code]
-        : ERROR_CODES.GATEWAY_ERROR;
-      throw new GatewayError(code, error?.message ?? String(error));
+      throw storeError(error);
     }
   }
 
@@ -2496,11 +2492,7 @@ export class GatewayService {
     try {
       return await operation();
     } catch (error) {
-      if (error instanceof GatewayError) throw error;
-      const code = typeof error?.code === "string" && ERROR_CODES[error.code]
-        ? ERROR_CODES[error.code]
-        : ERROR_CODES.GATEWAY_ERROR;
-      throw new GatewayError(code, error?.message ?? String(error));
+      throw storeError(error);
     }
   }
 
@@ -3088,17 +3080,23 @@ export class GatewayService {
     this.#setStatus(session, "closed", "session_closed");
     session.client = null;
     this.store.push(session, { type: "session_closed" });
-    this.store.delete(session.id);
-    this.#persistAdoption(session);
-    // Replay must not resurrect a session Main was told is gone, even when the
-    // registration record is still in the log ahead of this one.
-    this.stateStore?.append(WAL_TYPES.SESSION_CLOSED, session.id, {});
+    this.#dropSessionRecord(session);
     // The copy goes with the session. Main collects workspace_diff before close.
     if (session.workspace) await this.#removeWorkspace(session.workspace);
     // Anything still queued behind this close was written for a session that
     // now does not exist; waking it up would act on the deleted record.
     queue.closeWith(new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`));
     return true;
+  }
+
+  // A session record leaving for good, closed by Main or let go by retention:
+  // out of the store, its adoption made durable (#persistAdoption), then out of
+  // the log. Replay must not resurrect a session Main was told is gone, even
+  // when the registration record is still in the log ahead of this one.
+  #dropSessionRecord(session) {
+    this.store.delete(session.id);
+    this.#persistAdoption(session);
+    this.stateStore?.append(WAL_TYPES.SESSION_CLOSED, session.id, {});
   }
 
   syncSessionInputState(session) {
@@ -3756,25 +3754,10 @@ export class GatewayService {
   }
 
   createPermissionInbox(session, update, toolCall = null, options = null) {
-    const existing = [...this.inbox.values()].find((item) =>
-      item.sessionId === session.id && item.turnId === session.turnId
-      && item.requestId === update.requestId && item.type === "permission_request" && item.status === "pending"
-    );
-    if (existing?.status === "pending") return existing;
-    const inboxId = `inbox-${randomUUID()}`;
-    const now = new Date(this.now()).toISOString();
-    const item = {
-      inboxId,
-      ownerRootId: session.ownerRootId,
-      ...inboxOwnerCopy(session),
-      sessionId: session.id,
-      turnId: session.turnId,
-      type: "permission_request",
-      status: "pending",
-      createdAt: now,
-      resolvedAt: null,
-      resolution: null,
-      requestId: update.requestId,
+    const existing = this.#pendingInboxRow(session, update.requestId, "permission_request");
+    if (existing) return existing;
+    return this.#insertInboxRow(session, {
+      ...this.#newInboxRow(session, "permission_request", update.requestId),
       // Under the cap (the ordinary case) the row is exactly what it always was.
       // Over it, the row keeps the head Main needs to recognize the call and points
       // at the artifact the event path already wrote, instead of holding megabytes
@@ -3795,33 +3778,14 @@ export class GatewayService {
             optionsArtifact: options.artifact
           }
         : { options: update.options })
-    };
-    if (!this.#admitInboxItem(session, item)) return null;
-    this.inbox.set(inboxId, item);
-    this.#appendInboxCreated(item);
-    this.schedulePersist();
-    return item;
+    });
   }
 
   createElicitationInbox(session, update, projection = null) {
-    const existing = [...this.inbox.values()].find((item) =>
-      item.sessionId === session.id && item.turnId === session.turnId
-      && item.requestId === update.requestId && item.type === "worker_question" && item.status === "pending"
-    );
-    if (existing?.status === "pending") return existing;
-    const inboxId = `inbox-${randomUUID()}`;
-    const item = {
-      inboxId,
-      ownerRootId: session.ownerRootId,
-      ...inboxOwnerCopy(session),
-      sessionId: session.id,
-      turnId: session.turnId,
-      type: "worker_question",
-      status: "pending",
-      createdAt: new Date(this.now()).toISOString(),
-      resolvedAt: null,
-      resolution: null,
-      requestId: update.requestId,
+    const existing = this.#pendingInboxRow(session, update.requestId, "worker_question");
+    if (existing) return existing;
+    return this.#insertInboxRow(session, {
+      ...this.#newInboxRow(session, "worker_question", update.requestId),
       mode: update.mode,
       // The same capped projection the event carries. A worker question Main can
       // read is a bounded one; the full text stays in the artifact.
@@ -3843,9 +3807,39 @@ export class GatewayService {
           }
         : { requestedSchema: update.requestedSchema }),
       toolCallId: update.toolCallId
+    });
+  }
+
+  // The pending row of this session's turn for a worker request, if there is
+  // one: a request the worker sends again is that row, not a second one.
+  #pendingInboxRow(session, requestId, type) {
+    return [...this.inbox.values()].find((item) =>
+      item.sessionId === session.id && item.turnId === session.turnId
+      && item.requestId === requestId && item.type === type && item.status === "pending"
+    );
+  }
+
+  // What every new row starts as, ahead of what its kind of request carries.
+  #newInboxRow(session, type, requestId) {
+    return {
+      inboxId: `inbox-${randomUUID()}`,
+      ownerRootId: session.ownerRootId,
+      ...inboxOwnerCopy(session),
+      sessionId: session.id,
+      turnId: session.turnId,
+      type,
+      status: "pending",
+      createdAt: new Date(this.now()).toISOString(),
+      resolvedAt: null,
+      resolution: null,
+      requestId
     };
+  }
+
+  // A new row goes in only within the inbox budgets: null when refused.
+  #insertInboxRow(session, item) {
     if (!this.#admitInboxItem(session, item)) return null;
-    this.inbox.set(inboxId, item);
+    this.inbox.set(item.inboxId, item);
     this.#appendInboxCreated(item);
     this.schedulePersist();
     return item;
@@ -4144,9 +4138,7 @@ export class GatewayService {
           session.client.clearSession(session.acpSessionId);
           session.client = null;
         }
-        this.store.delete(session.id);
-        this.#persistAdoption(session);
-        this.stateStore?.append(WAL_TYPES.SESSION_CLOSED, session.id, {});
+        this.#dropSessionRecord(session);
         if (session.workspace) await this.#removeWorkspace(session.workspace);
         // Task handles deliberately survive their session now: a Task's lifetime
         // is its own ttl and taskRetentionMs, not its session's retention. Deleting
@@ -4622,6 +4614,16 @@ function requireRoot(context) {
   return context.rootId;
 }
 
+// A TaskStore throw as the GatewayError it surfaces as (#storeCall): its code
+// when that is one of ours, else GATEWAY_ERROR. A GatewayError passes as it is.
+function storeError(error) {
+  if (error instanceof GatewayError) return error;
+  const code = typeof error?.code === "string" && ERROR_CODES[error.code]
+    ? ERROR_CODES[error.code]
+    : ERROR_CODES.GATEWAY_ERROR;
+  return new GatewayError(code, error?.message ?? String(error));
+}
+
 function restoreMethod(initResult, requested) {
   const capabilities = initResult?.agentCapabilities ?? {};
   const canResume = Boolean(capabilities.sessionCapabilities?.resume);
@@ -5019,12 +5021,6 @@ function compileEventTypes(value) {
 function isExpired(timestamp, ttl, now) {
   const parsed = Date.parse(timestamp ?? "");
   return Number.isFinite(parsed) && parsed + ttl <= now;
-}
-
-function latestTimestamp(...timestamps) {
-  const valid = timestamps.filter((value) => Number.isFinite(Date.parse(value ?? "")));
-  if (!valid.length) return null;
-  return valid.reduce((latest, value) => Date.parse(value) > Date.parse(latest) ? value : latest);
 }
 
 async function requireDirectory(path) {

@@ -730,13 +730,9 @@ export class TaskStore {
     return summary;
   }
 
-  toPersistedRecords(options = {}) {
-    const includeTerminal = options?.includeTerminal ?? true;
+  toPersistedRecords() {
     this.expireSweep();
-    return [...this.#tasks.values()]
-      .filter((record) => includeTerminal || ACTIVE_TASK_STATUSES.has(record.status))
-      .sort(compareRecords)
-      .map(snapshot);
+    return [...this.#tasks.values()].sort(compareRecords).map(snapshot);
   }
 
   clear() {

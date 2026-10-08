@@ -484,12 +484,7 @@ test("overlapping front-door calls from one Codex process each keep their own th
   try {
     // The permission mock mints a distinct ACP session id per session/new, so
     // several opens on one provider can be in flight together.
-    const providersPath = join(directory, "providers.json");
-    await writeFile(providersPath, JSON.stringify({
-      version: 1,
-      providers: { mockperm: { command: process.execPath, args: [permissionAgent], permissionPolicy: "read_only" } }
-    }));
-    const providers = { ACP_GATEWAY_PROVIDERS: providersPath };
+    const providers = await writeMockProviders(directory, { provider: "mockperm", agent: permissionAgent });
     daemon = await startDaemon({ directory, env: providers });
     mcpClient = new Client({ name: "w1-overlap", version: "1.0.0" });
     await mcpClient.connect(new StdioClientTransport({

@@ -473,17 +473,12 @@ export class AcpClient {
             grant: this.#grantFor(params)
           };
           this.pendingPermissions.set(id, { rpcId: id, params: retained });
-          try {
-            this.sessionHandlers.get(params.sessionId)?.({
-              sessionUpdate: "permission_request",
-              requestId: id,
-              toolCall: params.toolCall,
-              options: params.options
-            });
-          } catch (error) {
-            this.pendingPermissions.delete(id);
-            throw error;
-          }
+          this.#announcePending(this.pendingPermissions, id, params.sessionId, {
+            sessionUpdate: "permission_request",
+            requestId: id,
+            toolCall: params.toolCall,
+            options: params.options
+          });
         }
         return;
       }
@@ -493,19 +488,14 @@ export class AcpClient {
         this.#requirePendingInputCapacity(params.sessionId);
         this.#requirePendingInputBytes(params);
         this.pendingElicitations.set(id, { rpcId: id, params: { sessionId: params.sessionId } });
-        try {
-          this.sessionHandlers.get(params.sessionId)?.({
-            sessionUpdate: "elicitation_request",
-            requestId: id,
-            mode: params.mode,
-            message: params.message,
-            requestedSchema: params.requestedSchema,
-            toolCallId: params.toolCallId ?? null
-          });
-        } catch (error) {
-          this.pendingElicitations.delete(id);
-          throw error;
-        }
+        this.#announcePending(this.pendingElicitations, id, params.sessionId, {
+          sessionUpdate: "elicitation_request",
+          requestId: id,
+          mode: params.mode,
+          message: params.message,
+          requestedSchema: params.requestedSchema,
+          toolCallId: params.toolCallId ?? null
+        });
         return;
       }
       if (method === "fs/read_text_file") {
@@ -888,17 +878,12 @@ export class AcpClient {
         resolve: (result) => { this.#respond(id, result ?? {}); done(); },
         reject: (error) => { this.#respondError(id, -32001, error.message); done(); }
       });
-      try {
-        this.sessionHandlers.get(params.sessionId)?.({
-          sessionUpdate: "permission_request",
-          requestId: id,
-          toolCall: operation.toolCall,
-          options
-        });
-      } catch (error) {
-        this.pendingOperations.delete(id);
-        throw error;
-      }
+      this.#announcePending(this.pendingOperations, id, params.sessionId, {
+        sessionUpdate: "permission_request",
+        requestId: id,
+        toolCall: operation.toolCall,
+        options
+      });
     });
   }
 
@@ -1022,6 +1007,18 @@ export class AcpClient {
     }
     if (held + bytes > this.maxPendingInputBytesPerSession) {
       throw new Error(`ACP session pending input byte budget exceeded (${held + bytes}/${this.maxPendingInputBytesPerSession})`);
+    }
+  }
+
+  // Tells Main about a request just registered under id in pending, where it
+  // waits for Main's answer. A handler that throws takes the registration back
+  // with it, and the worker is answered with the error instead.
+  #announcePending(pending, id, sessionId, update) {
+    try {
+      this.sessionHandlers.get(sessionId)?.(update);
+    } catch (error) {
+      pending.delete(id);
+      throw error;
     }
   }
 

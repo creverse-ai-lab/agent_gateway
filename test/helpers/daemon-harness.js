@@ -21,16 +21,21 @@ export function daemonPaths(directory) {
   };
 }
 
-// A providers.json pointed at the mock ACP agent, so a real daemon can run a
-// real task end to end with no worker installed. Returns the env additions.
-export async function writeMockProviders(directory, { permissionPolicy = "read_only" } = {}) {
+// A providers.json pointed at a mock ACP agent (mock-agent.js, or the script
+// agent names) under the id provider, so a real daemon can run a real task end
+// to end with no worker installed. Returns the env additions.
+export async function writeMockProviders(directory, {
+  permissionPolicy = "read_only",
+  provider = "mock",
+  agent = fileURLToPath(new URL("../mock-agent.js", import.meta.url))
+} = {}) {
   const providersPath = join(directory, "providers.json");
   await writeFile(providersPath, JSON.stringify({
     version: 1,
     providers: {
-      mock: {
+      [provider]: {
         command: process.execPath,
-        args: [fileURLToPath(new URL("../mock-agent.js", import.meta.url))],
+        args: [agent],
         permissionPolicy
       }
     }

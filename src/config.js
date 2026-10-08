@@ -48,7 +48,7 @@ export function gatewayProtectedPaths({ statePath = gatewayStatePath(), env = pr
 const TOKEN_REQUIRED = "ACP_GATEWAY_CONTROL_TOKEN must be set to at least 24 characters";
 const MIN_TOKEN_LENGTH = 24;
 
-export function controlToken(env = process.env) {
+function controlToken(env = process.env) {
   const value = env.ACP_GATEWAY_CONTROL_TOKEN;
   if (!value || value.length < MIN_TOKEN_LENGTH) throw new Error(TOKEN_REQUIRED);
   return value;

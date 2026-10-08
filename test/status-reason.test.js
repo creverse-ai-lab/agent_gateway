@@ -10,6 +10,7 @@ import test from "node:test";
 import { DURABLE_EVENT_TYPES, GatewayService, STATUS_REASONS } from "../src/gateway-service.js";
 import { SETTING_DEFINITIONS, validateSetting } from "../src/settings.js";
 import { readSnapshotBody } from "./helpers/state-files.js";
+import { until } from "./helpers/fake-worker.js";
 
 const MAIN = { rootId: "main-a" };
 const EPOCH = Date.parse("2026-01-01T00:00:00.000Z");
@@ -104,14 +105,6 @@ async function open(service, context = MAIN) {
   const opened = await service.call("session_open", { provider: "claude", cwd: process.cwd(), permissionPolicy: "ask" }, context);
   const session = service.requireSession(opened.sessionId);
   return { opened, session, worker: session.client };
-}
-
-async function until(predicate, description) {
-  for (let attempt = 0; attempt < 500; attempt += 1) {
-    if (predicate()) return;
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-  throw new Error(`Timed out waiting for ${description}`);
 }
 
 function reasonOf(session) {

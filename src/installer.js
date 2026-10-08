@@ -451,10 +451,12 @@ export async function runInstaller(options, dependencies = {}) {
   // Every entry is recorded as it is now: a rotated identity may take over.
   if (options.installControl) state.identity = identity;
   // Rotating is the user's call, not the migration's: an app such as AgenLynk
-  // keeps the identity it read, and a new token would lock it out.
+  // keeps the identity it read, and a new token would lock it out, as it would
+  // every open agent CLI session, whose Control MCP server read the token once,
+  // at start.
   if (mcpContext.migrated && !options.rotateToken) {
     const removed = mcpContext.migrated === 1 ? "one MCP registration" : `${mcpContext.migrated} MCP registrations`;
-    warnings.push(`The Control token was removed from ${removed}, but copies made before, such as the agent CLIs' config backups (*.bak), may still hold it. To retire it, stop the Gateway when it is idle (acp-gateway-admin shutdown_if_idle), run acp-gateway-bootstrap --rotate-token, and reconnect apps that keep the identity, such as AgenLynk`);
+    warnings.push(`The Control token was removed from ${removed}, but copies made before, such as the agent CLIs' config backups (*.bak), may still hold it. To retire it, stop the Gateway when it is idle (acp-gateway-admin shutdown_if_idle), run acp-gateway-bootstrap --rotate-token, restart the agent CLI sessions that are open (each one's Control MCP server reads the token once, at start), and reconnect apps that keep the identity, such as AgenLynk`);
   }
 
   if (state && !options.dryRun && (options.installControl || options.installGuide || options.installSkill || configuresAgentUpdates)) {
@@ -1385,9 +1387,9 @@ function hiddenEnv(env) {
 // whole. What they stop is a command that never ends, or never stops printing,
 // which in the daemon held an automatic update, and with it every shutdown,
 // forever.
-export const COMMAND_TIMEOUT_MS = 10 * 60_000;
+const COMMAND_TIMEOUT_MS = 10 * 60_000;
 // Per stream. Past it the first and last halves are kept around a marker.
-export const COMMAND_OUTPUT_BYTES = 1024 * 1024;
+const COMMAND_OUTPUT_BYTES = 1024 * 1024;
 // SIGTERM first, so npm can stop the lifecycle scripts it runs; SIGKILL if the
 // command is still there after this.
 const COMMAND_KILL_GRACE_MS = 2_000;

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -17,6 +17,7 @@ import {
   seatbeltSandbox,
   terminalSandboxProfile
 } from "../src/terminal-sandbox.js";
+import { processGone, withTemp } from "./helpers/scratch.js";
 
 // 1.8.0 W3, W4, P7 and P2: what Main is shown for a Gateway-mediated write or
 // terminal, what an approval lets through, the OS sandbox Gateway terminals run
@@ -36,15 +37,6 @@ function standInSandbox(calls = []) {
       return { command, args };
     }
   };
-}
-
-async function withTemp(prefix, body) {
-  const directory = await realpath(await mkdtemp(join(tmpdir(), prefix)));
-  try {
-    return await body(directory);
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
 }
 
 // One worker with one session. run(steps) is a turn of the mock's step script
@@ -81,15 +73,6 @@ async function until(predicate, what) {
 async function request(requests, count) {
   await until(() => requests.length >= count, `permission request ${count}`);
   return requests[count - 1];
-}
-
-function processGone(pid) {
-  try {
-    process.kill(pid, 0);
-    return false;
-  } catch (error) {
-    return error.code === "ESRCH";
-  }
 }
 
 // ------------------------------------------------------------------ W4: display

@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, lstatSync, readFileSync } from "node:fs";
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { ERROR_CODES } from "../src/errors.js";
@@ -10,6 +9,7 @@ import { listenPrivately, requireOwnSocket } from "../src/private-socket.js";
 import { GatewayRpcClient } from "../src/socket-rpc.js";
 import { statePaths } from "../src/state-store.js";
 import { startDaemon } from "./helpers/daemon-harness.js";
+import { withEnv, withTemp } from "./helpers/scratch.js";
 
 // W9: the daemon's socket is never reachable by another user, and a client
 // writes nothing, the token above all, to a socket another user could have put
@@ -17,29 +17,8 @@ import { startDaemon } from "./helpers/daemon-harness.js";
 
 const TOKEN = "t".repeat(32);
 const posix = typeof process.getuid === "function";
-
-async function withTemp(run) {
-  // Short: a Unix socket path must stay under ~104 bytes.
-  const directory = await realpath(await mkdtemp(join(tmpdir(), "acp-sock-")));
-  try {
-    return await run(directory);
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-}
-
-async function withEnv(values, body) {
-  const previous = Object.fromEntries(Object.keys(values).map((key) => [key, process.env[key]]));
-  Object.assign(process.env, values);
-  try {
-    return await body();
-  } finally {
-    for (const [key, value] of Object.entries(previous)) {
-      if (value == null) delete process.env[key];
-      else process.env[key] = value;
-    }
-  }
-}
+// Short: a Unix socket path must stay under ~104 bytes.
+const SOCKET_DIR = "acp-sock-";
 
 // A stand-in daemon that records every connection and every byte it receives,
 // and never answers. close() also drops what is still connected, so a failed
@@ -84,7 +63,7 @@ const untrusted = (expected = {}) => (error) => {
 };
 
 test("the daemon's socket is bound under umask 077 and left at 0600", { skip: !posix }, async () => {
-  await withTemp(async (directory) => {
+  await withTemp(SOCKET_DIR, async (directory) => {
     const path = join(directory, "g.sock");
     const server = createServer();
     // listen() binds synchronously, so the mode right after it is the mode the
@@ -112,7 +91,7 @@ test("the daemon's socket is bound under umask 077 and left at 0600", { skip: !p
 });
 
 test("a running daemon serves a 0600 socket owned by its user", { skip: !posix }, async () => {
-  await withTemp(async (directory) => {
+  await withTemp(SOCKET_DIR, async (directory) => {
     const daemon = await startDaemon({ directory });
     try {
       const info = lstatSync(daemon.socketPath);
@@ -126,7 +105,7 @@ test("a running daemon serves a 0600 socket owned by its user", { skip: !posix }
 });
 
 test("the owner check accepts this user's socket and a missing path, and refuses anything else", { skip: !posix }, async () => {
-  await withTemp(async (directory) => {
+  await withTemp(SOCKET_DIR, async (directory) => {
     const uid = process.getuid();
     const path = join(directory, "g.sock");
     await requireOwnSocket(path);
@@ -158,7 +137,7 @@ test("the owner check accepts this user's socket and a missing path, and refuses
 });
 
 test("a client never connects to a socket of another user, for any call", { skip: !posix }, async () => {
-  await withTemp(async (directory) => {
+  await withTemp(SOCKET_DIR, async (directory) => {
     const path = join(directory, "g.sock");
     const fixture = await recordingServer(path);
     const getuid = process.getuid;
@@ -182,7 +161,7 @@ test("a client never connects to a socket of another user, for any call", { skip
 });
 
 test("a connection whose socket changed hands after the first check is dropped before anything is sent", { skip: !posix }, async () => {
-  await withTemp(async (directory) => {
+  await withTemp(SOCKET_DIR, async (directory) => {
     const path = join(directory, "g.sock");
     const fixture = await recordingServer(path);
     const getuid = process.getuid;
@@ -209,7 +188,7 @@ test("a connection whose socket changed hands after the first check is dropped b
 });
 
 test("a file at the socket path is reported as it is: no daemon starts and no recovery marker masks it", { skip: !posix }, async () => {
-  await withTemp(async (directory) => {
+  await withTemp(SOCKET_DIR, async (directory) => {
     const path = join(directory, "g.sock");
     const statePath = join(directory, "state", "state.json");
     await writeFile(path, "not a socket");

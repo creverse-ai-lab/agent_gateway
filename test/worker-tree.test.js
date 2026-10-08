@@ -1,9 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -17,6 +16,7 @@ import {
   WORKER_TREE_EXIT_CODE, workerTreeReason
 } from "../src/worker-tree.js";
 import { startDaemon } from "./helpers/daemon-harness.js";
+import { withTemp } from "./helpers/scratch.js";
 
 // W1 (1.8.0 review): a Codex worker the daemon started loaded the user's own
 // ~/.codex/config.toml and launched the Control MCP registered there, which
@@ -28,15 +28,6 @@ import { startDaemon } from "./helpers/daemon-harness.js";
 const frontDoor = fileURLToPath(new URL("../src/index.js", import.meta.url));
 const configMcpAgent = fileURLToPath(new URL("./mock-config-mcp-agent.js", import.meta.url));
 const unix = process.platform !== "win32";
-
-async function withTemp(prefix, body) {
-  const directory = await realpath(await mkdtemp(join(tmpdir(), prefix)));
-  try {
-    return await body(directory);
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-}
 
 // An injected process table, pid -> [ppid, command], and the pids it was asked for.
 function processTable(entries) {

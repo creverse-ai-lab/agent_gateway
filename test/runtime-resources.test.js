@@ -17,9 +17,11 @@ import { ArtifactStore } from "../src/artifacts.js";
 import { BoundedUtf8Text } from "../src/bounded-utf8.js";
 import { ERROR_CODES } from "../src/errors.js";
 import { GatewayService } from "../src/gateway-service.js";
-import { parseInstallerArgs, runCommand, runInstaller } from "../src/installer.js";
+import { parseInstallerArgs, runCommand } from "../src/installer.js";
 import { GatewaySettings } from "../src/settings.js";
 import { decodeRecord, statePaths } from "../src/state-store.js";
+import { runInstaller } from "./helpers/installer.js";
+import { processGone } from "./helpers/scratch.js";
 
 const mockAgent = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 const MAIN = { rootId: "main-a" };
@@ -50,15 +52,6 @@ function directSession(service, id, ownerRootId = "main-a") {
   });
   session.status = "running";
   return session;
-}
-
-function processGone(pid) {
-  try {
-    process.kill(pid, 0);
-    return false;
-  } catch (error) {
-    return error.code === "ESRCH";
-  }
 }
 
 // The pid a test child wrote to path, or null if it has not written one yet.

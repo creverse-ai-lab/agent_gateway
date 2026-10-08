@@ -9,8 +9,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
@@ -20,19 +19,11 @@ import { DAEMON_IDENTITY_STDIN_ENV, takeDaemonIdentity } from "../src/config.js"
 import { GatewayRpcClient } from "../src/socket-rpc.js";
 import { statePaths } from "../src/state-store.js";
 import { startDaemon } from "./helpers/daemon-harness.js";
+import { withTemp } from "./helpers/scratch.js";
 
 const DAEMON = fileURLToPath(new URL("../src/gateway-daemon.js", import.meta.url));
 const TOKEN = "stdin-identity-control-token-at-least-24";
 const ROOT_ID = "main-stdin-identity";
-
-async function withDirectory(prefix, body) {
-  const directory = await realpath(await mkdtemp(join(tmpdir(), prefix)));
-  try {
-    return await body(directory);
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-}
 
 // Everything a daemon started from here could touch lives in the directory,
 // and none of this process's own Gateway env (the token included) rides along.
@@ -166,7 +157,7 @@ async function assertAutostarted(env) {
 }
 
 test("an autostarted daemon gets its identity over stdin and none of it is in the environment the OS keeps for it", async () => {
-  await withDirectory("acp-id-", async (directory) => {
+  await withTemp("acp-id-", async (directory) => {
     // Since 1.8.0 the identity is only in install.json, where the front door reads it.
     const env = isolatedEnv(directory);
     await writeFile(env.ACP_GATEWAY_INSTALL_STATE, JSON.stringify({
@@ -179,7 +170,7 @@ test("an autostarted daemon gets its identity over stdin and none of it is in th
 });
 
 test("a front door that carries the identity in its own env still leaves it out of the daemon's", async () => {
-  await withDirectory("acp-id-env-door-", async (directory) => {
+  await withTemp("acp-id-env-door-", async (directory) => {
     // An entry registered before 1.8.0: the token and root id are in the front
     // door's env, which the daemon's is built from.
     await assertAutostarted(isolatedEnv(directory, { ACP_GATEWAY_CONTROL_TOKEN: TOKEN, ACP_GATEWAY_ROOT_ID: ROOT_ID }));
@@ -187,7 +178,7 @@ test("a front door that carries the identity in its own env still leaves it out 
 });
 
 test("a daemon started with the token in its env takes it from there and never reads stdin", async () => {
-  await withDirectory("acp-id-env-", async (directory) => {
+  await withTemp("acp-id-env-", async (directory) => {
     // The harness launches as a supervisor would, stdin on /dev/null. The flag
     // set too, a daemon that read stdin anyway would halt: that is no pipe.
     const daemon = await startDaemon({ directory, env: { [DAEMON_IDENTITY_STDIN_ENV]: "1" } });
@@ -244,7 +235,7 @@ test("a daemon told to read its identity from stdin halts with a marker when the
     { name: "no line end in 16 KiB", feed: (stdin) => stdin.write("x".repeat(16 * 1024 + 1)), reason: /more than 16384 bytes arrived on stdin without a line end/ }
   ];
   for (const scenario of scenarios) {
-    await withDirectory("acp-id-bad-", async (directory) => {
+    await withTemp("acp-id-bad-", async (directory) => {
       const halted = await startReadingStdin(directory, scenario);
       assert.equal(halted.signalCode, null, scenario.name);
       assert.equal(halted.exitCode, 78, `${scenario.name}: ${halted.stderr}`);
@@ -272,7 +263,7 @@ test("a daemon told to read its identity from stdin halts with a marker when the
 });
 
 test("with neither a token in its env nor the stdin flag, the daemon fails as it always has", async () => {
-  await withDirectory("acp-id-none-", async (directory) => {
+  await withTemp("acp-id-none-", async (directory) => {
     const env = isolatedEnv(directory);
     const child = spawn(process.execPath, [DAEMON], { env, stdio: ["ignore", "ignore", "pipe"] });
     let stderr = "";

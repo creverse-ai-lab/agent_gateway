@@ -18,6 +18,7 @@ const { O_CREAT, O_NOFOLLOW = 0, O_NONBLOCK = 0, O_RDONLY, O_WRONLY } = constant
 // O_NOFOLLOW and cannot be combined with it (EINVAL).
 const O_NOFOLLOW_ANY = 0x20000000;
 
+/** Whether path is root or under it: lexical, so both must already be canonical. */
 export function isWithin(root, path) {
   const rel = relative(root, path);
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));

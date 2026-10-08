@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { childEnv } from "./caller.js";
 import { checkNpmRelease, NPM_UPGRADE_COMMAND } from "./gateway-source-monitor.js";
 import { detectInstallMode } from "./install-mode.js";
+import { processIsAlive } from "./state-store.js";
 import { GATEWAY_VERSION } from "./version.js";
 
 // The first half of `acp-gateway-bootstrap --update`, by install mode. Only a
@@ -183,22 +184,13 @@ async function acquireUpdateLock(root, run) {
     } catch (error) {
       if (error?.code !== "EEXIST") throw error;
       const owner = Number((await readFile(path, "utf8").catch(() => "")).trim());
-      if (Number.isInteger(owner) && owner > 0 && processAlive(owner)) {
+      if (Number.isInteger(owner) && owner > 0 && processIsAlive(owner)) {
         throw new Error(`Another ACP Gateway update is running (pid ${owner}); wait for it to finish`);
       }
       await unlink(path).catch(() => {});
     }
   }
   throw new Error(`Could not acquire the update lock at ${path}`);
-}
-
-function processAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === "EPERM";
-  }
 }
 
 async function defaultStagingDir() {

@@ -1127,7 +1127,9 @@ function unlinkSafe(path) {
   }
 }
 
-function processIsAlive(pid) {
+// Whether the process a lock or temporary file names still runs. One of
+// another user counts (EPERM): it exists, it just cannot be signaled.
+export function processIsAlive(pid) {
   try {
     process.kill(pid, 0);
     return true;

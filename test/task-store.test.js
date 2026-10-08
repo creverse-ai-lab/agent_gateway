@@ -770,7 +770,7 @@ test("recover ignores per-root budgets so durable handles are never lost", () =>
   assert.throws(() => store.create({ sessionId: "session-1", ownerRootId: "rootA" }), assertCode("TASK_LIMIT_EXCEEDED"));
 });
 
-test("toPersistedRecords can reproduce the legacy in-flight-only filter", () => {
+test("toPersistedRecords returns every record, terminal ones included, as copies", () => {
   const { store, clock } = makeStore();
   const first = store.create({ sessionId: "session-1", ownerRootId: "rootA" });
   clock.t = 10;
@@ -780,9 +780,6 @@ test("toPersistedRecords can reproduce the legacy in-flight-only filter", () => 
   const all = store.toPersistedRecords();
   assert.deepEqual(all.map((record) => record.taskId), [first.taskId, second.taskId]);
   assert.deepEqual(Object.keys(all[0]), Object.keys(first));
-
-  const inFlight = store.toPersistedRecords({ includeTerminal: false });
-  assert.deepEqual(inFlight.map((record) => record.taskId), [first.taskId]);
 
   // Persisted records are copies: mutating them cannot corrupt the store.
   all[0].status = "cancelled";

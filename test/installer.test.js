@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { parseInstallerArgs, runInstaller } from "../src/installer.js";
+import { parseInstallerArgs } from "../src/installer.js";
 import { GATEWAY_VERSION } from "../src/version.js";
+// The installer with every default path a test leaves out in a temp directory.
+import { runInstaller } from "./helpers/installer.js";
 
 const runtime = { nodeVersion: "22.0.0", platform: "darwin" };
 const providers = [
@@ -196,7 +198,7 @@ function rememberingClis(initial, { failAdds = {} } = {}) {
 const modeOf = async (path) => (await stat(path)).mode & 0o777;
 
 // The one warning a run that took the token out of agent configs ends with.
-const rotateAdvice = (count) => `The Control token was removed from ${count === 1 ? "one MCP registration" : `${count} MCP registrations`}, but copies made before, such as the agent CLIs' config backups (*.bak), may still hold it. To retire it, stop the Gateway when it is idle (acp-gateway-admin shutdown_if_idle), run acp-gateway-bootstrap --rotate-token, and reconnect apps that keep the identity, such as AgenLynk`;
+const rotateAdvice = (count) => `The Control token was removed from ${count === 1 ? "one MCP registration" : `${count} MCP registrations`}, but copies made before, such as the agent CLIs' config backups (*.bak), may still hold it. To retire it, stop the Gateway when it is idle (acp-gateway-admin shutdown_if_idle), run acp-gateway-bootstrap --rotate-token, restart the agent CLI sessions that are open (each one's Control MCP server reads the token once, at start), and reconnect apps that keep the identity, such as AgenLynk`;
 
 function claudeGetOutput(name, command, args) {
   return [

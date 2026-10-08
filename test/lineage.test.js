@@ -17,15 +17,13 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { isSameCaller, isTaskCreator } from "../src/attention.js";
-import { GatewayService } from "../src/gateway-service.js";
 import { GatewayRpcClient } from "../src/socket-rpc.js";
 import { statePaths } from "../src/state-store.js";
 import { requireTaskLinks, TaskStore } from "../src/task-store.js";
 import { startDaemon, writeMockProviders } from "./helpers/daemon-harness.js";
+import { EPOCH, finish, harness, start } from "./helpers/fake-worker.js";
 
 const ROOT = "main-root";
-const EPOCH = Date.parse("2026-01-01T00:00:00.000Z");
-const TERMINAL = ["completed", "failed", "cancelled"];
 const claudeCaller = { provider: "claude", sessionId: "claude-session-a", pid: 4242, instanceId: "mcp-a" };
 const codexCaller = { provider: "codex", sessionId: "codex-thread-b", pid: 5151, instanceId: "mcp-b" };
 // A Codex front door from before per-call thread ids: the process is all it can name.
@@ -41,76 +39,10 @@ const TASK_KEYS = [
   "caller", "createdAt", "lastUpdatedAt", "origin", "pollInterval", "sessionId", "status", "statusMessage", "taskId", "ttl", "turnId"
 ];
 
-class FakeWorker {
-  constructor(options) {
-    this.options = options;
-    this.config = { modelScope: "session" };
-    this.alive = false;
-    this.initResult = null;
-    this.stderr = "";
-    this.handlers = new Map();
-    this.turns = [];
-  }
-
-  async start() {
-    this.alive = true;
-    this.initResult = { protocolVersion: 1, agentCapabilities: { sessionCapabilities: { resume: {}, close: {} } } };
-    return this.initResult;
-  }
-
-  async sessionNew() {
-    FakeWorker.opened += 1;
-    return { sessionId: `fake-${FakeWorker.opened}`, configOptions: [] };
-  }
-
-  async sessionRestore({ sessionId }) { return { sessionId, configOptions: [] }; }
-  onSessionUpdate(sessionId, handler) { this.handlers.set(sessionId, handler); }
-  clearSession(sessionId) { this.handlers.delete(sessionId); }
-  sessionPrompt() { return new Promise((resolve, reject) => this.turns.push({ resolve, reject })); }
-  cancelSession() {}
-  pendingSessionInput() { return { permissions: 0, elicitations: 0 }; }
-  async respondPermission() {}
-  respondElicitation() {}
-  async setSessionConfigOption() { return { configOptions: [] }; }
-  async request() { return {}; }
-  async stop() { this.alive = false; }
-}
-FakeWorker.opened = 0;
-
-function harness(options = {}) {
-  const clock = { now: EPOCH };
-  const service = new GatewayService({
-    gcIntervalMs: 0,
-    now: () => clock.now,
-    createClient: (_provider, clientOptions) => new FakeWorker(clientOptions),
-    ...options
-  });
-  return { service, clock };
-}
-
 async function open(service, context = A) {
   const opened = await service.call("session_open", { provider: "claude", cwd: process.cwd(), permissionPolicy: "ask" }, context);
   const session = service.requireSession(opened.sessionId);
   return { session, worker: session.client };
-}
-
-async function until(predicate, description) {
-  for (let attempt = 0; attempt < 500; attempt += 1) {
-    if (predicate()) return;
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-  throw new Error(`Timed out waiting for ${description}`);
-}
-
-async function start(service, session, context, extra = {}) {
-  const ack = await service.call("run", { sessionId: session.id, prompt: "go", waitMs: 0, ...extra }, context);
-  assert.equal(ack.status, "working");
-  return ack.taskId;
-}
-
-async function finish(service, worker, taskId) {
-  worker.turns.at(-1).resolve({ stopReason: "end_turn" });
-  await until(() => TERMINAL.includes(service.taskStore.find(taskId)?.status), `task ${taskId} terminal`);
 }
 
 async function finished(service, { session, worker }, context, extra = {}) {
