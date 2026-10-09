@@ -1,6 +1,6 @@
 import { fstatSync, readFileSync, realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { CONTROL_IDENTITY_ENV } from "./caller.js";
 import { ERROR_CODES, GatewayError } from "./errors.js";
 import { resolveSettings, SETTING_DEFINITIONS, settingsPaths } from "./settings.js";
@@ -28,17 +28,23 @@ export function gatewayProtectedPaths({ statePath = gatewayStatePath(), env = pr
     dirname(statePath),
     gatewaySocketPath()
   ];
-  // The socket usually does not exist yet, so canonicalize through its parent:
-  // on macOS the temp directory is itself a symlink into /private.
+  // Canonical by the system realpath, the one worker-files.js resolves a
+  // requested path with (through fs/promises) before isWithin compares it with
+  // these, lexically; and nothing lexical first, as for the socket's own check
+  // (private-socket.js): a resolve() would drop a ".." together with the link
+  // in front of it, which the kernel follows before it. The JavaScript
+  // realpathSync resolve()s first itself and, on a case-insensitive macOS
+  // volume, keeps the case it was given where the system's returns the case on
+  // disk. What does not exist yet, the socket usually, resolves through its
+  // parent: on macOS the temp directory is itself a symlink into /private.
   const canonical = candidates.map((path) => {
-    const absolute = resolve(path);
     try {
-      return realpathSync(absolute);
+      return realpathSync.native(path);
     } catch {
       try {
-        return join(realpathSync(dirname(absolute)), absolute.slice(dirname(absolute).length + 1));
+        return join(realpathSync.native(dirname(path)), basename(path));
       } catch {
-        return absolute;
+        return resolve(path);
       }
     }
   });

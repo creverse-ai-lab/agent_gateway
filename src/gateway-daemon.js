@@ -16,7 +16,7 @@ import { ERROR_CODES, GatewayError, errorEnvelope } from "./errors.js";
 import { checkGatewaySource } from "./gateway-source-monitor.js";
 import { GatewayService } from "./gateway-service.js";
 import { readNdjson } from "./ndjson.js";
-import { listenPrivately } from "./private-socket.js";
+import { listenPrivately, requireTrustedSocketDir } from "./private-socket.js";
 import { createSocketSender } from "./socket-flow.js";
 import { processIsAlive, statePaths } from "./state-store.js";
 import { GATEWAY_VERSION } from "./version.js";
@@ -24,8 +24,9 @@ import { callerVerdicts, workerControlDeniedMessage } from "./worker-tree.js";
 
 // A start that dies before it serves is invisible: autostart spawns this
 // process with stdout and stderr ignored, so the only thing a Main ever sees is
-// a socket that never appears. Recovery failures, and an identity the autostart
-// failed to hand over, leave their reason in a file the client reads (halt).
+// a socket that never appears. Recovery failures, an identity the autostart
+// failed to hand over, and a socket directory another user could rewrite leave
+// their reason in a file the client reads (halt).
 const STARTUP_HALT_EXIT_CODE = 78; // EX_CONFIG: operator action required
 // Admission bound per control connection, as a module constant (the PR2
 // precedent for safety valves). The arithmetic that rules out a smaller number:
@@ -33,7 +34,6 @@ const STARTUP_HALT_EXIT_CODE = 78; // EX_CONFIG: operator action required
 // parked requests, so 256 is that with room to spare. A naive 64 would break the
 // intended usage instead of an abusive one.
 const MAX_INFLIGHT_REQUESTS_PER_CONNECTION = 256;
-const socketPath = gatewaySocketPath();
 const statePath = gatewayStatePath();
 // First, before anything copies the env (GatewaySettings keeps one): from here
 // on process.env holds neither the token nor the root id, so no child the
@@ -47,6 +47,25 @@ try {
   await halt(error);
 }
 const { token: expectedToken, rootId: expectedRootId } = identity;
+// Then, before anything touches the socket's path (the lock beside it, the
+// probe and unlink of a stale socket, the bind): its whole directory chain must
+// be this user's own (or root's) and writable by no one else, or another user
+// could swap a link into it and stand between a client and us, and the unlink
+// could remove a file of theirs. The default paths (a per-user tmpdir on macOS,
+// a sticky /tmp on Linux) pass; a hand-set ACP_GATEWAY_SOCKET in a shared
+// directory is what this turns away, with a message the operator can act on.
+// No other user can change a chain like that, so the proof still holds at the
+// bind and at the unlink on shutdown, but only for the canonical path it
+// returns, which is the only one used from here on: a link or ".." left in the
+// configured spelling would be resolved again at each use, wherever its owner
+// had pointed it by then.
+let socketPath;
+try {
+  socketPath = await requireTrustedSocketDir(gatewaySocketPath());
+} catch (error) {
+  if (error?.code !== ERROR_CODES.SOCKET_UNTRUSTED) throw error;
+  await halt(error);
+}
 const settings = new GatewaySettings();
 const gatewayConfig = gatewayLifecycleConfig(settings.activeValues);
 const agentUpdateManager = new AgentUpdateManager({ ...gatewayAgentUpdateConfig(settings.activeValues), sourceChecker: checkGatewaySource });
@@ -262,7 +281,7 @@ const server = createServer((socket) => {
 });
 
 try {
-  // Bound under umask 077, then 0600: never reachable by another user.
+  // Bound under umask 177, so born 0600: never reachable by another user.
   await listenPrivately(server, socketPath);
 } catch (error) {
   await releaseDaemonLock(daemonLock);

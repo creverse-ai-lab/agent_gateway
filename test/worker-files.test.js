@@ -318,3 +318,185 @@ test("fs/read_text_file refuses a FIFO at once and keeps serving reads", { skip:
     });
   });
 });
+
+// F11 (1.8.0 review): a write opens with O_CREAT, and Linux follows a link
+// anywhere above the last component, so a parent swapped for a link made the
+// open create an empty file wherever the link pointed before the descriptor
+// check refused the write. Removing it afterwards is no fix: Node has no
+// unlinkat, and an unlink by name follows the same swap, onto a file that
+// already existed, install.json included. So nothing is ever unlinked, and the
+// create itself stays in the checked directory instead: on Linux the file is
+// opened through a verified descriptor of its parent, on macOS the open refuses
+// a link anywhere in the path. These run on the real platform, not PORTABLE.
+test("on Linux a write whose parent was swapped for a link creates nothing where the link points", {
+  skip: process.platform !== "linux"
+}, async () => {
+  await withLayout(async ({ directory, root, options }) => {
+    const elsewhere = join(directory, "elsewhere"); // writable, outside the roots
+    await mkdir(elsewhere);
+    const parent = join(root, "d");
+    await assert.rejects(
+      openWorkerFile(join(parent, "new.txt"), { ...options, write: true, beforeOpen: () => swapForLink(parent, elsewhere) }),
+      /changed while the Gateway was opening it/
+    );
+    await swapBack(parent);
+    assert.equal(existsSync(join(elsewhere, "new.txt")), false, "the held parent was not the checked one, so nothing was created");
+    assert.equal(existsSync(join(parent, "new.txt")), false);
+  });
+});
+
+test("on Linux a parent swapped once it is held and verified still gets the file, the link's target never", {
+  skip: process.platform !== "linux"
+}, async () => {
+  await withLayout(async ({ directory, root, options }) => {
+    const elsewhere = join(directory, "elsewhere");
+    await mkdir(elsewhere);
+    const parent = join(root, "d");
+    // The swap lands between the check of the held directory and the create, so
+    // the path now leads elsewhere, but the create goes through the descriptor.
+    await assert.rejects(
+      openWorkerFile(join(parent, "new.txt"), { ...options, write: true, beforeCreate: () => swapForLink(parent, elsewhere) }),
+      /changed while the Gateway was opening it/
+    );
+    assert.equal(await readFile(join(`${parent}.real`, "new.txt"), "utf8"), "", "created, empty, in the held directory inside the roots");
+    assert.equal(existsSync(join(elsewhere, "new.txt")), false, "and nothing where the link points");
+    await swapBack(parent);
+  });
+});
+
+// /proc names no path longer than PATH_MAX, so a Worker that swaps the parent
+// for a link to a directory nested deeper than that makes the readlink fail
+// even though /proc is there. Only ENOENT (no /proc at all) skips a /proc check;
+// this failure refuses, or the Worker could switch the check off at will.
+
+// A directory nested deeper than PATH_MAX inside directory, built through short
+// links: deepest is a short link to it, and remove() takes it down level by
+// level the same way, since rm cannot walk a path that long.
+async function tooDeepForProc(directory) {
+  const name = "x".repeat(200);
+  const hops = [join(directory, "deep")];
+  await mkdir(hops[0]);
+  for (let length = hops[0].length; length <= 4096; length += name.length + 1) {
+    await mkdir(join(hops.at(-1), name));
+    hops.push(join(directory, `hop${hops.length}`));
+    await symlink(join(hops.at(-2), name), hops.at(-1));
+  }
+  return {
+    deepest: hops.at(-1),
+    async remove() {
+      for (let level = hops.length - 1; level > 0; level--) await rm(join(hops[level - 1], name), { recursive: true, force: true });
+    }
+  };
+}
+
+// A write must not fall back to the open by path, which would follow the link
+// and create the file in that directory.
+test("on Linux a write whose parent is too deep for /proc to name is refused, not opened by path", {
+  skip: process.platform !== "linux"
+}, async () => {
+  await withLayout(async ({ directory, root, options }) => {
+    const deep = await tooDeepForProc(directory);
+    const parent = join(root, "d");
+    try {
+      await assert.rejects(
+        openWorkerFile(join(parent, "new.txt"), { ...options, write: true, beforeOpen: () => swapForLink(parent, deep.deepest) }),
+        /changed while the Gateway was opening it/
+      );
+      await swapBack(parent);
+      assert.equal(existsSync(join(deep.deepest, "new.txt")), false, "nothing is created in the directory /proc cannot name");
+    } finally {
+      await deep.remove();
+    }
+  });
+});
+
+// A read opens by path, so the descriptor's check is what must not be skipped.
+// Left in place, the swap would fail the realpath re-check anyway; undone after
+// the open, with the deep file a second name for the decoy, the path resolves
+// as checked and to the very inode the descriptor holds, so only /proc tells
+// the two names apart, and it cannot name the descriptor.
+test("on Linux a read through a parent too deep for /proc to name is refused, not checked less", {
+  skip: process.platform !== "linux"
+}, async () => {
+  await withLayout(async ({ directory, root, options }) => {
+    const deep = await tooDeepForProc(directory);
+    const parent = join(root, "d");
+    const requested = join(parent, "install.json"); // the decoy
+    try {
+      await link(requested, join(deep.deepest, "install.json"));
+      await assert.rejects(
+        openWorkerFile(requested, { ...options, beforeOpen: () => swapForLink(parent, deep.deepest), afterOpen: () => swapBack(parent) }),
+        /changed while the Gateway was opening it/
+      );
+    } finally {
+      await deep.remove();
+    }
+  });
+});
+
+test("on macOS a write whose parent was swapped for a link is refused by the open, before anything is created", {
+  skip: process.platform !== "darwin"
+}, async () => {
+  await withLayout(async ({ directory, root, options }) => {
+    const elsewhere = join(directory, "elsewhere");
+    await mkdir(elsewhere);
+    const parent = join(root, "d");
+    await assert.rejects(
+      openWorkerFile(join(parent, "new.txt"), { ...options, write: true, beforeOpen: () => swapForLink(parent, elsewhere) }),
+      /symbolic link the Gateway does not follow/
+    );
+    await swapBack(parent);
+    assert.equal(existsSync(join(elsewhere, "new.txt")), false);
+    assert.equal(existsSync(join(parent, "new.txt")), false);
+  });
+});
+
+// The review's case against unlinking: the name is absent in the root, so the
+// write may create it, and the swap, left in place, leads the path to the
+// protected file of that name. A cleanup that unlinked what a refused open had
+// reached would delete install.json; nothing is unlinked, so it keeps the token.
+test("a refused write never deletes or empties the protected file a swapped parent leads to", async () => {
+  await withLayout(async ({ root, guarded, secret, options }) => {
+    const parent = join(root, "d");
+    const requested = join(parent, "install.json");
+    await rm(requested); // absent in the root
+    for (const platform of [PORTABLE, process.platform]) {
+      await assert.rejects(
+        openWorkerFile(requested, { ...options, write: true, platform, beforeOpen: () => swapForLink(parent, guarded) }),
+        RACE_REFUSED
+      );
+      await swapBack(parent);
+      assert.equal(await readFile(secret, "utf8"), TOKEN, `${platform}: the protected file is neither deleted nor emptied`);
+      assert.equal(existsSync(requested), false, `${platform}: and nothing was created in the root`);
+    }
+  });
+});
+
+test("a refused write to a file that already existed never deletes it", async () => {
+  await withLayout(async ({ root, guarded, secret, options }) => {
+    const directory = join(root, "d");
+    const requested = join(directory, "install.json"); // the decoy, already on disk
+    await assert.rejects(
+      openWorkerFile(requested, {
+        ...options, write: true, platform: PORTABLE,
+        beforeOpen: () => swapForLink(directory, guarded),
+        afterOpen: () => swapBack(directory)
+      }),
+      /changed while the Gateway was opening it/
+    );
+    assert.equal(await readFile(requested, "utf8"), "decoy", "the pre-existing in-root file is left intact");
+    assert.equal(await readFile(secret, "utf8"), TOKEN, "and the protected file it was pointed at is untouched");
+  });
+});
+
+test("a legitimate new-file write creates the file and keeps it", async () => {
+  await withLayout(async ({ root, options }) => {
+    const created = await openWorkerFile(join(root, "d", "fresh.txt"), { ...options, write: true });
+    try {
+      await created.writeFile("content", "utf8");
+    } finally {
+      await created.close();
+    }
+    assert.equal(await readFile(join(root, "d", "fresh.txt"), "utf8"), "content", "a verified new file is created where it was asked for and kept");
+  });
+});

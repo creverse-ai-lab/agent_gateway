@@ -9,7 +9,7 @@ import { DAEMON_IDENTITY_STDIN_ENV, gatewayLifecycleConfig, gatewaySocketPath, g
 import { ERROR_CODES } from "./errors.js";
 import { readNdjson } from "./ndjson.js";
 import { LANE_HIGH, LANE_NORMAL, NdjsonChannel } from "./ndjson-channel.js";
-import { requireOwnSocket } from "./private-socket.js";
+import { requireOwnSocket, requireTrustedSocket } from "./private-socket.js";
 import { statePaths } from "./state-store.js";
 
 // Lane B has no droppable traffic: every frame here has a pending promise behind
@@ -207,14 +207,18 @@ export class GatewayRpcClient {
   }
 
   // Every request carries the token, so nothing is written to a socket before it
-  // is known to be this user's own (private-socket.js): checked before the
-  // connect, and again once connected, because whoever could create the path
-  // may have bound it in between. A connection that fails the second check is
+  // is known to be this user's own (private-socket.js): the socket and its whole
+  // directory chain are proven this user's own before the connect, and the
+  // connect and every check after it use the canonical path that proof is of,
+  // never this.socketPath, whose links and ".." the kernel would resolve again,
+  // after whoever owns such a link had pointed it elsewhere. The owner is
+  // checked again once connected, because whoever could create the path may
+  // have bound it in between. A connection that fails the second check is
   // destroyed unused.
   async #connectOnce() {
-    await requireOwnSocket(this.socketPath);
+    const socketPath = await requireTrustedSocket(this.socketPath);
     const socket = await new Promise((resolve, reject) => {
-      const candidate = createConnection(this.socketPath);
+      const candidate = createConnection(socketPath);
       const onError = (error) => {
         candidate.destroy();
         reject(error);
@@ -228,7 +232,7 @@ export class GatewayRpcClient {
     const drop = () => socket.destroy();
     socket.on("error", drop);
     try {
-      await requireOwnSocket(this.socketPath, { allowMissing: false });
+      await requireOwnSocket(socketPath, { allowMissing: false });
     } catch (error) {
       socket.destroy();
       throw error;

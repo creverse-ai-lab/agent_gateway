@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, readFileSync } from "node:fs";
-import { mkdir, symlink, writeFile } from "node:fs/promises";
+import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
+import { chmod, mkdir, realpath, symlink, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { ERROR_CODES } from "../src/errors.js";
-import { listenPrivately, requireOwnSocket } from "../src/private-socket.js";
+import { listenPrivately, requireOwnSocket, requireTrustedSocket, requireTrustedSocketDir } from "../src/private-socket.js";
 import { GatewayRpcClient } from "../src/socket-rpc.js";
 import { statePaths } from "../src/state-store.js";
+import { GATEWAY_VERSION } from "../src/version.js";
 import { startDaemon } from "./helpers/daemon-harness.js";
 import { withEnv, withTemp } from "./helpers/scratch.js";
 
@@ -218,5 +219,253 @@ test("a file at the socket path is reported as it is: no daemon starts and no re
     if (started) process.kill(Number(readFileSync(`${path}.lock`, "utf8")), "SIGTERM");
     assert.equal(started, false, "no daemon was started");
     assert.equal(readFileSync(path, "utf8"), "not a socket", "nothing replaced the file");
+  });
+});
+
+// F7 (1.8.0 review): an lstat of the final socket rejects a last-component
+// symlink, not an intermediate one. A parent directory a stranger can replace
+// with a link lets the two owner checks see this user's own socket while the
+// connect in between reaches a foreign one. Node cannot read the connected
+// peer's uid without a native addon, so the trust check proves the whole path
+// chain is this user's own instead: a chain no other user can write is one no
+// other user can redirect between the check and the connect. That holds only
+// for the canonical path the check walked (its directory resolved by the
+// kernel, links and ".." included), so the check returns it and the connect,
+// the bind and every later check use it, never the spelling they were given.
+
+const CHAIN_UID = 4242;
+const SOCK = "/trusted/run/g.sock";
+const SOCK_DIR = "/trusted/run";
+// Stats as lstat would return them, so a chain is described without touching disk.
+const dirStat = (uid, mode) => ({
+  isDirectory: () => true, isSymbolicLink: () => false, isSocket: () => false,
+  isFIFO: () => false, isFile: () => false, uid, mode: 0o040000 | mode
+});
+const linkStat = (uid) => ({
+  isDirectory: () => false, isSymbolicLink: () => true, isSocket: () => false,
+  isFIFO: () => false, isFile: () => false, uid, mode: 0o120777
+});
+const socketStat = (uid) => ({
+  isDirectory: () => false, isSymbolicLink: () => false, isSocket: () => true,
+  isFIFO: () => false, isFile: () => false, uid, mode: 0o140600
+});
+// realpath resolves the parent as spelled (SOCK_DIR unless told otherwise) to
+// SOCK_DIR; lstat answers from a table of paths, noting each one it is asked.
+const injected = (entries, { parent = SOCK_DIR, seen = [] } = {}) => ({
+  realpath: async (path) => { assert.equal(path, parent); return SOCK_DIR; },
+  lstat: async (path) => {
+    seen.push(path);
+    if (!(path in entries)) assert.fail(`unexpected lstat ${path}`);
+    return entries[path];
+  }
+});
+const trustedChain = (overrides = {}) => ({
+  [SOCK]: socketStat(CHAIN_UID),
+  [SOCK_DIR]: dirStat(CHAIN_UID, 0o700),
+  "/trusted": dirStat(CHAIN_UID, 0o755),
+  "/": dirStat(0, 0o755),
+  ...overrides
+});
+
+test("the trust check accepts a chain this user owns down to the root", { skip: !posix }, async () => {
+  assert.equal(await requireTrustedSocket(SOCK, { uid: CHAIN_UID, ...injected(trustedChain()) }), SOCK);
+  assert.equal(await requireTrustedSocketDir(SOCK, { uid: CHAIN_UID, ...injected(trustedChain()) }), SOCK);
+});
+
+test("the trust check checks and returns the canonical path, never the spelling it was given", { skip: !posix }, async () => {
+  // realpath gets the parent exactly as spelled, ".." included: a lexical
+  // resolve first would drop the ".." together with the link in front of it,
+  // which the kernel follows before it.
+  for (const [spelled, parent] of [["/spelled/run/g.sock", "/spelled/run"], ["/spelled/link/../g.sock", "/spelled/link/.."]]) {
+    const seen = [];
+    assert.equal(await requireTrustedSocket(spelled, { uid: CHAIN_UID, ...injected(trustedChain(), { parent, seen }) }), SOCK);
+    assert.deepEqual(seen, [SOCK, SOCK_DIR, "/trusted", "/"], "the owner check, then the chain, of the canonical path only");
+    seen.length = 0;
+    assert.equal(await requireTrustedSocketDir(spelled, { uid: CHAIN_UID, ...injected(trustedChain(), { parent, seen }) }), SOCK);
+    assert.deepEqual(seen, [SOCK_DIR, "/trusted", "/"]);
+    // A refusal still names the path as configured.
+    const naming = (expected) => (error) => {
+      assert.equal(error.code, ERROR_CODES.SOCKET_UNTRUSTED, error.message);
+      assert.ok(error.message.startsWith(`Refusing Gateway socket ${spelled}: `), error.message);
+      for (const [key, value] of Object.entries(expected)) assert.equal(error.details?.[key], value, key);
+      return true;
+    };
+    await assert.rejects(
+      requireTrustedSocket(spelled, { uid: CHAIN_UID, ...injected(trustedChain({ [SOCK]: socketStat(CHAIN_UID + 1) }), { parent }) }),
+      naming({ socketPath: spelled, type: "socket", ownerUid: CHAIN_UID + 1 })
+    );
+    await assert.rejects(
+      requireTrustedSocketDir(spelled, { uid: CHAIN_UID, ...injected(trustedChain({ "/trusted": dirStat(CHAIN_UID, 0o777) }), { parent }) }),
+      naming({ socketPath: spelled, dir: "/trusted" })
+    );
+  }
+  // No uid to compare (Windows): the path comes back as given, nothing is read.
+  const untouched = { uid: null, realpath: async () => assert.fail("realpath without a uid"), lstat: async () => assert.fail("lstat without a uid") };
+  assert.equal(await requireTrustedSocket("/spelled/link/../g.sock", untouched), "/spelled/link/../g.sock");
+  assert.equal(await requireTrustedSocketDir("/spelled/link/../g.sock", untouched), "/spelled/link/../g.sock");
+});
+
+test("the trust check refuses a group- or other-writable intermediate directory", { skip: !posix }, async () => {
+  const entries = trustedChain({ "/trusted": dirStat(CHAIN_UID, 0o777) });
+  const refused = (error) => {
+    assert.equal(error.code, ERROR_CODES.SOCKET_UNTRUSTED);
+    assert.equal(error.details.dir, "/trusted");
+    assert.match(error.message, /writable by group or others/);
+    return true;
+  };
+  // The connect path (socket present) and the daemon's pre-bind path both refuse it.
+  await assert.rejects(requireTrustedSocket(SOCK, { uid: CHAIN_UID, ...injected(entries) }), refused);
+  await assert.rejects(requireTrustedSocketDir(SOCK, { uid: CHAIN_UID, ...injected(entries) }), refused);
+});
+
+test("the trust check allows a sticky world-writable directory such as /tmp", { skip: !posix }, async () => {
+  // Sticky (01000) lets only an entry's own owner replace it, so our own socket
+  // and directories are safe inside a shared /tmp.
+  await requireTrustedSocket(SOCK, { uid: CHAIN_UID, ...injected(trustedChain({ "/trusted": dirStat(0, 0o1777) })) });
+});
+
+test("the trust check refuses a directory in the chain owned by another user", { skip: !posix }, async () => {
+  await assert.rejects(
+    requireTrustedSocket(SOCK, { uid: CHAIN_UID, ...injected(trustedChain({ [SOCK_DIR]: dirStat(CHAIN_UID + 1, 0o700) })) }),
+    (error) => {
+      assert.equal(error.code, ERROR_CODES.SOCKET_UNTRUSTED);
+      assert.equal(error.details.dir, SOCK_DIR);
+      assert.equal(error.details.ownerUid, CHAIN_UID + 1);
+      assert.match(error.message, /owned by uid 4243, not this user/);
+      return true;
+    }
+  );
+});
+
+test("the trust check refuses a component that is no longer a directory", { skip: !posix }, async () => {
+  // A component swapped for a symlink in the very window after realpath: lstat
+  // sees the link, not a directory, and it is refused on that alone.
+  await assert.rejects(
+    requireTrustedSocket(SOCK, { uid: CHAIN_UID, ...injected(trustedChain({ [SOCK_DIR]: linkStat(CHAIN_UID) })) }),
+    (error) => {
+      assert.equal(error.code, ERROR_CODES.SOCKET_UNTRUSTED);
+      assert.equal(error.details.type, "symlink");
+      assert.match(error.message, /not a directory/);
+      return true;
+    }
+  );
+});
+
+test("the trust check names a foreign final socket before it walks the chain", { skip: !posix }, async () => {
+  // The owner check runs first, so a stranger's socket at the path is reported
+  // as the socket it is, even though the chain above it is this user's own.
+  await assert.rejects(
+    requireTrustedSocket(SOCK, { uid: CHAIN_UID, ...injected(trustedChain({ [SOCK]: socketStat(CHAIN_UID + 1) })) }),
+    (error) => {
+      assert.equal(error.code, ERROR_CODES.SOCKET_UNTRUSTED);
+      assert.equal(error.details.type, "socket");
+      assert.equal(error.details.ownerUid, CHAIN_UID + 1);
+      return true;
+    }
+  );
+});
+
+test("the directory trust check refuses a real group-writable directory and accepts it once tightened", { skip: !posix }, async () => {
+  await withTemp(SOCKET_DIR, async (directory) => {
+    const shared = join(directory, "shared");
+    await mkdir(shared);
+    const path = join(shared, "g.sock");
+    await chmod(shared, 0o777);
+    await assert.rejects(requireTrustedSocketDir(path), (error) => {
+      assert.equal(error.code, ERROR_CODES.SOCKET_UNTRUSTED);
+      assert.match(error.message, /writable by group or others/);
+      return true;
+    });
+    await chmod(shared, 0o700);
+    await requireTrustedSocketDir(path);
+  });
+});
+
+test("the trust check follows a link before the '..' after it, as the kernel does", { skip: !posix }, async () => {
+  await withTemp(SOCKET_DIR, async (directory) => {
+    const real = join(directory, "real");
+    await mkdir(join(real, "sub"), { recursive: true });
+    await symlink(join(real, "sub"), join(directory, "link"));
+    await chmod(real, 0o777);
+    await chmod(directory, 0o700);
+    // Not join(), which drops the ".." as resolve() would: the kernel parent
+    // is real, the open one, where lexically it would be the private directory.
+    const path = `${directory}/link/../g.sock`;
+    const realDir = await realpath(real);
+    const refused = (error) => {
+      assert.equal(error.code, ERROR_CODES.SOCKET_UNTRUSTED, error.message);
+      assert.equal(error.details.dir, realDir);
+      assert.ok(error.message.includes(realDir), error.message);
+      assert.match(error.message, /writable by group or others/);
+      return true;
+    };
+    await assert.rejects(requireTrustedSocketDir(path), refused);
+    await assert.rejects(requireTrustedSocket(path), refused);
+    await chmod(real, 0o700);
+    assert.equal(await requireTrustedSocketDir(path), join(realDir, "g.sock"));
+    assert.equal(await requireTrustedSocket(path), join(realDir, "g.sock"));
+  });
+});
+
+test("the daemon refuses to bind its socket in an untrusted directory and records the reason", { skip: !posix }, async () => {
+  await withTemp(SOCKET_DIR, async (directory) => {
+    const shared = join(directory, "shared");
+    await mkdir(shared);
+    await chmod(shared, 0o777);
+    const socketPath = join(shared, "gateway.sock");
+    const daemon = await startDaemon({ directory, expectExit: true, env: { ACP_GATEWAY_SOCKET: socketPath } });
+    const { exitCode, stderr } = await daemon.waitForExit();
+    assert.equal(exitCode, 78, `operator-action halt expected; stderr: ${stderr}`);
+    assert.match(stderr, /Refusing Gateway socket/);
+    assert.match(stderr, /writable by group or others/);
+    assert.equal(existsSync(socketPath), false, "no socket was bound in the untrusted directory");
+  });
+});
+
+test("the daemon checks the directory before it touches anything at the path", { skip: !posix }, async () => {
+  await withTemp(SOCKET_DIR, async (directory) => {
+    const shared = join(directory, "shared");
+    await mkdir(shared);
+    await chmod(shared, 0o777);
+    const socketPath = join(shared, "gateway.sock");
+    // A stale socket's probe and unlink would remove this, whoever's it is.
+    await writeFile(socketPath, "someone else's");
+    const daemon = await startDaemon({ directory, expectExit: true, env: { ACP_GATEWAY_SOCKET: socketPath } });
+    const { exitCode, stderr } = await daemon.waitForExit();
+    assert.equal(exitCode, 78, `operator-action halt expected; stderr: ${stderr}`);
+    assert.equal(JSON.parse(readFileSync(statePaths(daemon.statePath).marker, "utf8")).errorCode, ERROR_CODES.SOCKET_UNTRUSTED);
+    assert.equal(readFileSync(socketPath, "utf8"), "someone else's", "the file at the path was left alone");
+    assert.deepEqual(readdirSync(shared), ["gateway.sock"], "and no lock was created beside it");
+  });
+});
+
+test("the daemon binds, locks and removes, and a client connects to, the canonical path of a socket spelled through a link", { skip: !posix }, async () => {
+  await withTemp(SOCKET_DIR, async (directory) => {
+    const real = join(directory, "real");
+    const other = join(directory, "other");
+    await mkdir(real, { mode: 0o700 });
+    await mkdir(other, { mode: 0o700 });
+    const link = join(directory, "link");
+    await symlink(real, link);
+    const spelled = join(link, "gateway.sock");
+    const canonical = join(await realpath(real), "gateway.sock");
+    // Only the socket is spelled through the link: the harness keeps the state
+    // in, and waits for the socket at, the real directory.
+    const daemon = await startDaemon({ directory: real, env: { ACP_GATEWAY_SOCKET: spelled } });
+    const rpc = new GatewayRpcClient({ socketPath: spelled, token: daemon.token, rootId: daemon.rootId, autoStart: false, statePath: daemon.statePath });
+    try {
+      assert.equal((await rpc.call("setup", {}, 5_000)).gatewayVersion, GATEWAY_VERSION);
+      assert.ok(lstatSync(canonical).isSocket(), "bound at the canonical path");
+      assert.ok(lstatSync(`${canonical}.lock`).isFile(), "and locked there");
+      // Pointed elsewhere, as the link's owner could: what the daemon removes
+      // when it stops is its own socket and lock, not what the spelling reaches.
+      await unlink(link);
+      await symlink(other, link);
+    } finally {
+      rpc.close();
+      await daemon.stop();
+    }
+    assert.deepEqual(readdirSync(real).filter((name) => name.startsWith("gateway.sock")), []);
+    assert.deepEqual(readdirSync(other), []);
   });
 });

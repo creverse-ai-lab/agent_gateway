@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -236,6 +236,23 @@ test("default protected paths cover the token directory, state directory and soc
   assert.ok(paths.some((path) => path.endsWith(".acp-gateway")));
   assert.ok(paths.some((path) => path.endsWith("acp-iso")));
   assert.ok(paths.some((path) => path.endsWith(".sock")));
+});
+
+test("protected paths are canonical as the kernel resolves them: a link is followed before the '..' after it", { skip: process.platform === "win32" }, async () => {
+  await withTemp("acp-protect-", async (directory) => {
+    await mkdir(join(directory, "real", "sub"), { recursive: true });
+    await symlink(join(directory, "real", "sub"), join(directory, "link"));
+    // Not join(), which drops the ".." as resolve() would: the kernel parent
+    // is real, where lexically it would be the temp directory itself.
+    const spelled = `${directory}/link/../g.sock`;
+    const paths = await withEnv({ HOME: join(directory, "home"), ACP_GATEWAY_SOCKET: spelled }, () => gatewayProtectedPaths({
+      statePath: join(directory, "state", "state.json"),
+      env: { ACP_GATEWAY_INSTALL_STATE: join(directory, "install", "install.json"), ACP_GATEWAY_SETTINGS: join(directory, "settings", "settings.json") }
+    }));
+    assert.ok(paths.includes(join(await realpath(join(directory, "real")), "g.sock")), paths.join("\n"));
+    assert.equal(paths.includes(join(directory, "g.sock")), false, "not the lexical spelling");
+    assert.ok(paths.every((path) => path.startsWith(`${directory}/`)), "nothing outside the temp directory, the home included");
+  });
 });
 
 // ------------------------------------------------------ Claude session rules

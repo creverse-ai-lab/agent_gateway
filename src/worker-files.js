@@ -10,7 +10,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 // for it. So the file is opened once, the descriptor is what gets verified, and
 // every read and write goes through that descriptor.
 
-const { O_CREAT, O_NOFOLLOW = 0, O_NONBLOCK = 0, O_RDONLY, O_WRONLY } = constants;
+const { O_CREAT, O_DIRECTORY = 0, O_NOFOLLOW = 0, O_NONBLOCK = 0, O_RDONLY, O_WRONLY } = constants;
 // macOS 11 and later refuse a symbolic link anywhere in the path, not only as
 // its last component (sys/fcntl.h; Node does not export the constant). The path
 // opened is canonical, so it holds a link only when one was swapped in after
@@ -71,8 +71,18 @@ export function workerFilePathSync(requestedPath, { allowMissing = false } = {})
  * after this check. Refused: a symbolic link as the last component (one that
  * dangles would otherwise create its target wherever it points), anything but
  * a regular file, and a path that no longer leads to the opened file.
+ * A write never creates a file outside the checked directory on macOS (the open
+ * refuses a link anywhere in the path) or on Linux with /proc (the file is
+ * created through a verified descriptor of that directory). Elsewhere, on Linux
+ * without /proc and on other systems, the open still follows a link swapped in
+ * for a directory above the file, so a refused write can leave a new, empty file
+ * where the link points (1.7.2 wrote the whole file there). Nothing is ever
+ * unlinked to undo that: Node has no unlinkat, so an unlink goes by name, and
+ * the same swap can redirect it onto a file that already existed.
  * beforeOpen and afterOpen are test seams that run around the open, where a
- * racing Worker would swap the path; platform picks the OS-level check.
+ * racing Worker would swap the path, and beforeCreate one that runs on Linux
+ * once a write holds the verified parent, right before the file is opened
+ * through it; platform picks the OS-level check.
  */
 export async function openWorkerFile(requestedPath, {
   roots,
@@ -80,12 +90,13 @@ export async function openWorkerFile(requestedPath, {
   write = false,
   platform = process.platform,
   beforeOpen = null,
-  afterOpen = null
+  afterOpen = null,
+  beforeCreate = null
 }) {
   const requested = resolve(requestedPath);
   const path = await checkedPath(requested, { roots, protectedPaths, allowMissing: write });
   await beforeOpen?.(path);
-  const handle = await openNoFollow(path, write, platform);
+  const handle = await openNoFollow(path, write, platform, beforeCreate);
   try {
     await afterOpen?.(path);
     await verifyOpened(handle, requested, path, { roots, protectedPaths, platform });
@@ -96,7 +107,7 @@ export async function openWorkerFile(requestedPath, {
   }
 }
 
-async function openNoFollow(path, write, platform) {
+async function openNoFollow(path, write, platform, beforeCreate) {
   // O_NONBLOCK: opening a FIFO would otherwise park a libuv thread until a
   // writer appears, and four of those stall every file operation of the
   // daemon. It changes nothing for a regular file.
@@ -104,21 +115,66 @@ async function openNoFollow(path, write, platform) {
     | (platform === "darwin" ? O_NOFOLLOW_ANY : O_NOFOLLOW)
     | O_NONBLOCK;
   try {
-    return await open(path, flags, 0o666);
+    const created = write && platform === "linux" ? await openInVerifiedParent(path, flags, beforeCreate) : null;
+    return created ?? await open(path, flags, 0o666);
   } catch (error) {
     if (error?.code !== "ELOOP") throw error;
     throw new Error(`Path is or goes through a symbolic link the Gateway does not follow: ${path}`, { cause: error });
   }
 }
 
+// Linux refuses a link only as the last component, so an O_CREAT open by path
+// through a parent swapped for a link would create the file wherever the link
+// points, before verifyOpened could refuse it. A write therefore holds the
+// checked parent first, requires the descriptor's own path in /proc to be that
+// parent, and opens the file as /proc/self/fd/<dirfd>/<name>: the kernel
+// resolves that straight to the held directory, whatever has since been swapped
+// in at its path (openat, which Node lacks). A parent that is not the checked
+// one is refused before anything is created. null when there is no /proc to
+// name the descriptor: the caller then opens by path, as on other systems.
+async function openInVerifiedParent(path, flags, beforeCreate) {
+  const parent = dirname(path);
+  const directory = await open(parent, O_RDONLY | O_DIRECTORY | O_NONBLOCK);
+  try {
+    const held = await descriptorPath(directory, path);
+    if (held === null) return null;
+    if (held !== parent) throw pathChanged(path);
+    await beforeCreate?.(path);
+    return await open(`/proc/self/fd/${directory.fd}/${basename(path)}`, flags, 0o666);
+  } finally {
+    await directory.close().catch(() => {});
+  }
+}
+
+// The path Linux names for a descriptor (/proc/self/fd), wherever the walk to
+// it went; null only when there is no /proc (ENOENT: the descriptor is ours and
+// open, so nothing a Worker does can make its entry vanish). Any other failure
+// refuses the open rather than skip the check, since a Worker can cause one:
+// /proc names nothing longer than PATH_MAX, so a link to a directory nested
+// deeper fails the readlink with ENAMETOOLONG, while a path the check approved
+// always resolved and is never that long.
+async function descriptorPath(handle, path) {
+  try {
+    return await readlink(`/proc/self/fd/${handle.fd}`);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw pathChanged(path);
+  }
+}
+
+function pathChanged(path) {
+  return new Error(`Path changed while the Gateway was opening it: ${path}`);
+}
+
 async function verifyOpened(handle, requested, path, { roots, protectedPaths, platform }) {
   const opened = await handle.stat({ bigint: true });
   if (!opened.isFile()) throw new Error(`Path is not a regular file: ${path}`);
-  const changed = () => new Error(`Path changed while the Gateway was opening it: ${path}`);
+  const changed = () => pathChanged(path);
   // Linux names the file a descriptor holds, wherever the walk to it went: no
-  // swap between two calls can fool this one. Without /proc it is skipped.
+  // swap between two calls can fool this one. Skipped only without /proc; a
+  // name /proc cannot give refuses (descriptorPath).
   if (platform === "linux") {
-    const actual = await readlink(`/proc/self/fd/${handle.fd}`).catch(() => null);
+    const actual = await descriptorPath(handle, path);
     if (actual !== null && actual !== path) throw changed();
   }
   // Everywhere: resolved again, the path is still allowed, still the one that
