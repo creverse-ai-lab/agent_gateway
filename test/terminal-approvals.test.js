@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -784,6 +784,48 @@ test("F1: an execute approval is bound to its cwd; the same command in another d
     ]);
     assert.equal(requests.length, 2, "only the moved command went back to Main");
   }));
+});
+
+// One realpath: a Worker's path, an approval and a terminal's cwd are each
+// resolved by the system realpath, so on a case-insensitive volume (macOS by
+// default) every one of them takes the case on disk, as the session roots
+// always did. The JavaScript realpath, which writes and approvals went through,
+// kept the case each was spelled in: an approval and the write or terminal it
+// covered then compared unequal, and a path spelled in another case than the
+// root failed the root check.
+const upperTemp = tmpdir().toUpperCase();
+const caseInsensitiveTemp = upperTemp !== tmpdir() && existsSync(upperTemp);
+
+test("an approval, the write or terminal it covers and the root check compare one spelling, whatever its letter case", {
+  skip: caseInsensitiveTemp ? false : "the temp directory is on a case-sensitive volume"
+}, async () => {
+  await withTemp("acp-case-", async (directory) => {
+    const root = join(directory, "root");
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "approved.txt"), "before");
+    await withClient({ cwd: root, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
+      const turn = run([
+        // Approved in one case, written in another: one file, one approval.
+        { permission: { kind: "edit", path: join(directory, "ROOT", "Src", "APPROVED.txt") } },
+        { write: { path: join(directory, "Root", "SRC", "approved.TXT"), content: "after" } },
+        // A new file: its directory takes the case on disk, its name the one asked for.
+        { permission: { kind: "edit", path: join(directory, "ROOT", "src", "new.txt") } },
+        { write: { path: join(directory, "root", "SRC", "new.txt"), content: "new" } },
+        // A terminal approved in one spelling of the root runs in another.
+        { permission: { kind: "execute", command: "/bin/echo hi", cwd: join(directory, "ROOT") } },
+        { terminal: { command: "/bin/echo", args: ["hi"], cwd: join(directory, "Root") } }
+      ]);
+      for (const count of [1, 2, 3]) client.respondPermission((await request(requests, count)).requestId, "allow", sessionId);
+      assert.deepEqual(await turn, [
+        "allow", "write-ok",
+        "allow", "write-ok",
+        "allow", { output: "hi\n", exitStatus: { exitCode: 0, signal: null } }
+      ]);
+      assert.equal(requests.length, 3, "each ran on its approval, without a second request");
+    });
+    assert.equal(await readFile(join(root, "src", "approved.txt"), "utf8"), "after");
+    assert.deepEqual((await readdir(join(root, "src"))).sort(), ["approved.txt", "new.txt"]);
+  });
 });
 
 // N1 (release-gate review): the grant compares the whole explicit env. Before,

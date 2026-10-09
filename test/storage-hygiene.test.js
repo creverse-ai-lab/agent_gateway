@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, utimes, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, readdir, readFile, realpath, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import test from "node:test";
@@ -434,6 +434,41 @@ test("temporaries a dead writer left are swept at startup; a live writer's are n
       await locked.shutdown();
     }
     assert.equal(existsSync(held), true);
+  });
+});
+
+// A snapshot or settings file replaced by rename keeps its bytes under any other
+// name it has, out of reach of the protected directory's inode check: a hard
+// link made to it would go on holding the state (results, inbox payloads) or the
+// settings it held. Nothing keeps that file on purpose, a quarantine copy being
+// a copy, so each replacement empties it once the rename stands.
+test("a snapshot or settings file replaced by a newer one keeps nothing under a hard link", async () => {
+  await withDirectory("replaced", async (directory) => {
+    const statePath = join(directory, "state.json");
+    const service = mockService(directory);
+    try {
+      await service.init();
+      await openMock(service);
+      service.persistDirty = true;
+      await service.flushPersist();
+      await link(statePaths(statePath).snapshot, join(directory, "linked-snapshot.json"));
+      assert.equal(
+        await readFile(join(directory, "linked-snapshot.json"), "utf8"),
+        await readFile(statePaths(statePath).snapshot, "utf8")
+      );
+    } finally {
+      await service.shutdown();
+    }
+    assert.equal(await readFile(join(directory, "linked-snapshot.json"), "utf8"), "", "the shutdown's snapshot replaced it");
+    assert.equal((await readSnapshotBody(statePath)).sessions.length, 1, "and is whole");
+
+    const settingsPath = join(directory, "config", "settings.json");
+    const settings = new GatewaySettings({ path: settingsPath, legacy: join(directory, "config", "install.json"), env: {} });
+    settings.update({ expectedRevision: 0, values: { maxEvents: 300 } });
+    await link(settingsPath, join(directory, "linked-settings.json"));
+    settings.update({ expectedRevision: 1, values: { maxEvents: 400 } });
+    assert.equal(await readFile(join(directory, "linked-settings.json"), "utf8"), "");
+    assert.equal(JSON.parse(await readFile(settingsPath, "utf8")).values.maxEvents, 400);
   });
 });
 

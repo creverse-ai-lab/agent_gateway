@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
-  chmod, copyFile, link, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, symlink, unlink, writeFile
+  chmod, copyFile, link, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rename, rm, stat, symlink, unlink, writeFile
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +10,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { inspect } from "node:util";
 import { AcpClient } from "../src/acp-client.js";
+import { ArtifactStore } from "../src/artifacts.js";
 import { readTextHead, readTextLines } from "../src/bounded-utf8.js";
 import { GatewayService } from "../src/gateway-service.js";
 import { GatewayRpcClient } from "../src/socket-rpc.js";
@@ -440,6 +441,36 @@ test("on Linux a read through a parent too deep for /proc to name is refused, no
   });
 });
 
+// F11 held the parent open for reading, so a parent the daemon may write into
+// and search but not list (mode -wx) refused every write with EACCES. The
+// parent is now held with O_PATH, which needs no permission on the directory
+// itself; the swap tests above still refuse. Root may list any directory, so
+// only a run as another user shows the difference.
+test("on Linux a write into a parent the daemon may write and search but not list creates the file", {
+  skip: process.platform !== "linux" ? "Linux only" : process.getuid?.() === 0 && "root ignores directory permissions"
+}, async () => {
+  await withLayout(async ({ root, options }) => {
+    const parent = join(root, "d");
+    await chmod(parent, 0o300);
+    try {
+      const created = await openWorkerFile(join(parent, "new.txt"), { ...options, write: true });
+      try {
+        await created.writeFile("content", "utf8");
+      } finally {
+        await created.close();
+      }
+      // And a Worker's fs/write_text_file, its approval path and new-file check included.
+      await withCapabilityClient(parent, async (prompt) => {
+        assert.equal((await prompt("write")).stopReason, "end_turn");
+      });
+    } finally {
+      await chmod(parent, 0o700);
+    }
+    assert.equal(await readFile(join(parent, "new.txt"), "utf8"), "content");
+    assert.equal(await readFile(join(parent, "written.txt"), "utf8"), "written");
+  });
+});
+
 test("on macOS a write whose parent was swapped for a link is refused by the open, before anything is created", {
   skip: process.platform !== "darwin"
 }, async () => {
@@ -509,10 +540,12 @@ test("a legitimate new-file write creates the file and keeps it", async () => {
 
 // N3 (release-gate review): the inode check knows the files a protected
 // directory holds now. A hard link a Worker made to install.json keeps the old
-// inode once a non-rotating installer run replaces install.json by rename, with
-// the same token in it, and a copy never had a protected inode at all. So a
-// read is also judged by what it would return: text that carries the Control
-// token the daemon accepts is refused, before anything is returned.
+// inode once install.json is replaced by rename, with the same token in it when
+// the run did not rotate; the installer now empties that file (installer.test.js),
+// but only as far as it can open it for writing, and a copy never had a protected
+// inode at all. So a read is also judged by what it would return: text that
+// carries the Control token the daemon accepts is refused, before anything is
+// returned.
 
 const CREDENTIAL = /^File holds a Gateway credential; the Gateway does not return its content$/;
 
@@ -533,8 +566,8 @@ test("N3: a hard link that outlived an atomic rewrite of install.json is refused
     await writeFile(secret, installState(TOKEN));
     const notes = join(root, "notes.json");
     await link(secret, notes);
-    // A non-rotating installer run: the same token, written beside install.json
-    // and renamed over it.
+    // A replacement that left the old file whole: the same token, written beside
+    // install.json and renamed over it.
     await writeFile(`${secret}.4242.tmp`, installState(TOKEN));
     await rename(`${secret}.4242.tmp`, secret);
     // The link keeps the old inode, which no protected file has any more, so
@@ -644,6 +677,78 @@ test("N3: the daemon refuses a Worker's read of a file that holds the Control to
     } finally {
       client.close();
       await daemon.stop();
+    }
+  });
+});
+
+// An artifact sits a level below the protected directory, deeper than the inode
+// check walks, and holds what sessions sent and got back: transcripts, tool
+// payloads, terminal output, task results. A hard link a Worker made to one is
+// refused by the store's registry of its artifacts' inodes, for reads and writes
+// alike, before a byte is read or the file is emptied; and an artifact the store
+// deletes while such a link holds it is emptied first, so the link keeps nothing.
+
+const HELD = /Path is a hard link to a Gateway-protected file: /;
+
+test("a hard link to an artifact is refused for reads and writes, and holds nothing once the store deletes it", async () => {
+  await withLayout(async ({ root, guarded, options }) => {
+    const artifacts = join(guarded, "artifacts");
+    const store = new ArtifactStore({ root: artifacts });
+    const spill = (text) => {
+      const writer = store.create("another-session", "task-result", { durable: true });
+      writer.append(text);
+      writer.finalize(null, { sync: true });
+      return writer.metadata().path;
+    };
+    const result = spill("RESULT-OF-ANOTHER-SESSION");
+    await link(result, join(root, "notes.txt"));
+    // The file the capability agent's write names.
+    await link(result, join(root, "written.txt"));
+
+    // The protected directory's own walk does not reach it.
+    const unseen = await openWorkerFile(join(root, "notes.txt"), options);
+    await unseen.close();
+    const isProtectedFile = (info) => store.isArtifact(info);
+    for (const write of [false, true]) {
+      await assert.rejects(openWorkerFile(join(root, "notes.txt"), { ...options, isProtectedFile, write }), HELD);
+    }
+    await withCapabilityClient(root, async (prompt) => {
+      const refused = await readThrough(prompt, "notes.txt");
+      assert.match(refused.error, HELD);
+      assert.equal(refused.bytes, null, "nothing of the file was returned");
+      assert.equal((await prompt("write")).stopReason, "rejected");
+    }, { protectedPaths: [guarded], artifactStore: store });
+    assert.equal(await readFile(result, "utf8"), "RESULT-OF-ANOTHER-SESSION", "neither read out nor emptied through a link");
+
+    // A store that starts over the directory knows the artifact as well.
+    assert.equal(new ArtifactStore({ root: artifacts }).isArtifact(await stat(join(root, "notes.txt"), { bigint: true })), true);
+
+    // Reclaimed (discard) or aged out (prune), an artifact a link holds is
+    // emptied before it is unlinked: what is left under the links holds
+    // nothing, and is an ordinary in-root file again.
+    const used = store.usedBytes;
+    assert.equal(store.discard(result), true);
+    assert.equal(existsSync(result), false);
+    assert.equal(store.usedBytes, used - Buffer.byteLength("RESULT-OF-ANOTHER-SESSION"));
+    for (const name of ["notes.txt", "written.txt"]) assert.equal(await readFile(join(root, name), "utf8"), "", name);
+    const freed = await openWorkerFile(join(root, "notes.txt"), { ...options, isProtectedFile });
+    await freed.close();
+    const aged = spill("AN-OLDER-RESULT");
+    await link(aged, join(root, "aged.txt"));
+    assert.equal(store.prune(0, Date.now() + 1_000), 1);
+    assert.equal(existsSync(aged), false);
+    assert.equal(await readFile(join(root, "aged.txt"), "utf8"), "");
+    assert.equal(store.usedBytes, 0);
+
+    // One no other name holds is only unlinked: a reader that has it open, a
+    // Main following its pointer, still reads all of it.
+    const alone = spill("READ-WHILE-DELETED");
+    const reader = await open(alone, "r");
+    try {
+      assert.equal(store.discard(alone), true);
+      assert.equal(await reader.readFile("utf8"), "READ-WHILE-DELETED");
+    } finally {
+      await reader.close();
     }
   });
 });

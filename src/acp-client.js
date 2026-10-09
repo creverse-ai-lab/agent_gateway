@@ -685,8 +685,11 @@ export class AcpClient {
       return { kind, command, cwd: grantCwd(params.toolCall?.rawInput?.cwd, roots), env: envMap(params.toolCall?.rawInput?.env) };
     }
     if (kind === "write") {
+      // A relative path goes on the root as written, as #permissionScope reads
+      // it: join() would fold a ".." away before the realpath could follow the
+      // link in front of it, which the write it covers does follow.
       const root = this.sessionRoots.get(params.sessionId)?.[0] ?? "";
-      const paths = new Set(requestedPaths(params.toolCall).map((path) => grantPath(isAbsolute(path) ? path : join(root, path))));
+      const paths = new Set(requestedPaths(params.toolCall).map((path) => grantPath(isAbsolute(path) ? path : `${root}/${path}`)));
       return paths.size ? { kind, paths } : null;
     }
     return null;
@@ -712,10 +715,11 @@ export class AcpClient {
         : await readTextHead(handle, cap);
       // Every check before this one is about names and inodes, and a copy of the
       // token file passes them, as does a hard link that outlived an atomic
-      // rewrite of install.json: it keeps the old inode, which is no longer
-      // protected, and the same token. So the text itself must not carry a
-      // credential the daemon accepts. Refused before anything is returned, and
-      // the error says why, never what the file holds.
+      // rewrite of install.json where the installer could not empty the file it
+      // replaced (replaceFile, best effort): it keeps the old inode, which is no
+      // longer protected, and the same token. So the text itself must not carry
+      // a credential the daemon accepts. Refused before anything is returned,
+      // and the error says why, never what the file holds.
       if (this.#protectedSecrets.some((secret) => read.text.includes(secret))) {
         throw new Error("File holds a Gateway credential; the Gateway does not return its content");
       }
@@ -787,7 +791,9 @@ export class AcpClient {
   // other. On Linux the descriptor's own name settles it (/proc); without /proc
   // the approved path must realpath to itself and to this very inode, which also
   // rejects a parent symlink swapped back after the open — the file is then not
-  // at the approved path at all.
+  // at the approved path at all. The system realpath, as the approved path was
+  // resolved with (workerFilePathSync), compared in NFC: HFS+ stores the new
+  // name decomposed.
   async #requireApprovedNewFile(handle, approvedPath) {
     const changed = () => new Error(`Write target changed since it was approved: ${approvedPath}`);
     if (process.platform === "linux") {
@@ -799,11 +805,11 @@ export class AcpClient {
     }
     let resolved;
     try {
-      resolved = realpathSync(approvedPath);
+      resolved = realpathSync.native(approvedPath);
     } catch {
       throw changed();
     }
-    if (resolved !== approvedPath) throw changed();
+    if (resolved.normalize("NFC") !== approvedPath.normalize("NFC")) throw changed();
     const opened = await handle.stat({ bigint: true });
     const onPath = statSync(approvedPath, { bigint: true });
     if (onPath.dev !== opened.dev || onPath.ino !== opened.ino) throw changed();
@@ -851,8 +857,12 @@ export class AcpClient {
   // The directory a terminal/create names, links resolved the way the kernel
   // will: its cwd, or the session's when it names none. What a request is
   // checked in, and what a starting one is compared with (#requireApprovedCwd).
+  // The system realpath with nothing lexical before it, as the session roots and
+  // an approval's cwd (grantCwd) are resolved, so all three spell a directory
+  // alike: a ".." after a link is applied where the link leads, and on a
+  // case-insensitive macOS volume the case is the one on disk.
   #requestedTerminalCwd(params) {
-    return realpathSync(resolve(params.cwd ?? this.sessionRoots.get(params.sessionId)?.[0] ?? process.cwd()));
+    return realpathSync.native(params.cwd ?? this.sessionRoots.get(params.sessionId)?.[0] ?? process.cwd());
   }
 
   // The sandbox a terminal of this client runs in, or null: none is needed when
@@ -1006,11 +1016,16 @@ export class AcpClient {
   }
 
   // The file a Worker's fs/ request names, opened once and verified
-  // (worker-files.js); a write creates it when missing.
+  // (worker-files.js); a write creates it when missing. An artifact is refused
+  // by inode under any name: it sits deeper in the protected directory than the
+  // inode check looks, so a hard link a Worker made to one would pass that
+  // check (ArtifactStore#isArtifact).
   #openWorkerFile(sessionId, requestedPath, write = false) {
+    const artifacts = this.artifactStore;
     return openWorkerFile(requestedPath, {
       roots: this.sessionRoots.get(sessionId) ?? [],
       protectedPaths: this.protectedPaths,
+      isProtectedFile: typeof artifacts?.isArtifact === "function" ? (info) => artifacts.isArtifact(info) : null,
       write
     });
   }
@@ -1492,7 +1507,9 @@ function requestedPaths(toolCall) {
 // "root/link/../x" into "root/x" lexically, while the kernel opens
 // "<link target>/../x" — anywhere the link points. Synchronous because a
 // permission decision cannot wait on I/O; segments that do not exist yet (a new
-// file) are appended as written.
+// file) are appended as written. Each one by the system realpath, which the
+// roots and protected paths it is compared with were resolved by, so it takes
+// the case on disk on a case-insensitive macOS volume as they do.
 function canonicalizePhysical(path) {
   let current = "/";
   let physical = true;
@@ -1505,7 +1522,7 @@ function canonicalizePhysical(path) {
     const next = join(current, segment);
     if (physical) {
       try {
-        current = realpathSync(next);
+        current = realpathSync.native(next);
         continue;
       } catch {
         physical = false;
@@ -1660,12 +1677,12 @@ function grantPath(path) {
 }
 
 // The cwd an execute approval was given for, canonical, the way #terminalRequest
-// resolves a terminal's cwd, so the two compare: the request's own cwd, or the
-// session root when it named none.
+// resolves a terminal's cwd (#requestedTerminalCwd), so the two compare: the
+// request's own cwd, or the session root when it named none.
 function grantCwd(rawCwd, roots) {
   const base = rawCwd != null && rawCwd !== "" ? String(rawCwd) : (roots[0] ?? process.cwd());
   try {
-    return realpathSync(resolve(base));
+    return realpathSync.native(base);
   } catch {
     return resolve(base);
   }
@@ -1783,8 +1800,11 @@ function mentionsProtectedPath(raw, protectedPaths) {
   return false;
 }
 
+// The session roots by the system realpath, with nothing lexical before it:
+// what every Worker path, approval and terminal cwd is resolved by and compared
+// with (worker-files.js).
 async function canonicalRoots(cwd, additionalDirectories) {
-  return await Promise.all([cwd, ...additionalDirectories].map((path) => realpath(resolve(path))));
+  return await Promise.all([cwd, ...additionalDirectories].map((path) => realpath(path)));
 }
 
 export function requirePermissionPolicy(policy) {

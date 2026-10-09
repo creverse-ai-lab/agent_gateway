@@ -17,6 +17,7 @@ import {
   readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeSync
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { replaceFile } from "./atomic-json.js";
 import { ERROR_CODES, GatewayError } from "./errors.js";
 import { GATEWAY_API_VERSION, GATEWAY_VERSION, STATE_SCHEMA_VERSION } from "./version.js";
 
@@ -746,11 +747,13 @@ export class StateStore {
     } finally {
       closeSync(fd);
     }
-    renameSync(temporary, this.paths.snapshot);
-    if (sync) {
-      this.#syncDirectory();
-      this.#retireLegacyState();
-    }
+    // The snapshot this replaces is emptied, when a hard link still holds it,
+    // once the rename stands, and on the synced path once it is durable
+    // (replaceFile): the link would otherwise keep that state, task results and
+    // inbox payloads included, beyond the inode check of the state directory.
+    // Nothing keeps that file on purpose; a quarantine copy is a copy.
+    replaceFile(temporary, this.paths.snapshot, { afterRename: sync ? () => this.#syncDirectory() : null });
+    if (sync) this.#retireLegacyState();
     this.#snapshotDirty = false;
     this.#lastSnapshotAt = performance.now();
     return { bytes: body.length, walSeq: this.#seq, epoch: this.#epoch };

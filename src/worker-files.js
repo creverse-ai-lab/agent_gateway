@@ -1,6 +1,6 @@
 import { constants, realpathSync } from "node:fs";
 import { open, readdir, readlink, realpath, stat } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative } from "node:path";
 
 // fs/read_text_file and fs/write_text_file act on a file a Worker names: inside
 // its session roots, never under a Gateway-protected path. Checking the name and
@@ -17,6 +17,9 @@ const { O_CREAT, O_DIRECTORY = 0, O_NOFOLLOW = 0, O_NONBLOCK = 0, O_RDONLY, O_WR
 // the check, and the open itself fails instead of following it. It includes
 // O_NOFOLLOW and cannot be combined with it (EINVAL).
 const O_NOFOLLOW_ANY = 0x20000000;
+// Linux O_PATH, which Node does not export either: the same value on every
+// Linux architecture Node supports (openDirectory).
+const O_PATH = 0o10000000;
 
 /** Whether path is root or under it: lexical, so both must already be canonical. */
 export function isWithin(root, path) {
@@ -33,15 +36,18 @@ export function requireWorkerPath(path, { roots, protectedPaths }) {
 
 // The canonical path of requestedPath when it is inside one of roots and under
 // none of protectedPaths; throws otherwise. With allowMissing a file that does
-// not exist yet resolves through its parent.
+// not exist yet resolves through its parent. The system realpath, as for the
+// roots and the protected paths it is compared with, and nothing lexical
+// before it: resolve() would drop a ".." together with the link in front of
+// it, which the kernel follows first, and the JavaScript realpath keeps the
+// letter case it is given where a case-insensitive macOS volume has another.
 async function checkedPath(requestedPath, { roots, protectedPaths, allowMissing = false }) {
-  const requested = resolve(requestedPath);
   let path;
   try {
-    path = await realpath(requested);
+    path = await realpath(requestedPath);
   } catch (error) {
     if (!allowMissing || error?.code !== "ENOENT") throw error;
-    path = join(await realpath(dirname(requested)), basename(requested));
+    path = join(await realpath(dirname(requestedPath)), basename(requestedPath));
   }
   return requireWorkerPath(path, { roots, protectedPaths });
 }
@@ -51,15 +57,16 @@ async function checkedPath(requestedPath, { roots, protectedPaths, allowMissing 
  * as checkedPath (no root or protected check), synchronously: what an approval
  * is bound to and what a pending write is shown as must be decided before the
  * request is registered, without an I/O turn in which a later request could
- * overtake it. Throws like checkedPath when the path cannot be resolved.
+ * overtake it. The same system realpath, so an approval, the write it covers
+ * and the root check compare one spelling of a file. Throws like checkedPath
+ * when the path cannot be resolved.
  */
 export function workerFilePathSync(requestedPath, { allowMissing = false } = {}) {
-  const requested = resolve(requestedPath);
   try {
-    return realpathSync(requested);
+    return realpathSync.native(requestedPath);
   } catch (error) {
     if (!allowMissing || error?.code !== "ENOENT") throw error;
-    return join(realpathSync(dirname(requested)), basename(requested));
+    return join(realpathSync.native(dirname(requestedPath)), basename(requestedPath));
   }
 }
 
@@ -79,6 +86,10 @@ export function workerFilePathSync(requestedPath, { allowMissing = false } = {})
  * where the link points (1.7.2 wrote the whole file there). Nothing is ever
  * unlinked to undo that: Node has no unlinkat, so an unlink goes by name, and
  * the same swap can redirect it onto a file that already existed.
+ * isProtectedFile, when given, is asked about the opened file's bigint stat and
+ * refuses it, like a protected inode, when it answers true: the Gateway's files
+ * that sit deeper in a protected directory than verifyOpened looks, the
+ * artifacts (AcpClient asks its ArtifactStore).
  * beforeOpen and afterOpen are test seams that run around the open, where a
  * racing Worker would swap the path, and beforeCreate one that runs on Linux
  * once a write holds the verified parent, right before the file is opened
@@ -87,19 +98,19 @@ export function workerFilePathSync(requestedPath, { allowMissing = false } = {})
 export async function openWorkerFile(requestedPath, {
   roots,
   protectedPaths,
+  isProtectedFile = null,
   write = false,
   platform = process.platform,
   beforeOpen = null,
   afterOpen = null,
   beforeCreate = null
 }) {
-  const requested = resolve(requestedPath);
-  const path = await checkedPath(requested, { roots, protectedPaths, allowMissing: write });
+  const path = await checkedPath(requestedPath, { roots, protectedPaths, allowMissing: write });
   await beforeOpen?.(path);
   const handle = await openNoFollow(path, write, platform, beforeCreate);
   try {
     await afterOpen?.(path);
-    await verifyOpened(handle, requested, path, { roots, protectedPaths, platform });
+    await verifyOpened(handle, requestedPath, path, { roots, protectedPaths, isProtectedFile, platform });
     return handle;
   } catch (error) {
     await handle.close().catch(() => {});
@@ -134,7 +145,7 @@ async function openNoFollow(path, write, platform, beforeCreate) {
 // name the descriptor: the caller then opens by path, as on other systems.
 async function openInVerifiedParent(path, flags, beforeCreate) {
   const parent = dirname(path);
-  const directory = await open(parent, O_RDONLY | O_DIRECTORY | O_NONBLOCK);
+  const directory = await openDirectory(parent);
   try {
     const held = await descriptorPath(directory, path);
     if (held === null) return null;
@@ -143,6 +154,23 @@ async function openInVerifiedParent(path, flags, beforeCreate) {
     return await open(`/proc/self/fd/${directory.fd}/${basename(path)}`, flags, 0o666);
   } finally {
     await directory.close().catch(() => {});
+  }
+}
+
+// The parent a write holds, as an O_PATH descriptor: one that names the
+// directory without opening it, so it needs no permission on the directory
+// itself, and readlink of /proc/self/fd/<fd> and an open through
+// /proc/self/fd/<fd>/<name> both work on it. A parent the daemon may write into
+// and search but not list (-wx) thus takes a new file, as it did when a write
+// opened the file by path; the create still needs that write and search
+// permission. A kernel that refuses the flag (EINVAL) gets the open for
+// reading, which needs the directory to be listable too.
+async function openDirectory(parent) {
+  try {
+    return await open(parent, O_PATH | O_DIRECTORY);
+  } catch (error) {
+    if (error?.code !== "EINVAL") throw error;
+    return await open(parent, O_RDONLY | O_DIRECTORY | O_NONBLOCK);
   }
 }
 
@@ -166,7 +194,7 @@ function pathChanged(path) {
   return new Error(`Path changed while the Gateway was opening it: ${path}`);
 }
 
-async function verifyOpened(handle, requested, path, { roots, protectedPaths, platform }) {
+async function verifyOpened(handle, requested, path, { roots, protectedPaths, isProtectedFile, platform }) {
   const opened = await handle.stat({ bigint: true });
   if (!opened.isFile()) throw new Error(`Path is not a regular file: ${path}`);
   const changed = () => pathChanged(path);
@@ -198,8 +226,11 @@ async function verifyOpened(handle, requested, path, { roots, protectedPaths, pl
   // realpath above both show that in-root name, and the stat finds the
   // descriptor's inode through it, so nothing above tells the two names apart.
   // The inode does. Reads and writes both reach here before a byte is read or
-  // the file is truncated, so neither reads out nor empties a protected file.
-  if (await descriptorIsProtected(opened, protectedPaths)) {
+  // the file is truncated, so neither reads out nor empties a protected file:
+  // one directly inside a protected directory (descriptorIsProtected), or one
+  // the caller knows deeper down (isProtectedFile, the artifacts), which the
+  // one-level walk does not reach.
+  if (isProtectedFile?.(opened) || await descriptorIsProtected(opened, protectedPaths)) {
     throw new Error(`Path is a hard link to a Gateway-protected file: ${path}`);
   }
 }

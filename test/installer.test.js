@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, link, mkdir, mkdtemp, open, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { replaceFile } from "../src/atomic-json.js";
 import { parseInstallerArgs } from "../src/installer.js";
 import { GATEWAY_VERSION } from "../src/version.js";
 // The installer with every default path a test leaves out in a temp directory.
@@ -2261,6 +2262,95 @@ test("W5: a record a cut-short run left behind still proves an entry that only l
     const removed = await run(["codex"], { codex: { "agent-acp": { ...launch, env: {} } } }, removedCalls);
     assert.deepEqual(removed.warnings, [customized("codex:agent-acp")]);
     assert.deepEqual(removedCalls.filter(isMutation), []);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+// ------------------------------------- a replaced install.json keeps no identity
+
+// The installer replaces install.json by rename, and a rename replaces a name,
+// not a file: a hard link a Worker made to install.json (link(2) needs no
+// permission on the file) went on naming the old file, out of the protected
+// directory and its inode check, with the identity it held. Every write now
+// empties the file it replaced (replaceFile), and only once the rename succeeded.
+test("a hard link to install.json holds nothing once the installer replaces the file, rotating or not", async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "acp-installer-wipe-")));
+  const statePath = join(directory, "install.json");
+  try {
+    await writeManagedState(statePath, [["codex", "agent-acp", "control", identityFreeControl(NODE, gatewayScript("index.js"))]]);
+    const clis = rememberingClis({ codex: { "agent-acp": { command: NODE, args: [gatewayScript("index.js")], env: installStateEnv(statePath) } } });
+    const run = (argv) => withNode(() => runInstaller(parseInstallerArgs(argv), updateDependencies(statePath, directory, clis, [])));
+
+    // A run that keeps the identity writes the same token into a new file.
+    const kept = join(directory, "kept.json");
+    await link(statePath, kept);
+    const result = await run(["--install-control", "--target", "codex", "--skip-health-check"]);
+    assert.deepEqual(statusOf(result), { "codex:agent-acp": "unchanged" });
+    assert.equal(await readFile(kept, "utf8"), "", "the link names the file that was replaced, now empty");
+    assert.equal(JSON.parse(await readFile(statePath, "utf8")).identity.token, identityEnv.ACP_GATEWAY_CONTROL_TOKEN, "install.json is whole");
+    assert.equal(await modeOf(statePath), 0o600);
+
+    // A rotation: the replaced file keeps neither the retired token nor the new one.
+    const retired = join(directory, "retired.json");
+    await link(statePath, retired);
+    await run(["--rotate-token", "--skip-health-check"]);
+    assert.equal(await readFile(retired, "utf8"), "");
+    const rotated = JSON.parse(await readFile(statePath, "utf8")).identity;
+    assert.notEqual(rotated.token, identityEnv.ACP_GATEWAY_CONTROL_TOKEN);
+    assert.ok(rotated.token.length >= 24, "install.json holds the new identity");
+    assert.equal(await modeOf(statePath), 0o600);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a replacement of install.json empties only a replaced file another name holds, and never on a failed rename", async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "acp-installer-wipe-failed-")));
+  const statePath = join(directory, "install.json");
+  try {
+    await writeManagedState(statePath, []);
+    const before = await readFile(statePath, "utf8");
+    const notes = join(directory, "notes.json");
+    await link(statePath, notes);
+    // A rename the kernel refuses: a directory cannot take the name of a file.
+    const temporary = `${statePath}.4242.tmp`;
+    await mkdir(temporary);
+    assert.throws(() => replaceFile(temporary, statePath), (error) => ["ENOTDIR", "EISDIR"].includes(error.code));
+    assert.equal(await readFile(statePath, "utf8"), before, "install.json is as it was");
+    assert.equal(await readFile(notes, "utf8"), before, "and the file was never emptied");
+
+    // A rename from one name of the file to another succeeds and replaces
+    // nothing: install.json still names the file that was held, which stays whole.
+    await rm(temporary, { recursive: true });
+    await link(statePath, temporary);
+    replaceFile(temporary, statePath);
+    assert.equal(await readFile(statePath, "utf8"), before);
+
+    // A symbolic link at the path is what a rename replaces, not the file it
+    // leads to, which keeps its bytes.
+    const kept = join(directory, "elsewhere.json");
+    await writeFile(kept, before);
+    const linked = join(directory, "linked.json");
+    await symlink(kept, linked);
+    await writeFile(`${linked}.4242.tmp`, "{}\n");
+    replaceFile(`${linked}.4242.tmp`, linked);
+    assert.equal(await readFile(linked, "utf8"), "{}\n");
+    assert.equal(await readFile(kept, "utf8"), before);
+
+    // A replaced file no other name holds is out of everyone's reach and is left
+    // whole: a reader that opened it before the rename reads all of it, as an
+    // atomic replacement promises (front doors and apps read install.json).
+    const alone = join(directory, "alone.json");
+    await writeFile(alone, before);
+    const reader = await open(alone, "r");
+    try {
+      await writeFile(`${alone}.4242.tmp`, "{}\n");
+      replaceFile(`${alone}.4242.tmp`, alone);
+      assert.equal(await reader.readFile("utf8"), before);
+    } finally {
+      await reader.close();
+    }
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

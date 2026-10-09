@@ -1,7 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  closeSync, constants, fstatSync, fsyncSync, ftruncateSync, mkdirSync, openSync, readFileSync, renameSync, statSync,
+  unlinkSync, writeFileSync
+} from "node:fs";
 import { dirname } from "node:path";
 import { ERROR_CODES, GatewayError } from "./errors.js";
+
+const { O_NOFOLLOW = 0, O_NONBLOCK = 0, O_WRONLY } = constants;
 
 export function readJsonFile(path, fallback) {
   try { return JSON.parse(readFileSync(path, "utf8")); }
@@ -33,14 +38,84 @@ export function updateJsonFile(path, fallback, update) {
       writeFileSync(output, `${JSON.stringify(next, null, 2)}\n`);
       fsyncSync(output);
     } finally { if (output != null) closeSync(output); }
-    renameSync(temporary, path);
-    let directory;
-    try { directory = openSync(dirname(path), "r"); fsyncSync(directory); }
-    finally { if (directory != null) closeSync(directory); }
+    replaceFile(temporary, path, {
+      afterRename: () => {
+        let directory;
+        try { directory = openSync(dirname(path), "r"); fsyncSync(directory); }
+        finally { if (directory != null) closeSync(directory); }
+      }
+    });
     return next;
   } finally {
     closeSync(fd);
     try { unlinkSync(temporary); } catch (error) { if (error.code !== "ENOENT") throw error; }
     unlinkSync(lock);
+  }
+}
+
+/**
+ * Renames temporary over path, then empties the file path named until then if
+ * another name still holds it. A rename replaces a name, not a file: under any
+ * other name the old file keeps its bytes, and link(2) needs no permission on
+ * the file itself, so a hard link a Worker made to install.json, or to the
+ * settings or state kept beside it, would go on holding what that held, the
+ * Control token included, outside the protected directory and its inode check
+ * for good. So the old file is opened before the rename, never through a
+ * symbolic link (the rename replaces the link, not what it points to), and
+ * truncated through that descriptor only once the rename succeeded, path names
+ * another file, and afterRename (the directory fsync that makes the rename
+ * durable, where the caller makes one) has run. A failed rename leaves it as it
+ * was. Past the rename this is best effort: a file this process cannot open for
+ * writing, or a truncate that fails, is replaced without being emptied, and is
+ * never an error.
+ */
+export function replaceFile(temporary, path, { afterRename = null } = {}) {
+  const previous = openReplaced(path);
+  try {
+    renameSync(temporary, path);
+    afterRename?.();
+    if (previous !== null) emptyReplaced(previous, path);
+  } finally {
+    if (previous !== null) closeSync(previous);
+  }
+}
+
+// The regular file at path, open for writing, or null: nothing there yet, a
+// symbolic link, or a file this process may not write. O_NONBLOCK: a FIFO there
+// would otherwise park the open until a reader appears. Never without
+// O_NOFOLLOW (Windows): that open would follow a link at path to a file the
+// rename does not replace, and empty it.
+function openReplaced(path) {
+  if (!O_NOFOLLOW) return null;
+  let fd;
+  try {
+    fd = openSync(path, O_WRONLY | O_NOFOLLOW | O_NONBLOCK);
+  } catch {
+    return null;
+  }
+  try {
+    if (fstatSync(fd).isFile()) return fd;
+  } catch {
+    // Not one this can empty.
+  }
+  closeSync(fd);
+  return null;
+}
+
+// Truncates the held file when another name still holds it. One with no name
+// left is out of everyone's reach, and is left whole for a reader that opened
+// it before the rename, as an atomic replacement promises: install.json is read
+// by front doors, apps and the admin CLI whenever they start. Never the file
+// path still names: a rename from one name of a file to another of the same
+// file succeeds and replaces nothing.
+function emptyReplaced(fd, path) {
+  try {
+    const held = fstatSync(fd, { bigint: true });
+    if (held.nlink === 0n) return;
+    const current = statSync(path, { bigint: true, throwIfNoEntry: false });
+    if (current?.dev === held.dev && current?.ino === held.ino) return;
+    ftruncateSync(fd, 0);
+  } catch {
+    // The replacement stands; only the old file keeps its bytes.
   }
 }

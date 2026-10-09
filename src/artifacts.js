@@ -1,4 +1,7 @@
-import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync, writeSync } from "node:fs";
+import {
+  closeSync, constants, fstatSync, fsyncSync, ftruncateSync, lstatSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync,
+  writeSync
+} from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -6,12 +9,39 @@ import { basename, dirname, join, resolve } from "node:path";
 const DEFAULT_MAX_FILE_BYTES = 100 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES = 512 * 1024 * 1024;
 const ARTIFACT_PREFIX = "acp-artifact-";
+const { O_NOFOLLOW = 0, O_NONBLOCK = 0, O_WRONLY } = constants;
 
 export function defaultArtifactRoot() {
   return process.env.ACP_GATEWAY_ARTIFACTS || join(homedir(), ".acp-gateway", "artifacts");
 }
 
+// One file, whatever its name: device and inode of a bigint stat.
+function inodeKey(info) {
+  return `${info.dev}:${info.ino}`;
+}
+
+// Truncates the file at path, through a descriptor opened without following a
+// link, when that is still the file info describes.
+function emptyFile(path, info) {
+  const fd = openSync(path, O_WRONLY | O_NOFOLLOW | O_NONBLOCK);
+  try {
+    const opened = fstatSync(fd, { bigint: true });
+    if (opened.dev === info.dev && opened.ino === info.ino) ftruncateSync(fd, 0);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 export class ArtifactStore {
+  // The artifact files this store holds, by inodeKey, from the moment it
+  // creates one or finds it at startup until it deletes it. An artifact sits a
+  // level below the protected directory, deeper than the inode check of a
+  // Worker's file request looks (worker-files.js), and keeps transcripts, tool
+  // payloads, terminal output and task results of every session; link(2) needs
+  // no permission on the file, so a Worker could give one a name inside its
+  // roots. isArtifact is what lets that check refuse it there too.
+  #inodes = new Set();
+
   constructor({
     root = defaultArtifactRoot(),
     maxFileBytes = DEFAULT_MAX_FILE_BYTES,
@@ -26,12 +56,27 @@ export class ArtifactStore {
     this.maxFileBytes = maxFileBytes;
     this.maxTotalBytes = maxTotalBytes;
     this.durableReserveBytes = Math.max(0, Math.min(durableReserveBytes, maxTotalBytes));
-    this.usedBytes = directoryBytes(root);
+    this.usedBytes = this.#scan();
     this.activePaths = new Set();
   }
 
   create(sessionId, kind, { durable = false } = {}) {
     return new ArtifactWriter(this, sessionId, kind, durable);
+  }
+
+  /**
+   * Whether info, the bigint stat of a file a Worker's request opened, is one
+   * of this store's artifacts, under whatever name it was opened. A file the
+   * store has deleted is no longer one: a name left on it holds nothing
+   * (#delete).
+   */
+  isArtifact(info) {
+    return this.#inodes.has(inodeKey(info));
+  }
+
+  // Registers an artifact file the store just created (its bigint fstat).
+  remember(info) {
+    this.#inodes.add(inodeKey(info));
   }
 
   // Deletes one finished artifact ahead of age retention, for a caller that
@@ -41,9 +86,7 @@ export class ArtifactStore {
     if (typeof path !== "string" || this.activePaths.has(path)) return false;
     if (resolve(dirname(path)) !== resolve(this.root) || !basename(path).startsWith(ARTIFACT_PREFIX)) return false;
     try {
-      const { size } = statSync(path);
-      unlinkSync(path);
-      this.usedBytes = Math.max(0, this.usedBytes - size);
+      this.#delete(path);
       return true;
     } catch {
       return false;
@@ -58,16 +101,47 @@ export class ArtifactStore {
       const path = join(this.root, entry.name);
       if (keepPaths?.has(path) || this.activePaths.has(path)) continue;
       try {
-        const info = statSync(path);
-        if (info.mtimeMs + retentionMs > now) continue;
-        unlinkSync(path);
-        this.usedBytes = Math.max(0, this.usedBytes - info.size);
+        if (statSync(path).mtimeMs + retentionMs > now) continue;
+        this.#delete(path);
         removed += 1;
       } catch (error) {
         if (error?.code !== "ENOENT") throw error;
       }
     }
     return removed;
+  }
+
+  // Unlinks an artifact, emptied first when it has another name: a hard link
+  // made to it elsewhere keeps the inode, and would keep the bytes, outside this
+  // directory and no longer registered. Emptied before the unlink, so a crash
+  // between the two never leaves the link holding them. One with no other name
+  // is only unlinked, as before, whole for a reader that has it open. It leaves
+  // the registry once it is gone. Throws like the unlink did when the file
+  // cannot be emptied or removed, and then stays registered.
+  #delete(path) {
+    const info = lstatSync(path, { bigint: true });
+    if (info.isFile() && info.nlink > 1n) emptyFile(path, info);
+    unlinkSync(path);
+    this.usedBytes = Math.max(0, this.usedBytes - Number(info.size));
+    this.#inodes.delete(inodeKey(info));
+  }
+
+  // What the directory already holds: every regular file counts against the
+  // quota, and each artifact among them is registered like one the store
+  // creates.
+  #scan() {
+    let bytes = 0;
+    for (const entry of safeEntries(this.root)) {
+      if (!entry.isFile()) continue;
+      try {
+        const info = statSync(join(this.root, entry.name), { bigint: true });
+        bytes += Number(info.size);
+        if (info.isFile() && entry.name.startsWith(ARTIFACT_PREFIX)) this.remember(info);
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+    }
+    return bytes;
   }
 
   // Makes the directory entry itself durable. A file whose name a WAL record
@@ -183,6 +257,8 @@ class ArtifactWriter {
     this.fd = openSync(path, "wx", 0o600);
     this.path = path;
     this.store.markActive(path);
+    // Before a byte is written, so no content of it is ever unregistered.
+    this.store.remember(fstatSync(this.fd, { bigint: true }));
   }
 
   #close({ sync = false } = {}) {
@@ -215,19 +291,6 @@ function safeEntries(path) {
     if (error?.code === "ENOENT") return [];
     throw error;
   }
-}
-
-function directoryBytes(path) {
-  let bytes = 0;
-  for (const entry of safeEntries(path)) {
-    if (!entry.isFile()) continue;
-    try {
-      bytes += statSync(join(path, entry.name)).size;
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-    }
-  }
-  return bytes;
 }
 
 function safeName(value) {

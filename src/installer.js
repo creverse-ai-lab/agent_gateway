@@ -15,6 +15,7 @@ import {
   providerDefinition,
   selectDistribution
 } from "./acp-registry.js";
+import { replaceFile } from "./atomic-json.js";
 import { BoundedUtf8Text, utf8ByteHead } from "./bounded-utf8.js";
 import { childEnv, CONTROL_IDENTITY_ENV } from "./caller.js";
 import { GatewayRpcClient } from "./socket-rpc.js";
@@ -1323,11 +1324,16 @@ async function pathExists(path) {
   }
 }
 
+// Every write of install.json goes through here: the first identity, each
+// entry recorded as it is rewritten, a rotation and the end of a run. The file
+// it replaces is emptied once the rename succeeded when a hard link still holds
+// it (replaceFile), so a link a Worker made keeps no Control token, the retired
+// one included.
 async function writeInstallState(path, state) {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const temporary = `${path}.${process.pid}.tmp`;
   await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-  await rename(temporary, path);
+  replaceFile(temporary, path);
   await chmod(path, 0o600);
 }
 
