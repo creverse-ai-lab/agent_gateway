@@ -237,6 +237,11 @@ test("F1: a literal argv, a shell-metacharacter script and a login shell are dis
       [["echo", "a"], { command: "sh", args: ["-c", "echo a\nrm -rf x"] }],
       // A quoted-literal script word is not the same word as the bare script.
       [["sh", "-c", "'echo a; ./x'"], { command: "sh", args: ["-c", "echo a; ./x"] }],
+      // A `#` comment, and a quote that is not a whole field, make a string
+      // grant opaque: it tokenizes to nothing a shell would run, so it covers
+      // neither the command before the comment nor the concatenated word.
+      ["git commit -m ok # --no-verify", { command: "git", args: ["commit", "-m", "ok"] }],
+      ["rm \"a\"b", { command: "rm", args: ["ab"] }],
       // A plain command must not be spent as a login shell.
       ["echo hi", { command: "bash", args: ["-lc", "echo hi"] }],
       [["echo", "hi"], { command: "zsh", args: ["-l", "-c", "echo hi"] }]

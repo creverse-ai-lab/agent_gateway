@@ -1459,9 +1459,10 @@ function namesGatewayDirectory(text) {
 // it can never stand in for a tokenized command.
 // Shell syntax that makes a line more than its plain words: an operator,
 // redirection, expansion, command substitution, glob, brace/tilde, assignment,
-// an escape, or a newline/tab. A space is omitted on purpose — it separates
-// words.
-const SHELL_META = /[;&|<>()$`\\*?[\]{}~=\n\r\t]/;
+// an escape, or a comment. A space and a tab are omitted on purpose — they
+// separate words; any OTHER blank (newline, VT, FF, NBSP, …) is rejected in the
+// tokenizer, because it is not a word separator a shell would honour.
+const SHELL_META = /[;&|<>()$`\\*?[\]{}~=#]/;
 
 // The comparable form of an argv: its exact words, and a flat text used ONLY to
 // scan which env names the command interpolates (never for equality).
@@ -1479,15 +1480,40 @@ function shellCommand(text) {
 }
 
 // A command line split into argv, or null when it carries shell syntax an argv
-// cannot faithfully stand for. Plain words, each optionally single- or
-// double-quoted, separated by blanks.
+// cannot faithfully stand for. A field is EITHER a bare run of non-quote
+// characters OR one wholly single- or double-quoted word; a quote that is not
+// the whole field, an unclosed quote, a bare word containing a quote, or any
+// blank that is not a space or tab makes the line opaque. Only space and tab
+// separate words.
 function tokenizePlainLine(text) {
   const line = String(text);
-  if (SHELL_META.test(line)) return null;
+  // Any whitespace that is not a plain space or tab (newline, VT, FF, NBSP, …)
+  // is not a word separator a shell honours, so the line is opaque.
+  if (SHELL_META.test(line) || /[^\S \t]/.test(line)) return null;
   const tokens = [];
-  const pattern = /"([^"]*)"|'([^']*)'|(\S+)/g;
-  let match;
-  while ((match = pattern.exec(line)) !== null) tokens.push(match[1] ?? match[2] ?? match[3]);
+  const length = line.length;
+  let index = 0;
+  while (index < length) {
+    while (index < length && (line[index] === " " || line[index] === "\t")) index += 1;
+    if (index >= length) break;
+    const char = line[index];
+    if (char === "'" || char === "\"") {
+      const end = line.indexOf(char, index + 1);
+      if (end === -1) return null;
+      const after = line[end + 1];
+      if (after !== undefined && after !== " " && after !== "\t") return null;
+      tokens.push(line.slice(index + 1, end));
+      index = end + 1;
+    } else {
+      let stop = index;
+      while (stop < length && line[stop] !== " " && line[stop] !== "\t") {
+        if (line[stop] === "'" || line[stop] === "\"") return null;
+        stop += 1;
+      }
+      tokens.push(line.slice(index, stop));
+      index = stop;
+    }
+  }
   return tokens.length ? tokens : null;
 }
 
