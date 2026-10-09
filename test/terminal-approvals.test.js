@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, renameSync, statSync, symlinkSync } from "node:fs";
+import { constants, existsSync, openSync, readFileSync, renameSync, statSync, symlinkSync } from "node:fs";
 import { mkdir, readdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { AcpClient } from "../src/acp-client.js";
 import { GATEWAY_WORKER_ENV } from "../src/caller.js";
 import { GatewayService } from "../src/gateway-service.js";
-import { cwdCheckingLaunch, TERMINAL_CWD_CHANGED_EXIT_CODE, TERMINAL_CWD_SHELL } from "../src/terminal-cwd.js";
+import { cwdCheckingLaunch, startInApprovedCwd, TERMINAL_CWD_CHANGED_EXIT_CODE, TERMINAL_CWD_SHELL } from "../src/terminal-cwd.js";
 import {
   detectTerminalSandbox,
   SANDBOX_EXEC,
@@ -1215,7 +1215,8 @@ function swapBeforeSpawn({ approved, moved, other }) {
   };
 }
 
-const linuxProc = process.platform === "linux" && existsSync("/proc/self/fd") ? false : "Linux with /proc only";
+const procFd = process.platform === "linux" && existsSync("/proc/self/fd");
+const linuxProc = procFd ? false : "Linux with /proc only";
 const macOnly = process.platform === "darwin" ? false : "macOS only";
 
 test("N2: on Linux a terminal starts in the approved directory itself, though its path is swapped right before the spawn", { skip: linuxProc }, async () => {
@@ -1281,7 +1282,9 @@ test("N2: on macOS the script runs outside the terminal sandbox and execs sandbo
   });
 });
 
-test("N2: the cwd-checking script runs the command only in the approved directory and takes nothing else from its input", { skip: process.platform === "win32" }, async () => {
+const noDash = TERMINAL_CWD_SHELL && process.platform !== "win32" ? false : "no /bin/dash on this host";
+
+test("N2: the cwd-checking script runs the command only in the approved directory and takes nothing else from its input", { skip: noDash }, async () => {
   await withTemp("acp-n2-script-", async (directory) => {
     const approved = join(directory, "approved");
     await mkdir(approved);
@@ -1313,14 +1316,83 @@ test("N2: the cwd-checking script runs the command only in the approved director
     // On macOS the script runs outside the sandbox, so it must take no code
     // from the terminal's environment, which the Worker chooses: dash takes
     // neither functions nor shell options from it, where bash would.
-    if (process.platform === "darwin") assert.equal(TERMINAL_CWD_SHELL, "/bin/dash");
-    if (TERMINAL_CWD_SHELL === "/bin/dash") {
-      const injected = script({ command: process.execPath, args: ["-e", "process.stdout.write(process.cwd())"] }, {
-        env: { "BASH_FUNC_cd%%": "() { builtin cd /; }", SHELLOPTS: "xtrace", PS4: `$(${touch.command} -e 'require("node:fs").writeFileSync(${JSON.stringify(marker)}, "")')` }
-      });
-      assert.deepEqual([injected.status, injected.stdout, injected.stderr], [0, approved, ""]);
-      assert.equal(existsSync(marker), false);
+    const injected = script({ command: process.execPath, args: ["-e", "process.stdout.write(process.cwd())"] }, {
+      env: { "BASH_FUNC_cd%%": "() { builtin cd /; }", SHELLOPTS: "xtrace", PS4: `$(${touch.command} -e 'require("node:fs").writeFileSync(${JSON.stringify(marker)}, "")')` }
+    });
+    assert.deepEqual([injected.status, injected.stdout, injected.stderr], [0, approved, ""]);
+    assert.equal(existsSync(marker), false);
+  });
+});
+
+// Without dash the script is never run under another shell: bash, /bin/sh on
+// macOS, Fedora and RHEL, would take functions and options, and with them
+// commands, from the Worker's environment, outside the sandbox on macOS. Such a
+// host starts the terminal by path right after the check by path, as before the
+// binding, unless it can hold the directory (Linux with /proc). macOS ships
+// dash, so there the script always runs.
+test("N2: the script runs only under dash; without it a terminal starts by path, or in a held descriptor on Linux", async () => {
+  if (process.platform === "darwin") assert.equal(TERMINAL_CWD_SHELL, "/bin/dash");
+  assert.ok(TERMINAL_CWD_SHELL === "/bin/dash" || TERMINAL_CWD_SHELL === null, String(TERMINAL_CWD_SHELL));
+  await withTemp("acp-n2-start-", async (directory) => {
+    const approved = join(directory, "approved");
+    await mkdir(approved);
+    const info = statSync(approved, { bigint: true });
+    const identity = { dev: info.dev, ino: info.ino };
+    const launch = { command: "/bin/echo", args: ["hi"] };
+    const byPath = { ...launch, cwd: approved };
+    const startOf = (options) => {
+      const start = startInApprovedCwd(launch, approved, identity, options);
+      start.release();
+      return { command: start.command, args: start.args, cwd: start.cwd };
+    };
+    assert.deepEqual(startOf({ platform: "darwin", shell: "/bin/dash" }), cwdCheckingLaunch(launch, approved, identity, "/bin/dash"));
+    assert.deepEqual(startOf({ platform: "darwin", shell: null }), byPath, "no dash: by path, no script");
+    assert.deepEqual(startOf({ platform: "win32", shell: "/bin/dash" }), byPath, "Windows: by path");
+
+    // A kernel that refuses O_PATH (EINVAL) gets the directory opened for
+    // reading instead; one that cannot be read then is left to the other
+    // starts; anything else is a directory that is not there.
+    const failing = (...codes) => {
+      const flags = [];
+      const open = (path, flag) => {
+        flags.push(flag);
+        const code = codes.shift();
+        if (code) throw Object.assign(new Error(code), { code });
+        return openSync(path, constants.O_RDONLY | constants.O_DIRECTORY);
+      };
+      return { flags, open };
+    };
+    const retried = failing("EINVAL");
+    const held = startOf({ platform: "linux", shell: null, open: retried.open });
+    assert.equal(retried.flags.length, 2);
+    assert.equal(retried.flags[1], constants.O_RDONLY | constants.O_DIRECTORY);
+    if (procFd) assert.match(held.cwd, /^\/proc\/self\/fd\/\d+$/);
+    else assert.deepEqual(held, byPath, "no /proc to lead a child to it: by path");
+    assert.deepEqual(startOf({ platform: "linux", shell: "/bin/dash", open: failing("EINVAL", "EACCES").open }),
+      cwdCheckingLaunch(launch, approved, identity, "/bin/dash"), "a directory it may enter but not read: the script");
+    for (const codes of [["ENOENT"], ["EACCES"], ["EINVAL", "ENOENT"]]) {
+      assert.throws(() => startOf({ platform: "linux", shell: "/bin/dash", open: failing(...codes).open }), {
+        message: `Terminal cwd no longer resolves since it was approved: ${approved}`
+      }, codes.join(" then "));
     }
+  });
+});
+
+test("N2: with no dash injected, a terminal starts without the script and still in the approved directory", async () => {
+  await withTemp("acp-n2-nodash-", async (directory) => {
+    const approved = join(directory, "approved");
+    await mkdir(approved);
+    const starts = [];
+    const beforeTerminalSpawn = (cwd, start) => starts.push({ cwd, command: start.command, startCwd: start.cwd });
+    await withClient({ cwd: directory, policy: "auto_approve", protectedPaths: [], terminalCwdShell: null, beforeTerminalSpawn }, async ({ run }) => {
+      assert.deepEqual(await run([{ terminal: { ...recordCwd, cwd: approved } }]), [{ output: approved, exitStatus: { exitCode: 0, signal: null } }]);
+    });
+    assert.equal(starts.length, 1);
+    assert.equal(starts[0].cwd, approved);
+    assert.equal(starts[0].command, recordCwd.command, "the command itself, not a shell around it");
+    if (procFd) assert.match(starts[0].startCwd, /^\/proc\/self\/fd\/\d+$/);
+    else assert.equal(starts[0].startCwd, approved, "by path, after the check by path");
+    assert.equal(readFileSync(join(approved, "ran.txt"), "utf8"), approved);
   });
 });
 

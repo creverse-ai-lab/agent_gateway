@@ -5,8 +5,8 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { existsSync, readdirSync } from "node:fs";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import test from "node:test";
@@ -710,6 +710,34 @@ test("discard removes only a finished artifact of the store's own", async () => 
     assert.equal(existsSync(finished.metadata().path), false);
     assert.equal(store.usedBytes, used - 3);
     open.finalize();
+  });
+});
+
+// A store that starts over its directory charges and registers what is there by
+// lstat'ing each name, not by the type a listing reports. A file system that
+// reports no type (DT_UNKNOWN: some NFS and virtiofs mounts) has Node's typed
+// listing lstat every entry itself, and one entry gone by then failed that whole
+// listing, which read as no directory: nothing charged, no artifact registered.
+test("a store starting over its directory charges every regular file and registers every artifact, skipping a name gone since the listing", async () => {
+  await withDirectory("scan", async (directory) => {
+    const root = join(directory, "artifacts");
+    await mkdir(join(root, "acp-artifact-dir"), { recursive: true });
+    const artifact = join(root, "acp-artifact-s-terminal-1.txt");
+    await writeFile(artifact, "abcde");
+    await writeFile(join(root, "notes.txt"), "xyz");
+    await symlink(artifact, join(root, "acp-artifact-link.txt"));
+    // The names as listed, and one more that is gone before its lstat.
+    const listings = [];
+    const readdir = (...call) => {
+      listings.push(call);
+      return [...readdirSync(...call), "acp-artifact-gone.txt"];
+    };
+    const store = new ArtifactStore({ root, readdir });
+    assert.deepEqual(listings, [[root]], "one listing of names, no types asked for");
+    assert.equal(store.usedBytes, 8, "both regular files; not the link, the directory or the name that is gone");
+    assert.equal(store.isArtifact(await stat(artifact, { bigint: true })), true);
+    assert.equal(store.isArtifact(await stat(join(root, "notes.txt"), { bigint: true })), false, "a regular file, but not an artifact");
+    assert.equal(new ArtifactStore({ root: join(directory, "missing") }).usedBytes, 0, "no directory yet: nothing to charge");
   });
 });
 

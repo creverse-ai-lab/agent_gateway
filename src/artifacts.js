@@ -50,13 +50,15 @@ export class ArtifactStore {
     // {durable: true})): a durable Task result whose artifact is cut short has
     // nothing but its preview to recover from, so transcripts, terminal output
     // and tool-event spills stop short of it. 0 shares the whole quota.
-    durableReserveBytes = 0
+    durableReserveBytes = 0,
+    // The names in a directory, as readdirSync gives them; injectable for tests.
+    readdir = readdirSync
   } = {}) {
     this.root = root;
     this.maxFileBytes = maxFileBytes;
     this.maxTotalBytes = maxTotalBytes;
     this.durableReserveBytes = Math.max(0, Math.min(durableReserveBytes, maxTotalBytes));
-    this.usedBytes = this.#scan();
+    this.usedBytes = this.#scan(readdir);
     this.activePaths = new Set();
   }
 
@@ -128,15 +130,27 @@ export class ArtifactStore {
 
   // What the directory already holds: every regular file counts against the
   // quota, and each artifact among them is registered like one the store
-  // creates.
-  #scan() {
+  // creates. Each name is lstat'd here, whatever type the listing could have
+  // reported: a file system that reports none (DT_UNKNOWN, as some NFS and
+  // virtiofs mounts do) has Node's typed listing lstat every entry itself, and
+  // one entry gone by then fails that whole listing, which would read as no
+  // directory and leave every artifact in it uncharged and unregistered. A
+  // name gone by the lstat here is skipped alone.
+  #scan(readdir) {
+    let names;
+    try {
+      names = readdir(this.root);
+    } catch (error) {
+      if (error?.code === "ENOENT") return 0;
+      throw error;
+    }
     let bytes = 0;
-    for (const entry of safeEntries(this.root)) {
-      if (!entry.isFile()) continue;
+    for (const name of names) {
       try {
-        const info = statSync(join(this.root, entry.name), { bigint: true });
+        const info = lstatSync(join(this.root, name), { bigint: true });
+        if (!info.isFile()) continue;
         bytes += Number(info.size);
-        if (info.isFile() && entry.name.startsWith(ARTIFACT_PREFIX)) this.remember(info);
+        if (name.startsWith(ARTIFACT_PREFIX)) this.remember(info);
       } catch (error) {
         if (error?.code !== "ENOENT") throw error;
       }

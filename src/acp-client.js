@@ -8,7 +8,7 @@ import { workerEnv } from "./caller.js";
 import { ERROR_CODES, GatewayError } from "./errors.js";
 import { readNdjson } from "./ndjson.js";
 import { LANE_HIGH, LANE_NORMAL, NdjsonChannel } from "./ndjson-channel.js";
-import { startInApprovedCwd, terminalCwdChanged, terminalCwdGone } from "./terminal-cwd.js";
+import { startInApprovedCwd, TERMINAL_CWD_SHELL, terminalCwdChanged, terminalCwdGone } from "./terminal-cwd.js";
 import { detectTerminalSandbox } from "./terminal-sandbox.js";
 import { GATEWAY_VERSION } from "./version.js";
 import { ACP_PROTOCOL_VERSION } from "./acp-version.js";
@@ -98,9 +98,14 @@ export class AcpClient {
     // the descriptor, where a racing worker would swap a parent directory.
     this.beforeWriteOpen = options.beforeWriteOpen ?? null;
     // A test seam that runs right before a terminal is spawned, after its cwd
-    // was checked (and on Linux opened), where a racing worker would swap the
-    // directory. Synchronous: nothing may come between the check and the spawn.
+    // was checked (and on Linux opened), with the cwd and the start about to be
+    // spawned, where a racing worker would swap the directory. Synchronous:
+    // nothing may come between the check and the spawn.
     this.beforeTerminalSpawn = options.beforeTerminalSpawn ?? null;
+    // The shell that checks a starting terminal's cwd where a descriptor cannot
+    // be one: dash, or null where there is none and the terminal starts by path
+    // (terminal-cwd.js). Injectable for tests.
+    this.terminalCwdShell = options.terminalCwdShell === undefined ? TERMINAL_CWD_SHELL : options.terminalCwdShell;
     this.proc = null;
     this.rl = null;
     this.channel = null;
@@ -892,7 +897,8 @@ export class AcpClient {
   // terminal that starts at once (auto_approve, a grant) passes unless the
   // worker raced it. The start itself is bound to that directory as well, not
   // to its path (startInApprovedCwd), which closes the race between this check
-  // and the child's chdir.
+  // and the child's chdir, except on a host with neither /proc nor dash, where
+  // this check is the last one.
   #requireApprovedCwd(params, operation) {
     let current;
     let directory;
@@ -922,18 +928,19 @@ export class AcpClient {
     // swapped the directory while Main decided is refused here, with an error;
     // one that races these few synchronous steps meets the start itself, which
     // is bound to the directory and not to its path (startInApprovedCwd): on
-    // Linux the child starts in the descriptor held here, elsewhere it refuses
-    // to run the command.
+    // Linux the child starts in the descriptor held here, elsewhere a dash
+    // script refuses to run the command anywhere else, and only a host with
+    // neither starts it by path, after this check.
     this.#requireApprovedCwd(params, operation);
     const terminalId = `terminal-${this.nextId++}`;
     // #terminalRequest already refused a present-but-invalid limit, so Number()
     // is finite here; floor keeps it the integer BoundedUtf8Text requires.
     const limit = Math.min(Math.max(Math.floor(Number(params.outputByteLimit ?? 1_000_000)), 1), this.maxTerminalOutputBytes);
     const launch = sandbox ? sandbox.wrap(request.command, request.args, this.protectedPaths) : request;
-    const start = startInApprovedCwd(launch, operation.cwd, operation.cwdIdentity);
+    const start = startInApprovedCwd(launch, operation.cwd, operation.cwdIdentity, { shell: this.terminalCwdShell });
     let child;
     try {
-      this.beforeTerminalSpawn?.(operation.cwd);
+      this.beforeTerminalSpawn?.(operation.cwd, start);
       // Same scrub and marker as the worker's own env. What the worker asks for
       // explicitly is its own identity, not the Main's, and is kept; the marker
       // is not the worker's to remove.

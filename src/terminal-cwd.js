@@ -14,16 +14,21 @@ import { closeSync, constants, existsSync, fstatSync, openSync, statSync } from 
 //   is at its path by then. The descriptor is closed once spawn returns.
 // - Elsewhere (macOS, and Linux without /proc) a descriptor cannot be a cwd:
 //   spawn into /dev/fd/<fd> fails with ENOTDIR on macOS. The child is a short
-//   fixed sh script instead (SCRIPT): it changes into the path, compares the
-//   directory it is then in, ".", held by inode and not by name, with the
-//   approved device and inode, and only then execs the command, which keeps
-//   the pid, the process group, the output and the exit status. On a mismatch
-//   it runs nothing, writes one line to stderr and exits with
+//   fixed script run by dash instead (SCRIPT): it changes into the path,
+//   compares the directory it is then in, ".", held by inode and not by name,
+//   with the approved device and inode, and only then execs the command, which
+//   keeps the pid, the process group, the output and the exit status. On a
+//   mismatch it runs nothing, writes one line to stderr and exits with
 //   TERMINAL_CWD_CHANGED_EXIT_CODE. The cwd, its identity, the command and its
 //   args are the script's positional parameters, never part of it. On macOS
 //   it runs outside the terminal sandbox and execs sandbox-exec, so what is
 //   sandboxed is the command, as before.
-// - On Windows the check by path is all there is.
+// - Without dash the script is not run at all (TERMINAL_CWD_SHELL): a host with
+//   neither /proc nor dash (a Linux without /proc whose /bin/sh is bash or
+//   busybox, as on Fedora, RHEL or Alpine) starts the terminal by path right
+//   after the check by path, as before, and so does Windows. That is the one
+//   race left: a Worker that swaps the directory between that check and the
+//   child's chdir there still moves the command.
 
 /** The exit status of a terminal whose cwd was not the approved directory when it started (EX_TEMPFAIL). */
 export const TERMINAL_CWD_CHANGED_EXIT_CODE = 75;
@@ -33,15 +38,18 @@ export const TERMINAL_CWD_CHANGED_EXIT_CODE = 75;
 // only search permission.
 const O_PATH = 0o10000000;
 
-// dash where there is one (macOS, Debian, Ubuntu), since the script reads the
-// terminal's environment, the Worker's to choose, and on macOS runs outside
-// the sandbox: dash takes no code from it. /bin/sh is bash on macOS, which
-// imports functions (BASH_FUNC_cd%%) and options (SHELLOPTS=xtrace, with a PS4
-// that runs a command) from the environment. dash passes the environment on to
-// the command as it is, except variables whose names are not shell names
-// (BASH_FUNC_name%%, a name with a dot), which it drops, and PWD and OLDPWD,
-// which it sets.
-export const TERMINAL_CWD_SHELL = existsSync("/bin/dash") ? "/bin/dash" : "/bin/sh";
+/**
+ * The shell the script runs under: dash, or null where there is none. Never
+ * another sh. The script reads the terminal's environment, which is the
+ * Worker's to choose, and on macOS it runs outside the sandbox; dash takes no
+ * code from that environment, and bash (/bin/sh on macOS, Fedora and RHEL)
+ * does: functions (BASH_FUNC_cd%%) and shell options (SHELLOPTS, xtrace with a
+ * PS4 that runs a command among them). dash passes the environment on to the
+ * command as it is, except variables whose names are not shell names
+ * (BASH_FUNC_name%%, a name with a dot), which it drops, and PWD and OLDPWD,
+ * which it sets.
+ */
+export const TERMINAL_CWD_SHELL = existsSync("/bin/dash") ? "/bin/dash" : null;
 
 // The device and inode of ".", as Node's stat gives them: BSD stat on macOS,
 // GNU or busybox stat on Linux, by absolute path so the terminal's PATH cannot
@@ -50,17 +58,13 @@ const STAT_IDENTITY = process.platform === "linux"
   ? `${existsSync("/usr/bin/stat") ? "/usr/bin/stat" : "/bin/stat"} -c %d:%i .`
   : "/usr/bin/stat -f %d:%i .";
 
-// A command can be named like an option ("-c"). dash's exec takes no options
-// and runs it as the command, and would take a "--" for the command too;
-// another sh's exec needs the "--", or bash would take "-c" for its own option
-// and run the next word, in an empty environment.
-const EXEC = TERMINAL_CWD_SHELL === "/bin/dash" ? 'exec "$@"' : 'exec -- "$@"';
-
-// $1 the approved cwd, $2 its "dev:ino", then the command and its args.
+// $1 the approved cwd, $2 its "dev:ino", then the command and its args. dash's
+// exec takes no options, so a command named like one ("-c") is run as the
+// command, never read as an option of exec.
 const SCRIPT = [
   `if cd -P -- "$1" 2>/dev/null && [ "$(${STAT_IDENTITY} 2>/dev/null)" = "$2" ]; then`,
   "  shift 2",
-  `  ${EXEC}`,
+  '  exec "$@"',
   "fi",
   `printf '%s\\n' "Terminal cwd changed since it was approved: $1" >&2`,
   `exit ${TERMINAL_CWD_CHANGED_EXIT_CODE}`
@@ -79,12 +83,12 @@ export function terminalCwdGone(cwd) {
 /**
  * The script's start of launch ({command, args}) in cwd, as {command, args,
  * cwd} for spawn: it runs launch there only while the directory at cwd is the
- * one identity ({dev, ino}) names. Exported for tests; startInApprovedCwd
- * chooses it.
+ * one identity ({dev, ino}) names. shell is dash's path (TERMINAL_CWD_SHELL).
+ * Exported for tests; startInApprovedCwd chooses it.
  */
-export function cwdCheckingLaunch(launch, cwd, identity) {
+export function cwdCheckingLaunch(launch, cwd, identity, shell = TERMINAL_CWD_SHELL) {
   return {
-    command: TERMINAL_CWD_SHELL,
+    command: shell,
     args: ["-c", SCRIPT, "sh", cwd, `${identity.dev}:${identity.ino}`, launch.command, ...launch.args],
     // Anywhere that is always there, so the spawn itself cannot fail on it.
     cwd: "/"
@@ -96,25 +100,29 @@ export function cwdCheckingLaunch(launch, cwd, identity) {
  * identity ({dev, ino}) names, at cwd: {command, args, cwd} for spawn, and
  * release(), to call once spawn has returned or thrown. On Linux with /proc
  * throws, naming only cwd, when the directory there is no longer that one or
- * cannot be opened; elsewhere the started script refuses it.
+ * is gone; through the script, the started script refuses it; by path (no
+ * /proc and no dash, or Windows) only the caller's check by path has. platform,
+ * shell (dash's path, or null for none) and open are injectable for tests.
  */
-export function startInApprovedCwd(launch, cwd, identity) {
-  if (process.platform === "win32") return { ...launch, cwd, release() {} };
-  const fd = process.platform === "linux" ? holdApprovedDirectory(cwd, identity) : null;
-  if (fd !== null) return { ...launch, cwd: `/proc/self/fd/${fd}`, release: () => closeSync(fd) };
-  return { ...cwdCheckingLaunch(launch, cwd, identity), release() {} };
+export function startInApprovedCwd(launch, cwd, identity, {
+  platform = process.platform,
+  shell = TERMINAL_CWD_SHELL,
+  open = openSync
+} = {}) {
+  if (platform === "linux") {
+    const fd = holdApprovedDirectory(cwd, identity, open);
+    if (fd !== null) return { ...launch, cwd: `/proc/self/fd/${fd}`, release: () => closeSync(fd) };
+  }
+  if (platform !== "win32" && shell) return { ...cwdCheckingLaunch(launch, cwd, identity, shell), release() {} };
+  return { ...launch, cwd, release() {} };
 }
 
 // A descriptor of the directory at cwd, once it is the approved one, or null
-// where /proc cannot lead a child to it: /proc/self/fd/<fd> must lead to the
-// very directory held.
-function holdApprovedDirectory(cwd, identity) {
-  let fd;
-  try {
-    fd = openSync(cwd, O_PATH | constants.O_DIRECTORY);
-  } catch {
-    throw terminalCwdGone(cwd);
-  }
+// where it cannot be held or /proc cannot lead a child to it: /proc/self/fd/<fd>
+// must lead to the very directory held.
+function holdApprovedDirectory(cwd, identity, open) {
+  const fd = openApprovedDirectory(cwd, open);
+  if (fd === null) return null;
   let held = false;
   try {
     const opened = fstatSync(fd, { bigint: true });
@@ -130,4 +138,24 @@ function holdApprovedDirectory(cwd, identity) {
     if (!held) closeSync(fd);
   }
   return held ? fd : null;
+}
+
+// The directory at cwd, opened to be held, or null where it cannot be: with
+// O_PATH, which needs no permission on the directory itself; on a kernel that
+// refuses the flag (EINVAL), open for reading, which needs read permission
+// too, and a directory that only refuses that (EACCES, EPERM) can still be
+// entered, so it is left to the other starts. Anything else means the
+// directory is not there to be held.
+function openApprovedDirectory(cwd, open) {
+  try {
+    return open(cwd, O_PATH | constants.O_DIRECTORY);
+  } catch (error) {
+    if (error?.code !== "EINVAL") throw terminalCwdGone(cwd);
+  }
+  try {
+    return open(cwd, constants.O_RDONLY | constants.O_DIRECTORY);
+  } catch (error) {
+    if (error?.code === "EACCES" || error?.code === "EPERM") return null;
+    throw terminalCwdGone(cwd);
+  }
 }
