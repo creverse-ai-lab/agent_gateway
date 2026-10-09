@@ -2,6 +2,89 @@
 
 **한국어** | [English](CHANGELOG.md)
 
+## v1.8.0 변경 사항
+
+Worker와 다른 로컬 프로세스가 Gateway 제어 권한에 닿지 못하게 하고, Main마다 자기 세션만 다루게 하며, 승인을 그 승인이 가리킨 작업에만 묶고, daemon이 상태가 바뀔 때마다 전체 상태를 다시 쓰지 않게 하는 릴리스입니다. API major **1**과 state schema **5**는 유지되며, 새 설정과 새 WAL 레코드 유형은 없습니다. 새 오류 코드는 `WORKER_CONTROL_DENIED`, `SOCKET_UNTRUSTED`, `DAEMON_IDENTITY_INVALID`입니다. 일부 동작은 의도적으로 바뀌었으니, 업그레이드하기 전에 **동작 변경**을 먼저 읽어 주세요.
+
+- **agent CLI 설정에서 Control token 제거:**
+  - installer는 Control MCP를 `ACP_GATEWAY_CONTROL_TOKEN`과 `ACP_GATEWAY_ROOT_ID` 없이 등록합니다. 항목에는 `install.json`이 기본 경로에 있지 않을 때만 `ACP_GATEWAY_INSTALL_STATE`가 들어갑니다. 프론트 도어는 각 값을 환경 변수에 있으면 거기서(1.8.0 이전에 등록한 항목, 격리된 배포), 없으면 `install.json`에서 읽고, 둘 다 없으면 예전처럼 처리합니다(token은 오류, root id는 `main-<ppid>`). agent CLI의 설정에도, 항목을 등록하는 `mcp add` 명령줄에도 token이 남지 않습니다.
+  - installer가 자신이 등록했다고 입증할 수 있는 항목(1.7.2의 소유 규칙)은 그 자리에서, 또는 새 설치본으로 옮기면서 식별 정보 없이 다시 등록하며, 다시 쓴 항목은 즉시 `install.json`에 기록합니다. 자기 것이라고 입증할 수 없는 항목(1.7.2 이전에 등록했거나, 그 뒤 env가 바뀌었거나, 다른 Gateway 설치본을 실행하는 항목)은 경고와 함께 token을 그대로 두며, token이 든 agent 설정을 다른 사용자가 읽을 수 있으면 그 파일을 `0600`으로 바꿉니다(Grok CLI는 자기 설정을 `0644`로 씁니다). `--force`를 주면 이런 항목도 token 없이 다시 등록합니다.
+  - 항목에서 token을 뺀 실행은 마지막에 `acp-gateway-bootstrap --rotate-token`을 권하는 경고를 남깁니다. agent CLI의 `*.bak` 백업처럼 그 전에 만든 사본에는 token이 그대로 남아 있기 때문입니다. installer가 알아서 교체하지는 않습니다. AgenLynk 같은 앱은 읽어 둔 식별 정보를 계속 쓰기 때문입니다.
+  - `--rotate-token`은 `install.json`의 식별 정보만 바꾸고, 거기서 식별 정보를 읽는 항목은 다시 등록하지 않습니다. 항목 하나라도 갱신하지 못한 교체는 확정하지 않고 `install.json`에 이전 식별 정보를 남기며, 교체에 실패한 항목은 원래 모습 그대로 되돌립니다. 예전에는 되돌린 항목에 새 token을 넣었습니다.
+- **daemon 식별 정보를 프로세스 환경 변수에서 제거:**
+  - daemon을 자동으로 띄우는 client는 token과 root id를 daemon의 stdin으로 JSON 한 줄에 담아 넘기고, 환경 변수에는 `ACP_GATEWAY_IDENTITY_STDIN=1`만 넣습니다. OS는 프로세스가 시작할 때의 환경 변수를 같은 사용자의 모든 프로세스가 읽을 수 있게 남겨 두고(macOS의 `ps -E`, Linux의 `/proc/<pid>/environ`), daemon의 pid는 `<socket>.lock`에 적혀 있기 때문입니다. 환경 변수에 `ACP_GATEWAY_CONTROL_TOKEN`을 넣어 띄운 daemon(직접 띄우거나, supervisor나 daemon을 직접 띄우는 소비자가 띄운 경우)은 계속 거기서 읽습니다. Windows는 환경 변수를 그대로 씁니다.
+  - 줄이 없거나, 늦거나(5초), 너무 길거나(16KiB), 쓸 수 없으면 daemon은 exit 78로 멈추고 recovery marker에 `DAEMON_IDENTITY_INVALID`를 남기며, client가 이를 보고합니다. 받은 줄을 오류에 다시 적지는 않습니다.
+  - daemon은 시작할 때 자기 환경 변수에서 식별 정보를 지우고, daemon이 띄우는 모든 프로세스(Worker, 터미널, installer와 adapter 업데이트 명령, `git`, `ps`)는 식별 정보, `ACP_GATEWAY_SOCKET`, Main의 세션 표시가 빠진 환경 변수를 받습니다. 예전에는 자동 adapter 업데이트가 실행하는 npm·uv lifecycle script가 token을 받았습니다.
+- **Worker는 Control을 받지 못함:**
+  - Gateway는 자신이 띄우는 모든 Worker와 터미널에 `ACP_GATEWAY_WORKER=1`을 붙입니다. Control MCP는 이 표시가 있거나 조상 프로세스 중에 daemon이 있으면(남은 잠금 파일에 속지 않는, 깊이가 제한된 탐색) 시작을 거부하고, 식별 정보를 읽기 전에 stderr에 한 줄을 남기고 77로 종료합니다. 예전에는 `~/.codex/config.toml`을 읽은 Codex Worker가 사용자의 Control MCP를 token과 함께 띄워 `agent_acp_*` 도구를 모두 쓸 수 있었습니다.
+  - daemon은 `caller.pid`가 daemon 자신이나 daemon이 띄운 provider·터미널이거나 그 아래에서 실행 중인 control 요청을 아무것도 실행하기 전에 `WORKER_CONTROL_DENIED`로 거부합니다. daemon이 pid 1인 경우(컨테이너 entrypoint)에는 프로세스 트리를 거슬러 올라가는 탐색이 pid 1에서 멈춰 daemon과 대조되지 않지만, daemon이 띄운 프로세스까지 대조하므로 이때도 Worker를 가려냅니다. 그 pid는 프로세스를 띄운 순간부터 끝날 때까지 대조 대상에 있습니다. 그사이 Gateway가 그 프로세스를 어떻게 다뤘든(시작에 실패했든, adapter 업데이트나 전송 오류 뒤 새 프로세스가 그 자리를 대신했든, SIGTERM을 무시하는 프로세스를 끝내는 중이든) 마찬가지입니다. 프로세스가 끝나면 바로 빠지므로 나중에 같은 번호를 받은 프로세스는 거부되지 않습니다. 호출자 pid를 보내지 않는 연결(관리 client)에는 영향이 없습니다.
+  - macOS와 Linux에서 프로세스 정보를 전혀 읽을 수 없는 환경(`/proc`이 없고 `ps`도 없거나 막힌 경우)에서는 Worker가 Main 행세를 하지 못하도록 양쪽 모두 거부합니다. 이런 환경에서는 자기 프로세스조차 읽지 못하는 Control MCP가 Gateway Worker 안에서 실행 중인지 판단할 수 없다는 한 줄을 stderr에 남기고 77로 종료하며, daemon은 어디서 실행 중인지 확인할 수 없는 호출자를 `WORKER_CONTROL_DENIED`("ancestry cannot be verified on this host")로 거부합니다. `/proc`을 `hidepid=1`이나 `2`로 마운트한 호스트에 SSH로 로그인했을 때의 root 소유 `sshd`처럼 이 사용자가 볼 수 없는 프로세스에서 탐색이 끊기면 그 위에 daemon이 없는 것으로 보므로, 그런 Main은 정상적으로 시작합니다. `/proc`도 `ps`도 없는 Windows는 `ACP_GATEWAY_WORKER` 표시와, 호출자 pid가 daemon 자신이나 daemon이 띄운 프로세스인지에 기댑니다.
+  - `session_open`과 `session_restore`는 env에 Control 식별 정보나 `ACP_GATEWAY_INSTALL_STATE`를 설정하거나, command·args가 Control bin을 실행하거나 Gateway의 `src/index.js`(설치된 runtime 경로 포함)로 이어지는 Worker MCP 서버도 거부합니다. filesystem 서버에 넘긴 `acp-gateway`라는 이름의 checkout처럼 bin과 이름만 같은 디렉터리는 해당하지 않습니다.
+- **Main별 분리:**
+  - `caller`가 있는 control 요청(프론트 도어 Main)은 그 Main의 세션과 그 작업·inbox 항목, 그리고 기록된 Main이 없는 기록에만 닿습니다. 다른 Main의 기록은 `NOT_SESSION_OWNER`, `NOT_TASK_OWNER`, `NOT_INBOX_OWNER`로 응답하고 목록, attention, setup 경고, 구독에서 빠지며, `clean`은 호출한 Main의 세션만 닫고, 호출자가 볼 수 없는 작업으로의 연결은 작업 조회에서 빠집니다. `caller`가 없는 요청(AgenLynk, `acp-gateway-admin`, installer health check, 1.6 이전 프론트 도어)과 observer는 root 전체에 그대로 접근합니다.
+  - 새 식별 정보로 돌아온 Main(새 CLI 세션, 또는 세션 id를 보내지 않는 프론트 도어를 다시 시작한 경우)은 이전 Main에게 살아 있는 control 연결이나 구독이 남아 있지 않을 때, `provider`·`acpSessionId`·`cwd`를 지정한 `agent_acp_session_restore`를 명시적으로 호출해 이전 세션을 되찾습니다. 세션의 작업과 inbox 항목도 함께 넘어오며, 세션 응답에는 `adoptedFrom`이 붙습니다. 넘겨받은 사실은 다음 snapshot에 저장되며, 넘겨받은 세션을 닫거나 보존 정리가 지울 때는 이 사실을 먼저 저장합니다.
+  - observer 접근과 마찬가지로, token을 가진 프로세스를 막는 인증 경계는 아닙니다.
+- **승인은 작업을 밝히고 그 작업에만 적용:**
+  - Main의 응답을 기다리는 `terminal/create`나 `fs/write_text_file`은 `Run: <command line>`과 `rawInput: {command, args, cwd, env}`, 또는 `Write <path> (<n> bytes)`와 `locations`, `rawInput: {path, bytes}`로 보입니다. `env`의 각 항목은 무엇이 실행될지를 좌우하는 변수이면 `{name, value}`이고, 나머지는 `{name}`뿐입니다. 나머지의 값은 자격 증명일 수 있기 때문입니다(대기 중인 요청은 저장됩니다). 무엇이 실행될지를 좌우하는 변수는 명령줄이 참조하는 변수(`$NAME`, `${NAME}`)와, loader·인터프리터·shell·흔한 도구가 코드를 불러오거나 실행하게 하는 변수입니다. `PATH`, `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`, `GCONV_PATH`, 모든 `DYLD_*`, `PYTHONPATH`·`PERL5OPT`·`RUBYOPT`·`NODE_OPTIONS`·`NODE_PATH`·`JAVA_TOOL_OPTIONS`·`CLASSPATH` 같은 인터프리터 경로와 옵션, `BASH_ENV`·`ENV`·`ZDOTDIR`·`PROMPT_COMMAND`·모든 `BASH_FUNC_*` 같은 shell 시작 파일과 hook, `HOME`과 `XDG_CONFIG_HOME`, git의 `GIT_DIR`·`GIT_SSH_COMMAND`·`GIT_CONFIG_*`와 git이 실행하는 프로그램, 그리고 `EDITOR`·`VISUAL`·`PAGER`·`LESSOPEN`이 여기에 속하며, 전체 목록은 Management API에 있습니다. 이름이나 값이 문자열이 아닌 `env` 항목은 Main에게 묻기 전에 거부합니다. 예전에는 Main에게 메서드 이름만 보였습니다.
+  - Worker의 `execute` 요청을 승인하면 터미널 하나가 통과합니다. argv가 단어 하나하나까지 같고 작업 디렉터리도 같아야 하며, 환경 변수도 요청이 지정한 것과 이름과 값이 모두 같고 그 밖의 것은 없어야 합니다. 명령줄 문자열은 평범한 단어로만 이루어진 경우에 한해 그 단어들을 argv로 삼습니다. shell 문법, 단어 전체를 감싸지 않는 따옴표, 닫히지 않은 따옴표, `#`, 공백·탭이 아닌 다른 공백 문자가 하나라도 있으면 아무것도 통과시키지 않습니다. 그래서 `sh -c` 스크립트, 로그인 shell, 리터럴 argv는 서로를 대신할 수 없고, 간접 확장이나 산술 확장(`${!NAME}`, `$((…))`)을 쓰는 명령은 승인으로 통과하지 않습니다.
+  - `edit`·`delete`·`move` 요청을 승인하면 그 요청이 가리킨 파일마다(Main에게 물을 때 해석한 파일) 쓰기 한 번이 통과합니다. 모든 쓰기는 요청이 들어왔을 때 해석한 정규 경로, 즉 Main에게 보여 준 대상에 묶입니다. Main이 결정하는 사이에 Worker가 링크를 다른 곳으로 돌리거나 파일을 바꿔 넣으면 승인된 쓰기는 거부되고, 아무것도 쓰거나 비우지 않습니다.
+  - 터미널도 같은 방식으로 Main에게 보여 준 정규 작업 디렉터리와 그곳에 있던 디렉터리에 묶입니다. Main이 결정하는 사이에 Worker가 `cwd`의 링크를 다른 곳으로 돌리거나 그 경로에 다른 디렉터리를 넣으면 승인된 터미널은 거부되고 아무것도 실행되지 않으며, 오류에는 승인된 디렉터리만 나옵니다.
+  - 승인은 턴이 끝나면 사라집니다. 예전에는 어떤 승인이든 같은 종류의 다음 쓰기나 터미널을, 무엇이든 통과시켰습니다.
+  - Main을 기다리는 쓰기와 터미널은 쓰지 않는 필드까지 포함해 요청 전체를 세션의 대기 입력 바이트 예산(512KiB)에 포함합니다.
+- **Gateway 터미널은 보호 경로에 닿지 못함:**
+  - macOS에서 Gateway가 Worker에게 열어 주는 터미널은 보호 경로의 실제 경로에 대한 읽기·쓰기·연결을 막는 profile로 `sandbox-exec` 아래에서 실행됩니다. pid, 프로세스 그룹, 종료 상태, 출력은 명령 자신의 것입니다.
+  - sandbox가 없는 환경(Linux, 또는 profile을 적용할 수 없는 `sandbox-exec`)에서 `auto_approve`는 더 이상 터미널을 알아서 실행하지 않고, 하나하나 전체 명령과 함께 Main에게 보냅니다. 쓰기는 계속 자동입니다.
+  - `.acp-gateway` 경로 구성 요소가 든 명령 단어가 보호 경로로 이어지지 않으면 자동으로 정하지 않고 Main에게 보냅니다(`read_only`는 여전히 거부). 보호 경로로 이어지는 단어는 예전처럼 거부합니다.
+  - `outputByteLimit`이 주어졌지만 1 이상의 유한한 수가 아닌 `terminal/create`는 아무것도 띄우기 전에 거부합니다. 예전에는 숫자가 아닌 값을 주면 터미널 출력이 한없이 쌓였습니다.
+  - Gateway가 provider를 멈출 때(종료, idle unload, 교체된 adapter 세대 정리)와 치명적인 전송 오류가 났을 때(frame 상한을 넘는 줄, stdin을 더 읽지 않는 provider) 모두, provider에 SIGTERM을 보내고 2초 뒤에도 실행 중이면 SIGKILL을 보냅니다. 터미널도 macOS와 Linux에서는 프로세스 그룹 단위로, Windows에서는 터미널 프로세스 자체를 끝내며 같은 방식으로 SIGKILL로 마무리하고, `stop()`은 정해진 시간 안에서 이들이 모두 끝나기를 기다립니다. 예전에는 provider에 SIGTERM을 한 번만 보냈기 때문에 이를 무시하는 provider는 계속 실행됐고, `stop()`은 터미널의 명령에도 SIGTERM만 보냈습니다.
+- **Worker 파일 콜백은 확인한 descriptor로만 처리:**
+  - `fs/read_text_file`과 `fs/write_text_file`은 확인한 경로를 한 번만 열고(`O_NOFOLLOW`, macOS에서는 경로 어디에도 symbolic link를 허용하지 않음), 일반 파일인지 확인하고, descriptor가 그 경로의 파일인지(Linux에서는 `/proc/self/fd`까지) 확인한 뒤 그 descriptor로만 읽고, 비우고, 씁니다. 그 사이에 Worker가 링크나 디렉터리를 바꿔 넣거나, 마지막 구성 요소가 끊긴 symbolic link여도 작업을 다른 곳으로 돌릴 수 없습니다. FIFO가 daemon 스레드를 붙잡는 일도 없어졌습니다.
+  - `ln ~/.acp-gateway/install.json ./notes`처럼 보호 파일에 건 하드 링크는 읽기든 쓰기든 한 바이트도 읽거나 파일을 비우기 전에 거부합니다. descriptor를 보호 디렉터리 바로 아래의 모든 일반 파일과 장치·inode 번호로 대조하기 때문입니다. Gateway가 확인할 수 없는 보호 경로나 파일이 있으면 열기를 거부하며, Linux에서는 `/proc`이 없어서가 아닌 다른 이유로 `/proc/self/fd` 조회가 실패해도 거부합니다.
+  - `fs/read_text_file`은 읽은 텍스트에 daemon이 받아들이는 Control token이 들어 있으면 아무것도 돌려주기 전에 거부하고, 파일에 Gateway 자격 증명이 들어 있다고만 알릴 뿐 내용은 전혀 담지 않습니다. 이름과 inode를 보는 검사로는 루트 안에 있는 `install.json`의 복사본이나, installer가 같은 token으로 그 파일을 이름 바꾸기로 다시 써서(새 inode) 옛 inode에 남은 하드 링크를 알아볼 수 없기 때문입니다.
+  - 쓰기는 새 파일을 검사한 디렉터리 안에만 만듭니다. macOS에서는 열기 자체가 경로 어디에 있는 링크든 거부하고, `/proc`이 있는 Linux에서는 그 디렉터리를 열어 둔 descriptor가 검사한 디렉터리인지 `/proc`으로 확인한 뒤 그 descriptor를 거쳐 파일을 만듭니다. `/proc`이 없는 Linux와 다른 시스템에서는 쓰기 도중 디렉터리를 링크로 바꿔치기하면 쓰기가 거부되기 전에 그 링크가 가리키는 곳에 빈 파일이 남을 수 있지만, 그 파일에는 아무것도 쓰지 않습니다. 이름으로 지우는 일도 같은 바꿔치기로 다른 곳을 향할 수 있으므로, 거부된 쓰기는 아무것도 지우지 않습니다.
+- **socket 소유자 확인:**
+  - daemon은 umask 177 아래에서 socket을 만들므로, bind한 순간부터 권한이 `0600`입니다.
+  - 모든 client는 socket이 든 디렉터리를 커널처럼 link와 `..`까지 따라가 실제 경로를 구하고, 그 뒤로는 이 정규 경로만 씁니다. 연결하기 전에는 그 자리에 socket이 있다면 현재 사용자의 것인지, 그리고 파일 시스템 루트부터 socket이 든 디렉터리까지 모든 디렉터리가 그 사용자나 root의 것이고 다른 누구도 쓸 수 없는지 확인합니다(`/tmp`처럼 sticky 비트가 있는 디렉터리는 예외). 연결한 뒤에는 socket 소유자를 한 번 더 확인합니다. 하나라도 어긋나면 token을 포함해 아무것도 쓰기 전에 `SOCKET_UNTRUSTED`로 실패하고(문제가 된 디렉터리는 `details.dir`), daemon도 띄우지 않습니다. socket 소유자만 확인해서는 다른 사용자가 상위 디렉터리를 자기 socket을 가리키는 link로 바꿔치기해도 알아챌 수 없었습니다. socket이 들어갈 디렉터리 자체가 없으면 믿을 수 없는 경로로 보지 않습니다. 그 안에서 기다리는 daemon이 있을 수 없으므로, client는 아무것도 보내지 않고 socket이 없을 때처럼 daemon이 없는 것으로 봅니다.
+  - daemon도 그 경로를 건드리기 전(잠금 파일, 남은 socket 확인과 삭제, bind)에 같은 디렉터리 확인을 하고, 이 모든 작업에 정규 경로를 씁니다. 확인에 실패하면(daemon은 디렉터리를 만들지 않으므로 디렉터리가 없을 때도 포함) recovery marker에 `SOCKET_UNTRUSTED`를 기록하고 78로 종료하며, 이 daemon을 자동으로 띄운 client가 이를 보고합니다.
+  - 기본 경로는 그대로(`<tmpdir>/acp-gateway-<uid>.sock`)이며, macOS의 사용자별 임시 디렉터리와 Linux의 sticky `/tmp`에서 이 확인을 통과합니다. 다른 사용자와 함께 쓰는 Linux 호스트에서는 모든 client에 `ACP_GATEWAY_SOCKET`을 본인만 쓸 수 있는 디렉터리로 지정하세요.
+- **동작 변경:**
+  - Worker와 그 터미널은 여전히 daemon 환경 변수의 나머지를 물려받습니다. 이 환경은 daemon을 띄운 쪽(보통 프론트 도어나 installer)에서 온 것으로, API 키, 클라우드 자격 증명, `SSH_AUTH_SOCK`도 포함합니다. 빠지는 것은 Gateway 식별 정보, socket 경로, Main의 세션 표시뿐입니다. allowlist는 없으므로, 환경 변수로 로그인하는 provider는 계속 동작합니다.
+  - Main마다 자기 세션만 봅니다. 새 대화의 Main에게는 이전 세션이 넘겨받기 전까지 목록에 나오지 않습니다. 절차는 `agent-delegator` skill과 운영 가이드에 있습니다. `_PER_ROOT` 예산(세션 64개, 대기 inbox 바이트, inbox 이력)은 여전히 이 기기의 모든 Main이 함께 씁니다.
+  - Worker 자신의 CLI가 `agent-acp` MCP 서버를 시작하지 못했다고(exit 77) 보고할 수 있습니다. 거부가 제대로 동작한 결과입니다.
+  - macOS의 Gateway 터미널에서는 `ps`, `top` 같은 setuid 프로그램을 실행할 수 없고, 시작하지 못한 명령은 상태 코드 71(`sandbox-exec: execvp() of '<command>' failed`)로 끝납니다. 예전에는 없는 명령이면 프로세스 생성 자체가 실패했습니다.
+  - Linux의 `auto_approve` 세션은 Gateway 터미널마다 Main에게 묻습니다. 짧은 명령을 많이 실행하는 Worker라면 그만큼 요청이 생깁니다. 모든 OS에서 `grep -rn ".acp-gateway" src`처럼 `.acp-gateway`를 언급하는 명령은 `auto_approve`에서도 Main에게 묻습니다.
+  - execute 승인은 그 승인이 가리킨 argv, 작업 디렉터리, 환경 변수와 정확히 같은 터미널만 통과시킵니다. 같은 명령이라도 다른 형태(argv 대신 shell 스크립트, 로그인 shell, shell 문법이 든 명령줄 문자열)로, 다른 디렉터리에서, 또는 환경 변수를 하나라도 더하거나 빼거나 바꿔 다시 보내면 Main에게 다시 묻습니다.
+  - Main을 기다리는 Gateway 터미널은 프로그램이 코드를 불러오거나 실행하게 하는 변수(`PATH`, `PYTHONPATH`, `GIT_SSH_COMMAND`와 위의 나머지)와 명령줄이 참조하는 변수를 이름뿐 아니라 값까지 Main에게 보여 주고, Main에게 보여 준 작업 디렉터리에서만 실행됩니다. 기다리는 사이에 그 디렉터리가 다른 곳을 가리키게 되거나 바뀌면 터미널은 거부되며, Worker가 다시 보내야 합니다. env에 문자열이 아닌 값이 든 `terminal/create`는 거부합니다.
+  - Worker가 `fs/read_text_file`로 Control token이 든 파일(`install.json`의 복사본 등)을 읽으면 루트 안에 있더라도 실패합니다.
+  - `/proc`도 제대로 동작하는 `ps`도 없는 macOS·Linux 호스트에서는 Control MCP가 시작하지 않고, daemon은 pid를 보내는 호출자를 모두 거부합니다. AgenLynk 같은 관리 client는 계속 동작합니다.
+  - `ACP_GATEWAY_SOCKET`을 직접 지정했다면 그 경로의 디렉터리가 모두 본인이나 root의 것이고 다른 누구도 쓸 수 없어야 합니다(`/tmp` 같은 sticky 디렉터리는 예외). 그렇지 않으면 client는 `SOCKET_UNTRUSTED`로 실패하고 daemon은 시작을 거부합니다(exit 78). socket이 들어갈 디렉터리 자체가 없으면 `daemon_shutdown`과 `shutdown_if_idle`에는 예전처럼 멈춘 Gateway로 보이고, 그곳에 daemon을 띄우는 호출은 이제 socket이 없다는 오류 대신 daemon이 시작을 거부한 이유(`SOCKET_UNTRUSTED`)를 보고합니다.
+  - Linux에서 Worker의 쓰기는 상위 디렉터리를 먼저 열기 때문에, 그 디렉터리에 읽기 권한이 있어야 합니다.
+  - 1.8.0으로 처음 설치하거나 업데이트한 뒤에는 installer가 권하는 대로 token을 교체하세요. 한가할 때 Gateway를 멈추고(`acp-gateway-admin shutdown_if_idle`), `acp-gateway-bootstrap --rotate-token`을 실행한 다음, 호스트 세션과 AgenLynk처럼 식별 정보를 보관하는 앱을 다시 연결합니다. daemon은 시작할 때 받은 식별 정보만 받아들이므로, daemon이 실행 중일 때 교체하면 health check가 `CONTROL_ACCESS_DENIED`로 실패합니다. 이때는 `<socket>.lock`에 적힌 pid에 SIGTERM을 보내 그 daemon을 끝내세요.
+- **영속성:**
+  - v4 `state.json`은 더 이상 기록하지 않습니다. 남아 있는 파일은 시작할 때 계속 읽어 이전하고, 동기화된 v5 snapshot이 그 내용을 담은 뒤 지웁니다.
+  - `ACP_GATEWAY_WAL_INLINE_RESULT_BYTES`보다 큰 Task 결과는 WAL에서처럼 snapshot에도 참조(artifact 포인터와 미리보기)로 남기며, 복구도 같은 방식으로 되살립니다.
+  - WAL이 켜져 있으면 상태가 바뀌는 동안 전체 snapshot은 많아야 약 1초에 한 번, 그리고 WAL 회전과 종료 때 다시 씁니다. WAL을 끄면 50ms 경로는 그대로입니다. WAL이 보장하던 것은 하나도 바뀌지 않습니다.
+  - 손상된 상태 파일의 격리 사본은 파일과 이유별로 최신 3개만 남기고 7일이 지나면 지웁니다. 비정상 종료한 writer가 상태, snapshot, 설정, install 파일 옆에 남긴 임시 파일은 시작할 때 지웁니다.
+  - snapshot 작업 폴더에는 `owner.json`이 들어갑니다. 이 상태가 표시한 고아 폴더는 시작과 maintenance 때 회수하고, 실패한 삭제는 다시 시도하며, 살아 있는 복사본 전체가 4GiB 예산을 함께 쓰고 `session_open`에서 확인합니다(`WORKSPACE_ERROR`, `details: {bytes, usedBytes, limitBytes}`).
+  - 닫힌 pin 세션은 다른 세션처럼 보존 기간이 지나면 정리되고, 처리 완료 inbox 이력 상한(root당 1000건)은 항목이 처리될 때마다 적용됩니다.
+  - 넘겨받은 세션을 닫거나 보존 정리가 지울 때는 넘겨받은 사실을 담은 snapshot을 먼저 쓰고 동기화한 뒤에 닫기를 기록합니다. 이 쓰기에 실패하면 닫기를 기록하지 않고, maintenance나 닫기, clean이 그 사실을 저장할 수 있을 때까지 레코드를 닫힌 상태로 남겨 둡니다. 그동안 persistence는 unhealthy로 보고되며, 그 사이에 장애가 나도 넘겨받은 Main이 작업·inbox 항목과 함께 세션을 다시 가져올 수 있습니다. 명시적인 닫기는 여전히 평소처럼 응답하고 worker 세션을 끝내며, 남겨 둔 레코드에는 더 이상 프롬프트를 보내거나 설정을 바꾸거나 Worker 요청에 답할 수 없습니다.
+- **성능과 자원 상한**(1.7.2와 1.8.0을 Apple M4 Pro에서 같은 측정 도구로 측정):
+  - 상태 쓰기: 승인 40건, 약 20KB 결과의 20턴 세션에서 snapshot에 쓴 바이트가 연달아 실행할 때 2.4MB에서 0.25MB로, 단계마다 Main이 100ms 생각할 때 13.6MB에서 0.65MB로 줄었습니다. 마지막 snapshot 크기는 442KB에서 126KB로 줄었습니다.
+  - 텍스트 버퍼는 밀려난 chunk를 바로 놓고 큰 backing store를 붙잡지 않습니다. 64KiB chunk를 받는 1MB 터미널 출력은 약 65MB를 붙잡던 것이 1MB만 붙잡고, 1바이트 append 300,000번은 heap을 34MB 늘리던 것이 0.08MB만 늘립니다. 돌려주는 텍스트는 그대로입니다.
+  - 연결의 큐 예산 4MB보다 큰 응답 하나(frame 상한 32MB 이하)는 다른 것이 기다리고 있지 않으면 `TRANSPORT_CONGESTED`로 연결을 닫는 대신 그대로 보냅니다. `subscribe` replay는 이 예산의 절반으로 제한하고, 최신 이벤트부터 채우며, 잘린 경우 `cursorTruncated`와 함께 `budgetTruncated`, `omittedEvents`, `omittedBefore`로 알립니다.
+  - poll은 각 부분을 한 번만 직렬화해 poll당 직렬화 작업이 약 절반으로 줄었습니다. 요청이 취소되거나 연결이 닫힌 긴 poll은 `WAIT_ABORTED`로 waiter와 timer를 바로 정리합니다.
+  - installer가 실행하는 모든 명령(자동 adapter 업데이트 포함)에는 10분 기한이 있고, 출력은 스트림마다 처음과 마지막 512KB까지만 남깁니다. 종료할 때는 adapter 업데이트를 최대 5초만 기다린 뒤 중단합니다. 스스로 끝난 명령은 기한이 늦게 와도 자기 종료 상태를 유지합니다.
+  - Gateway 밖으로 나간 적 없는 대체된 `tool_call_update` payload 파일은 바로 지우고, 내구성 있는 Task 결과는 artifact 한도의 마지막 1/8(64MB)을 따로 확보합니다.
+- **테스트:** 38개 파일의 테스트 557개에서 46개 파일의 763개로 늘었습니다. 식별 정보 넘겨주기, Worker 감지, Main별 분리와 넘겨받기, 터미널 승인과 sandbox profile, 확인한 파일 handle, socket 소유자, 저장소 정리, 런타임 상한을 새 테스트로 다룹니다.
+- **호환성:**
+  - 그대로인 것: API major 1, state schema 5, 설정, WAL 레코드 유형, 기본 socket 경로, `install.json` 형식. AgenLynk 같은 관리 소비자에게는 `GatewayRpcClient`, `install.json`의 `identity.{token,rootId}`, bootstrap 플래그, `caller` 없는 요청의 root 전체 접근, `agent-acp` 항목 이름으로 프론트 도어를 찾는 방식이 그대로입니다.
+  - additive: 위의 오류 코드 세 개, 세션 응답의 `adoptedFrom`, 잘린 replay의 `budgetTruncated`·`omittedEvents`·`omittedBefore`, 작업 폴더 예산 오류의 `details`, installer MCP action의 `removedEnv`(교체로 빠지는 식별 정보 변수 이름).
+  - 의도적으로 바뀐 것: Main을 기다리는 Gateway 터미널·쓰기 요청의 `toolCall`(위 참고). `title`을 메서드 이름과 비교하던 소비자는 `kind`를 읽어야 합니다. 프론트 도어 Main의 조회와 목록이 돌려주는 범위(분리). socket 경로나 그 위의 디렉터리를 믿을 수 없으면 `daemon_shutdown`과 `shutdown_if_idle`이 `alreadyStopped` 대신 `SOCKET_UNTRUSTED`를 보고하는 것(socket이 들어갈 디렉터리 자체가 없는 경우는 여기에 해당하지 않으며, 여전히 `alreadyStopped`로 답합니다).
+- **다운그레이드:**
+  - 1.4~1.7 Gateway도 1.8.0이 쓴 상태를 읽지만, 참조로 남긴 큰 Task 결과는 미리보기(`resultDegraded`)로만 돌아오고, Main별 분리와 넘겨받기는 함께 사라집니다. 1.4보다 오래된 Gateway는 `state.json`을 찾지 못하고 빈 상태로 시작하며, 지워진 v4 파일은 되살릴 수 없습니다.
+  - 1.7.x 프론트 도어는 token을 항목의 환경 변수에서만 읽으므로, 1.8.0이 옮긴 항목으로는 시작할 수 없습니다. 되돌린 뒤에는 이전 installer로 Control MCP를 다시 등록하세요: `acp-gateway-bootstrap --install-control --target <프론트 도어> --force`. 이전 installer의 `--update`는 식별 정보 없는 항목을 그대로 둡니다.
+- **업그레이드:** npm 설치본은 `npm install -g acp-gateway-daemon@latest`를 실행한 뒤 `acp-gateway-bootstrap --update`를 실행하세요. installer가 등록한 Control 항목에서 token을 빼고 daemon도 다시 시작합니다. 소스 checkout은 `acp-gateway-bootstrap --update`로 업데이트하고, 앱이 관리하는 runtime은 그 앱이 업데이트합니다. 그다음 호스트 세션을 다시 연결해 1.8.0 프론트 도어를 띄우고, 바뀐 `agent-delegator` 안내는 `acp-gateway-bootstrap --update-skill`로 받으세요. installer 경고에서 token을 그대로 둔 항목이 있는지 확인하고, 위에서 설명한 대로 token을 교체하세요. 직접 지정해 둔 `ACP_GATEWAY_SOCKET`이 있다면 본인만 쓸 수 있는 디렉터리에 있는지 확인하고, 다른 사용자와 함께 쓰는 Linux 호스트에서는 모든 client에 그런 경로를 지정하세요.
+
 ## v1.7.2 변경 사항
 
 1.7.0에서 도입한 복구 관련 사실이 업그레이드와 장애 뒤에도 정확하게 유지되도록 고치고, installer가 자신이 썼다고 입증할 수 없는 MCP 항목은 다시 등록하지 않게 하며, npm 12에서도 검증된 의존성 트리를 Claude Code 바이너리 없이 설치하게 하고, npm 게시를 trusted publishing으로 바꾸고, README에서 Worker와 Gateway 제어 권한에 대해 설명한 내용을 바로잡는 패치 릴리스입니다. API major **1**과 state schema **5**는 유지되며, 새 설정·오류 코드는 없습니다. 새로 공개되는 것은 복구 결과를 디스크에 확실히 기록하지 못했을 때만 복구 응답에 붙는 `durability` 필드와 setup 경고 `STATE_RESTORE_NOT_DURABLE`뿐입니다.

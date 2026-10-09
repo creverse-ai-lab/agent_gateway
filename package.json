@@ -1,6 +1,6 @@
 {
   "name": "acp-gateway-daemon",
-  "version": "1.7.2",
+  "version": "1.8.0",
   "description": "Let your coding agent delegate work to Claude Code, Codex and Grok: a local MCP server and Agent Client Protocol (ACP) gateway with persistent sessions, approvals and crash-safe recovery.",
   "keywords": [
     "acp",

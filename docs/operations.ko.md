@@ -153,14 +153,14 @@ Dependabot 설정은 GitHub의 기본 브랜치에 존재해야 활성화되며,
 
 Gateway는 npm에 `acp-gateway-daemon`으로 게시합니다(명령 이름은 그대로 `acp-gateway-*`). 릴리스 버전이 `package.json`, `package-lock.json`, `src/version.js`의 `GATEWAY_VERSION`, 두 변경 이력의 최신 제목에 모두 반영된 commit만 게시하세요. 이 값들이 서로 맞는지는 `npm run ci`가 검사합니다. npm 버전은 바꿀 수 없습니다. 한 번 게시한 버전 번호는 unpublish한 뒤에도 다시 쓸 수 없으므로, 잘못 게시했다면 새 버전을 내는 수밖에 없습니다.
 
-- **GitHub Actions(기본 경로):** 릴리스 태그를 push한 뒤, 그 태그에서 `Publish npm` workflow(`.github/workflows/publish-npm.yml`, 수동 `workflow_dispatch`)를 입력 `version`과 함께 실행합니다. 예: `gh workflow run publish-npm.yml --ref v1.7.2 -f version=1.7.2`. 실행이 `refs/tags/v<version>`에서 시작되지 않았거나, 입력 버전이 `package.json` 버전·`GATEWAY_VERSION`과 다르거나, 패키지 이름이 `acp-gateway-daemon`이 아니거나, checkout한 커밋이 태그의 커밋과 다르면(실행 후 태그를 옮긴 경우 포함) 실패합니다. npm에 이미 있는 버전은 거부합니다. 게시 권한이 없는 job에서 `npm ci --omit=optional`로 설치한 뒤 `npm run ci`와 `npm run smoke:npm`(npm 10·11·12)을 실행하고, `scripts/pack-release.js`로 pack합니다. 이렇게 만든 tarball의 sha256이 smoke test가 설치한 tarball과 다르면 실패합니다. GitHub OIDC 토큰을 요청할 수 있는 유일한 job인 두 번째 job은 저장소 코드를 실행하지 않고, 검증된 그 tarball만 npm 11로 게시합니다(`npm publish --provenance --access public`).
+- **GitHub Actions(기본 경로):** 릴리스 태그를 push한 뒤, 그 태그에서 `Publish npm` workflow(`.github/workflows/publish-npm.yml`, 수동 `workflow_dispatch`)를 입력 `version`과 함께 실행합니다. 예: `gh workflow run publish-npm.yml --ref v1.8.0 -f version=1.8.0`. 실행이 `refs/tags/v<version>`에서 시작되지 않았거나, 입력 버전이 `package.json` 버전·`GATEWAY_VERSION`과 다르거나, 패키지 이름이 `acp-gateway-daemon`이 아니거나, checkout한 커밋이 태그의 커밋과 다르면(실행 후 태그를 옮긴 경우 포함) 실패합니다. npm에 이미 있는 버전은 거부합니다. 게시 권한이 없는 job에서 `npm ci --omit=optional`로 설치한 뒤 `npm run ci`와 `npm run smoke:npm`(npm 10·11·12)을 실행하고, `scripts/pack-release.js`로 pack합니다. 이렇게 만든 tarball의 sha256이 smoke test가 설치한 tarball과 다르면 실패합니다. GitHub OIDC 토큰을 요청할 수 있는 유일한 job인 두 번째 job은 저장소 코드를 실행하지 않고, 검증된 그 tarball만 npm 11로 게시합니다(`npm publish --provenance --access public`).
   - 게시는 npm trusted publishing(OIDC)을 사용하며, 저장소에 npm 토큰을 두지 않고 workflow도 토큰을 쓰지 않습니다. npmjs.com의 `acp-gateway-daemon` → Settings → Trusted Publisher에 GitHub Actions를 organization `creverse-ai-lab`, repository `agent_gateway`, workflow filename `publish-npm.yml`, environment 비움으로 등록하고, allowed actions에 `npm publish`를 포함해야 합니다. 2026-09-03 이후 만든 설정은 `npm publish`를 따로 체크하지 않으면 `npm stage publish`만 허용하는데, 이 workflow는 `npm publish`를 실행합니다. 각 항목은 대소문자를 구분하고 저장할 때 npm이 검증하지 않으므로, 값이 틀리면 게시 job의 실패(예: `ENEEDAUTH`, `E404`)로만 드러납니다. workflow 파일 이름을 바꾸면 이 설정을 고칠 때까지 게시할 수 없습니다.
   - trusted publishing이 동작하면 Settings → Publishing access를 "Require two-factor authentication and disallow tokens"로 바꾸세요. trusted publishing은 계속 동작하고, 유출된 토큰으로는 더 이상 게시할 수 없습니다.
   - npm은 공개 GitHub 저장소에서만 provenance를 붙이고 trusted publishing은 GitHub-hosted runner에서만 동작하므로, 저장소가 비공개인 동안에는 이 workflow로 게시할 수 없습니다.
 - **로컬 게시:** 릴리스 태그를 깨끗하게 checkout한 상태에서 `npm ci --omit=optional`로 설치하고, 검사를 돌리고, 로그인한 뒤 게시합니다. 패키지는 설치된 `node_modules`를 그대로 번들하며, `npm publish`는 잠긴 production 트리와 정확히 같지 않은 트리를 거부하는 `prepack` 검사(`scripts/pack-release.js`)를 실행하므로 `--ignore-scripts`를 붙이지 마세요. 이 경로로 게시하면 provenance가 붙지 않습니다.
 
 ```bash
-git clone --branch v1.7.2 https://github.com/creverse-ai-lab/agent_gateway.git
+git clone --branch v1.8.0 https://github.com/creverse-ai-lab/agent_gateway.git
 cd agent_gateway
 npm ci --omit=optional
 npm run ci

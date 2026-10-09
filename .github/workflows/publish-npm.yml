@@ -10,7 +10,7 @@ name: Publish npm
 # this workflow runs `npm publish`.
 #
 # Run it on the release tag:
-#   gh workflow run publish-npm.yml --ref v1.7.2 -f version=1.7.2
+#   gh workflow run publish-npm.yml --ref v1.8.0 -f version=1.8.0
 #
 # Two jobs, because any process in a job with id-token: write can exchange a
 # GitHub OIDC token for an npm publish token. `verify` runs the dependency,
@@ -24,7 +24,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Gateway version to publish (must equal package.json and GATEWAY_VERSION, e.g. 1.7.2); run it on the tag v<version>
+        description: Gateway version to publish (must equal package.json and GATEWAY_VERSION, e.g. 1.8.0); run it on the tag v<version>
         required: true
 
 permissions:
