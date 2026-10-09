@@ -287,6 +287,11 @@ export class GatewayService {
     // hold; new sessions get a process of the current definition. gc stops each
     // one once no session references it.
     this.retiredClients = new Set();
+    // The pid of every process a client of this service spawned for a worker,
+    // its provider and its terminals, from the spawn until the exit. Each client
+    // keeps its own children in it (AcpClient spawnedProcesses), so it does not
+    // depend on whether the service still holds the client (spawnedPids).
+    this.spawnedProcesses = new Set();
     this.clientStarts = new Map();
     this.stopped = false;
     // Counts transitions the table rejected. Zero is the invariant; the strict
@@ -1039,18 +1044,18 @@ export class GatewayService {
   }
 
   // The pids of every live process the daemon spawned for a worker — each
-  // provider and its terminals — across all clients, current and retired. The
-  // daemon passes this to the per-connection caller check, which refuses a
-  // control caller that is or runs under one of them, so a worker is caught even
-  // when the daemon is pid 1 and cannot be told apart by its own pid (F5). Read
-  // afresh per caller lookup: a pid a client drops when its child exits leaves
-  // the set at once, so a later process that reuses it is not refused.
+  // provider and its terminals — as a copy. The daemon passes this to the
+  // per-connection caller check, which refuses a control caller that is or runs
+  // under one of them, so a worker is caught even when the daemon is pid 1 and
+  // cannot be told apart by its own pid (F5). Each client keeps its children in
+  // the set from spawn to exit, whether or not the service still holds the
+  // client: one still starting or stopping after a failed start, a retired one
+  // gc has dropped while its stop() is still ending the provider, and a dead one
+  // a new start has replaced all count for as long as their processes run. Read
+  // afresh per caller lookup: a pid leaves at its process's exit, so a later
+  // process that reuses it is not refused.
   spawnedPids() {
-    const pids = new Set();
-    for (const client of [...this.clients.values(), ...this.retiredClients]) {
-      for (const pid of client?.spawnedPids?.() ?? []) pids.add(pid);
-    }
-    return pids;
+    return new Set(this.spawnedProcesses);
   }
 
   async withSessionAdmission(provider, context, operation) {
@@ -3347,6 +3352,8 @@ export class GatewayService {
       writeTimeoutMs: this.resourceLimits.writeTimeoutMs,
       protectedPaths: this.protectedPaths,
       terminalSandbox: this.terminalSandbox,
+      // Where the client keeps the pids of the processes it spawns (spawnedPids).
+      spawnedProcesses: this.spawnedProcesses,
       onExit: (error) => {
         const text = error?.message ?? String(error);
         // Through each session's mailbox: a close already in flight has to finish

@@ -53,7 +53,11 @@ export const ERROR_CODES = Object.freeze({
   // with it (type, ownerUid, mode or reason) for the directory chain. The
   // daemon raises it as a startup halt: it checks the same chain before it
   // locks, probes, unlinks or binds anything at the path, and on failure exits
-  // 78 with this code in the recovery marker.
+  // 78 with this code in the recovery marker. A socket directory that does not
+  // exist is not this to a client: nothing can be listening there, so it sends
+  // nothing and takes it as no daemon (ENOENT, alreadyStopped for a shutdown).
+  // A daemon autostarted into it halts with this code, which the client then
+  // reports from the recovery marker.
   SOCKET_UNTRUSTED: "SOCKET_UNTRUSTED",
   // The caller's pid is, or runs under, the daemon or a process the daemon
   // spawned (a provider or one of its terminals): the agent CLI behind this

@@ -73,9 +73,12 @@ export async function requireOwnSocket(path, {
  * swapped for a link to a foreign socket between this check and the connect,
  * provided the connect goes to the path returned here and not to the one
  * passed in. Throws SOCKET_UNTRUSTED, naming path and the offending component,
- * otherwise. Without a uid (Windows) nothing is checked and path comes back as
- * it is. The owner check runs first, so a stranger's socket at the path is
- * still reported as the socket it is before the chain is walked.
+ * otherwise. A socket directory that does not exist is not untrusted: nothing
+ * can be listening there, so its ENOENT is rethrown as it is, before anything
+ * is sent, and the caller takes it as it takes a missing socket (no daemon).
+ * Without a uid (Windows) nothing is checked and path comes back as it is. The
+ * owner check runs first, so a stranger's socket at the path is still reported
+ * as the socket it is before the chain is walked.
  */
 export async function requireTrustedSocket(path, {
   uid = typeof process.getuid === "function" ? process.getuid() : null,
@@ -83,7 +86,7 @@ export async function requireTrustedSocket(path, {
   realpath: realpathPath = realpath
 } = {}) {
   if (uid == null) return path;
-  const { directory, canonical } = await canonicalSocketPath(path, { uid, realpath: realpathPath });
+  const { directory, canonical } = await canonicalSocketPath(path, { uid, realpath: realpathPath, allowMissing: true });
   await requireOwnSocketAt(path, canonical, { allowMissing: true, uid, lstat: lstatPath });
   await requireTrustedChain(path, directory, { uid, lstat: lstatPath });
   return canonical;
@@ -96,7 +99,9 @@ export async function requireTrustedSocket(path, {
  * (or root's) and writable by no one else, or it refuses to put the socket
  * where another user could swap a link for it. Resolves to the canonical path,
  * the only one to lock, probe, unlink and bind; without a uid (Windows), to
- * path as it is.
+ * path as it is. A directory that does not exist is SOCKET_UNTRUSTED here, as
+ * any other that cannot be resolved: the daemon halts on it and records why,
+ * which is how an autostart into a missing directory reports it.
  */
 export async function requireTrustedSocketDir(path, {
   uid = typeof process.getuid === "function" ? process.getuid() : null,
@@ -136,12 +141,14 @@ async function requireOwnSocketAt(path, canonical, { allowMissing, uid, lstat: l
 // front of it, which the kernel follows before it, and so name a directory the
 // connect never goes through. So the realpath is the system's (fs/promises):
 // the JavaScript fs.realpath and fs.realpathSync resolve() the path first.
-async function canonicalSocketPath(path, { uid, realpath: realpathPath }) {
+// With allowMissing a directory that is not there throws its ENOENT as it is.
+async function canonicalSocketPath(path, { uid, realpath: realpathPath, allowMissing = false }) {
   const parent = dirname(path);
   let directory;
   try {
     directory = await realpathPath(parent);
   } catch (error) {
+    if (allowMissing && error?.code === "ENOENT") throw error;
     throw untrustedChain(path, parent, "its directory cannot be resolved", { uid, reason: error.message });
   }
   return { directory, canonical: join(directory, basename(path)) };

@@ -4,7 +4,7 @@ import { chmod, mkdir, realpath, symlink, unlink, writeFile } from "node:fs/prom
 import { createServer } from "node:net";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import { ERROR_CODES } from "../src/errors.js";
+import { ERROR_CODES, GatewayError } from "../src/errors.js";
 import { listenPrivately, requireOwnSocket, requireTrustedSocket, requireTrustedSocketDir } from "../src/private-socket.js";
 import { GatewayRpcClient } from "../src/socket-rpc.js";
 import { statePaths } from "../src/state-store.js";
@@ -467,5 +467,82 @@ test("the daemon binds, locks and removes, and a client connects to, the canonic
     }
     assert.deepEqual(readdirSync(real).filter((name) => name.startsWith("gateway.sock")), []);
     assert.deepEqual(readdirSync(other), []);
+  });
+});
+
+// R3 (1.8.0 release review): a socket directory that does not exist failed the
+// client's trust check with SOCKET_UNTRUSTED, so daemon_shutdown and
+// shutdown_if_idle reported that instead of alreadyStopped, and no client would
+// start a daemon there. Nothing can be listening in a directory that is not
+// there, so the client rethrows the ENOENT as it is, before anything is sent;
+// the daemon, which would have to bind there, still halts on it.
+
+test("a socket directory that does not exist is ENOENT to the client's check and untrusted to the daemon's", { skip: !posix }, async () => {
+  await withTemp(SOCKET_DIR, async (directory) => {
+    const path = join(directory, "missing", "g.sock");
+    await assert.rejects(requireTrustedSocket(path), (error) => {
+      assert.equal(error.code, "ENOENT", error.message);
+      assert.equal(error instanceof GatewayError, false, "the realpath's own error");
+      return true;
+    });
+    await assert.rejects(requireTrustedSocketDir(path), (error) => {
+      assert.equal(error.code, ERROR_CODES.SOCKET_UNTRUSTED, error.message);
+      assert.equal(error.details.dir, dirname(path));
+      assert.match(error.message, /its directory cannot be resolved/);
+      return true;
+    });
+  });
+  // Rethrown as it is, and only for ENOENT: a directory that cannot be resolved
+  // for any other reason is still refused.
+  const missing = Object.assign(new Error("ENOENT: no such file or directory"), { code: "ENOENT" });
+  const failing = (error) => ({ realpath: async () => { throw error; }, lstat: async () => assert.fail("nothing is checked past the realpath") });
+  await assert.rejects(requireTrustedSocket(SOCK, { uid: CHAIN_UID, ...failing(missing) }), (error) => error === missing);
+  for (const code of ["ENOTDIR", "EACCES", "ELOOP"]) {
+    await assert.rejects(requireTrustedSocket(SOCK, { uid: CHAIN_UID, ...failing(Object.assign(new Error(code), { code })) }), (error) => {
+      assert.equal(error.code, ERROR_CODES.SOCKET_UNTRUSTED, code);
+      assert.equal(error.details.dir, SOCK_DIR);
+      return true;
+    });
+  }
+  await assert.rejects(requireTrustedSocketDir(SOCK, { uid: CHAIN_UID, ...failing(missing) }), (error) => error.code === ERROR_CODES.SOCKET_UNTRUSTED);
+});
+
+test("with its socket directory missing a shutdown finds the Gateway already stopped, and an autostart reports the daemon's halt", { skip: !posix, timeout: 60_000 }, async () => {
+  await withTemp(SOCKET_DIR, async (directory) => {
+    const path = join(directory, "missing", "g.sock");
+    const statePath = join(directory, "state", "state.json");
+    // The daemon a call autostarts inherits this environment: keep it isolated.
+    await withEnv({
+      ACP_GATEWAY_STATE: statePath,
+      ACP_GATEWAY_SETTINGS: join(directory, "state", "settings.json"),
+      ACP_GATEWAY_INSTALL_STATE: join(directory, "state", "install.json"),
+      ACP_GATEWAY_WORKSPACES: join(directory, "workspaces"),
+      ACP_GATEWAY_AGENT_AUTO_UPDATE: "false"
+    }, async () => {
+      const rpc = new GatewayRpcClient({ socketPath: path, token: TOKEN, rootId: "main-x", statePath });
+      const observer = new GatewayRpcClient({ socketPath: path, token: TOKEN, rootId: "main-x", statePath, autoStart: false });
+      try {
+        assert.deepEqual(await rpc.call("daemon_shutdown", {}, 5_000), { ok: true, alreadyStopped: true });
+        assert.deepEqual(await rpc.call("shutdown_if_idle", {}, 5_000), { ok: true, alreadyStopped: true });
+        await assert.rejects(observer.call("setup", {}, 5_000), (error) => error.code === "ENOENT");
+        assert.equal(existsSync(dirname(statePath)), false, "no daemon was started, so none halted");
+        // Any other call starts a daemon, as for a missing socket. That daemon
+        // cannot resolve the directory either: it halts (exit 78) and leaves its
+        // reason in the recovery marker, which is what clients report from then on.
+        await assert.rejects(rpc.call("setup", {}, 20_000));
+        const marker = statePaths(statePath).marker;
+        for (let attempt = 0; attempt < 200 && !existsSync(marker); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+        assert.equal(JSON.parse(readFileSync(marker, "utf8")).errorCode, ERROR_CODES.SOCKET_UNTRUSTED);
+        await assert.rejects(observer.call("setup", {}, 5_000), (error) => {
+          assert.equal(error.code, ERROR_CODES.SOCKET_UNTRUSTED, error.message);
+          assert.match(error.message, /^Gateway could not start: Refusing Gateway socket .*: its directory cannot be resolved/);
+          return true;
+        });
+      } finally {
+        rpc.close();
+        observer.close();
+      }
+    });
+    assert.equal(existsSync(dirname(path)), false, "nothing created the socket's directory");
   });
 });

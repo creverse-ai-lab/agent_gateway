@@ -15,10 +15,10 @@ import { GatewayRpcClient } from "../src/socket-rpc.js";
 import {
   callerVerdicts, canReadAncestry, daemonLockPid, findAncestor, MAX_ANCESTRY_DEPTH, readProcessInfo, runsGatewayDaemon,
   runsUnder, WORKER_CALLER_ANCESTRY_UNVERIFIABLE, WORKER_CALLER_UNDER_DAEMON, WORKER_CALLER_UNDER_SPAWNED,
-  WORKER_TREE_EXIT_CODE, workerControlDeniedMessage, workerTreeReason
+  WORKER_TREE_ANCESTRY_UNREADABLE, WORKER_TREE_EXIT_CODE, workerControlDeniedMessage, workerTreeReason, workerTreeRefusalMessage
 } from "../src/worker-tree.js";
 import { startDaemon } from "./helpers/daemon-harness.js";
-import { withTemp } from "./helpers/scratch.js";
+import { processGone, withEnv, withTemp } from "./helpers/scratch.js";
 
 // W1 (1.8.0 review): a Codex worker the daemon started loaded the user's own
 // ~/.codex/config.toml and launched the Control MCP registered there, which
@@ -30,6 +30,7 @@ import { withTemp } from "./helpers/scratch.js";
 const frontDoor = fileURLToPath(new URL("../src/index.js", import.meta.url));
 const configMcpAgent = fileURLToPath(new URL("./mock-config-mcp-agent.js", import.meta.url));
 const capabilityAgent = fileURLToPath(new URL("./mock-capability-agent.js", import.meta.url));
+const permissionAgent = fileURLToPath(new URL("./mock-permission-agent.js", import.meta.url));
 const unix = process.platform !== "win32";
 
 // An injected process table, pid -> [ppid, command], and the pids it was asked for.
@@ -41,6 +42,27 @@ function processTable(entries) {
     return entry ? { ppid: entry[0], command: entry[1] } : null;
   };
   return { readProcess, reads };
+}
+
+const byPid = (pids) => [...pids].sort((a, b) => a - b);
+
+// Terminal scripts that say "ready" once they run: one that is done then, one
+// that keeps running, and one that also ignores SIGTERM.
+const READY = "console.log('ready');";
+const READY_AND_RUNNING = "console.log('ready'); setInterval(() => {}, 1000);";
+const STUBBORN = "process.on('SIGTERM', () => {}); console.log('ready'); setInterval(() => {}, 1000);";
+
+// One turn of the permission mock on a started client that opens a terminal for
+// each script and leaves it to run (hold); the terminals' records, once each has
+// said it runs.
+async function heldTerminals(client, cwd, scripts) {
+  const { sessionId } = await client.sessionNew({ cwd, permissionPolicy: "auto_approve" });
+  const steps = scripts.map((script) => ({ terminal: { command: process.execPath, args: ["-e", script], hold: true } }));
+  const held = await client.sessionPrompt({ sessionId, prompt: JSON.stringify({ steps }) });
+  assert.deepEqual(JSON.parse(held.stopReason), steps.map(() => "terminal-held"));
+  const terminals = [...client.terminals.values()];
+  for (const terminal of terminals) await waitFor(() => terminal.outputBuffer.toString().includes("ready"), () => "a terminal to start");
+  return terminals;
 }
 
 // What W1 looked like: front door <- codex <- the adapter <- npm exec <- daemon.
@@ -291,6 +313,106 @@ test("F6: where no host can read ancestry at all (no /proc, no ps), an unreadabl
   assert.equal(await callerVerdicts({ daemonPid: 40, readProcess: unreadable, ancestrySupported: false })(100).denied, null);
 });
 
+// R1 (1.8.0 release review): with /proc mounted hidepid=1 or 2 a user cannot
+// see another user's processes, so the walk of a Main started over SSH is cut
+// short at the root-owned sshd above its login shell, and F6 refused that Main
+// (exit 77) although /proc and ps work. The front door now fails closed on a
+// walk cut short only where it cannot read its own entry either, the broken
+// host F6 is about; anywhere else the walk ends there, no daemon above.
+test("R1: a walk cut short by a process this user cannot see ends there, unless this process cannot read itself either", async () => {
+  const socketPath = "/nonexistent/gateway.sock";
+  // The front door (150), the agent CLI, the login shell and sshd's session
+  // process are this user's; sshd's privileged monitor above them (60) is
+  // root's, and hidepid hides it: its read fails as a gone process's would.
+  const sshMain = {
+    150: [100, "node /home/me/.acp-gateway/runtime/current/gateway/src/index.js"],
+    100: [90, "/home/me/.local/bin/claude"],
+    90: [80, "-bash"],
+    80: [60, "sshd: me@pts/0"]
+  };
+  const hidden = processTable(sshMain);
+  assert.equal(await workerTreeReason({ env: {}, pid: 150, ppid: 100, socketPath, readProcess: hidden.readProcess }), null);
+  assert.deepEqual(hidden.reads, [100, 90, 80, 60, 150], "up to the hidden process, then this process's own entry");
+  // A read of the hidden process that throws (ps refusing it) ends the walk alike.
+  const refusing = async (pid) => {
+    if (pid === 60) throw new Error("ps refused");
+    return processTable(sshMain).readProcess(pid);
+  };
+  assert.equal(await workerTreeReason({ env: {}, pid: 150, ppid: 100, socketPath, readProcess: refusing }), null);
+
+  // A worker's chain reaches the daemon through this user's own processes,
+  // which hidepid never hides, so the daemon is found before anything hidden.
+  const underDaemon = processTable({ ...WORKER_CHAIN, 150: [100, "node /x/src/index.js"], 40: [35, WORKER_CHAIN[40][1]] });
+  assert.match(
+    await workerTreeReason({ env: {}, pid: 150, ppid: 100, socketPath, readProcess: underDaemon.readProcess }),
+    /^ancestor process 40 runs the Gateway daemon: /
+  );
+  assert.deepEqual(underDaemon.reads, [100, 50, 45, 40], "neither the process above it nor this one is read");
+
+  // This process cannot read even itself: the host can place no process, and
+  // the front door is refused as unverifiable, not as a worker.
+  const noSelf = { ...sshMain };
+  delete noSelf[150];
+  for (const readProcess of [
+    processTable(noSelf).readProcess,
+    async (pid) => {
+      if (pid === 150) throw new Error("ps blocked");
+      return processTable(noSelf).readProcess(pid);
+    }
+  ]) assert.equal(await workerTreeReason({ env: {}, pid: 150, ppid: 100, socketPath, readProcess }), WORKER_TREE_ANCESTRY_UNREADABLE);
+  // Only a walk cut short asks: one read all the way to pid 1 never does.
+  const whole = processTable({ ...noSelf, 80: [1, "sshd: me@pts/0"] });
+  assert.equal(await workerTreeReason({ env: {}, pid: 150, ppid: 100, socketPath, readProcess: whole.readProcess }), null);
+  assert.deepEqual(whole.reads, [100, 90, 80]);
+
+  // Where no ancestry is read at all (Windows), nothing changes: marker only,
+  // and this process is never probed.
+  const nothing = processTable({});
+  assert.equal(await workerTreeReason({ env: {}, pid: 150, ppid: 100, socketPath, readProcess: nothing.readProcess, ancestrySupported: false }), null);
+  assert.deepEqual(nothing.reads, [100]);
+  // The marker still decides before any of it.
+  assert.equal(
+    await workerTreeReason({ env: { [GATEWAY_WORKER_ENV]: "1" }, pid: 150, ppid: 100, socketPath, readProcess: () => assert.fail("the marker decides first") }),
+    "ACP_GATEWAY_WORKER=1 is set"
+  );
+});
+
+// R2 (1.8.0 release review): the front door said "refusing to start inside a
+// Gateway worker" also when it had found no worker, only an ancestry it could
+// not read. It now says it cannot tell.
+test("R2: the front door's refusal names the worker it found, or says it cannot tell", async () => {
+  await withTemp("acp-r2-", async (directory) => {
+    const socketPath = join(directory, "gateway.sock");
+    await writeFile(`${socketPath}.lock`, "40\n");
+    const { readProcess } = processTable(WORKER_CHAIN);
+    const found = [
+      await workerTreeReason({ env: { [GATEWAY_WORKER_ENV]: "1" }, ppid: 100, socketPath, readProcess }),
+      await workerTreeReason({ env: {}, ppid: 100, socketPath, readProcess }),
+      await workerTreeReason({ env: {}, ppid: 100, socketPath: join(directory, "other.sock"), readProcess })
+    ];
+    assert.deepEqual(found.map((reason) => reason.split(" ").slice(0, 4).join(" ")), [
+      "ACP_GATEWAY_WORKER=1 is set",
+      "ancestor process 40 holds",
+      "ancestor process 40 runs"
+    ]);
+    for (const reason of found) {
+      assert.equal(
+        workerTreeRefusalMessage(reason),
+        `acp-gateway-control: refusing to start inside a Gateway worker (${reason}). `
+          + "Only a Main's agent CLI may run the Control MCP; workers never get it."
+      );
+    }
+    const unreadable = await workerTreeReason({ env: {}, ppid: 100, socketPath, readProcess: async () => null });
+    assert.equal(unreadable, WORKER_TREE_ANCESTRY_UNREADABLE);
+    assert.equal(
+      workerTreeRefusalMessage(unreadable),
+      "acp-gateway-control: refusing to start: it cannot tell whether it runs inside a Gateway worker, because its process "
+        + "ancestry cannot be read (no /proc, and ps is missing or blocked). Workers never get the Control, so it starts only "
+        + "once /proc or ps is available."
+    );
+  });
+});
+
 // F5 (1.8.0 review): when the daemon is pid 1 (a container entrypoint with no
 // init) the ancestry walk cannot match a caller to the daemon's own pid — pid 1
 // ends every chain — so a worker whose CLI forwards no marker (Codex) was not
@@ -363,33 +485,279 @@ test("F5: a started client reports its provider pid and drops it on stop", async
   assert.deepEqual(client.spawnedPids(), [], "nothing after stop nulls the provider");
 });
 
-test("F5: a client includes a live terminal pid and drops it once the terminal exits", () => {
-  // White-box on the gating, so it holds on every platform regardless of terminal
-  // approval: the provider pid is reported, a terminal whose child is live is
-  // reported, and one whose child has exited (exitStatus set) is left out even
-  // while its record lingers in `terminals` until the worker releases it.
-  const client = new AcpClient({ provider: "mock", command: "node", args: [] });
-  client.proc = { pid: 4242 };
-  client.terminals.set("terminal-1", { child: { pid: 5000 }, exitStatus: null });
-  client.terminals.set("terminal-2", { child: { pid: 5001 }, exitStatus: null });
-  assert.deepEqual(client.spawnedPids().sort((a, b) => a - b), [4242, 5000, 5001]);
-  // terminal-1's child exits: its pid leaves the set, lingering record and all.
-  client.terminals.get("terminal-1").exitStatus = { exitCode: 0, signal: null };
-  assert.deepEqual(client.spawnedPids().sort((a, b) => a - b), [4242, 5001]);
-  // The provider exits (proc nulled by stop/#fail): only the live terminal remains.
-  client.proc = null;
-  assert.deepEqual(client.spawnedPids(), [5001]);
+test("F5: a client includes a live terminal pid and drops it once the terminal exits", { skip: !unix }, async () => {
+  // The provider and each terminal count while their processes run; one that has
+  // exited is left out even while its record lingers in `terminals` until the
+  // worker releases it.
+  await withTemp("acp-f5-terminals-", async (directory) => {
+    const client = new AcpClient(
+      { provider: "mock", command: process.execPath, args: [permissionAgent], permissionPolicy: "auto_approve" },
+      { protectedPaths: [], terminalSandbox: null }
+    );
+    try {
+      await client.start();
+      const [done, running] = await heldTerminals(client, directory, [READY, READY_AND_RUNNING]);
+      await waitFor(() => done.exitStatus !== null, () => "the first terminal to exit");
+      assert.equal(client.terminals.size, 2, "its record lingers");
+      assert.deepEqual(byPid(client.spawnedPids()), byPid([client.proc.pid, running.child.pid]));
+    } finally {
+      await client.stop();
+    }
+    assert.deepEqual(client.spawnedPids(), [], "stop() ended the provider and the running terminal");
+  });
 });
 
-test("F5: the service unions the spawned pids of its clients, current and retired", async () => {
+test("F5: every client the service creates keeps its pids in one set of the service's, read as a copy", async () => {
   await withTemp("acp-f5-service-", async (directory) => {
-    const service = new GatewayService({ statePath: join(directory, "state.json"), gcIntervalMs: 0, artifactStore: { create: () => null } });
-    service.clients.set("claude", { spawnedPids: () => [101, 102] });
-    service.clients.set("codex", { spawnedPids: () => [201] });
-    // A retiring client's processes still count; a pid shared with a live client
-    // (101) appears once.
-    service.retiredClients.add({ spawnedPids: () => [301, 101] });
-    assert.deepEqual([...service.spawnedPids()].sort((a, b) => a - b), [101, 102, 201, 301]);
+    const handed = [];
+    const service = new GatewayService({
+      statePath: join(directory, "state.json"),
+      gcIntervalMs: 0,
+      artifactStore: { create: () => null },
+      // An injected factory gets the set in its options, as an AcpClient does.
+      createClient: (_provider, options) => {
+        handed.push(options.spawnedProcesses);
+        return { alive: true, initResult: {}, start: async () => ({}), stop: async () => {} };
+      }
+    });
+    try {
+      const first = await service.getClient("claude");
+      // Gone, so the next start creates another client.
+      first.alive = false;
+      await service.getClient("claude");
+      assert.equal(handed.length, 2);
+      assert.ok(handed[0] instanceof Set);
+      assert.equal(handed[1], handed[0], "one set for every client");
+      // A client adds a child's pid at its spawn and removes it at its exit.
+      handed[0].add(101).add(102);
+      const pids = service.spawnedPids();
+      assert.deepEqual(byPid(pids), [101, 102]);
+      pids.delete(101);
+      assert.deepEqual(byPid(service.spawnedPids()), [101, 102], "a copy: the caller check cannot change the set");
+      handed[1].delete(101);
+      assert.deepEqual(byPid(service.spawnedPids()), [102]);
+    } finally {
+      await service.shutdown();
+    }
+  });
+});
+
+// R4 (1.8.0 release review): a teardown dropped the provider's or a terminal's
+// handle as it started (#fail, a released terminal, a closed session's) or once
+// stop()'s bounded wait was over, and the pid left spawnedPids() with it, while
+// a process that ignores SIGTERM runs on through the grace; and the service
+// counted only the clients it still held, so a retired client gc had dropped
+// before its stop() was done, a dead one a new start had replaced, or one whose
+// start was under way or had failed counted for nothing. Under a pid-1 daemon a
+// markerless Control MCP one of their processes started then was not refused.
+// Each client now keeps every child's pid, in its own set and in one the service
+// hands it, from the spawn until the child's exit.
+
+// A GatewayService whose clients run the permission mock, with its state in
+// directory. The nth client it creates takes starts[n] (later ones are
+// ordinary): a stubborn one ignores SIGTERM and gets a grace no test waits out,
+// so the test ends it; any other entry is an AcpClient option. shutdown() first
+// ends whatever a failed test left running.
+function mockService(directory, starts = []) {
+  const created = [];
+  const service = new GatewayService({
+    statePath: join(directory, "state.json"),
+    gcIntervalMs: 0,
+    createClient: (_provider, options) => {
+      const { stubborn = false, ...overrides } = starts[created.length] ?? {};
+      const client = new AcpClient(
+        { provider: "mock", command: process.execPath, args: [permissionAgent], env: stubborn ? { ACP_MOCK_IGNORE_SIGTERM: "1" } : {}, permissionPolicy: "auto_approve" },
+        { ...options, ...(stubborn ? { killGraceMs: 60_000 } : {}), ...overrides }
+      );
+      created.push(client);
+      return client;
+    }
+  });
+  const shutdown = async () => {
+    for (const pid of service.spawnedPids()) if (!processGone(pid)) process.kill(pid, "SIGKILL");
+    await service.shutdown();
+  };
+  return { service, created, shutdown };
+}
+
+test("R4: a terminal that stop() gave up on stays a spawned pid until it exits", { skip: !unix }, async () => {
+  await withTemp("acp-r4-stop-", async (directory) => {
+    // The terminal's group gets the SIGTERM, which it ignores; its SIGKILL is
+    // swallowed and every check finds it running, so stop() gives up on it after
+    // the bounded wait, as on a process stuck in the kernel.
+    const killProcess = (pid, signal) => (pid < 0 && signal !== "SIGTERM" ? true : process.kill(pid, signal));
+    const client = new AcpClient(
+      { provider: "mock", command: process.execPath, args: [permissionAgent], permissionPolicy: "auto_approve" },
+      { protectedPaths: [], terminalSandbox: null, killGraceMs: 100, killProcess }
+    );
+    let terminalPid = null;
+    try {
+      await client.start();
+      const [terminal] = await heldTerminals(client, directory, [STUBBORN]);
+      terminalPid = terminal.child.pid;
+      const exited = once(terminal.child, "exit");
+      await client.stop();
+      assert.equal(client.terminals.size, 0, "stop() dropped the terminal's record");
+      assert.equal(processGone(terminalPid), false, "and gave up on its process");
+      assert.deepEqual(client.spawnedPids(), [terminalPid], "which still counts, unlike the provider that exited");
+      process.kill(terminalPid, "SIGKILL");
+      await exited;
+      assert.deepEqual(client.spawnedPids(), []);
+    } finally {
+      if (terminalPid && !processGone(terminalPid)) process.kill(terminalPid, "SIGKILL");
+      await client.stop().catch(() => {});
+    }
+  });
+});
+
+test("R4: a provider that ignores SIGTERM stays a spawned pid after a fatal error drops its handle, until it exits", { skip: !unix }, async () => {
+  const client = new AcpClient(
+    { provider: "mock", command: process.execPath, args: [permissionAgent], env: { ACP_MOCK_IGNORE_SIGTERM: "1" }, permissionPolicy: "auto_approve" },
+    { maxFrameBytes: 4096, killGraceMs: 1_000 }
+  );
+  let provider = null;
+  try {
+    await client.start();
+    provider = client.proc;
+    const exited = once(provider, "exit");
+    // A frame over maxFrameBytes is a fatal read overflow: #fail drops the
+    // handle and starts the bounded teardown, whose SIGTERM this provider ignores.
+    provider.stdout.emit("data", Buffer.alloc(5_000, 0x78));
+    await waitFor(() => !client.alive, () => "the fatal transport error");
+    assert.equal(client.proc, null);
+    assert.equal(processGone(provider.pid), false, "the provider still runs");
+    assert.deepEqual(client.spawnedPids(), [provider.pid]);
+    // The SIGKILL after the grace ends it, and its exit takes the pid out.
+    await exited;
+    assert.deepEqual(client.spawnedPids(), []);
+  } finally {
+    await client.stop().catch(() => {});
+    if (provider?.pid && !processGone(provider.pid)) process.kill(provider.pid, "SIGKILL");
+  }
+});
+
+test("R4: a terminal that ignores SIGTERM stays a spawned pid after the provider's exit drops its record, until it exits", { skip: !unix }, async () => {
+  await withTemp("acp-r4-terminal-", async (directory) => {
+    const client = new AcpClient(
+      { provider: "mock", command: process.execPath, args: [permissionAgent], permissionPolicy: "auto_approve" },
+      { protectedPaths: [], terminalSandbox: null, killGraceMs: 1_000 }
+    );
+    let terminalPid = null;
+    try {
+      await client.start();
+      const [terminal] = await heldTerminals(client, directory, [STUBBORN]);
+      terminalPid = terminal.child.pid;
+      const exited = once(terminal.child, "exit");
+      assert.deepEqual(byPid(client.spawnedPids()), byPid([client.proc.pid, terminalPid]));
+      // The provider dies: #fail clears the terminals and starts ending them.
+      client.proc.kill("SIGKILL");
+      await waitFor(() => !client.alive, () => "the provider's exit");
+      assert.equal(client.terminals.size, 0, "the terminal's record is gone");
+      assert.equal(processGone(terminalPid), false, "its process is not");
+      assert.deepEqual(client.spawnedPids(), [terminalPid]);
+      await exited;
+      assert.deepEqual(client.spawnedPids(), []);
+    } finally {
+      await client.stop().catch(() => {});
+      if (terminalPid && !processGone(terminalPid)) process.kill(terminalPid, "SIGKILL");
+    }
+  });
+});
+
+test("R4: a retired provider that gc lets go of before its stop() is done stays a spawned pid until it exits", { skip: !unix }, async () => {
+  await withTemp("acp-r4-retired-", async (directory) => {
+    const providersPath = join(directory, "providers.json");
+    const definition = (version) => JSON.stringify({
+      version: 1,
+      providers: { mockreg: { registryVersion: version, command: process.execPath, args: [permissionAgent, `--v=${version}`], env: {}, modelScope: "session" } }
+    });
+    await writeFile(providersPath, definition("1.0.0"));
+    await withEnv({ ACP_GATEWAY_PROVIDERS: providersPath }, async () => {
+      const { service, shutdown } = mockService(directory, [{ stubborn: true }]);
+      try {
+        await service.init();
+        const retired = await service.getClient("mockreg");
+        const provider = retired.proc;
+        const exited = once(provider, "exit");
+        // An adapter update changes the definition: the next start retires this
+        // process, and gc stops it once it serves no session.
+        await writeFile(providersPath, definition("2.0.0"));
+        assert.notEqual(await service.getClient("mockreg"), retired);
+        assert.equal(service.retiredClients.has(retired), true);
+        const maintenance = service.runMaintenance();
+        // gc drops the client first, then waits for its stop(), whose SIGTERM
+        // this provider ignores.
+        await waitFor(() => !service.retiredClients.has(retired), () => "gc to let go of the retired client");
+        assert.equal(processGone(provider.pid), false, "its stop() is still ending the provider");
+        assert.deepEqual([...service.spawnedPids()], [provider.pid], "the current provider, which gc stopped first, has exited");
+        process.kill(provider.pid, "SIGKILL");
+        await exited;
+        await maintenance;
+        assert.equal(service.spawnedPids().size, 0);
+      } finally {
+        await shutdown();
+      }
+    });
+  });
+});
+
+test("R4: a provider that ignores SIGTERM stays a spawned pid after a fatal error and a new start replace its client, until it exits", { skip: !unix }, async () => {
+  await withTemp("acp-r4-replaced-", async (directory) => {
+    const { service, shutdown } = mockService(directory, [{ stubborn: true, maxFrameBytes: 4096 }]);
+    try {
+      await service.init();
+      const dead = await service.getClient("claude");
+      const provider = dead.proc;
+      const exited = once(provider, "exit");
+      // A fatal read overflow: #fail drops the provider's handle and starts the
+      // teardown, whose SIGTERM this provider ignores.
+      provider.stdout.emit("data", Buffer.alloc(5_000, 0x78));
+      await waitFor(() => !dead.alive, () => "the fatal transport error");
+      // The next start replaces the dead client, which the service then holds nowhere.
+      const replacement = await service.getClient("claude");
+      assert.notEqual(replacement, dead);
+      assert.equal([...service.clients.values(), ...service.retiredClients].includes(dead), false);
+      assert.equal(processGone(provider.pid), false, "its provider still runs");
+      assert.deepEqual(byPid(service.spawnedPids()), byPid([provider.pid, replacement.proc.pid]));
+      process.kill(provider.pid, "SIGKILL");
+      await exited;
+      assert.deepEqual([...service.spawnedPids()], [replacement.proc.pid]);
+    } finally {
+      await shutdown();
+    }
+  });
+});
+
+test("R4: a provider whose start fails stays a spawned pid while its client is in no list, until it exits", { skip: !unix }, async () => {
+  await withTemp("acp-r4-failed-start-", async (directory) => {
+    // A provider that fixes its model at start has to name the one asked for. The
+    // mock names none, so the start fails once the provider is up and stops a
+    // client the service never listed.
+    const providersPath = join(directory, "providers.json");
+    await writeFile(providersPath, JSON.stringify({
+      version: 1,
+      providers: { mockreg: { command: process.execPath, args: [permissionAgent], env: {}, modelScope: "process" } }
+    }));
+    await withEnv({ ACP_GATEWAY_PROVIDERS: providersPath }, async () => {
+      const { service, created, shutdown } = mockService(directory, [{ stubborn: true }]);
+      try {
+        await service.init();
+        const starting = service.getClient("mockreg", "fixed-model");
+        starting.catch(() => {});
+        await waitFor(() => created[0]?.proc && !created[0].alive, () => "the failed start to stop its client");
+        const provider = created[0].proc;
+        const exited = once(provider, "exit");
+        assert.equal(service.clients.size + service.retiredClients.size, 0, "the client is in no list");
+        assert.equal(processGone(provider.pid), false, "its stop() is still ending the provider");
+        assert.deepEqual([...service.spawnedPids()], [provider.pid]);
+        process.kill(provider.pid, "SIGKILL");
+        await exited;
+        await assert.rejects(starting, /required model=fixed-model, actual=<missing>/);
+        assert.equal(service.spawnedPids().size, 0);
+      } finally {
+        await shutdown();
+      }
+    });
   });
 });
 

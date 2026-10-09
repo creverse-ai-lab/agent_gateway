@@ -105,6 +105,13 @@ export class AcpClient {
     this.sessionRoots = new Map();
     this.sessionPolicies = new Map();
     this.terminals = new Map();
+    // The pids of this client's provider and terminals, each from its spawn
+    // until its exit (#trackSpawned). spawnedProcesses is the set the service
+    // hands every client it creates (GatewayService.spawnedPids), kept by the
+    // same rule, so it still holds a process after the service has let go of
+    // this client; null when there is none.
+    this.livePids = new Set();
+    this.spawnedProcesses = options.spawnedProcesses ?? null;
     this.initResult = null;
     this.stderr = "";
     this.alive = false;
@@ -124,6 +131,7 @@ export class AcpClient {
       env: workerEnv({ ...this.config.env, NO_COLOR: "1" }),
       ...(this.config.cwd ? { cwd: this.config.cwd } : {})
     });
+    this.#trackSpawned(this.proc);
     this.alive = true;
     this.proc.once("error", (error) => this.#fail(error));
     this.proc.once("close", (code, signal) => {
@@ -223,22 +231,35 @@ export class AcpClient {
     this.initResult = null;
   }
 
-  // The pids of the live processes this client spawned: the provider, and each
-  // terminal whose child has not exited. The service aggregates these so the
-  // daemon can refuse a control caller that is or runs under one of them
-  // (worker-tree.js), which catches a worker even when the daemon is pid 1. A
-  // terminal whose child has exited is left out even while its record lingers in
-  // `terminals` (until the worker releases it): its pid is the kernel's to reuse,
-  // and a reused pid must not be taken for the terminal. The provider is dropped
-  // the moment it exits — stop() and #fail() null `proc` — so it needs no such
-  // guard here.
+  // The pids of the processes this client spawned, the provider and its
+  // terminals, each from its spawn until its exit (#trackSpawned). The daemon
+  // refuses a control caller that is or runs under one of them (worker-tree.js,
+  // through GatewayService.spawnedPids), which catches a worker even when the
+  // daemon is pid 1. No teardown takes a pid out early: not #fail nulling
+  // `proc`, not a terminal's record leaving `terminals`, not a stop() that gave
+  // up waiting, since a process that ignores SIGTERM runs on until the SIGKILL
+  // and what it starts meanwhile is still a worker's. Its exit takes it out at
+  // once, even while a record lingers (a terminal's, until the worker releases
+  // it): from then on the pid is the kernel's to reuse, and a reused pid must
+  // not be taken for the process that had it.
   spawnedPids() {
-    const pids = [];
-    if (Number.isInteger(this.proc?.pid)) pids.push(this.proc.pid);
-    for (const terminal of this.terminals.values()) {
-      if (terminal.exitStatus === null && Number.isInteger(terminal.child?.pid)) pids.push(terminal.child.pid);
-    }
-    return pids;
+    return [...this.livePids];
+  }
+
+  // A child counts from its spawn until its exit: its pid is added to this
+  // client's set, and to the service's when there is one, and removed from both
+  // on its "exit", which Node emits as it reaps the child, before the pid can
+  // be reused, whatever has become of the handle or of this client by then. A
+  // spawn that failed got no pid and is no process.
+  #trackSpawned(child) {
+    const pid = child.pid;
+    if (!Number.isInteger(pid)) return;
+    this.livePids.add(pid);
+    this.spawnedProcesses?.add(pid);
+    child.once("exit", () => {
+      this.livePids.delete(pid);
+      this.spawnedProcesses?.delete(pid);
+    });
   }
 
   request(method, params = {}, timeoutMs = null) {
@@ -839,6 +860,7 @@ export class AcpClient {
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32"
     });
+    this.#trackSpawned(child);
     const artifactWriter = this.artifactStore?.create(params.sessionId, "terminal") ?? null;
     const outputBuffer = new BoundedUtf8Text(limit, { onTrim: (buffer) => artifactWriter?.append(buffer) });
     const terminal = {

@@ -111,11 +111,12 @@ export async function findAncestor(pid, options = {}) {
 
 /**
  * The same walk as findAncestor, as {match, unreadable}: unreadable when it was
- * cut short because a process could not be read, so the chain cannot be told to
- * hold the daemon or not. A walk that reaches pid 1, loops, or exhausts maxDepth
- * read everything it looked at and is not unreadable; a match is never
- * unreadable. The front door and the daemon fail closed on unreadable where the
- * host can read ancestry at all (canReadAncestry).
+ * cut short because a process could not be read, so the rest of the chain cannot
+ * be told to hold the daemon or not. A walk that reaches pid 1, loops, or
+ * exhausts maxDepth read everything it looked at and is not unreadable; a match
+ * is never unreadable. The front door fails closed on unreadable only where the
+ * host can read ancestry at all (canReadAncestry) and this process cannot read
+ * even its own entry (workerTreeReason).
  */
 async function traceAncestry(pid, {
   pids = [],
@@ -153,6 +154,10 @@ export function daemonLockPid(socketPath = gatewaySocketPath()) {
   }
 }
 
+// workerTreeReason's reason when this process cannot read even its own entry:
+// no worker was found, but none could be ruled out either.
+export const WORKER_TREE_ANCESTRY_UNREADABLE = "its process ancestry cannot be read (no /proc, and ps is missing or blocked)";
+
 /**
  * Why this process must not serve the Control, or null. It runs inside a
  * worker when its env carries the marker the Gateway puts on workers and their
@@ -163,10 +168,15 @@ export function daemonLockPid(socketPath = gatewaySocketPath()) {
  * on the way). The lock outlives a daemon that dies without removing it, and
  * its pid may since belong to the Main's own CLI or another ancestor, which
  * would then refuse the Main; so the lock pid counts only when its command
- * line runs the daemon, or cannot be read. Run once, at startup.
+ * line runs the daemon, or cannot be read. A walk cut short by a process it
+ * cannot read is no daemon above, unless this process cannot read its own entry
+ * either: then it cannot tell (WORKER_TREE_ANCESTRY_UNREADABLE). pid and ppid
+ * are this process's and its parent's, injectable for tests. Run once, at
+ * startup.
  */
 export async function workerTreeReason({
   env = process.env,
+  pid = process.pid,
   ppid = process.ppid,
   socketPath = gatewaySocketPath(),
   readProcess = readProcessInfo,
@@ -187,14 +197,43 @@ export async function workerTreeReason({
       ? `ancestor process ${daemon.pid} holds the Gateway daemon lock ${socketPath}.lock`
       : `ancestor process ${daemon.pid} runs the Gateway daemon: ${daemon.command.slice(0, 200)}`;
   }
-  // No daemon above it. If the chain could not be read, and this host can read
-  // one at all, a worker could be hiding its daemon by denying the lookup: fail
-  // closed. A Main's own front door can always read its parent chain, and the
-  // marker already decided before any of this.
-  if (unreadable && ancestrySupported) {
-    return "its process ancestry cannot be read (no /proc and ps is unavailable or blocked), so a worker cannot be told from a Main";
+  // No daemon above, as far as the walk could read. A walk cut short by a
+  // process it could not read fails closed only where this process cannot read
+  // its own entry either, the probe callerDenied makes of the daemon's: that
+  // host (no /proc, and ps missing or blocked) can place nothing, and a worker
+  // could hide its daemon by denying the lookup. Anywhere else the walk ends
+  // there, no daemon above. With /proc mounted hidepid=1 or 2 a user cannot see
+  // another user's processes, so a Main started over SSH stops at the
+  // root-owned sshd above its login shell. Nothing is lost: the daemon runs as
+  // this user, so the chain from a worker's CLI up to it is this user's own
+  // processes, which hidepid never hides; and a worker can leave the daemon's
+  // tree anyway (a double fork, at, systemd-run --user). This check is for a
+  // worker CLI that starts the Control MCP as its own descendant (Codex does),
+  // and the marker, checked first, is the other signal.
+  if (unreadable && ancestrySupported && !(await canReadProcess(pid, readProcess))) {
+    return WORKER_TREE_ANCESTRY_UNREADABLE;
   }
   return null;
+}
+
+/** The line the front door writes to stderr when it refuses to start for reason. */
+export function workerTreeRefusalMessage(reason) {
+  return reason === WORKER_TREE_ANCESTRY_UNREADABLE
+    ? `acp-gateway-control: refusing to start: it cannot tell whether it runs inside a Gateway worker, because ${reason}. `
+      + "Workers never get the Control, so it starts only once /proc or ps is available."
+    : `acp-gateway-control: refusing to start inside a Gateway worker (${reason}). `
+      + "Only a Main's agent CLI may run the Control MCP; workers never get it.";
+}
+
+// Whether pid, a process known to be alive (this one, or the daemon itself),
+// can be read: a read that fails there is a host that can read no process at
+// all, not a process that is gone or hidden.
+async function canReadProcess(pid, readProcess) {
+  try {
+    return (await readProcess(pid)) !== null;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -271,10 +310,5 @@ async function callerDenied(pid, daemonPid, ancestrySupported, spawnedPids, opti
   const match = await findAncestor(pid, { ...options, pids: [daemonPid, ...spawned] });
   if (match) return match.pid === daemonPid ? WORKER_CALLER_UNDER_DAEMON : WORKER_CALLER_UNDER_SPAWNED;
   if (!ancestrySupported) return null;
-  const readProcess = options.readProcess ?? readProcessInfo;
-  try {
-    return (await readProcess(daemonPid)) === null ? WORKER_CALLER_ANCESTRY_UNVERIFIABLE : null;
-  } catch {
-    return WORKER_CALLER_ANCESTRY_UNVERIFIABLE;
-  }
+  return (await canReadProcess(daemonPid, options.readProcess ?? readProcessInfo)) ? null : WORKER_CALLER_ANCESTRY_UNVERIFIABLE;
 }

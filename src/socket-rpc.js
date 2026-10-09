@@ -214,7 +214,9 @@ export class GatewayRpcClient {
   // after whoever owns such a link had pointed it elsewhere. The owner is
   // checked again once connected, because whoever could create the path may
   // have bound it in between. A connection that fails the second check is
-  // destroyed unused.
+  // destroyed unused. A socket directory that is not there fails the first
+  // check with ENOENT, as a missing socket fails the connect: no daemon either
+  // way, so a shutdown is alreadyStopped and any other call may start one.
   async #connectOnce() {
     const socketPath = await requireTrustedSocket(this.socketPath);
     const socket = await new Promise((resolve, reject) => {
