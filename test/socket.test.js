@@ -13,7 +13,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 test("socket Gateway separates public guide access from Main control", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "acp-gateway-socket-"));
+  const directory = await mkdtemp(join(tmpdir(), "acp-socket-"));
   const socketPath = join(directory, "gateway.sock");
   const statePath = join(directory, "state.json");
   const token = "test-control-token-at-least-24-characters";
@@ -104,7 +104,7 @@ test("socket Gateway separates public guide access from Main control", async () 
 });
 
 test("socket client reconnects subscriptions with the last delivered cursor", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "acp-gateway-reconnect-"));
+  const directory = await mkdtemp(join(tmpdir(), "acp-reconnect-"));
   const socketPath = join(directory, "gateway.sock");
   const received = [];
   let restoredCursor;
@@ -197,7 +197,7 @@ test("socket client removes only the failed subscription on subscription_error",
 });
 
 test("concurrent daemon starts leave exactly one owner for a socket and state file", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "acp-gateway-daemon-lock-"));
+  const directory = await mkdtemp(join(tmpdir(), "acp-dmn-lock-"));
   const socketPath = join(directory, "gateway.sock");
   const statePath = join(directory, "state.json");
   const token = "daemon-lock-token-at-least-24-characters";

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, statSync, symlinkSync } from "node:fs";
 import { mkdir, readdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { AcpClient } from "../src/acp-client.js";
 import { GATEWAY_WORKER_ENV } from "../src/caller.js";
 import { GatewayService } from "../src/gateway-service.js";
+import { cwdCheckingLaunch, TERMINAL_CWD_CHANGED_EXIT_CODE, TERMINAL_CWD_SHELL } from "../src/terminal-cwd.js";
 import {
   detectTerminalSandbox,
   SANDBOX_EXEC,
@@ -1146,6 +1147,180 @@ test("N2: an unchanged pending terminal runs in the approved directory; granted 
       assert.deepEqual(await run([{ terminal: { ...recordCwd, cwd: current } }]), [ran]);
       assert.equal(requests.length, 0);
     });
+  });
+});
+
+// The check above is by path, and the child changed into its cwd by path after
+// it, so a Worker that renamed the approved directory and put a link at its
+// path in between still moved the command. The start itself is now bound to
+// the directory (terminal-cwd.js): on Linux the child starts in a descriptor of
+// it, elsewhere a script refuses to run the command anywhere else.
+
+// The three ways a terminal starts, each with the policy it needs: approved by
+// Main while it waits, on an approval Main gave the execute request before it,
+// and on its own under auto_approve. start() resolves with the outcome of the
+// terminal step.
+const STARTS = {
+  pending: {
+    policy: "ask",
+    start: async ({ client, sessionId, requests, run }, terminal) => {
+      const before = requests.length;
+      const turn = run([{ terminal }]);
+      await client.respondPermission((await request(requests, before + 1)).requestId, "allow-once", sessionId);
+      return (await turn)[0];
+    }
+  },
+  granted: {
+    policy: "ask",
+    start: async ({ client, sessionId, requests, run }, terminal) => {
+      const before = requests.length;
+      const turn = run([
+        { permission: { kind: "execute", command: [terminal.command, ...terminal.args], cwd: terminal.cwd } },
+        { terminal }
+      ]);
+      client.respondPermission((await request(requests, before + 1)).requestId, "allow", sessionId);
+      const [allowed, outcome] = await turn;
+      assert.equal(allowed, "allow");
+      assert.equal(requests.length, before + 1, "the approval covered the terminal");
+      return outcome;
+    }
+  },
+  "auto-approved": {
+    policy: "auto_approve",
+    start: async ({ run }, terminal) => (await run([{ terminal }]))[0]
+  }
+};
+
+// The approved directory and another one under base, and where the approved
+// one goes when a racing Worker moves it.
+async function raceDirectories(base) {
+  const dirs = { approved: join(base, "approved"), moved: join(base, "moved"), other: join(base, "other") };
+  await mkdir(dirs.approved, { recursive: true });
+  await mkdir(dirs.other);
+  return dirs;
+}
+
+// What that Worker does once every check has passed, right before the first
+// spawn: the approved directory goes elsewhere, and a link to the other one
+// takes its path.
+function swapBeforeSpawn({ approved, moved, other }) {
+  let swaps = 0;
+  return {
+    beforeTerminalSpawn: () => {
+      if (swaps++ > 0) return;
+      renameSync(approved, moved);
+      symlinkSync(other, approved);
+    },
+    swaps: () => swaps
+  };
+}
+
+const linuxProc = process.platform === "linux" && existsSync("/proc/self/fd") ? false : "Linux with /proc only";
+const macOnly = process.platform === "darwin" ? false : "macOS only";
+
+test("N2: on Linux a terminal starts in the approved directory itself, though its path is swapped right before the spawn", { skip: linuxProc }, async () => {
+  await withTemp("acp-n2-procfd-", async (directory) => {
+    for (const [way, { policy, start }] of Object.entries(STARTS)) {
+      const dirs = await raceDirectories(join(directory, way));
+      const race = swapBeforeSpawn(dirs);
+      await withClient({ cwd: directory, policy, protectedPaths: [], beforeTerminalSpawn: race.beforeTerminalSpawn }, async (session) => {
+        // Its cwd is named by the name the directory has now.
+        assert.deepEqual(await start(session, { ...recordCwd, cwd: dirs.approved }), {
+          output: dirs.moved,
+          exitStatus: { exitCode: 0, signal: null }
+        }, way);
+      });
+      assert.equal(race.swaps(), 1, way);
+      assert.equal(readFileSync(join(dirs.moved, "ran.txt"), "utf8"), dirs.moved, `${way}: it ran in the approved directory`);
+      assert.equal(existsSync(join(dirs.other, "ran.txt")), false, `${way}: not where the link leads`);
+    }
+  });
+});
+
+test("N2: on macOS a terminal whose path is swapped right before the spawn runs nothing and exits with the script's status", { skip: macOnly }, async () => {
+  await withTemp("acp-n2-script-race-", async (directory) => {
+    for (const [way, { policy, start }] of Object.entries(STARTS)) {
+      const dirs = await raceDirectories(join(directory, way));
+      const race = swapBeforeSpawn(dirs);
+      await withClient({ cwd: directory, policy, protectedPaths: [], beforeTerminalSpawn: race.beforeTerminalSpawn }, async (session) => {
+        assert.deepEqual(await start(session, { ...recordCwd, cwd: dirs.approved }), {
+          output: `Terminal cwd changed since it was approved: ${dirs.approved}\n`,
+          exitStatus: { exitCode: TERMINAL_CWD_CHANGED_EXIT_CODE, signal: null }
+        }, way);
+      });
+      assert.equal(race.swaps(), 1, way);
+      assert.equal(existsSync(join(dirs.other, "ran.txt")), false, `${way}: not where the link leads`);
+      assert.equal(existsSync(join(dirs.moved, "ran.txt")), false, `${way}: nor anywhere else`);
+    }
+  });
+});
+
+test("N2: on macOS the script runs outside the terminal sandbox and execs sandbox-exec, so the command is what is sandboxed", { skip: noOsSandbox }, async () => {
+  await withTemp("acp-n2-script-sandbox-", async (directory) => {
+    const guarded = join(directory, "guarded");
+    await mkdir(guarded);
+    const dirs = await raceDirectories(join(directory, "race"));
+    const race = swapBeforeSpawn(dirs);
+    await withClient({ cwd: directory, policy: "auto_approve", protectedPaths: [guarded], beforeTerminalSpawn: race.beforeTerminalSpawn }, async ({ requests, run }) => {
+      const [swapped, unswapped, missing] = await run([
+        { terminal: { ...recordCwd, cwd: dirs.approved } },
+        { terminal: { ...recordCwd, cwd: dirs.moved } },
+        { terminal: { command: "acp-gateway-no-such-command", args: [] } }
+      ]);
+      assert.equal(requests.length, 0, "sandboxed, so started without Main");
+      assert.deepEqual(swapped, {
+        output: `Terminal cwd changed since it was approved: ${dirs.approved}\n`,
+        exitStatus: { exitCode: TERMINAL_CWD_CHANGED_EXIT_CODE, signal: null }
+      });
+      assert.deepEqual(unswapped, { output: dirs.moved, exitStatus: { exitCode: 0, signal: null } });
+      // A command that cannot start is still sandbox-exec's to report, as before.
+      assert.equal(missing.exitStatus.exitCode, 71);
+      assert.match(missing.output, /execvp\(\) of 'acp-gateway-no-such-command' failed/);
+    });
+    assert.equal(existsSync(join(dirs.other, "ran.txt")), false);
+  });
+});
+
+test("N2: the cwd-checking script runs the command only in the approved directory and takes nothing else from its input", { skip: process.platform === "win32" }, async () => {
+  await withTemp("acp-n2-script-", async (directory) => {
+    const approved = join(directory, "approved");
+    await mkdir(approved);
+    const info = statSync(approved, { bigint: true });
+    const identity = { dev: info.dev, ino: info.ino };
+    const marker = join(directory, "ran");
+    const touch = { command: process.execPath, args: ["-e", `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "")`] };
+    const script = (launch, { cwd = approved, as = identity, env = {} } = {}) => {
+      const start = cwdCheckingLaunch(launch, cwd, as);
+      return spawnSync(start.command, start.args, { cwd: start.cwd, env: { PATH: process.env.PATH, ...env }, encoding: "utf8" });
+    };
+    const changed = (cwd) => [TERMINAL_CWD_CHANGED_EXIT_CODE, "", `Terminal cwd changed since it was approved: ${cwd}\n`];
+
+    // The approved directory: the command runs there, its args as they are.
+    const literal = ["$1", "`id`", "$(id)", "a b", "'q'", "-c"];
+    const report = "process.stdout.write(JSON.stringify([process.cwd(), process.argv.slice(1)]))";
+    const ran = script({ command: process.execPath, args: ["-e", report, ...literal] });
+    assert.deepEqual([ran.status, JSON.parse(ran.stdout), ran.stderr], [0, [approved, literal], ""]);
+    // Another directory's identity, or a cwd that is gone: nothing runs.
+    const other = script(touch, { as: { dev: identity.dev, ino: identity.ino + 1n } });
+    assert.deepEqual([other.status, other.stdout, other.stderr], changed(approved));
+    const gone = script(touch, { cwd: join(directory, "gone") });
+    assert.deepEqual([gone.status, gone.stdout, gone.stderr], changed(join(directory, "gone")));
+    // A command named like an option is a command, not an option of the
+    // shell's exec (bash's -c would run the next word).
+    assert.equal(script({ command: "-c", args: [touch.command, ...touch.args] }).status, 127);
+    assert.equal(existsSync(marker), false);
+
+    // On macOS the script runs outside the sandbox, so it must take no code
+    // from the terminal's environment, which the Worker chooses: dash takes
+    // neither functions nor shell options from it, where bash would.
+    if (process.platform === "darwin") assert.equal(TERMINAL_CWD_SHELL, "/bin/dash");
+    if (TERMINAL_CWD_SHELL === "/bin/dash") {
+      const injected = script({ command: process.execPath, args: ["-e", "process.stdout.write(process.cwd())"] }, {
+        env: { "BASH_FUNC_cd%%": "() { builtin cd /; }", SHELLOPTS: "xtrace", PS4: `$(${touch.command} -e 'require("node:fs").writeFileSync(${JSON.stringify(marker)}, "")')` }
+      });
+      assert.deepEqual([injected.status, injected.stdout, injected.stderr], [0, approved, ""]);
+      assert.equal(existsSync(marker), false);
+    }
   });
 });
 

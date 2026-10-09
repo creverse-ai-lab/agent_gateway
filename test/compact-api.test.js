@@ -810,7 +810,7 @@ test("T11: abandoning the wait does not cancel the turn; cancel does", async () 
 });
 
 test("T1b: through the real front door, the run CallToolResult IS the tasks/result one", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "acp-run-frontdoor-"));
+  const directory = await mkdtemp(join(tmpdir(), "acp-run-fd-"));
   let daemon = null;
   let mcpClient = null;
   try {

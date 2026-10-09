@@ -13,7 +13,11 @@ export const HARNESS_ROOT_ID = "main-harness";
 
 const DAEMON_PATH = fileURLToPath(new URL("../../src/gateway-daemon.js", import.meta.url));
 
-// Exported so a test can pre-seed state.json before the daemon reads it.
+// Exported so a test can pre-seed state.json before the daemon reads it. The
+// socket's canonical path has to fit in a Unix socket address, 103 bytes on
+// macOS, where a temporary directory resolves 8 bytes longer under /private, or
+// the daemon refuses it (SOCKET_PATH_TOO_LONG): test directories keep it within
+// 90.
 export function daemonPaths(directory) {
   return {
     socketPath: join(directory, "gateway.sock"),

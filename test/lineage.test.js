@@ -177,7 +177,7 @@ test("links must name tasks this root can see; a refused link starts nothing", a
 });
 
 test("through the real front door, an explicit attach is refused start-only arguments instead of dropping them", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "acp-lineage-frontdoor-"));
+  const directory = await mkdtemp(join(tmpdir(), "acp-lin-fd-"));
   let daemon = null;
   let mcpClient = null;
   let rpc = null;

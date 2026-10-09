@@ -5,7 +5,9 @@ import { createServer } from "node:net";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { ERROR_CODES, GatewayError } from "../src/errors.js";
-import { listenPrivately, requireOwnSocket, requireTrustedSocket, requireTrustedSocketDir } from "../src/private-socket.js";
+import {
+  listenPrivately, requireOwnSocket, requireTrustedSocket, requireTrustedSocketDir, SOCKET_PATH_MAX_BYTES
+} from "../src/private-socket.js";
 import { GatewayRpcClient } from "../src/socket-rpc.js";
 import { statePaths } from "../src/state-store.js";
 import { GATEWAY_VERSION } from "../src/version.js";
@@ -412,7 +414,7 @@ test("the daemon refuses to bind its socket in an untrusted directory and record
     const shared = join(directory, "shared");
     await mkdir(shared);
     await chmod(shared, 0o777);
-    const socketPath = join(shared, "gateway.sock");
+    const socketPath = join(shared, "g.sock");
     const daemon = await startDaemon({ directory, expectExit: true, env: { ACP_GATEWAY_SOCKET: socketPath } });
     const { exitCode, stderr } = await daemon.waitForExit();
     assert.equal(exitCode, 78, `operator-action halt expected; stderr: ${stderr}`);
@@ -427,7 +429,7 @@ test("the daemon checks the directory before it touches anything at the path", {
     const shared = join(directory, "shared");
     await mkdir(shared);
     await chmod(shared, 0o777);
-    const socketPath = join(shared, "gateway.sock");
+    const socketPath = join(shared, "g.sock");
     // A stale socket's probe and unlink would remove this, whoever's it is.
     await writeFile(socketPath, "someone else's");
     const daemon = await startDaemon({ directory, expectExit: true, env: { ACP_GATEWAY_SOCKET: socketPath } });
@@ -435,7 +437,7 @@ test("the daemon checks the directory before it touches anything at the path", {
     assert.equal(exitCode, 78, `operator-action halt expected; stderr: ${stderr}`);
     assert.equal(JSON.parse(readFileSync(statePaths(daemon.statePath).marker, "utf8")).errorCode, ERROR_CODES.SOCKET_UNTRUSTED);
     assert.equal(readFileSync(socketPath, "utf8"), "someone else's", "the file at the path was left alone");
-    assert.deepEqual(readdirSync(shared), ["gateway.sock"], "and no lock was created beside it");
+    assert.deepEqual(readdirSync(shared), ["g.sock"], "and no lock was created beside it");
   });
 });
 
@@ -544,5 +546,133 @@ test("with its socket directory missing a shutdown finds the Gateway already sto
       }
     });
     assert.equal(existsSync(dirname(path)), false, "nothing created the socket's directory");
+  });
+});
+
+// The canonical path is the one bound and connected, and it can be longer than
+// the configured one (on macOS a temporary directory resolves under /private).
+// Some systems take no socket path past sun_path less its NUL, and Node did not
+// refuse a longer one there but cut it short (Node 22 on macOS 14, and Linux),
+// so the daemon bound another path and a client found nothing. Both ends now
+// refuse such a path before anything is sent or bound.
+
+const tooLong = (expected = {}) => (error) => {
+  assert.equal(error.code, ERROR_CODES.SOCKET_PATH_TOO_LONG, error.message);
+  assert.equal(error.details?.limitBytes, SOCKET_PATH_MAX_BYTES);
+  for (const [key, value] of Object.entries(expected)) assert.equal(error.details?.[key], value, key);
+  assert.ok(error.message.includes(`${error.details.bytes} bytes, over the ${SOCKET_PATH_MAX_BYTES}-byte limit`), error.message);
+  return true;
+};
+
+// A directory under base (canonical, as a withTemp directory is), nested as
+// deep as it takes, in which name makes a path of exactly bytes.
+async function socketDirectoryOf(base, name, bytes) {
+  let directory = base;
+  let remaining = bytes - Buffer.byteLength(join(base, name));
+  assert.ok(remaining === 0 || remaining >= 2, `${base} cannot make a ${bytes}-byte socket path`);
+  while (remaining > 0) {
+    // A separator and a name; the last one takes what is left.
+    const segment = remaining - 1 <= 40 ? remaining - 1 : 30;
+    directory = join(directory, "d".repeat(segment));
+    remaining -= segment + 1;
+  }
+  await mkdir(directory, { recursive: true });
+  return directory;
+}
+
+test("the trust checks refuse a canonical path over the socket path limit, counted in UTF-8, before anything at it is checked", { skip: !posix }, async () => {
+  assert.equal(SOCKET_PATH_MAX_BYTES, process.platform === "linux" ? 107 : 103);
+  const spelled = "/spelled/g.sock";
+  // The parent as configured resolves to directory, so the canonical path is
+  // directory/g.sock: exactly the limit, then a byte over, in ASCII and with a
+  // two-byte character that keeps it at the limit in characters.
+  const atLimit = `/${"d".repeat(SOCKET_PATH_MAX_BYTES - "/g.sock".length - 1)}`;
+  const resolvingTo = (directory, lstat) => ({ uid: CHAIN_UID, realpath: async () => directory, lstat });
+  const chain = {
+    [`${atLimit}/g.sock`]: socketStat(CHAIN_UID),
+    [atLimit]: dirStat(CHAIN_UID, 0o700),
+    "/": dirStat(0, 0o755)
+  };
+  const lstat = async (path) => chain[path] ?? assert.fail(`unexpected lstat ${path}`);
+  assert.equal(await requireTrustedSocket(spelled, resolvingTo(atLimit, lstat)), `${atLimit}/g.sock`);
+  assert.equal(await requireTrustedSocketDir(spelled, resolvingTo(atLimit, lstat)), `${atLimit}/g.sock`);
+  const untouched = async () => assert.fail("nothing is checked at a path too long to connect to");
+  for (const directory of [`${atLimit}d`, `${atLimit.slice(0, -1)}é`]) {
+    const canonicalPath = `${directory}/g.sock`;
+    const expected = { socketPath: spelled, canonicalPath, bytes: SOCKET_PATH_MAX_BYTES + 1 };
+    await assert.rejects(requireTrustedSocket(spelled, resolvingTo(directory, untouched)), tooLong(expected));
+    await assert.rejects(requireTrustedSocketDir(spelled, resolvingTo(directory, untouched)), tooLong(expected));
+  }
+  // No uid (Windows pipes): no limit, nothing measured.
+  const long = `/${"d".repeat(200)}/g.sock`;
+  assert.equal(await requireTrustedSocket(long, { uid: null, realpath: untouched, lstat: untouched }), long);
+  assert.equal(await requireTrustedSocketDir(long, { uid: null, realpath: untouched, lstat: untouched }), long);
+});
+
+test("a client refuses a socket path over the limit for every call and starts no daemon; a shutdown is not alreadyStopped", { skip: !posix }, async () => {
+  await withTemp(SOCKET_DIR, async (directory) => {
+    const deep = await socketDirectoryOf(directory, "g.sock", SOCKET_PATH_MAX_BYTES + 1);
+    const path = join(deep, "g.sock");
+    const statePath = join(directory, "state", "state.json");
+    // Isolation in case a regression autostarts a daemon after all.
+    await withEnv({
+      ACP_GATEWAY_STATE: statePath,
+      ACP_GATEWAY_SETTINGS: join(directory, "state", "settings.json"),
+      ACP_GATEWAY_INSTALL_STATE: join(directory, "state", "install.json"),
+      ACP_GATEWAY_WORKSPACES: join(directory, "workspaces"),
+      ACP_GATEWAY_AGENT_AUTO_UPDATE: "false"
+    }, async () => {
+      const rpc = new GatewayRpcClient({ socketPath: path, token: TOKEN, rootId: "main-x", statePath });
+      try {
+        const expected = { socketPath: path, canonicalPath: path, bytes: SOCKET_PATH_MAX_BYTES + 1 };
+        await assert.rejects(rpc.call("setup", {}, 5_000), tooLong(expected));
+        // Nothing can be told about a daemon there, so a shutdown says so too.
+        await assert.rejects(rpc.call("daemon_shutdown", {}, 5_000), tooLong(expected));
+        await assert.rejects(rpc.call("shutdown_if_idle", {}, 5_000), tooLong(expected));
+        await assert.rejects(rpc.subscribe({}, () => {}, 5_000), tooLong(expected));
+      } finally {
+        rpc.close();
+      }
+    });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.deepEqual(readdirSync(deep), [], "no daemon was started: no lock, no socket");
+    assert.equal(existsSync(dirname(statePath)), false, "and none halted");
+  });
+});
+
+test("the daemon refuses a socket path over the limit and records why; at the limit daemon and client work", { skip: !posix, timeout: 60_000 }, async () => {
+  await withTemp(SOCKET_DIR, async (directory) => {
+    // A byte over: halted before it locks, probes, unlinks or binds anything.
+    const over = await socketDirectoryOf(join(directory, "o"), "gateway.sock", SOCKET_PATH_MAX_BYTES + 1);
+    const halted = await startDaemon({ directory: over, expectExit: true });
+    const { exitCode, stderr } = await halted.waitForExit();
+    assert.equal(exitCode, 78, `operator-action halt expected; stderr: ${stderr}`);
+    assert.match(stderr, /Refusing Gateway socket .*: its canonical path .* is \d+ bytes, over the \d+-byte limit/);
+    assert.equal(JSON.parse(readFileSync(statePaths(halted.statePath).marker, "utf8")).errorCode, ERROR_CODES.SOCKET_PATH_TOO_LONG);
+    assert.deepEqual(readdirSync(over).filter((name) => name.startsWith("gateway.so")), [], "no socket, cut short or not, and no lock");
+    // A client finds the path too long itself, before any marker could explain it.
+    const observer = new GatewayRpcClient({ socketPath: halted.socketPath, token: halted.token, rootId: halted.rootId, autoStart: false, statePath: halted.statePath });
+    try {
+      await assert.rejects(observer.call("setup", {}, 5_000), (error) => {
+        assert.ok(tooLong({ socketPath: halted.socketPath })(error));
+        assert.match(error.message, /^Refusing Gateway socket /);
+        return true;
+      });
+    } finally {
+      observer.close();
+    }
+
+    // At the limit: bound at the path itself, and served.
+    const at = await socketDirectoryOf(join(directory, "a"), "gateway.sock", SOCKET_PATH_MAX_BYTES);
+    const daemon = await startDaemon({ directory: at });
+    const rpc = new GatewayRpcClient({ socketPath: daemon.socketPath, token: daemon.token, rootId: daemon.rootId, autoStart: false, statePath: daemon.statePath });
+    try {
+      assert.equal(Buffer.byteLength(daemon.socketPath), SOCKET_PATH_MAX_BYTES);
+      assert.equal((await rpc.call("setup", {}, 5_000)).gatewayVersion, GATEWAY_VERSION);
+      assert.ok(lstatSync(daemon.socketPath).isSocket());
+    } finally {
+      rpc.close();
+      await daemon.stop();
+    }
   });
 });

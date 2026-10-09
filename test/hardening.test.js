@@ -834,7 +834,7 @@ test("W2: the daemon takes its identity once and leaves it out of its own env", 
 });
 
 test("W2: a daemon child cannot inherit the token, even through a spawn that forgets to scrub its env", async () => {
-  await withTemp("acp-daemon-child-env-", async (directory) => {
+  await withTemp("acp-child-env-", async (directory) => {
     const envLog = join(directory, "worker-env.json");
     const providers = await writeMockProviders(directory, { provider: "mockenv", agent: permissionAgent });
     const daemon = await startDaemon({

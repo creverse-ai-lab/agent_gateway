@@ -130,7 +130,7 @@ test("a response frame over the cap surfaces to the worker as an error", async (
 // stand-in server, so without this the rewritten sender's ordinary delivery path
 // would have no coverage at all.
 test("a real daemon delivers a live turn's events through the lane channel", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "acp-daemon-events-"));
+  const directory = await mkdtemp(join(tmpdir(), "acp-events-"));
   const providers = await writeMockProviders(directory, { permissionPolicy: "read_only" });
   const daemon = await startDaemon({ directory, env: providers });
   const client = new GatewayRpcClient({
@@ -179,7 +179,7 @@ test("a real daemon delivers a live turn's events through the lane channel", asy
 // premise underneath — that a refused write does not imply a destroyed socket —
 // is asserted deterministically in test/socket-flow.test.js.
 test("a reply to a peer that hung up mid-request cannot take the daemon down", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "acp-daemon-halfclose-"));
+  const directory = await mkdtemp(join(tmpdir(), "acp-halfclose-"));
   const daemon = await startDaemon({ directory });
   try {
     for (let round = 0; round < 5; round += 1) {
@@ -217,7 +217,7 @@ test("a reply to a peer that hung up mid-request cannot take the daemon down", a
 // One raw write of every frame, so the daemon reads the burst as a single chunk
 // and the admission counter is what decides the outcome.
 test("a control connection refuses requests past its in-flight bound without dispatching them", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "acp-daemon-inflight-"));
+  const directory = await mkdtemp(join(tmpdir(), "acp-inflight-"));
   const daemon = await startDaemon({ directory });
   const socket = createConnection(daemon.socketPath);
   await once(socket, "connect");

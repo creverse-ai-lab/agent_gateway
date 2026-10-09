@@ -25,6 +25,12 @@ const HIGH_LANE_METHODS = new Set([
 // {ok:true, alreadyStopped:true} instead.
 const NO_AUTOSTART_METHODS = new Set(["daemon_shutdown", "shutdown_if_idle"]);
 
+// What the client's own check of the socket path refuses (private-socket.js):
+// something at the path that is not this user's socket, a directory on it
+// another user could change, or a path too long for a socket. Each is reported
+// as it is: starting a daemon cannot fix it, and no recovery marker explains it.
+const SOCKET_PATH_REFUSALS = new Set([ERROR_CODES.SOCKET_UNTRUSTED, ERROR_CODES.SOCKET_PATH_TOO_LONG]);
+
 function daemonStarting(socketPath) {
   try {
     const pid = Number(readFileSync(`${socketPath}.lock`, "utf8").trim());
@@ -183,9 +189,9 @@ export class GatewayRpcClient {
     try {
       await this.#connectOnce();
     } catch (error) {
-      // Someone else's file at the path is reported as such: starting a daemon
-      // cannot fix it, and no recovery marker explains it.
-      if (error?.code === ERROR_CODES.SOCKET_UNTRUSTED) throw error;
+      // Someone else's file at the path, or a path too long for a socket, is
+      // reported as such (SOCKET_PATH_REFUSALS).
+      if (SOCKET_PATH_REFUSALS.has(error?.code)) throw error;
       if (!autoStart || !["ENOENT", "ECONNREFUSED"].includes(error?.code)) throw recoveryError(error, this.statePath);
       this.#startDaemon();
       let lastError = error;
@@ -196,7 +202,7 @@ export class GatewayRpcClient {
           lastError = null;
           break;
         } catch (retryError) {
-          if (retryError?.code === ERROR_CODES.SOCKET_UNTRUSTED) throw retryError;
+          if (SOCKET_PATH_REFUSALS.has(retryError?.code)) throw retryError;
           lastError = retryError;
         }
       }
@@ -216,7 +222,9 @@ export class GatewayRpcClient {
   // have bound it in between. A connection that fails the second check is
   // destroyed unused. A socket directory that is not there fails the first
   // check with ENOENT, as a missing socket fails the connect: no daemon either
-  // way, so a shutdown is alreadyStopped and any other call may start one.
+  // way, so a shutdown is alreadyStopped and any other call may start one. A
+  // canonical path too long for a socket fails it with SOCKET_PATH_TOO_LONG,
+  // before the connect Node would make to that path cut short.
   async #connectOnce() {
     const socketPath = await requireTrustedSocket(this.socketPath);
     const socket = await new Promise((resolve, reject) => {

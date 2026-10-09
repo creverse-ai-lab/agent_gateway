@@ -14,7 +14,7 @@ const SESSION_ID = "acp-chaos-session";
 const INBOX_ID = "inbox-chaos-pending";
 
 test("daemon restart after SIGKILL reapplies restart semantics without duplicating state", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "acp-chaos-restart-"));
+  const directory = await mkdtemp(join(tmpdir(), "acp-chaos-"));
   const { statePath } = daemonPaths(directory);
   let daemon = null;
   let client = null;

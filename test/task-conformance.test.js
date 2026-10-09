@@ -358,7 +358,7 @@ test("conformance: a per-root task budget rejection leaves the session promptabl
 });
 
 test("conformance: a budget rejection reaches Main as a structured error over the daemon socket", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "acp-task-budget-"));
+  const directory = await mkdtemp(join(tmpdir(), "acp-task-bdg-"));
   const { statePath } = daemonPaths(directory);
   let daemon = null;
   let client = null;
@@ -420,7 +420,7 @@ test("conformance: a budget rejection reaches Main as a structured error over th
 });
 
 test("conformance: MCP tasks block for results, enforce cancel semantics, and use metadata only where allowed", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "acp-task-frontdoor-"));
+  const directory = await mkdtemp(join(tmpdir(), "acp-task-fd-"));
   let daemon = null;
   let rpcClient = null;
   let mcpClient = null;

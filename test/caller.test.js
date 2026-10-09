@@ -354,7 +354,7 @@ test("an embedded caller is normalized before it is recorded: nothing forged sur
 });
 
 test("the caller rides the control socket; an observer's claim is not recorded", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "acp-caller-daemon-"));
+  const directory = await mkdtemp(join(tmpdir(), "acp-call-dmn-"));
   let daemon = null;
   const clients = [];
   const connect = (options) => {
@@ -411,7 +411,7 @@ test("the caller rides the control socket; an observer's claim is not recorded",
 });
 
 test("through the real front door, a Codex call's _meta becomes that call's caller", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "acp-caller-frontdoor-"));
+  const directory = await mkdtemp(join(tmpdir(), "acp-call-fd-"));
   let daemon = null;
   let mcpClient = null;
   try {
@@ -478,7 +478,7 @@ test("through the real front door, a Codex call's _meta becomes that call's call
 });
 
 test("overlapping front-door calls from one Codex process each keep their own thread", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "acp-caller-overlap-"));
+  const directory = await mkdtemp(join(tmpdir(), "acp-call-ovl-"));
   let daemon = null;
   let mcpClient = null;
   try {

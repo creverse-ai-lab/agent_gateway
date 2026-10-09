@@ -403,7 +403,7 @@ async function mockpermDaemon(directory, clients) {
 }
 
 test("over the control socket each front door's caller confines its calls and its subscriptions", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "acp-isolation-daemon-"));
+  const directory = await mkdtemp(join(tmpdir(), "acp-iso-dmn-"));
   let daemon = null;
   const clients = [];
   try {
@@ -1137,7 +1137,7 @@ async function settled(call, done, description, timeoutMs = 10_000) {
 }
 
 test("over the control socket a Main's connections and subscriptions keep its sessions; then a new Main adopts them", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "acp-isolation-adopt-daemon-"));
+  const directory = await mkdtemp(join(tmpdir(), "acp-iso-adopt-"));
   let daemon = null;
   const clients = [];
   try {

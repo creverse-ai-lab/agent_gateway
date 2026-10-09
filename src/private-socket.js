@@ -25,6 +25,17 @@ import { ERROR_CODES, GatewayError } from "./errors.js";
 // the bind. A link or ".." left in the configured spelling would be resolved
 // again by the kernel at each use, and whoever owns that link (a name of their
 // own in a sticky /tmp will do) could point it somewhere else after the check.
+//
+// The canonical path is also the one that has to fit in a Unix socket address,
+// and it can be longer than the configured one (on macOS a path in the
+// temporary directory gains /private). Some systems take no path past
+// sun_path less its NUL, and Node does not refuse a longer one there but cuts
+// it short (Node 22 on macOS 14 and on Linux): the daemon would bind its
+// socket at another path, and a client find nothing at this one. So a path
+// over that is refused, at both ends, before anything is sent or bound.
+
+/** The longest canonical socket path, in UTF-8 bytes: sun_path less the NUL that ends it, 104 bytes on macOS (and the BSDs), 108 on Linux. */
+export const SOCKET_PATH_MAX_BYTES = process.platform === "linux" ? 107 : 103;
 
 /**
  * Binds server to the Unix socket path and leaves it at 0600. The umask is
@@ -78,7 +89,8 @@ export async function requireOwnSocket(path, {
  * is sent, and the caller takes it as it takes a missing socket (no daemon).
  * Without a uid (Windows) nothing is checked and path comes back as it is. The
  * owner check runs first, so a stranger's socket at the path is still reported
- * as the socket it is before the chain is walked.
+ * as the socket it is before the chain is walked. A canonical path too long
+ * for a socket address throws SOCKET_PATH_TOO_LONG before either check.
  */
 export async function requireTrustedSocket(path, {
   uid = typeof process.getuid === "function" ? process.getuid() : null,
@@ -101,7 +113,8 @@ export async function requireTrustedSocket(path, {
  * the only one to lock, probe, unlink and bind; without a uid (Windows), to
  * path as it is. A directory that does not exist is SOCKET_UNTRUSTED here, as
  * any other that cannot be resolved: the daemon halts on it and records why,
- * which is how an autostart into a missing directory reports it.
+ * which is how an autostart into a missing directory reports it. A canonical
+ * path too long for a socket address is SOCKET_PATH_TOO_LONG, and a halt too.
  */
 export async function requireTrustedSocketDir(path, {
   uid = typeof process.getuid === "function" ? process.getuid() : null,
@@ -142,6 +155,7 @@ async function requireOwnSocketAt(path, canonical, { allowMissing, uid, lstat: l
 // connect never goes through. So the realpath is the system's (fs/promises):
 // the JavaScript fs.realpath and fs.realpathSync resolve() the path first.
 // With allowMissing a directory that is not there throws its ENOENT as it is.
+// A canonical path too long for a socket address is SOCKET_PATH_TOO_LONG.
 async function canonicalSocketPath(path, { uid, realpath: realpathPath, allowMissing = false }) {
   const parent = dirname(path);
   let directory;
@@ -151,7 +165,18 @@ async function canonicalSocketPath(path, { uid, realpath: realpathPath, allowMis
     if (allowMissing && error?.code === "ENOENT") throw error;
     throw untrustedChain(path, parent, "its directory cannot be resolved", { uid, reason: error.message });
   }
-  return { directory, canonical: join(directory, basename(path)) };
+  const canonical = join(directory, basename(path));
+  const bytes = Buffer.byteLength(canonical, "utf8");
+  if (bytes > SOCKET_PATH_MAX_BYTES) {
+    throw new GatewayError(
+      ERROR_CODES.SOCKET_PATH_TOO_LONG,
+      `Refusing Gateway socket ${path}: its canonical path ${canonical} is ${bytes} bytes, over the `
+        + `${SOCKET_PATH_MAX_BYTES}-byte limit of a Unix socket path here, past which Node can cut it short and use another `
+        + "path, so nothing was sent to it or bound there. Set ACP_GATEWAY_SOCKET to a shorter path",
+      { socketPath: path, canonicalPath: canonical, bytes, limitBytes: SOCKET_PATH_MAX_BYTES }
+    );
+  }
+  return { directory, canonical };
 }
 
 // Walks the socket's real directory up to the filesystem root, refusing on the

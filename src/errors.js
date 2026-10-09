@@ -59,6 +59,20 @@ export const ERROR_CODES = Object.freeze({
   // A daemon autostarted into it halts with this code, which the client then
   // reports from the recovery marker.
   SOCKET_UNTRUSTED: "SOCKET_UNTRUSTED",
+  // The socket path, once canonical (the path SOCKET_UNTRUSTED is checked on:
+  // its links and ".." resolved, so on macOS a path in the temporary directory
+  // gains /private), is longer than a Unix socket path can be here: 103 bytes
+  // on macOS, 107 on Linux, counted in UTF-8. Some systems take no longer one,
+  // and Node does not refuse it there but cuts it short (Node 22 on macOS 14
+  // and on Linux): a daemon would bind its socket at another path, and a client
+  // find nothing at this one. A client raises it before it connects or writes
+  // anything, and starts no daemon; daemon_shutdown and shutdown_if_idle report
+  // it too, not alreadyStopped. The daemon raises it as a startup halt, before
+  // it locks, probes, unlinks or binds anything, and exits 78 with this code in
+  // the recovery marker. details: socketPath (as configured), canonicalPath,
+  // bytes and limitBytes. Where there is no uid (Windows pipes) nothing is
+  // measured.
+  SOCKET_PATH_TOO_LONG: "SOCKET_PATH_TOO_LONG",
   // The caller's pid is, or runs under, the daemon or a process the daemon
   // spawned (a provider or one of its terminals): the agent CLI behind this
   // connection is a worker, or something a worker or its terminal started. The

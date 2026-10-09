@@ -327,7 +327,7 @@ test("a durable event that overtakes queued chunks retracts them into a gap inst
   assert.equal(Object.hasOwn(gap, "sequence"), false);
 
   // The other half: that exact wire, through the real client delivery path.
-  const directory = await mkdtemp(join(tmpdir(), "acp-gateway-overtake-"));
+  const directory = await mkdtemp(join(tmpdir(), "acp-overtake-"));
   const socketPath = join(directory, "gateway.sock");
   const client = new GatewayRpcClient({ socketPath, token: "t".repeat(24), rootId: "main-a", autoStart: false });
   const received = [];
@@ -430,7 +430,7 @@ test("tool_call_update is coalesced by tool call, keeping the newest state", () 
 // The tripwire for R2: without the gapFloor fix the resubscribe asks for 6 and the
 // dropped range is lost silently forever, which is worse than the error it replaced.
 test("a gap marker rewinds the resubscribe cursor to the first dropped sequence", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "acp-gateway-gapfloor-"));
+  const directory = await mkdtemp(join(tmpdir(), "acp-gapfloor-"));
   const socketPath = join(directory, "gateway.sock");
   const client = new GatewayRpcClient({ socketPath, token: "t".repeat(24), rootId: "main-a", autoStart: false });
   const received = [];
@@ -531,7 +531,7 @@ test("a refused write does not mean a destroyed socket", () => {
 // new cursor raises the effective start from 0 to the floor — and every sequence
 // below it is skipped by the server on replay and by #deliver on arrival.
 test("a gap for a session with no cursor leaves the replay asking for everything", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "acp-gateway-nocursor-"));
+  const directory = await mkdtemp(join(tmpdir(), "acp-nocursor-"));
   const socketPath = join(directory, "gateway.sock");
   const client = new GatewayRpcClient({ socketPath, token: "t".repeat(24), rootId: "main-a", autoStart: false });
   const received = [];

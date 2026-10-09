@@ -101,8 +101,10 @@ test("W1: an ancestor holding the daemon lock refuses the front door", async () 
     const { readProcess, reads } = processTable(WORKER_CHAIN);
     assert.equal(await workerTreeReason({ env: {}, ppid: 100, socketPath, readProcess }), held);
     assert.deepEqual(reads, [100, 50, 45, 40]);
-    // One whose command line cannot be read still counts: gone from the table,
-    // a read that fails, or an empty command line.
+    // One whose command line cannot be read still counts where this process
+    // (150, in none of these tables) cannot read its own entry either: gone
+    // from the table, a read that fails, or an empty command line. Where it
+    // can, see R1 below.
     const unlisted = { ...WORKER_CHAIN };
     delete unlisted[40];
     for (const unreadable of [
@@ -112,7 +114,7 @@ test("W1: an ancestor holding the daemon lock refuses the front door", async () 
         return processTable(WORKER_CHAIN).readProcess(pid);
       },
       processTable({ ...WORKER_CHAIN, 40: [1, " "] }).readProcess
-    ]) assert.equal(await workerTreeReason({ env: {}, ppid: 100, socketPath, readProcess: unreadable }), held);
+    ]) assert.equal(await workerTreeReason({ env: {}, pid: 150, ppid: 100, socketPath, readProcess: unreadable }), held);
   });
 });
 
@@ -375,6 +377,61 @@ test("R1: a walk cut short by a process this user cannot see ends there, unless 
     await workerTreeReason({ env: { [GATEWAY_WORKER_ENV]: "1" }, pid: 150, ppid: 100, socketPath, readProcess: () => assert.fail("the marker decides first") }),
     "ACP_GATEWAY_WORKER=1 is set"
   );
+});
+
+// The same hidepid, and the daemon lock: a lock pid whose command line cannot
+// be read counted as the daemon, so a stale lock whose pid a root-owned process
+// above a Main had taken (sshd's, over SSH) refused that Main. The daemon runs
+// as this user, whose processes hidepid never hides, so an unreadable lock pid
+// is the daemon only where this process cannot read its own entry either.
+test("R1: an unreadable lock pid is the daemon only where this process cannot read its own entry either", async () => {
+  await withTemp("acp-r1-lock-", async (directory) => {
+    const socketPath = join(directory, "gateway.sock");
+    const held = (pid) => `ancestor process ${pid} holds the Gateway daemon lock ${socketPath}.lock`;
+    // The SSH Main of the test above. The stale lock names sshd's monitor (60),
+    // root's, which hidepid hides from this user.
+    const sshMain = {
+      150: [100, "node /home/me/.acp-gateway/runtime/current/gateway/src/index.js"],
+      100: [90, "/home/me/.local/bin/claude"],
+      90: [80, "-bash"],
+      80: [60, "sshd: me@pts/0"]
+    };
+    await writeFile(`${socketPath}.lock`, "60\n");
+    const hidden = processTable(sshMain);
+    assert.equal(await workerTreeReason({ env: {}, pid: 150, ppid: 100, socketPath, readProcess: hidden.readProcess }), null);
+    assert.deepEqual(hidden.reads, [100, 90, 80, 60, 150], "the lock pid, then this process's own entry, once");
+    // A read of it that throws (ps refusing it) reads the same.
+    const refusing = async (pid) => {
+      if (pid === 60) throw new Error("ps refused");
+      return processTable(sshMain).readProcess(pid);
+    };
+    assert.equal(await workerTreeReason({ env: {}, pid: 150, ppid: 100, socketPath, readProcess: refusing }), null);
+    // A lock pid that can be read but names no command (a zombie, a kernel
+    // thread) is passed like any other process: the walk goes on above it, and
+    // a daemon there is still found by its command line.
+    await writeFile(`${socketPath}.lock`, "50\n");
+    const blank = processTable({ ...WORKER_CHAIN, 150: [100, "node /x/src/index.js"], 50: [45, " "] });
+    assert.match(
+      await workerTreeReason({ env: {}, pid: 150, ppid: 100, socketPath, readProcess: blank.readProcess }),
+      /^ancestor process 40 runs the Gateway daemon: /
+    );
+    assert.deepEqual(blank.reads, [100, 50, 150, 45, 40]);
+
+    // This process cannot read even itself: an unreadable lock pid still
+    // counts, as it always did.
+    await writeFile(`${socketPath}.lock`, "60\n");
+    const noSelf = { ...sshMain };
+    delete noSelf[150];
+    assert.equal(await workerTreeReason({ env: {}, pid: 150, ppid: 100, socketPath, readProcess: processTable(noSelf).readProcess }), held(60));
+    await writeFile(`${socketPath}.lock`, "50\n");
+    const blankNoSelf = processTable({ ...WORKER_CHAIN, 50: [45, " "] });
+    assert.equal(await workerTreeReason({ env: {}, pid: 150, ppid: 100, socketPath, readProcess: blankNoSelf.readProcess }), held(50));
+    // A lock pid that runs the daemon counts at once, and this process is not read.
+    await writeFile(`${socketPath}.lock`, "40\n");
+    const daemon = processTable({ ...WORKER_CHAIN, 150: [100, "node /x/src/index.js"] });
+    assert.equal(await workerTreeReason({ env: {}, pid: 150, ppid: 100, socketPath, readProcess: daemon.readProcess }), held(40));
+    assert.deepEqual(daemon.reads, [100, 50, 45, 40]);
+  });
 });
 
 // R2 (1.8.0 release review): the front door said "refusing to start inside a

@@ -98,12 +98,13 @@ export function runsGatewayDaemon(command) {
  * cannot be read. A pid match needs no read, unless verifyPids: then a listed
  * process whose command line can be read must match too, and one that does
  * not has taken the pid of one that is gone (a stale lock), so the walk goes
- * on past it; one whose command line cannot be read still matches. Never
- * throws: a lookup that fails is no evidence either way, and callers treat it
- * as none. pid 1 ends the walk, neither matched nor read: it is the top of
- * every chain, so being under it says nothing. A daemon that is pid 1 (a
- * container's entrypoint) cannot be told apart this way, only by the worker
- * marker.
+ * on past it; one whose command line cannot be read still matches, unless
+ * unreadableMatches (asked then) resolves false: then it is one more process
+ * the walk could not read. Never throws: a lookup that fails is no evidence
+ * either way, and callers treat it as none. pid 1 ends the walk, neither
+ * matched nor read: it is the top of every chain, so being under it says
+ * nothing. A daemon that is pid 1 (a container's entrypoint) cannot be told
+ * apart this way, only by the worker marker.
  */
 export async function findAncestor(pid, options = {}) {
   return (await traceAncestry(pid, options)).match;
@@ -122,6 +123,7 @@ async function traceAncestry(pid, {
   pids = [],
   commandMatches = () => false,
   verifyPids = false,
+  unreadableMatches = async () => true,
   readProcess = readProcessInfo,
   maxDepth = MAX_ANCESTRY_DEPTH
 } = {}) {
@@ -136,7 +138,7 @@ async function traceAncestry(pid, {
       info = await readProcess(pid);
     } catch {}
     const command = typeof info?.command === "string" && info.command.trim() ? info.command : null;
-    if (listed && (command === null || commandMatches(command))) return { match: { pid, command }, unreadable: false };
+    if (listed && command === null && await unreadableMatches()) return { match: { pid, command }, unreadable: false };
     if (!info) return { match: null, unreadable: true };
     if (command !== null && commandMatches(command)) return { match: { pid, command }, unreadable: false };
     pid = info.ppid;
@@ -168,11 +170,11 @@ export const WORKER_TREE_ANCESTRY_UNREADABLE = "its process ancestry cannot be r
  * on the way). The lock outlives a daemon that dies without removing it, and
  * its pid may since belong to the Main's own CLI or another ancestor, which
  * would then refuse the Main; so the lock pid counts only when its command
- * line runs the daemon, or cannot be read. A walk cut short by a process it
- * cannot read is no daemon above, unless this process cannot read its own entry
- * either: then it cannot tell (WORKER_TREE_ANCESTRY_UNREADABLE). pid and ppid
- * are this process's and its parent's, injectable for tests. Run once, at
- * startup.
+ * line runs the daemon, or cannot be read while this process cannot read its
+ * own entry either. A walk cut short by a process it cannot read is no daemon
+ * above, unless this process cannot read its own entry either: then it cannot
+ * tell (WORKER_TREE_ANCESTRY_UNREADABLE). pid and ppid are this process's and
+ * its parent's, injectable for tests. Run once, at startup.
  */
 export async function workerTreeReason({
   env = process.env,
@@ -185,10 +187,22 @@ export async function workerTreeReason({
 } = {}) {
   if (env[GATEWAY_WORKER_ENV] === "1") return `${GATEWAY_WORKER_ENV}=1 is set`;
   const lockPid = daemonLockPid(socketPath);
+  // Whether this process can read its own entry: read at most once, and only
+  // once something else could not be.
+  let selfProbe = null;
+  const readsItself = () => (selfProbe ??= canReadProcess(pid, readProcess));
   const { match: daemon, unreadable } = await traceAncestry(ppid, {
     pids: lockPid ? [lockPid] : [],
     verifyPids: true,
     commandMatches: runsGatewayDaemon,
+    // The lock's pid, when its command line cannot be read. The daemon runs as
+    // this user, and /proc hidepid never hides a user's own processes from it,
+    // so where this process can read its own entry the daemon's is readable
+    // too: a lock pid that is not is another user's process (a stale lock's
+    // pid taken by a root-owned one, such as the sshd above an SSH login) or
+    // gone, and no daemon. Only on a host that can read no process at all is
+    // it still the daemon.
+    unreadableMatches: async () => !(await readsItself()),
     readProcess,
     maxDepth
   });
@@ -210,7 +224,7 @@ export async function workerTreeReason({
   // tree anyway (a double fork, at, systemd-run --user). This check is for a
   // worker CLI that starts the Control MCP as its own descendant (Codex does),
   // and the marker, checked first, is the other signal.
-  if (unreadable && ancestrySupported && !(await canReadProcess(pid, readProcess))) {
+  if (unreadable && ancestrySupported && !(await readsItself())) {
     return WORKER_TREE_ANCESTRY_UNREADABLE;
   }
   return null;

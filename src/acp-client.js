@@ -8,6 +8,7 @@ import { workerEnv } from "./caller.js";
 import { ERROR_CODES, GatewayError } from "./errors.js";
 import { readNdjson } from "./ndjson.js";
 import { LANE_HIGH, LANE_NORMAL, NdjsonChannel } from "./ndjson-channel.js";
+import { startInApprovedCwd, terminalCwdChanged, terminalCwdGone } from "./terminal-cwd.js";
 import { detectTerminalSandbox } from "./terminal-sandbox.js";
 import { GATEWAY_VERSION } from "./version.js";
 import { ACP_PROTOCOL_VERSION } from "./acp-version.js";
@@ -96,6 +97,10 @@ export class AcpClient {
     // A test seam that runs between a write's approval-path pre-check and opening
     // the descriptor, where a racing worker would swap a parent directory.
     this.beforeWriteOpen = options.beforeWriteOpen ?? null;
+    // A test seam that runs right before a terminal is spawned, after its cwd
+    // was checked (and on Linux opened), where a racing worker would swap the
+    // directory. Synchronous: nothing may come between the check and the spawn.
+    this.beforeTerminalSpawn = options.beforeTerminalSpawn ?? null;
     this.proc = null;
     this.rl = null;
     this.channel = null;
@@ -885,7 +890,9 @@ export class AcpClient {
   // much it is in-root. Only the approved cwd is named in the error, never
   // where the worker steered it, which no root or protected check has seen. A
   // terminal that starts at once (auto_approve, a grant) passes unless the
-  // worker raced it.
+  // worker raced it. The start itself is bound to that directory as well, not
+  // to its path (startInApprovedCwd), which closes the race between this check
+  // and the child's chdir.
   #requireApprovedCwd(params, operation) {
     let current;
     let directory;
@@ -893,11 +900,11 @@ export class AcpClient {
       current = this.#requestedTerminalCwd(params);
       directory = statSync(operation.cwd, { bigint: true });
     } catch {
-      throw new Error(`Terminal cwd no longer resolves since it was approved: ${operation.cwd}`);
+      throw terminalCwdGone(operation.cwd);
     }
     if (current !== operation.cwd
       || directory.dev !== operation.cwdIdentity.dev || directory.ino !== operation.cwdIdentity.ino) {
-      throw new Error(`Terminal cwd changed since it was approved: ${operation.cwd}`);
+      throw terminalCwdChanged(operation.cwd);
     }
   }
 
@@ -911,23 +918,34 @@ export class AcpClient {
     if (activeForSession >= this.maxTerminalsPerSession) {
       throw new Error(`ACP session terminal limit exceeded: ${this.maxTerminalsPerSession}`);
     }
-    // In the same turn as the spawn, after the last await, so only a race
-    // inside these few synchronous steps could still swap the directory.
+    // In the same turn as the spawn, after the last await, so a Worker that
+    // swapped the directory while Main decided is refused here, with an error;
+    // one that races these few synchronous steps meets the start itself, which
+    // is bound to the directory and not to its path (startInApprovedCwd): on
+    // Linux the child starts in the descriptor held here, elsewhere it refuses
+    // to run the command.
     this.#requireApprovedCwd(params, operation);
     const terminalId = `terminal-${this.nextId++}`;
     // #terminalRequest already refused a present-but-invalid limit, so Number()
     // is finite here; floor keeps it the integer BoundedUtf8Text requires.
     const limit = Math.min(Math.max(Math.floor(Number(params.outputByteLimit ?? 1_000_000)), 1), this.maxTerminalOutputBytes);
     const launch = sandbox ? sandbox.wrap(request.command, request.args, this.protectedPaths) : request;
-    // Same scrub and marker as the worker's own env. What the worker asks for
-    // explicitly is its own identity, not the Main's, and is kept; the marker
-    // is not the worker's to remove.
-    const child = spawn(launch.command, launch.args, {
-      cwd: request.cwd,
-      env: workerEnv(Object.fromEntries(request.env.map(({ name, value }) => [name, value]))),
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: process.platform !== "win32"
-    });
+    const start = startInApprovedCwd(launch, operation.cwd, operation.cwdIdentity);
+    let child;
+    try {
+      this.beforeTerminalSpawn?.(operation.cwd);
+      // Same scrub and marker as the worker's own env. What the worker asks for
+      // explicitly is its own identity, not the Main's, and is kept; the marker
+      // is not the worker's to remove.
+      child = spawn(start.command, start.args, {
+        cwd: start.cwd,
+        env: workerEnv(Object.fromEntries(request.env.map(({ name, value }) => [name, value]))),
+        stdio: ["ignore", "pipe", "pipe"],
+        detached: process.platform !== "win32"
+      });
+    } finally {
+      start.release();
+    }
     this.#trackSpawned(child);
     const artifactWriter = this.artifactStore?.create(params.sessionId, "terminal") ?? null;
     const outputBuffer = new BoundedUtf8Text(limit, { onTrim: (buffer) => artifactWriter?.append(buffer) });

@@ -9,7 +9,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { GatewayRpcClient } from "../src/socket-rpc.js";
 
-const directory = await mkdtemp(join(tmpdir(), "acp-gateway-smoke-"));
+const directory = await mkdtemp(join(tmpdir(), "acp-smoke-"));
 const socketPath = join(directory, "gateway.sock");
 const statePath = join(directory, "state.json");
 const token = "live-smoke-control-token-at-least-24-characters";

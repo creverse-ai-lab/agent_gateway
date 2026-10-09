@@ -25,8 +25,9 @@ import { callerVerdicts, workerControlDeniedMessage } from "./worker-tree.js";
 // A start that dies before it serves is invisible: autostart spawns this
 // process with stdout and stderr ignored, so the only thing a Main ever sees is
 // a socket that never appears. Recovery failures, an identity the autostart
-// failed to hand over, and a socket directory another user could rewrite leave
-// their reason in a file the client reads (halt).
+// failed to hand over, a socket directory another user could rewrite and a
+// socket path too long to bind leave their reason in a file the client reads
+// (halt).
 const STARTUP_HALT_EXIT_CODE = 78; // EX_CONFIG: operator action required
 // Admission bound per control connection, as a module constant (the PR2
 // precedent for safety valves). The arithmetic that rules out a smaller number:
@@ -58,12 +59,13 @@ const { token: expectedToken, rootId: expectedRootId } = identity;
 // bind and at the unlink on shutdown, but only for the canonical path it
 // returns, which is the only one used from here on: a link or ".." left in the
 // configured spelling would be resolved again at each use, wherever its owner
-// had pointed it by then.
+// had pointed it by then. A canonical path too long for a socket address halts
+// the same way: Node would bind it cut short, at a path no client looks at.
 let socketPath;
 try {
   socketPath = await requireTrustedSocketDir(gatewaySocketPath());
 } catch (error) {
-  if (error?.code !== ERROR_CODES.SOCKET_UNTRUSTED) throw error;
+  if (error?.code !== ERROR_CODES.SOCKET_UNTRUSTED && error?.code !== ERROR_CODES.SOCKET_PATH_TOO_LONG) throw error;
   await halt(error);
 }
 const settings = new GatewaySettings();
