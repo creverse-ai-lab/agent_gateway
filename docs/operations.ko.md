@@ -87,7 +87,7 @@ acp-gateway-bootstrap --update-skill    # 2. skill 갱신 (수정본이면 --for
 
 Skill은 Codex `~/.codex/skills`, Claude `~/.claude/skills`, Grok `~/.grok/skills`, Auggie `~/.augment/skills`에 설치합니다. 별도 경로가 알려지지 않은 registry provider는 공용 `~/.agents/skills`를 사용합니다. 같은 공용 경로를 사용하는 provider가 여러 개면 skill 파일은 한 번만 복사하고 installer 상태에는 각 provider를 모두 기록합니다.
 
-Control·Guide MCP 등록은 Codex, Claude, Grok, Auggie를 지원합니다. 기본 `--install-all`에서 Control은 사용자가 프론트 도어로 선택한 Codex·Claude·Grok 중 하나에만 등록되고, Guide와 skill은 발견된 지원 agent 전체에 설치됩니다. `--target`은 고급 수동 대상 지정 용도로 유지됩니다. Control MCP는 Gateway 전체 제어 권한이 있으므로 신뢰하는 로컬 agent에만 설치하세요. v1.8.0부터 이 항목에는 token이 들어 있지 않지만(아래 참고), 자기 도구로 Gateway를 거치지 않고 파일을 읽는 Worker(Codex는 `read_only`에서도 그렇게 읽는 것을 확인했습니다)는 여전히 `install.json`에서, 또는 이전 installer가 써서 아직 token이 남아 있는 항목에서 token을 읽어 Main처럼 행동할 수 있습니다. 이런 Worker에게 신뢰할 수 없는 자료를 맡기기 전에 [권한 정책](../README.ko.md#권한-정책)을 확인하세요. Worker 자신의 agent CLI가 사용자 설정에서 Control MCP를 불러올 수도 있습니다(Codex Worker는 `~/.codex/config.toml`을 읽습니다). v1.8.0부터 이 서버는 Worker의 프로세스 트리 안에서는 시작을 거부하고 상태 코드 77로 종료하며 stderr에 한 줄을 남깁니다. 그래서 Worker의 CLI가 `agent-acp`를 시작하지 못했다고 보고할 수 있는데, 정상 동작입니다.
+Control·Guide MCP 등록은 Codex, Claude, Grok, Auggie를 지원합니다. 기본 `--install-all`에서 Control은 사용자가 프론트 도어로 선택한 Codex·Claude·Grok 중 하나에만 등록되고, Guide와 skill은 발견된 지원 agent 전체에 설치됩니다. `--target`은 고급 수동 대상 지정 용도로 유지됩니다. Control MCP는 Gateway 전체 제어 권한이 있으므로 신뢰하는 로컬 agent에만 설치하세요. v1.8.0부터 이 항목에는 token이 들어 있지 않지만(아래 참고), 자기 도구로 Gateway를 거치지 않고 파일을 읽는 Worker(Codex는 `read_only`에서도 그렇게 읽는 것을 확인했습니다)는 여전히 `install.json`에서, 또는 이전 installer가 써서 아직 token이 남아 있는 항목에서 token을 읽어 Main처럼 행동할 수 있습니다. 이런 Worker에게 신뢰할 수 없는 자료를 맡기기 전에 [권한 정책](../README.ko.md#권한-정책)을 확인하세요. Worker 자신의 agent CLI가 사용자 설정에서 Control MCP를 불러올 수도 있습니다(Codex Worker는 `~/.codex/config.toml`을 읽습니다). v1.8.0부터 이 서버는 Worker의 프로세스 트리 안에서는 시작을 거부하고 상태 코드 77로 종료하며 stderr에 한 줄을 남깁니다. 그래서 Worker의 CLI가 `agent-acp`를 시작하지 못했다고 보고할 수 있는데, 정상 동작입니다. 자기 조상 프로세스를 읽을 수 없는 macOS·Linux 호스트(`/proc`이 없고 `ps`도 없거나 막힌 경우)에서는 Worker와 Main을 구별할 수 없으므로 같은 방식으로 시작을 거부하고, daemon도 어디서 실행 중인지 확인할 수 없는 호출자를 `WORKER_CONTROL_DENIED`("ancestry cannot be verified on this host")로 거부합니다. 이런 호스트에서는 `/proc`이나 `ps`를 쓸 수 있게 되어야 Main이 다시 Control MCP를 쓸 수 있습니다.
 
 공식 registry 원본은 `https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json`이며 `~/.acp-gateway/registry.json`에 24시간 캐시합니다. 발견된 provider 실행 정의는 `~/.acp-gateway/providers.json`에 저장됩니다. `npx`·`uvx` 배포는 registry에 고정된 버전을 설치하고, binary 배포는 이미 설치된 실행 파일을 사용합니다. registry에 등록되지 않은 임의의 AI는 ACP 실행 계약을 안전하게 추론할 수 없으므로 자동 등록하지 않습니다.
 
@@ -189,6 +189,7 @@ v1.3.0부터 poll 기본값이 절약형입니다. 턴이 진행 중일 때 `res
 - v1.8.0부터 `~/.acp-gateway/state.json`(v4 형식)은 더 이상 기록하지 않습니다. 남아 있는 파일은 시작할 때 계속 읽어 이전하고, 동기화된 v5 snapshot이 그 내용을 담은 뒤에 지웁니다. 롤백한 1.4~1.7 Gateway도 v5 파일을 읽지만, 큰 Task 결과는 미리보기만 제공합니다(`resultDegraded` 표시). 1.4보다 오래된 Gateway는 상태를 찾지 못하고 빈 상태로 시작합니다. v5 파일은 따로 변환할 필요가 없지만, Control MCP 항목은 다시 등록해야 할 수 있습니다. 1.8 installer가 등록했거나 다시 쓴 항목에는 token이 없고, 1.7.x 프론트 도어는 token을 항목의 환경 변수에서만 읽으므로 그런 항목으로는 시작하지 못합니다. 설치된 패키지를 1.7.x로 되돌린 뒤, 그런 항목을 가진 호스트마다 그 버전의 `acp-gateway-bootstrap --install-control --target <host> --force`를 실행하고 해당 호스트 세션을 다시 연결하세요([호스트 재연결 절차](#호스트-재연결-절차)의 3번). 1.8 installer로는 이 작업을 할 수 없습니다. `--force`를 주어도 token을 다시 넣지 않기 때문입니다. `--force` 없이는 1.7.x installer도 여전히 올바른 스크립트를 실행하는 항목은 그대로 둡니다.
 - 상태가 바뀌는 동안 WAL이 켜져 있으면 전체 snapshot은 많아야 약 1초에 한 번 다시 쓰고, WAL 회전과 종료 때도 씁니다. WAL 레코드 자체는 전처럼 즉시 기록합니다.
 - idle resumable 세션은 기본 30분 후 unload
+- Gateway가 Worker의 provider 프로세스를 끝낼 때(종료할 때, idle 세션을 unload할 때, adapter 업데이트로 교체된 프로세스가 더는 세션을 맡지 않을 때, provider가 입력을 읽지 않는 등 전송에 실패했을 때)는 SIGTERM을 보내고, 2초 뒤에도 실행 중이면 SIGKILL을 보냅니다. Worker가 연 터미널도 같은 방식으로, 각자의 프로세스 그룹 전체를 끝냅니다. v1.8.0 이전에는 SIGTERM을 무시하는 provider가 계속 실행됐습니다.
 - 결과와 이벤트는 기본 24시간 보존
 - session resume checkpoint는 기본 7일 보존, Task 핸들의 바이트는 기본 24시간 보존(`ACP_GATEWAY_TASK_RETENTION_MS`)
 - 장시간 유지가 필요한 세션은 `pin` 사용. pin은 세션이 열려 있는 동안만 보호하며, 닫힌 pin 세션은 다른 세션처럼 보존 기간이 지나면 정리됩니다.
@@ -235,7 +236,7 @@ Task 생성과 결과 확정은 응답을 반환하기 전에 WAL에 append + fs
 | `ACP_GATEWAY_STATE_RECOVERY` | (없음) | `truncate`: 손상 직전까지 WAL replay 후 시작 / `snapshot-drop`: snapshot을 폐기하고 WAL만으로 복구, 남은 v4 `state.json`이 있으면 그것도 사용(v1.8.0부터 이 파일은 아무도 쓰지 않으므로, 정상 종료 뒤라면 WAL에 남은 것이 없음) / `cold`: 빈 상태로 시작 |
 | `ACP_GATEWAY_TASK_RETENTION_MS` | `24h` | Task 레코드와 결과 artifact의 디스크 생존 기간(세션 보존과 독립) |
 | `ACP_GATEWAY_MAX_QUEUE_BYTES` | `4000000` | control 연결당 OS+channel 합산 쓰기 예산. HIGH는 전체, NORMAL은 7/8, LOW는 1/2까지 사용. v1.8.0부터 예산 전체보다 큰 응답 하나(`ACP_GATEWAY_MAX_FRAME_BYTES` 이하)도 기다리는 것이 없으면 연결을 닫지 않고 보내며, 그 뒤의 frame은 자기 예산을 그대로 씀. 첫 응답을 보내는 중에 그런 응답이 하나 더 오면 전처럼 연결을 닫음. `subscribe` replay는 이 예산의 절반으로 제한(관리 API 참고) |
-| `ACP_GATEWAY_WRITE_TIMEOUT_MS` | `10000` | 이 시간 동안 OS가 한 바이트도 받지 않으면 해당 연결·프로바이더를 종료 |
+| `ACP_GATEWAY_WRITE_TIMEOUT_MS` | `10000` | 이 시간 동안 OS가 한 바이트도 받지 않으면 해당 연결을 닫거나 프로바이더를 종료(SIGTERM을 보내고, 2초 뒤에도 실행 중이면 SIGKILL) |
 | `ACP_GATEWAY_MAX_PROMPT_BYTES` | `1000000` | 초과 prompt는 턴을 만들기 전에 `PROMPT_TOO_LARGE`로 거부 |
 | `ACP_GATEWAY_MAX_FILE_READ_BYTES` | `500000` | worker의 `fs/read_text_file` 응답 바이트 상한(거부 대신 절단) |
 | `ACP_GATEWAY_MAX_TERMINAL_OUTPUT_BYTES` | `10000000` | terminal 출력 버퍼 상한(기존 하드코딩 값과 동일) |

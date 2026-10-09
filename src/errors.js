@@ -41,21 +41,34 @@ export const ERROR_CODES = Object.freeze({
   ROOT_REQUIRED: "ROOT_REQUIRED",
   ROOT_MISMATCH: "ROOT_MISMATCH",
   SOCKET_ALREADY_BOUND: "SOCKET_ALREADY_BOUND",
-  // Raised by the client, never by the daemon: the socket path holds something
-  // other than a socket owned by this user (on Linux the default path is in the
-  // shared /tmp, where another user can create it first). Nothing was written
-  // to it, the token included, and no daemon was started. details: socketPath,
-  // type, ownerUid, uid.
+  // The socket path cannot be trusted with the token. A client raises it before
+  // it connects or writes anything: the path holds something other than a
+  // socket owned by this user (on Linux the default path is in the shared /tmp,
+  // where another user can create it first), or a directory from the
+  // filesystem root down to the socket's is not this user's or root's, or is
+  // writable by group or others without the sticky bit, so another user could
+  // swap a link into it. Nothing was written to it, the token included, and no
+  // daemon was started. details: socketPath, type, ownerUid, uid for the socket
+  // itself; socketPath, dir (the directory at fault), uid and what is wrong
+  // with it (type, ownerUid, mode or reason) for the directory chain. The
+  // daemon raises it as a startup halt: it checks the same chain before it
+  // locks, probes, unlinks or binds anything at the path, and on failure exits
+  // 78 with this code in the recovery marker.
   SOCKET_UNTRUSTED: "SOCKET_UNTRUSTED",
   // The caller's pid is, or runs under, the daemon or a process the daemon
   // spawned (a provider or one of its terminals): the agent CLI behind this
   // connection is a worker, or something a worker or its terminal started. The
   // spawned-process match still catches a worker when the daemon is pid 1, where
   // no ancestor can be matched to the daemon's own pid. Workers never get the
-  // Control, whatever token they present. Refused before the connection binds or
-  // anything runs. The verdict is reused only while the connection's caller pid
-  // stays the same; a request that names another pid is checked on its own. A
-  // connection that never names a caller pid (management clients) is never
+  // Control, whatever token they present. Also raised, with "ancestry cannot be
+  // verified on this host" in the message, when the caller cannot be placed at
+  // all: the walk did not reach the daemon or a spawned process, and the daemon
+  // cannot read even its own process entry (no /proc, and ps missing or
+  // blocked), so a worker could not be told from a Main. Windows, which reads
+  // no ancestry, is never refused for that. Refused before the connection binds
+  // or anything runs. The verdict is reused only while the connection's caller
+  // pid stays the same; a request that names another pid is checked on its own.
+  // A connection that never names a caller pid (management clients) is never
   // refused for this.
   WORKER_CONTROL_DENIED: "WORKER_CONTROL_DENIED",
   // The fail-closed persistence path: a Task handle is a durability promise, so

@@ -19,8 +19,8 @@ If the work is expensive to duplicate and you have no handle yet, pass `idempote
 | `status: "error"` / `unavailable` | the turn or the provider failed | read `error`, collect what exists, then restore or re-run |
 | `SESSION_QUARANTINED` | the session failed to restore `failures` times in a row; the Gateway stopped retrying it | pick from `details.next`: `check` it, retry once with `agent_acp_session_restore` (same provider, acpSessionId, cwd), or open a new session |
 | `NOT_SESSION_OWNER` | the session belongs to another Main, possibly your own from before a restart | if it was yours, take it back as in "After you come back as a new Main" below; otherwise leave it |
-| `WORKER_CONTROL_DENIED` | you are running inside a Gateway Worker; Workers never get the Control | do not retry; report back to the Main that gave you the work |
-| `SOCKET_UNTRUSTED` | the Gateway socket path holds something this user does not own; nothing was sent | surface it: the user removes a stale file there, or sets `ACP_GATEWAY_SOCKET` to a directory only they can write |
+| `WORKER_CONTROL_DENIED` | you are running inside a Gateway Worker, and Workers never get the Control; or, when the message says `ancestry cannot be verified on this host`, the host has neither `/proc` nor a working `ps` | do not retry; inside a Worker, report back to the Main that gave you the work; otherwise surface it to the user |
+| `SOCKET_UNTRUSTED` | the Gateway socket path holds something this user does not own, or a directory on its path (`details.dir`) is one another user could change; nothing was sent | surface it: the user removes a stale file there, or sets `ACP_GATEWAY_SOCKET` to a directory only they can write |
 | `DAEMON_IDENTITY_INVALID` | the daemon did not get its identity when it was started | retry the call once, which starts it again; if it recurs, surface it |
 | `disconnected` | the worker process is gone | collect retained results and inbox history, then reuse the session — prompt and config reconnect automatically for a resumable provider |
 
