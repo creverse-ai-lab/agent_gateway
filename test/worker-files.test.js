@@ -31,7 +31,7 @@ const RACE_REFUSED = /symbolic link the Gateway does not follow|changed while th
 const PORTABLE = "sunos";
 
 async function withLayout(run) {
-  const directory = await realpath(await mkdtemp(join(tmpdir(), "acp-worker-files-")));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "acp-wfiles-")));
   try {
     const root = join(directory, "root");
     const guarded = join(directory, "home", ".acp-gateway");
