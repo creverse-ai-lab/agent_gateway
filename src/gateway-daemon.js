@@ -86,11 +86,14 @@ const server = createServer((socket) => {
   let boundRootId = null;
   let boundAccess = null;
   let inflight = 0;
-  // Whether the caller on this connection runs under this daemon: looked up
-  // on the first request that names a caller pid and reused while the pid
-  // stays the same; a request that names another pid is looked up on its own
-  // (worker-tree.js).
-  const callerVerdict = callerVerdicts();
+  // Whether the caller on this connection is a worker's: looked up on the first
+  // request that names a caller pid and reused while the pid stays the same; a
+  // request that names another pid is looked up on its own (worker-tree.js). The
+  // caller is refused when it is or runs under this daemon, or under any process
+  // the daemon spawned (a provider or terminal). The spawned-pid set is read live
+  // for each lookup, so it reflects spawns and exits since the connection opened;
+  // it is what catches a worker when the daemon is pid 1 (F5).
+  const callerVerdict = callerVerdicts({ spawnedPids: () => service.spawnedPids() });
   const requireBinding = (rootId, access) => {
     if (boundRootId && rootId !== boundRootId) {
       throw new GatewayError(ERROR_CODES.SOCKET_ALREADY_BOUND, "Socket is already bound to another Main");

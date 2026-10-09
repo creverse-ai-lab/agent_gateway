@@ -205,14 +205,21 @@ export async function runsUnder(pid, daemonPid, { readProcess = readProcessInfo,
   return (await findAncestor(pid, { pids: [daemonPid], readProcess, maxDepth })) !== null;
 }
 
-// Why callerVerdicts refuses a caller: it runs under the daemon, so it is a
+// Why callerVerdicts refuses a caller: it is or runs under the daemon, or under
+// a process the daemon spawned (a provider or one of its terminals), so it is a
 // worker's; or this process cannot read ancestry on the host and so cannot place
-// it, which is refused as unverifiable rather than mislabelled a worker.
+// it, which is refused as unverifiable rather than mislabelled a worker. The
+// spawned-process signal is the one that still holds when the daemon is pid 1 (a
+// container entrypoint), where no ancestor can be matched to the daemon's own pid
+// because pid 1 ends every chain (F5).
 export const WORKER_CALLER_UNDER_DAEMON = "under_daemon";
+export const WORKER_CALLER_UNDER_SPAWNED = "under_spawned";
 export const WORKER_CALLER_ANCESTRY_UNVERIFIABLE = "ancestry_unverifiable";
 
 /** The WORKER_CONTROL_DENIED message for a callerVerdicts refusal reason. */
 export function workerControlDeniedMessage(reason, pid) {
+  // Both worker signals — under the daemon, or under a process it spawned — read
+  // the same to the caller: it is a worker's, and never gets the Control.
   return reason === WORKER_CALLER_ANCESTRY_UNVERIFIABLE
     ? `Control access denied: caller process ${pid} ancestry cannot be verified on this host`
     : `Control access denied: caller process ${pid} runs inside a Gateway worker`;
@@ -228,28 +235,41 @@ export function workerControlDeniedMessage(reason, pid) {
  * a connection pays for one lookup; a request that names another pid gets a
  * lookup, and a verdict, of its own. A request with no pid gets the connection's
  * latest verdict, so it waits behind a lookup in flight instead of overtaking the
- * requests before it.
+ * requests before it. spawnedPids is read afresh for each lookup (a function, or
+ * a set/array of the live provider/terminal pids), so a pid removed when its
+ * child exits no longer refuses a later process that reuses it; it is injectable
+ * for tests.
  */
-export function callerVerdicts({ daemonPid = process.pid, ancestrySupported = canReadAncestry(), ...options } = {}) {
+export function callerVerdicts({ daemonPid = process.pid, ancestrySupported = canReadAncestry(), spawnedPids = () => [], ...options } = {}) {
   let verdict = null;
   return (pid) => {
     if (Number.isInteger(pid) && pid > 1 && pid !== verdict?.pid) {
-      verdict = { pid, denied: callerDenied(pid, daemonPid, ancestrySupported, options) };
+      verdict = { pid, denied: callerDenied(pid, daemonPid, ancestrySupported, spawnedPids, options) };
     }
     return verdict;
   };
 }
 
-// The reason a caller pid is refused, or null. Under the daemon is the clear
-// case. The walk not placing it there is not: unlike the front door, which walks
-// from its own live parent, the daemon walks from a caller pid it does not
-// control, and that pid may simply be gone — no worker. So a broken host is told
-// from a gone pid by reading a process known to be alive, the daemon itself: a
-// read that fails there means the host cannot place any caller (unverifiable);
-// one that succeeds means the caller really runs outside the daemon. Windows,
-// which can read no ancestry (ancestrySupported false), stays marker-only.
-async function callerDenied(pid, daemonPid, ancestrySupported, options) {
-  if (await runsUnder(pid, daemonPid, options)) return WORKER_CALLER_UNDER_DAEMON;
+// The reason a caller pid is refused, or null. One walk up the caller's ancestry
+// matches both the daemon's own pid and the live pids of the processes it spawned
+// (its providers and their terminals): a caller that is, or runs under, any of
+// them is a worker's, whatever token it holds. The spawned-pid match is the
+// signal that still catches a worker when the daemon is pid 1 — the daemon-pid
+// walk stops at the top of the tree without matching it, because pid 1 ends every
+// chain, but a provider or terminal is a real child the caller descends from,
+// never pid 1. A pid gone from the set (its child exited) no longer matches, so a
+// reused pid is not mistaken for it. The walk not placing the caller is not proof
+// it is a Main: unlike the front door, which walks from its own live parent, the
+// daemon walks from a caller pid it does not control, and that pid may simply be
+// gone — no worker. So a broken host is told from a gone pid by reading a process
+// known to be alive, the daemon itself: a read that fails there means the host
+// cannot place any caller (unverifiable); one that succeeds means the caller
+// really runs outside. Windows, which can read no ancestry (ancestrySupported
+// false), stays marker-only.
+async function callerDenied(pid, daemonPid, ancestrySupported, spawnedPids, options) {
+  const spawned = (typeof spawnedPids === "function" ? spawnedPids() : spawnedPids) ?? [];
+  const match = await findAncestor(pid, { ...options, pids: [daemonPid, ...spawned] });
+  if (match) return match.pid === daemonPid ? WORKER_CALLER_UNDER_DAEMON : WORKER_CALLER_UNDER_SPAWNED;
   if (!ancestrySupported) return null;
   const readProcess = options.readProcess ?? readProcessInfo;
   try {

@@ -1038,6 +1038,21 @@ export class GatewayService {
       .some((client) => client?.alive && client.gatewayProvider === provider);
   }
 
+  // The pids of every live process the daemon spawned for a worker — each
+  // provider and its terminals — across all clients, current and retired. The
+  // daemon passes this to the per-connection caller check, which refuses a
+  // control caller that is or runs under one of them, so a worker is caught even
+  // when the daemon is pid 1 and cannot be told apart by its own pid (F5). Read
+  // afresh per caller lookup: a pid a client drops when its child exits leaves
+  // the set at once, so a later process that reuses it is not refused.
+  spawnedPids() {
+    const pids = new Set();
+    for (const client of [...this.clients.values(), ...this.retiredClients]) {
+      for (const pid of client?.spawnedPids?.() ?? []) pids.add(pid);
+    }
+    return pids;
+  }
+
   async withSessionAdmission(provider, context, operation) {
     if (this.draining) throw new GatewayError(ERROR_CODES.GATEWAY_DRAINING, "Gateway is draining");
     const root = requireRoot(context);

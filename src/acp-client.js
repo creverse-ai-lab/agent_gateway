@@ -223,6 +223,24 @@ export class AcpClient {
     this.initResult = null;
   }
 
+  // The pids of the live processes this client spawned: the provider, and each
+  // terminal whose child has not exited. The service aggregates these so the
+  // daemon can refuse a control caller that is or runs under one of them
+  // (worker-tree.js), which catches a worker even when the daemon is pid 1. A
+  // terminal whose child has exited is left out even while its record lingers in
+  // `terminals` (until the worker releases it): its pid is the kernel's to reuse,
+  // and a reused pid must not be taken for the terminal. The provider is dropped
+  // the moment it exits — stop() and #fail() null `proc` — so it needs no such
+  // guard here.
+  spawnedPids() {
+    const pids = [];
+    if (Number.isInteger(this.proc?.pid)) pids.push(this.proc.pid);
+    for (const terminal of this.terminals.values()) {
+      if (terminal.exitStatus === null && Number.isInteger(terminal.child?.pid)) pids.push(terminal.child.pid);
+    }
+    return pids;
+  }
+
   request(method, params = {}, timeoutMs = null) {
     if (!this.proc?.stdin || !this.channel) throw new Error("ACP process is not running");
     if (this.pending.size >= MAX_OUTBOUND_INFLIGHT_REQUESTS) {

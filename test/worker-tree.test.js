@@ -6,15 +6,16 @@ import { createServer } from "node:net";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { AcpClient } from "../src/acp-client.js";
 import { GATEWAY_WORKER_ENV, withoutSessionMarkers, workerEnv } from "../src/caller.js";
 import { ERROR_CODES } from "../src/errors.js";
-import { sanitizeWorkerMcpServers } from "../src/gateway-service.js";
+import { GatewayService, sanitizeWorkerMcpServers } from "../src/gateway-service.js";
 import { readNdjson } from "../src/ndjson.js";
 import { GatewayRpcClient } from "../src/socket-rpc.js";
 import {
   callerVerdicts, canReadAncestry, daemonLockPid, findAncestor, MAX_ANCESTRY_DEPTH, readProcessInfo, runsGatewayDaemon,
-  runsUnder, WORKER_CALLER_ANCESTRY_UNVERIFIABLE, WORKER_CALLER_UNDER_DAEMON, WORKER_TREE_EXIT_CODE,
-  workerControlDeniedMessage, workerTreeReason
+  runsUnder, WORKER_CALLER_ANCESTRY_UNVERIFIABLE, WORKER_CALLER_UNDER_DAEMON, WORKER_CALLER_UNDER_SPAWNED,
+  WORKER_TREE_EXIT_CODE, workerControlDeniedMessage, workerTreeReason
 } from "../src/worker-tree.js";
 import { startDaemon } from "./helpers/daemon-harness.js";
 import { withTemp } from "./helpers/scratch.js";
@@ -28,6 +29,7 @@ import { withTemp } from "./helpers/scratch.js";
 
 const frontDoor = fileURLToPath(new URL("../src/index.js", import.meta.url));
 const configMcpAgent = fileURLToPath(new URL("./mock-config-mcp-agent.js", import.meta.url));
+const capabilityAgent = fileURLToPath(new URL("./mock-capability-agent.js", import.meta.url));
 const unix = process.platform !== "win32";
 
 // An injected process table, pid -> [ppid, command], and the pids it was asked for.
@@ -287,6 +289,108 @@ test("F6: where no host can read ancestry at all (no /proc, no ps), an unreadabl
     null
   );
   assert.equal(await callerVerdicts({ daemonPid: 40, readProcess: unreadable, ancestrySupported: false })(100).denied, null);
+});
+
+// F5 (1.8.0 review): when the daemon is pid 1 (a container entrypoint with no
+// init) the ancestry walk cannot match a caller to the daemon's own pid — pid 1
+// ends every chain — so a worker whose CLI forwards no marker (Codex) was not
+// told from a Main by that test. The daemon now also refuses a caller that is or
+// runs under one of the actual processes it spawned (providers and terminals),
+// whose pids are real children and never 1.
+test("F5: a caller that is or descends from a spawned process is refused, even when the daemon is pid 1", async () => {
+  // The daemon is pid 1; 7000 is the provider it spawned, 8100 one of that
+  // provider's terminals. The control MCP the worker starts is or runs under them.
+  const { readProcess } = processTable({
+    8300: [8100, "node /x/control/src/index.js"], // control MCP under the terminal
+    8100: [7000, "/bin/bash -lc codex"],          // terminal child
+    7000: [1, "codex app-server"],                // provider, child of the pid-1 daemon
+    1: [0, "/sbin/init"]
+  });
+  const spawnedPids = () => [7000, 8100];
+  // The caller IS the provider pid: matched before any read.
+  assert.equal(
+    await callerVerdicts({ daemonPid: 1, spawnedPids, readProcess: () => assert.fail("a pid match needs no read") })(7000).denied,
+    WORKER_CALLER_UNDER_SPAWNED
+  );
+  // The caller DESCENDS from the terminal pid.
+  assert.equal(await callerVerdicts({ daemonPid: 1, spawnedPids, readProcess })(8300).denied, WORKER_CALLER_UNDER_SPAWNED);
+});
+
+test("F5: a pid gone from the spawned set is no longer refused, so a reused pid is not stale-denied", async () => {
+  // 8100 was a terminal; its child exited and the pid now belongs to an unrelated
+  // process that goes straight to init. The daemon is pid 1, so nothing else can
+  // place the caller.
+  const { readProcess } = processTable({ 8100: [1, "/usr/bin/some-reused-tool"], 1: [0, "/sbin/init"] });
+  // While 8100 is tracked, a caller that is it is refused.
+  assert.equal(await callerVerdicts({ daemonPid: 1, spawnedPids: () => [8100], readProcess })(8100).denied, WORKER_CALLER_UNDER_SPAWNED);
+  // Once it leaves the set, the same pid is allowed: the pid-1 daemon is readable,
+  // so the host can place callers and this one runs outside everything tracked.
+  assert.equal(await callerVerdicts({ daemonPid: 1, spawnedPids: () => [], readProcess })(8100).denied, null);
+});
+
+test("F5: a Main outside every spawned process is allowed; the daemon-pid test and no-caller are unchanged", async () => {
+  // Spawned processes exist, but this Main's chain touches none; the daemon (40)
+  // is alive and readable.
+  const { readProcess } = processTable({ 100: [90, "/bin/zsh"], 90: [1, "/sbin/launchd"], 40: [1, "node /x/src/gateway-daemon.js"], 1: [0, "/sbin/init"] });
+  const spawnedPids = () => [7000, 8100];
+  assert.equal(await callerVerdicts({ daemonPid: 40, spawnedPids, readProcess })(100).denied, null);
+  // A management request names no caller: never looked up, spawned set or not.
+  assert.equal(callerVerdicts({ daemonPid: 40, spawnedPids, readProcess })(undefined), null);
+  // The daemon-pid test still fires for a caller that is the daemon itself but not
+  // in the spawned set — a pid match needs no read.
+  assert.equal(
+    await callerVerdicts({ daemonPid: 40, spawnedPids, readProcess: () => assert.fail() })(40).denied,
+    WORKER_CALLER_UNDER_DAEMON
+  );
+});
+
+test("F5: the spawned-worker denial carries the worker message", () => {
+  assert.equal(
+    workerControlDeniedMessage(WORKER_CALLER_UNDER_SPAWNED, 4242),
+    "Control access denied: caller process 4242 runs inside a Gateway worker"
+  );
+});
+
+test("F5: a started client reports its provider pid and drops it on stop", async () => {
+  const client = new AcpClient({ provider: "mock", command: process.execPath, args: [capabilityAgent], permissionPolicy: "auto_approve" });
+  await client.start();
+  try {
+    assert.ok(Number.isInteger(client.proc.pid));
+    assert.deepEqual(client.spawnedPids(), [client.proc.pid], "just the live provider");
+  } finally {
+    await client.stop();
+  }
+  assert.deepEqual(client.spawnedPids(), [], "nothing after stop nulls the provider");
+});
+
+test("F5: a client includes a live terminal pid and drops it once the terminal exits", () => {
+  // White-box on the gating, so it holds on every platform regardless of terminal
+  // approval: the provider pid is reported, a terminal whose child is live is
+  // reported, and one whose child has exited (exitStatus set) is left out even
+  // while its record lingers in `terminals` until the worker releases it.
+  const client = new AcpClient({ provider: "mock", command: "node", args: [] });
+  client.proc = { pid: 4242 };
+  client.terminals.set("terminal-1", { child: { pid: 5000 }, exitStatus: null });
+  client.terminals.set("terminal-2", { child: { pid: 5001 }, exitStatus: null });
+  assert.deepEqual(client.spawnedPids().sort((a, b) => a - b), [4242, 5000, 5001]);
+  // terminal-1's child exits: its pid leaves the set, lingering record and all.
+  client.terminals.get("terminal-1").exitStatus = { exitCode: 0, signal: null };
+  assert.deepEqual(client.spawnedPids().sort((a, b) => a - b), [4242, 5001]);
+  // The provider exits (proc nulled by stop/#fail): only the live terminal remains.
+  client.proc = null;
+  assert.deepEqual(client.spawnedPids(), [5001]);
+});
+
+test("F5: the service unions the spawned pids of its clients, current and retired", async () => {
+  await withTemp("acp-f5-service-", async (directory) => {
+    const service = new GatewayService({ statePath: join(directory, "state.json"), gcIntervalMs: 0, artifactStore: { create: () => null } });
+    service.clients.set("claude", { spawnedPids: () => [101, 102] });
+    service.clients.set("codex", { spawnedPids: () => [201] });
+    // A retiring client's processes still count; a pid shared with a live client
+    // (101) appears once.
+    service.retiredClients.add({ spawnedPids: () => [301, 101] });
+    assert.deepEqual([...service.spawnedPids()].sort((a, b) => a - b), [101, 102, 201, 301]);
+  });
 });
 
 test("W1: the daemon lock yields a pid only when it holds one", async () => {

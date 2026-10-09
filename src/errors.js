@@ -47,13 +47,16 @@ export const ERROR_CODES = Object.freeze({
   // to it, the token included, and no daemon was started. details: socketPath,
   // type, ownerUid, uid.
   SOCKET_UNTRUSTED: "SOCKET_UNTRUSTED",
-  // The caller's pid is the daemon or runs under it: the agent CLI behind this
-  // connection is a worker, or something a worker or its terminal started.
-  // Workers never get the Control, whatever token they present. Refused before
-  // the connection binds or anything runs. The verdict is reused only while
-  // the connection's caller pid stays the same; a request that names another
-  // pid is checked on its own. A connection that never names a caller pid
-  // (management clients) is never refused for this.
+  // The caller's pid is, or runs under, the daemon or a process the daemon
+  // spawned (a provider or one of its terminals): the agent CLI behind this
+  // connection is a worker, or something a worker or its terminal started. The
+  // spawned-process match still catches a worker when the daemon is pid 1, where
+  // no ancestor can be matched to the daemon's own pid. Workers never get the
+  // Control, whatever token they present. Refused before the connection binds or
+  // anything runs. The verdict is reused only while the connection's caller pid
+  // stays the same; a request that names another pid is checked on its own. A
+  // connection that never names a caller pid (management clients) is never
+  // refused for this.
   WORKER_CONTROL_DENIED: "WORKER_CONTROL_DENIED",
   // The fail-closed persistence path: a Task handle is a durability promise, so
   // it is refused rather than issued while the state store cannot keep it.
