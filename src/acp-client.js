@@ -55,6 +55,11 @@ function laneForRequest(method) {
 }
 
 export class AcpClient {
+  // The Gateway credentials no file a Worker reads may carry (the daemon's
+  // Control token, through GatewayService). Private, so nothing that prints or
+  // serializes a client can show them.
+  #protectedSecrets = [];
+
   constructor(config, options = {}) {
     this.config = config;
     this.permissionPolicy = options.permissionPolicy ?? config.permissionPolicy;
@@ -76,6 +81,8 @@ export class AcpClient {
     this.maxQueueBytes = options.maxQueueBytes ?? CHILD_STDIN_QUEUE_BYTES;
     // Canonical paths no session may touch, even when a root contains them.
     this.protectedPaths = [...(options.protectedPaths ?? [])];
+    // An empty one would be in every text.
+    this.#protectedSecrets = (options.protectedSecrets ?? []).filter((secret) => typeof secret === "string" && secret !== "");
     // What keeps a Gateway terminal off the protected paths besides the string
     // checks (terminal-sandbox.js): left out, whatever this OS offers; null,
     // none. Without one, auto_approve no longer starts terminals on its own.
@@ -670,9 +677,10 @@ export class AcpClient {
       // A command whose decisive variable the Gateway cannot know ahead of time
       // (indirect or arithmetic expansion names it at runtime) is never bound.
       if (!command || usesDynamicExpansion(command.text)) return null;
-      // Bound to the cwd and env Main approved, not the command alone: the same
-      // argv in another directory, or with PATH/LD_PRELOAD/an interpolated
-      // variable changed, runs something Main did not see, so it is asked anew.
+      // Bound to the cwd and the whole env Main approved, not the command alone:
+      // the same argv in another directory, or with any variable added, removed
+      // or changed (PATH, PYTHONPATH, one the command interpolates), may run
+      // something Main did not see, so it is asked anew.
       const roots = this.sessionRoots.get(params.sessionId) ?? [];
       return { kind, command, cwd: grantCwd(params.toolCall?.rawInput?.cwd, roots), env: envMap(params.toolCall?.rawInput?.env) };
     }
@@ -702,6 +710,15 @@ export class AcpClient {
             maxBytes: cap
           })
         : await readTextHead(handle, cap);
+      // Every check before this one is about names and inodes, and a copy of the
+      // token file passes them, as does a hard link that outlived an atomic
+      // rewrite of install.json: it keeps the old inode, which is no longer
+      // protected, and the same token. So the text itself must not carry a
+      // credential the daemon accepts. Refused before anything is returned, and
+      // the error says why, never what the file holds.
+      if (this.#protectedSecrets.some((secret) => read.text.includes(secret))) {
+        throw new Error("File holds a Gateway credential; the Gateway does not return its content");
+      }
       // An untruncated answer stays byte-identical to every previous version: no
       // _meta key at all. Truncation used to be silent, which is the actual bug.
       if (!read.truncated) return { content: read.text };
@@ -793,20 +810,26 @@ export class AcpClient {
   }
 
   // A terminal/create, checked: cwd inside the roots, a command, args that are
-  // strings, and no word that names a protected path. Before Main is asked, so
-  // Main is never shown a request that cannot run or that names a protected
-  // path, and again when the terminal starts, which can be long after.
-  #terminalRequest(params) {
+  // strings, env entries whose name and value are strings, and no word that
+  // names a protected path. Before Main is asked, so Main is never shown a
+  // request that cannot run or that names a protected path, and again when the
+  // terminal starts, which can be long after: then in approvedCwd, the
+  // directory it was approved for, not params.cwd resolved anew
+  // (#requireApprovedCwd).
+  #terminalRequest(params, approvedCwd = null) {
     const roots = this.sessionRoots.get(params.sessionId) ?? [];
-    const cwd = realpathSync(resolve(params.cwd ?? roots[0] ?? process.cwd()));
+    const cwd = approvedCwd ?? this.#requestedTerminalCwd(params);
     if (!roots.some((root) => isWithin(root, cwd))) throw new Error(`Terminal cwd is outside ACP session roots: ${cwd}`);
     if (typeof params.command !== "string" || !params.command) throw new Error("Terminal command is required");
     const args = params.args ?? [];
     if (!Array.isArray(args) || args.some((arg) => typeof arg !== "string")) {
       throw new Error("Terminal args must be an array of strings");
     }
+    // A value that is not a string (ACP's EnvVariable has a string value) would
+    // not be what Main is shown or what a grant compares: spawn passes a null on
+    // as "null", and a missing one unsets the variable the daemon has.
     const env = params.env ?? [];
-    if (!Array.isArray(env) || env.some((entry) => typeof entry?.name !== "string")) {
+    if (!Array.isArray(env) || env.some((entry) => typeof entry?.name !== "string" || typeof entry.value !== "string")) {
       throw new Error("Terminal env must be an array of {name, value}");
     }
     // A present-but-invalid outputByteLimit is refused here, before the spawn:
@@ -825,6 +848,13 @@ export class AcpClient {
     return { cwd, command: params.command, args, env };
   }
 
+  // The directory a terminal/create names, links resolved the way the kernel
+  // will: its cwd, or the session's when it names none. What a request is
+  // checked in, and what a starting one is compared with (#requireApprovedCwd).
+  #requestedTerminalCwd(params) {
+    return realpathSync(resolve(params.cwd ?? this.sessionRoots.get(params.sessionId)?.[0] ?? process.cwd()));
+  }
+
   // The sandbox a terminal of this client runs in, or null: none is needed when
   // nothing is protected, and one that cannot apply a profile here is none.
   async #terminalSandboxReady() {
@@ -836,8 +866,33 @@ export class AcpClient {
     }
   }
 
-  async #createTerminal(params) {
-    const request = this.#terminalRequest(params);
+  // A terminal runs in the directory it was approved for, operation.cwd (the
+  // canonical cwd Main is shown), only while params.cwd still leads there and
+  // the directory there is the one that was there then (operation.cwdIdentity).
+  // Bound like a pending write (#writeTextFile): a worker that re-points a
+  // symlink in params.cwd, or puts another directory at the path, while Main
+  // decides must not move the command into a directory Main never saw, however
+  // much it is in-root. Only the approved cwd is named in the error, never
+  // where the worker steered it, which no root or protected check has seen. A
+  // terminal that starts at once (auto_approve, a grant) passes unless the
+  // worker raced it.
+  #requireApprovedCwd(params, operation) {
+    let current;
+    let directory;
+    try {
+      current = this.#requestedTerminalCwd(params);
+      directory = statSync(operation.cwd, { bigint: true });
+    } catch {
+      throw new Error(`Terminal cwd no longer resolves since it was approved: ${operation.cwd}`);
+    }
+    if (current !== operation.cwd
+      || directory.dev !== operation.cwdIdentity.dev || directory.ino !== operation.cwdIdentity.ino) {
+      throw new Error(`Terminal cwd changed since it was approved: ${operation.cwd}`);
+    }
+  }
+
+  async #createTerminal(params, operation) {
+    const request = this.#terminalRequest(params, operation.cwd);
     // Before the limit check, which has to stay in one turn with the insert.
     const sandbox = await this.#terminalSandboxReady();
     // A stop() that began meanwhile would not wait for this terminal.
@@ -846,6 +901,9 @@ export class AcpClient {
     if (activeForSession >= this.maxTerminalsPerSession) {
       throw new Error(`ACP session terminal limit exceeded: ${this.maxTerminalsPerSession}`);
     }
+    // In the same turn as the spawn, after the last await, so only a race
+    // inside these few synchronous steps could still swap the directory.
+    this.#requireApprovedCwd(params, operation);
     const terminalId = `terminal-${this.nextId++}`;
     // #terminalRequest already refused a present-but-invalid limit, so Number()
     // is finite here; floor keeps it the integer BoundedUtf8Text requires.
@@ -966,10 +1024,11 @@ export class AcpClient {
       ? this.#writeOperation(id, params)
       : this.#terminalOperation(id, params);
     // Built from the operation, so the write carries the canonical target Main
-    // approved (operation.path) and the inode it had then (operation.target).
+    // approved (operation.path) and the inode it had then (operation.target),
+    // and the terminal its canonical cwd and that directory's inode.
     const run = operation.kind === "write"
       ? () => this.#writeTextFile(params, operation.path, operation.target)
-      : () => this.#createTerminal(params);
+      : () => this.#createTerminal(params, operation);
     // auto_approve runs a write, and a terminal the OS keeps off the protected
     // paths (or when nothing is protected). Without that, all that stands
     // between a terminal and install.json is its command line, which a shell
@@ -1048,20 +1107,25 @@ export class AcpClient {
 
   // A terminal/create as Main is asked about it: the command, its args, the
   // working directory, and the env it sets. The values of env that decide what
-  // runs — the loader names (PATH/LD_PRELOAD/DYLD_*/...) and any the command line
-  // interpolates — are shown, because hiding them would let an approval cover a
-  // command whose behaviour Main never saw; every other value stays hidden, as a
-  // worker-supplied credential should. cwd and env also ride the operation, so a
-  // grant is spent only by a request with the same ones.
+  // runs — the names that make the loader, an interpreter, a shell or a common
+  // tool load or run code (PATH, LD_PRELOAD, PYTHONPATH, GIT_SSH_COMMAND, ...)
+  // and any the command line interpolates — are shown, because hiding them
+  // would let Main approve a command whose behaviour it never saw; every other
+  // value stays hidden, as a worker-supplied credential should (a pending
+  // request is persisted). cwd and env also ride the operation, so a grant is
+  // spent only by a request with the same ones, and so is the inode of the cwd,
+  // which the terminal must still find there when it starts.
   #terminalOperation(id, params) {
     const request = this.#terminalRequest(params);
     const argv = [request.command, ...request.args];
     const command = commandForm(argv);
     const decisive = interpolatedEnvNames(command.text);
+    const directory = statSync(request.cwd, { bigint: true });
     return {
       kind: "terminal",
       command,
       cwd: request.cwd,
+      cwdIdentity: { dev: directory.dev, ino: directory.ino },
       env: envMap(request.env),
       namesGatewayDirectory: this.#namesGatewayDirectory(argv.join(" ")),
       // What waiting for Main actually holds is the whole retained request, so a
@@ -1125,14 +1189,16 @@ export class AcpClient {
       if (operation.kind === "write") return grant.paths.has(operation.path);
       // A terminal grant covers the operation only with the same command form
       // (a literal argv never matches a shell script, nor a login shell a
-      // non-login one), the same cwd, and the same values for the
-      // execution-affecting env of that command (which also rejects a request
-      // that adds one not approved). A command using dynamic expansion is never
-      // bound, so it never matches.
+      // non-login one), the same cwd, and the same explicit env, every name and
+      // every value. No list of the variables that make a program load code is
+      // complete (PYTHONPATH, RUBYOPT, a git config, a shell's startup file, and
+      // whatever a tool reads next), so a variable added, removed or changed is
+      // asked about anew, whichever it is. A command using dynamic expansion is
+      // never bound, so it never matches.
       if (usesDynamicExpansion(operation.command.text)) return false;
       return sameCommand(grant.command, operation.command)
         && grant.cwd === operation.cwd
-        && sameEnv(executionEnv(operation.command.text, grant.env), executionEnv(operation.command.text, operation.env));
+        && sameEnv(grant.env, operation.env);
     }) ?? -1;
     if (index === -1) return false;
     const grant = grants[index];
@@ -1605,21 +1671,41 @@ function grantCwd(rawCwd, roots) {
   }
 }
 
-// Env vars that change which program runs or how it is loaded, not data a
-// command reads: a grant is bound to their values and Main is shown them. The
-// glibc loader injection vars (LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH, GCONV_PATH)
-// run attacker code at load time as surely as PATH does; DYLD_* is their macOS
-// family, matched by prefix.
+// Env vars that change which program runs or make it load or run other code,
+// not data a command reads: a pending terminal shows Main their values (a grant
+// compares every variable regardless, #consumeGrant). The glibc loader
+// injection vars (LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH, GCONV_PATH) run
+// attacker code at load time as surely as PATH does. An interpreter's search
+// paths and startup options, a shell's startup files and hooks, the config
+// directories git and most tools take commands from, and the programs a common
+// tool starts on its own (an editor, a pager, git's ssh) do the same a step
+// later. The common ones, not every one: a value left hidden is still compared.
 const EXECUTION_ENV_NAMES = new Set([
-  "PATH", "LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH", "GCONV_PATH", "NODE_OPTIONS", "BASH_ENV"
+  "PATH", "LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH", "GCONV_PATH",
+  "NODE_OPTIONS", "NODE_PATH",
+  "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE",
+  "PERL5LIB", "PERLLIB", "PERL5OPT",
+  "RUBYLIB", "RUBYOPT", "GEM_HOME", "GEM_PATH", "BUNDLE_GEMFILE",
+  "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS", "CLASSPATH",
+  "LUA_PATH", "LUA_CPATH", "LUA_INIT",
+  "BASH_ENV", "ENV", "ZDOTDIR", "PROMPT_COMMAND", "SHELLOPTS", "BASHOPTS", "PS4",
+  "HOME", "XDG_CONFIG_HOME",
+  "GIT_DIR", "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS", "SSH_ASKPASS",
+  "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+  "GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "GIT_PAGER", "GIT_PROXY_COMMAND", "GIT_EXTERNAL_DIFF",
+  "EDITOR", "VISUAL", "PAGER", "MANPAGER", "LESSOPEN", "LESSCLOSE"
 ]);
+// The same by prefix: the macOS loader's DYLD_*, git's numbered config pairs
+// (GIT_CONFIG_KEY_<n> and GIT_CONFIG_VALUE_<n>), and the functions bash imports
+// from the env (BASH_FUNC_<name>%%), which can stand in for any command.
+const EXECUTION_ENV_PREFIXES = ["DYLD_", "GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_", "BASH_FUNC_"];
 
 function isExecutionEnvName(name) {
-  return EXECUTION_ENV_NAMES.has(name) || name.startsWith("DYLD_");
+  return EXECUTION_ENV_NAMES.has(name) || EXECUTION_ENV_PREFIXES.some((prefix) => name.startsWith(prefix));
 }
 
 // The names a command line interpolates ($NAME or ${NAME}). Their values are
-// part of what runs, so they are treated like the execution-affecting names.
+// part of what runs, so Main sees them like the execution-affecting names.
 function interpolatedEnvNames(commandLine) {
   const names = new Set();
   const pattern = /\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g;
@@ -1640,17 +1726,7 @@ function envMap(env) {
   return map;
 }
 
-// The execution-affecting slice of an env map for a command line: the loader
-// names plus whatever the line interpolates. The rest is data a grant ignores.
-function executionEnv(commandLine, env) {
-  const decisive = interpolatedEnvNames(commandLine);
-  const result = new Map();
-  for (const [name, value] of env) {
-    if (isExecutionEnvName(name) || decisive.has(name)) result.set(name, value);
-  }
-  return result;
-}
-
+// Two env maps with the same names, each with the same value.
 function sameEnv(a, b) {
   if (a.size !== b.size) return false;
   for (const [name, value] of a) if (b.get(name) !== value) return false;

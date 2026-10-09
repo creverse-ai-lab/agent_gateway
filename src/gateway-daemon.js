@@ -80,7 +80,11 @@ const service = new GatewayService({
   ...gatewayConfig,
   ...gatewayObservabilityConfig(settings.activeValues),
   persistence: gatewayPersistenceConfig(settings.activeValues),
-  isOwnerLive: (owner) => callers.isLive(owner)
+  isOwnerLive: (owner) => callers.isLive(owner),
+  // A Worker's file read never returns this token, wherever a copy of it is:
+  // a link that outlived an atomic rewrite of install.json is not protected
+  // by inode any more (AcpClient #readTextFile).
+  protectedSecrets: [expectedToken]
 });
 const clients = new Set();
 let shutdownPromise = null;

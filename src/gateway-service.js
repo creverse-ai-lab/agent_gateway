@@ -161,6 +161,10 @@ const ATTRIBUTED_METHODS = new Set(["session_open", "session_restore", "prompt",
 export { DURABLE_EVENT_TYPES } from "./sessions.js";
 
 export class GatewayService {
+  // What every client is handed as protectedSecrets. Private, so nothing that
+  // prints or serializes the service, setup's answer included, shows it.
+  #protectedSecrets = [];
+
   constructor({
     statePath,
     settings = null,
@@ -221,6 +225,10 @@ export class GatewayService {
     // Canonical paths no worker may read or write (Control token, settings,
     // state, socket). Injectable so tests can point them at a temp directory.
     protectedPaths = null,
+    // Credentials no file a worker reads through the Gateway may carry: the
+    // daemon passes the Control token it accepts. Handed to every client and
+    // kept nowhere else (#protectedSecrets).
+    protectedSecrets = [],
     // The OS sandbox Gateway terminals run in (terminal-sandbox.js): left out,
     // each client uses what this OS offers; null, none. Injectable for tests.
     terminalSandbox = undefined,
@@ -266,6 +274,7 @@ export class GatewayService {
     this.settings = settings;
     this.protectedPaths = protectedPaths
       ?? gatewayProtectedPaths(statePath ? { statePath } : {});
+    this.#protectedSecrets = [...(protectedSecrets ?? [])];
     this.terminalSandbox = terminalSandbox;
     this.draining = false;
     this.inflightMutations = 0;
@@ -1278,7 +1287,7 @@ export class GatewayService {
   // type of its own would make a 1.7 Gateway refuse the log on a downgrade. A
   // crash within the snapshot interval can lose it, and the Main's same
   // explicit restore then takes the session again, while the session is there
-  // to take (#persistAdoption covers its close).
+  // to take (#dropSessionRecord keeps it there until the adoption is saved).
   #adopt(session, context) {
     const adopter = this.#attributed(context);
     session.adoptedFrom = session.openedBy;
@@ -1292,25 +1301,28 @@ export class GatewayService {
     this.schedulePersist();
   }
 
-  // Called with the session already out of the store, right before its
-  // SESSION_CLOSED is appended. That record is in the log at once, and no log
-  // record says who owns a task or an inbox row: the startup re-binding works
-  // from the session row, which the close takes away. A crash before the next
-  // snapshot would then hand the session's tasks and rows back to the Main it
-  // was adopted from, with no session left to adopt again. So while the
-  // snapshot may not hold the adoption yet (changes not written, or the last
-  // write failed), it is written now, and synced, ahead of the record that
-  // depends on it. Without the WAL nothing is appended, and the next snapshot
-  // carries the close and the adoption together.
+  // Called while the session record is still in the store, right before it
+  // leaves and its SESSION_CLOSED is appended. That record is in the log at
+  // once, and no log record says who owns a task or an inbox row: the startup
+  // re-binding works from the session row, which the close takes away. A crash
+  // before the next snapshot would then hand the session's tasks and rows back
+  // to the Main it was adopted from, with no session left to adopt again. So
+  // while the snapshot may not hold the adoption yet (changes not written, or
+  // the last write failed), it is written now, and synced, ahead of the record
+  // that depends on it. Without the WAL nothing is appended, and the next
+  // snapshot carries the close and the adoption together. Returns whether the
+  // record may go: false only when that write failed, which persistence health
+  // then reports.
   #persistAdoption(session) {
-    if (!session.adoptedFrom || this.stateStore?.mode !== "wal") return;
-    if (!this.persistDirty && this.persistError == null) return;
+    if (!session.adoptedFrom || this.stateStore?.mode !== "wal") return true;
+    if (!this.persistDirty && this.persistError == null) return true;
     try {
       this.stateStore.writeSnapshot({ sync: true });
+      this.persistError = null;
+      return true;
     } catch (error) {
-      // The close goes on regardless: a failed write costs no more than the
-      // crash window did before.
       this.persistError = error?.message ?? String(error);
+      return false;
     }
   }
 
@@ -2971,6 +2983,12 @@ export class GatewayService {
       await this.closeSession(session);
       return { ok: true, closed: session.id };
     }
+    // A closed record, kept until its close can be saved (dropOwed) or by a
+    // state from before 1.8.0 until retention, is no session to work on: get,
+    // check, close and clean still reach it.
+    if (CLOSED_STATUSES.has(session.status) && ["workspace_diff", "pin", "unpin"].includes(args.action)) {
+      throw new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`);
+    }
     if (args.action === "workspace_diff") {
       const diff = await snapshotDiff(session.workspace);
       const budget = this.resourceLimits.maxInlineResultBytes;
@@ -3061,6 +3079,13 @@ export class GatewayService {
   }
 
   async closeSession(session) {
+    // A record a close or retention already ended, kept because its adoption
+    // could not be saved then (dropOwed): its mailbox is closed, so only the
+    // drop is tried again, here, and nothing is closed twice.
+    if (dropOwed(session)) {
+      this.#dropSessionRecord(session);
+      return false;
+    }
     return this.#queueFor(session).run("close", () => this.#closeLocked(session));
   }
 
@@ -3100,23 +3125,33 @@ export class GatewayService {
     this.#setStatus(session, "closed", "session_closed");
     session.client = null;
     this.store.push(session, { type: "session_closed" });
+    // Closed either way: a record whose adoption cannot be saved yet stays in
+    // the store, closed, until a later drop can (#dropSessionRecord).
     this.#dropSessionRecord(session);
     // The copy goes with the session. Main collects workspace_diff before close.
     if (session.workspace) await this.#removeWorkspace(session.workspace);
     // Anything still queued behind this close was written for a session that
-    // now does not exist; waking it up would act on the deleted record.
+    // is closed now; waking it up would act on a record that is gone, or kept
+    // only until its close can be saved.
     queue.closeWith(new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`));
     return true;
   }
 
-  // A session record leaving for good, closed by Main or let go by retention:
-  // out of the store, its adoption made durable (#persistAdoption), then out of
-  // the log. Replay must not resurrect a session Main was told is gone, even
-  // when the registration record is still in the log ahead of this one.
+  // A session record leaving for good, closed by Main or let go by retention,
+  // and already closed: its adoption made durable (#persistAdoption), then out
+  // of the store and out of the log. Replay must not resurrect a session Main
+  // was told is gone, even when the registration record is still in the log
+  // ahead of this one. When the adoption cannot be made durable the record
+  // stays, closed, and no SESSION_CLOSED is appended: a crash then brings the
+  // session back, for its adopter to take again with the tasks and rows that
+  // hang off it, and the next drop tries again (maintenance, a close, a clean).
+  // Returns whether the record is gone.
   #dropSessionRecord(session) {
+    if (!this.store.get(session.id)) return true;
+    if (!this.#persistAdoption(session)) return false;
     this.store.delete(session.id);
-    this.#persistAdoption(session);
     this.stateStore?.append(WAL_TYPES.SESSION_CLOSED, session.id, {});
+    return true;
   }
 
   syncSessionInputState(session) {
@@ -3351,6 +3386,7 @@ export class GatewayService {
       maxTerminalOutputBytes: this.resourceLimits.maxTerminalOutputBytes,
       writeTimeoutMs: this.resourceLimits.writeTimeoutMs,
       protectedPaths: this.protectedPaths,
+      protectedSecrets: [...this.#protectedSecrets],
       terminalSandbox: this.terminalSandbox,
       // Where the client keeps the pids of the processes it spawns (spawnedPids).
       spawnedProcesses: this.spawnedProcesses,
@@ -4113,6 +4149,13 @@ export class GatewayService {
     if (this.#evictInboxHistory()) changed = true;
 
     for (const session of [...this.store.list()]) {
+      // A record a close or retention let go of but had to keep, because its
+      // adoption could not be saved then (dropOwed): only its drop is tried
+      // again, and nothing else here applies to it.
+      if (dropOwed(session)) {
+        if (this.store.get(session.id) && this.#dropSessionRecord(session)) changed = true;
+        continue;
+      }
       const presence = this.rootPresence.get(session.ownerRootId);
       const orphanExpired = !session.pinned && session.orphanedAt
         && (presence?.connections ?? 0) === 0
@@ -4160,6 +4203,9 @@ export class GatewayService {
           session.client.clearSession(session.acpSessionId);
           session.client = null;
         }
+        // Closed, as by Main: a record that has to stay until its adoption can
+        // be saved (#dropSessionRecord) is not a session to act on.
+        this.#setStatus(session, "closed", "session_closed");
         this.#dropSessionRecord(session);
         if (session.workspace) await this.#removeWorkspace(session.workspace);
         // Task handles deliberately survive their session now: a Task's lifetime
@@ -4755,6 +4801,15 @@ function taskStatusPayload(task) {
 // prompted again, so a pin on it would only keep its bytes forever.
 function pinHolds(session) {
   return session?.pinned === true && !CLOSED_STATUSES.has(session.status);
+}
+
+// A record a close or retention let go of but had to keep, because its adoption
+// could not be saved then (#dropSessionRecord), or that a crash caught between
+// that save and the logged close. Nothing else is closed and adopted: a closed
+// record a state kept from before 1.8.0, which ages out by retention, was never
+// adopted, and adoption came with 1.8.0.
+function dropOwed(session) {
+  return CLOSED_STATUSES.has(session.status) && session.adoptedFrom != null;
 }
 
 // What a snapshot copy counts against the combined budget: the source size its

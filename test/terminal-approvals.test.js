@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -175,17 +175,18 @@ test("W4: Main's inbox shows the operation, in full and in the summary", async (
       const { sessionId } = await service.call("session_open", { provider: "claude", cwd: directory, permissionPolicy: "ask" }, context);
       const pending = await service.call("run", {
         sessionId,
-        prompt: JSON.stringify({ steps: [{ terminal: { command: "git", args: ["status", "--short"], env: [{ name: "GIT_DIR", value: "/elsewhere" }] } }] }),
+        prompt: JSON.stringify({ steps: [{ terminal: { command: "git", args: ["status", "--short"], env: [{ name: "GIT_AUTHOR_NAME", value: "Somebody Elsewhere" }] } }] }),
         waitMs: 10_000
       }, context);
       assert.equal(pending.status, "input_required");
       const [full] = (await service.call("inbox", { action: "list" }, context)).items;
-      // GIT_DIR is neither a loader variable nor interpolated by the command, so
-      // its value stays hidden; the env entry is now {name} rather than a bare name.
-      assert.deepEqual(full.toolCall.rawInput, { command: "git", args: ["status", "--short"], cwd: directory, env: [{ name: "GIT_DIR" }] });
+      // GIT_AUTHOR_NAME is data: it makes git load or run nothing, and the
+      // command does not interpolate it, so its value stays hidden; the env
+      // entry is {name} rather than a bare name.
+      assert.deepEqual(full.toolCall.rawInput, { command: "git", args: ["status", "--short"], cwd: directory, env: [{ name: "GIT_AUTHOR_NAME" }] });
       const [summary] = (await service.call("inbox", { action: "list", detail: "summary" }, context)).items;
       assert.equal(summary.toolCall.title, "Run: git status --short", "the summary keeps only the title, so it names the command");
-      assert.doesNotMatch(JSON.stringify(full), /elsewhere/);
+      assert.doesNotMatch(JSON.stringify(full), /Elsewhere/);
     } finally {
       await service.shutdown();
     }
@@ -785,8 +786,11 @@ test("F1: an execute approval is bound to its cwd; the same command in another d
   }));
 });
 
-test("F1: an execute approval is bound to its execution-affecting env; a changed or added one is asked anew", async () => {
-  await withTemp("acp-f1-env-", (directory) => withClient({ cwd: directory, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
+// N1 (release-gate review): the grant compares the whole explicit env. Before,
+// only the execution-affecting and interpolated names were compared, so a
+// variable on no list (PYTHONPATH then) rode along on an approval unseen.
+test("N1: an execute approval is bound to its whole env; a variable added, removed or changed is asked anew", async () => {
+  await withTemp("acp-n1-env-", (directory) => withClient({ cwd: directory, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
     const turn = run([
       { permission: { kind: "execute", command: "/bin/echo hi", env: [{ name: "PATH", value: "/safe/bin" }] } },
       // PATH swapped: not the environment the approval named.
@@ -795,21 +799,87 @@ test("F1: an execute approval is bound to its execution-affecting env; a changed
       { terminal: { command: "/bin/echo", args: ["hi"], env: [{ name: "PATH", value: "/safe/bin" }, { name: "LD_PRELOAD", value: "/x.so" }] } },
       // LD_AUDIT added: the glibc audit interface loads it like LD_PRELOAD.
       { terminal: { command: "/bin/echo", args: ["hi"], env: [{ name: "PATH", value: "/safe/bin" }, { name: "LD_AUDIT", value: "/a.so" }] } },
-      // The approved PATH plus a non-execution-affecting var: still the one approval.
-      { terminal: { command: "/bin/echo", args: ["hi"], env: [{ name: "PATH", value: "/safe/bin" }, { name: "NOTE", value: "fyi" }] } }
+      // A variable on no list added: asked too, since no list is complete.
+      { terminal: { command: "/bin/echo", args: ["hi"], env: [{ name: "PATH", value: "/safe/bin" }, { name: "NOTE", value: "fyi" }] } },
+      // The approved PATH left out.
+      { terminal: { command: "/bin/echo", args: ["hi"] } },
+      // Exactly the approved env: the one approval.
+      { terminal: { command: "/bin/echo", args: ["hi"], env: [{ name: "PATH", value: "/safe/bin" }] } }
     ]);
     client.respondPermission((await request(requests, 1)).requestId, "allow", sessionId);
-    await client.respondPermission((await request(requests, 2)).requestId, "reject-once", sessionId);
-    await client.respondPermission((await request(requests, 3)).requestId, "reject-once", sessionId);
-    await client.respondPermission((await request(requests, 4)).requestId, "reject-once", sessionId);
+    for (const count of [2, 3, 4, 5, 6]) {
+      await client.respondPermission((await request(requests, count)).requestId, "reject-once", sessionId);
+    }
     assert.deepEqual(await turn, [
       "allow",
       "terminal-error: Main rejected ACP operation",
       "terminal-error: Main rejected ACP operation",
       "terminal-error: Main rejected ACP operation",
+      "terminal-error: Main rejected ACP operation",
+      "terminal-error: Main rejected ACP operation",
       { output: "hi\n", exitStatus: { exitCode: 0, signal: null } }
     ]);
-    assert.equal(requests.length, 4, "each added or swapped loader var went back to Main");
+    assert.equal(requests.length, 6, "each added, removed or swapped variable went back to Main");
+  }));
+});
+
+// The review's case: Main approves a python3 -c with no env, and the Worker
+// sends the same argv and cwd with PYTHONPATH pointing at a sitecustomize.py of
+// its own, which Python would run first. A variable no list names is the same.
+test("N1: the same argv and cwd with an interpreter's loader variable, or any other, added is not the approved command", async () => {
+  await withTemp("acp-n1-loader-", (directory) => withClient({ cwd: directory, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
+    const argv = ["python3", "-c", "print('ok')"];
+    const injected = join(directory, "injected");
+    for (const variable of [{ name: "PYTHONPATH", value: injected }, { name: "WORKER_PLUGIN_DIR", value: injected }]) {
+      const before = requests.length;
+      const turn = run([
+        { permission: { kind: "execute", command: argv } },
+        { terminal: { command: argv[0], args: argv.slice(1), env: [variable] } }
+      ]);
+      client.respondPermission((await request(requests, before + 1)).requestId, "allow", sessionId);
+      const asked = await request(requests, before + 2);
+      // PYTHONPATH makes Python load code, so Main sees where it points; the
+      // other is shown by name only, and asked about all the same.
+      assert.deepEqual(asked.toolCall.rawInput.env, [variable.name === "PYTHONPATH" ? variable : { name: variable.name }]);
+      await client.respondPermission(asked.requestId, "reject-once", sessionId);
+      assert.deepEqual(await turn, ["allow", "terminal-error: Main rejected ACP operation"], variable.name);
+    }
+  }));
+});
+
+test("N1: a pending terminal shows the values of the variables that make a program load or run code, and only the names of the rest", async () => {
+  await withTemp("acp-n1-shown-", (directory) => withClient({ cwd: directory, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
+    const shown = [
+      ["PYTHONPATH", "/repo/injected"], ["PERL5OPT", "-Mevil"], ["RUBYOPT", "-revil"], ["NODE_PATH", "/repo/node"],
+      ["JAVA_TOOL_OPTIONS", "-javaagent:/repo/a.jar"], ["CLASSPATH", "/repo/classes"], ["LUA_INIT", "@/repo/init.lua"],
+      ["ZDOTDIR", "/repo/zsh"], ["ENV", "/repo/env.sh"], ["PROMPT_COMMAND", "./hook"], ["PS4", "$(./hook)"],
+      ["HOME", "/repo/home"], ["GIT_DIR", "/repo/fake.git"], ["GIT_SSH_COMMAND", "./ssh"], ["GIT_CONFIG_COUNT", "1"],
+      ["GIT_CONFIG_KEY_0", "core.fsmonitor"], ["GIT_CONFIG_VALUE_0", "./monitor"], ["EDITOR", "./edit"],
+      ["PAGER", "./page"], ["LESSOPEN", "|./open %s"], ["DYLD_INSERT_LIBRARIES", "/repo/x.dylib"],
+      ["BASH_FUNC_ls%%", "() { ./evil; }"]
+    ].map(([name, value]) => ({ name, value }));
+    const hidden = [{ name: "API_KEY", value: "hidden-key" }, { name: "GITHUB_TOKEN", value: "hidden-token" }];
+    const turn = run([{ terminal: { command: "/bin/echo", args: ["hi"], env: [...shown, ...hidden] } }]);
+    const asked = await request(requests, 1);
+    assert.deepEqual(asked.toolCall.rawInput.env, [...shown, ...hidden.map(({ name }) => ({ name }))]);
+    assert.doesNotMatch(JSON.stringify(asked), /hidden-/);
+    await client.respondPermission(asked.requestId, "reject-once", sessionId);
+    assert.deepEqual(await turn, ["terminal-error: Main rejected ACP operation"]);
+  }));
+});
+
+// ACP's EnvVariable has a string value. Anything else would not be what Main is
+// shown or what a grant compares: spawn passes a null on as "null" (a relative
+// PYTHONPATH entry), and a missing value unsets the variable.
+test("N1: a terminal env value that is not a string is refused before Main is asked", async () => {
+  await withTemp("acp-n1-value-", (directory) => withClient({ cwd: directory, protectedPaths: [] }, async ({ requests, run }) => {
+    const refused = "terminal-error: Terminal env must be an array of {name, value}";
+    assert.deepEqual(await run([
+      { terminal: { command: "/bin/echo", args: ["hi"], env: [{ name: "PYTHONPATH", value: null }] } },
+      { terminal: { command: "/bin/echo", args: ["hi"], env: [{ name: "PYTHONPATH" }] } },
+      { terminal: { command: "/bin/echo", args: ["hi"], env: [{ name: "PYTHONPATH", value: 1 }] } }
+    ]), [refused, refused, refused]);
+    assert.equal(requests.length, 0);
   }));
 });
 
@@ -930,6 +1000,109 @@ test("F2: a new-file write whose parent is swapped to a symlink after the pre-ch
       assert.match(outcome, /^write-error: Write target changed since it was approved/);
       const landed = await readFile(join(evil, "new.txt"), "utf8").catch(() => null);
       assert.notEqual(landed, "PWNED", "the content never reached the swapped-in directory");
+    });
+  });
+});
+
+// ---------------------------------------------------------------- N2: approved cwd
+
+// N2 (release-gate review): a pending terminal resolved its cwd again when
+// Main approved it, so a Worker that re-pointed a symlinked cwd while Main
+// decided ran the command in a directory Main never saw, inside the roots or
+// not. Like a pending write (F2), it is now bound to the canonical cwd Main is
+// shown and to the directory that was there.
+
+// Writes where it ran into ran.txt there, then prints it.
+const recordCwd = {
+  command: process.execPath,
+  args: ["-e", "require('node:fs').writeFileSync('ran.txt', process.cwd()); process.stdout.write(process.cwd())"]
+};
+
+test("N2: a pending terminal whose symlinked cwd is re-pointed while Main decides is refused, and runs nowhere", async () => {
+  await withTemp("acp-n2-repoint-", async (directory) => {
+    const approved = join(directory, "approved");
+    const other = join(directory, "other");
+    const current = join(directory, "current");
+    await mkdir(approved);
+    await mkdir(other);
+    await symlink(approved, current);
+    await withClient({ cwd: directory, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
+      const turn = run([{ terminal: { ...recordCwd, cwd: current } }]);
+      const asked = await request(requests, 1);
+      assert.equal(asked.toolCall.rawInput.cwd, approved, "Main is shown where the link leads now");
+      await rm(current);
+      await symlink(other, current);
+      await client.respondPermission(asked.requestId, "allow-once", sessionId);
+      assert.deepEqual(await turn, [`terminal-error: Terminal cwd changed since it was approved: ${approved}`]);
+    });
+    assert.equal(existsSync(join(other, "ran.txt")), false, "not in the directory the link was steered to");
+    assert.equal(existsSync(join(approved, "ran.txt")), false, "nor anywhere else");
+  });
+});
+
+test("N2: a pending terminal whose cwd was replaced by another directory at the same path is refused", async () => {
+  await withTemp("acp-n2-replaced-", async (directory) => {
+    const approved = join(directory, "approved");
+    await mkdir(approved);
+    await withClient({ cwd: directory, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
+      const turn = run([{ terminal: { ...recordCwd, cwd: approved } }]);
+      const asked = await request(requests, 1);
+      // The same canonical path, but not the directory Main was shown.
+      await rename(approved, `${approved}.seen`);
+      await mkdir(approved);
+      await client.respondPermission(asked.requestId, "allow-once", sessionId);
+      assert.deepEqual(await turn, [`terminal-error: Terminal cwd changed since it was approved: ${approved}`]);
+    });
+    assert.equal(existsSync(join(approved, "ran.txt")), false);
+  });
+});
+
+test("N2: the refusal names only the approved cwd, never the directory outside the roots it was steered to", async () => {
+  await withTemp("acp-n2-noleak-", async (directory) => {
+    const root = join(directory, "root");
+    const approved = join(root, "approved");
+    const current = join(root, "current");
+    const secret = join(directory, "SECRET-OUTSIDE");
+    await mkdir(approved, { recursive: true });
+    await mkdir(secret);
+    await symlink(approved, current);
+    await withClient({ cwd: root, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
+      const turn = run([{ terminal: { ...recordCwd, cwd: current } }]);
+      const asked = await request(requests, 1);
+      await rm(current);
+      await symlink(secret, current);
+      await client.respondPermission(asked.requestId, "allow-once", sessionId);
+      const [outcome] = await turn;
+      assert.equal(outcome, `terminal-error: Terminal cwd changed since it was approved: ${approved}`);
+      assert.doesNotMatch(outcome, /SECRET-OUTSIDE/);
+    });
+    assert.equal(existsSync(join(secret, "ran.txt")), false);
+  });
+});
+
+test("N2: an unchanged pending terminal runs in the approved directory; granted and auto-approved ones start at once as before", async () => {
+  await withTemp("acp-n2-unchanged-", async (directory) => {
+    const approved = join(directory, "approved");
+    const current = join(directory, "current");
+    await mkdir(approved);
+    await symlink(approved, current);
+    const ran = { output: approved, exitStatus: { exitCode: 0, signal: null } };
+    await withClient({ cwd: directory, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
+      const pending = run([{ terminal: { ...recordCwd, cwd: current } }]);
+      await client.respondPermission((await request(requests, 1)).requestId, "allow-once", sessionId);
+      assert.deepEqual(await pending, [ran]);
+      // On a grant for the same command and cwd: no second request.
+      const granted = run([
+        { permission: { kind: "execute", command: [recordCwd.command, ...recordCwd.args], cwd: current } },
+        { terminal: { ...recordCwd, cwd: current } }
+      ]);
+      client.respondPermission((await request(requests, 2)).requestId, "allow", sessionId);
+      assert.deepEqual(await granted, ["allow", ran]);
+      assert.equal(requests.length, 2);
+    });
+    await withClient({ cwd: directory, policy: "auto_approve", protectedPaths: [] }, async ({ requests, run }) => {
+      assert.deepEqual(await run([{ terminal: { ...recordCwd, cwd: current } }]), [ran]);
+      assert.equal(requests.length, 0);
     });
   });
 });

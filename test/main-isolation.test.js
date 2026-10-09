@@ -786,6 +786,245 @@ test("an adopted session closed or retired just before a crash leaves its tasks 
   }
 });
 
+// N4 (release-gate review): the synced snapshot that saves an adoption ahead of
+// its close can fail, as when the state directory stops taking new files while
+// the open log still takes appends. The close used to go on and log
+// SESSION_CLOSED anyway, so a crash then removed the session row the adopter's
+// tasks and inbox rows hung on, with nothing left to adopt again. Now the
+// record stays, closed, with no SESSION_CLOSED behind it, persistence health
+// says why, and the next drop tries again: maintenance, another close, a clean.
+
+// A state directory that takes no new snapshot, and the same one healed.
+function failSnapshots(service) {
+  service.stateStore.writeSnapshot = () => {
+    throw Object.assign(new Error("EACCES: permission denied, open 'state.snapshot.json.tmp'"), { code: "EACCES" });
+  };
+}
+
+function healSnapshots(service) {
+  delete service.stateStore.writeSnapshot;
+}
+
+async function closedInLog(paths, sessionId) {
+  return (await readFile(paths.wal, "utf8")).split("\n").filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .some((record) => record.type === "session.closed" && record.key === sessionId);
+}
+
+test("a close whose adoption cannot be saved keeps the record, closed and not live, until a later drop saves it", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-isolation-adopt-unsaved-"));
+  const statePath = join(directory, "state.json");
+  const paths = statePaths(statePath);
+  const { service } = harness({ statePath, isOwnerLive: () => false, snapshotIntervalMs: 60_000 });
+  try {
+    await service.init();
+    const a = await open(service, A);
+    const id = a.session.id;
+    const done = await finished(service, a, A);
+    const b = await open(service, B);
+    await service.flushPersist();
+    await restoresInPlace(service, a.session, A2);
+    const asked = [];
+    a.worker.request = async (method, params) => {
+      asked.push([method, params?.sessionId]);
+      return {};
+    };
+    failSnapshots(service);
+
+    // A session nobody adopted closes as before: no snapshot needed, gone, logged.
+    assert.deepEqual(await service.call("session", { action: "close", sessionId: b.session.id }, B), { ok: true, closed: b.session.id });
+    assert.equal(service.store.get(b.session.id), undefined);
+    assert.equal(await closedInLog(paths, b.session.id), true);
+    assert.equal(service.persistError, null);
+
+    // The adopted one answers as a close does and ends its worker session...
+    assert.deepEqual(await service.call("session", { action: "close", sessionId: id }, A2), { ok: true, closed: id });
+    assert.deepEqual(asked, [["session/close", b.session.acpSessionId], ["session/close", a.session.acpSessionId]]);
+    // ...but its record stays, closed, with no SESSION_CLOSED behind it, and
+    // persistence health says why.
+    assert.equal(service.store.get(id), a.session);
+    assert.deepEqual([a.session.status, a.session.client], ["closed", null]);
+    assert.equal(await closedInLog(paths, id), false);
+    assert.match(service.persistError, /EACCES/);
+
+    // It reads as closed, and nothing acts on it as a session.
+    assert.equal((await service.call("session", { action: "get", sessionId: id }, A2)).status, "closed");
+    assert.deepEqual((await service.call("session", { action: "check", sessionId: id }, A2)).caveats, ["session_closed"]);
+    await assert.rejects(service.call("run", { sessionId: id, prompt: "go", waitMs: 0 }, A2), { code: "SESSION_CLOSED" });
+    await assert.rejects(service.call("cancel", { sessionId: id }, A2), { code: "SESSION_CLOSED" });
+    for (const action of ["pin", "unpin", "workspace_diff"]) {
+      await assert.rejects(service.call("session", { action, sessionId: id }, A2), { code: "SESSION_CLOSED" }, action);
+    }
+    // Its task stays the adopter's meanwhile.
+    assert.deepEqual(await taskIds(service, A2), [done]);
+    assert.deepEqual(await taskIds(service, A), []);
+
+    // Another close, a clean and maintenance each try again, and keep it while
+    // the snapshot still fails; the close still answers as a close.
+    assert.deepEqual(await service.call("session", { action: "close", sessionId: id }, A2), { ok: true, closed: id });
+    assert.deepEqual((await service.call("session", { action: "clean", sessionId: id }, A2)).closed, []);
+    await service.runMaintenance();
+    assert.equal(service.store.get(id), a.session);
+    assert.equal(await closedInLog(paths, id), false);
+    assert.equal(asked.length, 2, "the worker session was closed once");
+
+    // Once the directory takes the snapshot again, maintenance saves the
+    // adoption, drops the record and logs its close.
+    healSnapshots(service);
+    await service.runMaintenance();
+    assert.equal(service.store.get(id), undefined);
+    assert.equal(await closedInLog(paths, id), true);
+    assert.equal(service.persistError, null);
+    assert.deepEqual(await taskIds(service, A2), [done]);
+    assert.deepEqual(await taskIds(service, A), []);
+  } finally {
+    await service.shutdown().catch(() => {});
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("retention that cannot save an adoption keeps the record closed, and a clean that can drops it", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-isolation-adopt-unsaved-retention-"));
+  const statePath = join(directory, "state.json");
+  const paths = statePaths(statePath);
+  const { service, clock } = harness({ statePath, isOwnerLive: () => false, snapshotIntervalMs: 60_000, sessionRetentionMs: 60_000 });
+  try {
+    await service.init();
+    const a = await open(service, A);
+    const id = a.session.id;
+    const done = await finished(service, a, A);
+    await service.flushPersist();
+    await restoresInPlace(service, a.session, A2);
+    failSnapshots(service);
+    clock.now += 2 * 60_000;
+    await service.runMaintenance();
+    assert.equal(service.store.get(id), a.session, "retention let it go, and had to keep it");
+    assert.deepEqual([a.session.status, a.session.client], ["closed", null]);
+    assert.equal(await closedInLog(paths, id), false);
+    assert.match(service.persistError, /EACCES/);
+    await assert.rejects(service.call("run", { sessionId: id, prompt: "go", waitMs: 0 }, A2), { code: "SESSION_CLOSED" });
+
+    healSnapshots(service);
+    // Not closed a second time: only the drop was owed.
+    assert.deepEqual((await service.call("session", { action: "clean", sessionId: id }, A2)).closed, []);
+    assert.equal(service.store.get(id), undefined);
+    assert.equal(await closedInLog(paths, id), true);
+    assert.deepEqual(await taskIds(service, A2), [done]);
+  } finally {
+    await service.shutdown().catch(() => {});
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a crash while the record is kept brings the session back for the adopter to take again, tasks and rows included", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-isolation-adopt-unsaved-crash-"));
+  const statePath = join(directory, "state.json");
+  const paths = statePaths(statePath);
+  const options = { statePath, isOwnerLive: () => false, snapshotIntervalMs: 60_000 };
+  let ids = null;
+  let crashed = null;
+  try {
+    const first = harness(options);
+    try {
+      await first.service.init();
+      const a = await open(first.service, A);
+      const done = await finished(first.service, a, A);
+      const answered = await start(first.service, a.session, A);
+      permission(a.worker, a.session, 1);
+      await until(() => first.service.inbox.size === 1, "permission row");
+      const [row] = first.service.inbox.values();
+      await first.service.call("permission", { sessionId: a.session.id, requestId: 1, optionId: "allow-once" }, A);
+      await until(() => a.session.status === "running", "answered");
+      await finish(first.service, a.worker, answered);
+      await first.service.flushPersist();
+      ids = { session: a.session.id, done, answered, row: row.inboxId };
+      await restoresInPlace(first.service, a.session, A2);
+      failSnapshots(first.service);
+      await first.service.call("session", { action: "close", sessionId: ids.session }, A2);
+      assert.equal(first.service.store.get(ids.session)?.status, "closed");
+      // What a crash right now would leave: the log holds no close of it.
+      crashed = { snapshot: await readFile(paths.snapshot), wal: await readFile(paths.wal) };
+    } finally {
+      healSnapshots(first.service);
+      await first.service.shutdown();
+    }
+    await writeFile(paths.snapshot, crashed.snapshot, { mode: 0o600 });
+    await writeFile(paths.wal, crashed.wal, { mode: 0o600 });
+    await rm(paths.rotating, { force: true });
+
+    const recovered = harness(options);
+    try {
+      await recovered.service.init();
+      // The adoption never reached a snapshot, so A holds the session again,
+      // and it is there to take: before, its close was logged and it was gone.
+      const session = recovered.service.store.get(ids.session);
+      assert.ok(session, "the session survived the crash");
+      assert.deepEqual([session.status, session.openedBy], ["disconnected", claudeCaller]);
+      const restored = await recovered.service.call("session_restore", restoreArgs(session), A2);
+      assert.deepEqual([restored.openedBy, restored.adoptedFrom], [claudeCallerNew, claudeCaller]);
+      assert.deepEqual(await taskIds(recovered.service, A2), sorted(ids.done, ids.answered));
+      assert.deepEqual(await taskIds(recovered.service, A), []);
+      assert.deepEqual(await inboxIds(recovered.service, A2), [ids.row]);
+      assert.deepEqual(await inboxIds(recovered.service, A), []);
+      // And the close goes through now.
+      await recovered.service.call("session", { action: "close", sessionId: ids.session }, A2);
+      assert.equal(recovered.service.store.get(ids.session), undefined);
+      assert.deepEqual(await taskIds(recovered.service, A2), sorted(ids.done, ids.answered));
+    } finally {
+      await recovered.service.shutdown();
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a kept record a later snapshot holds is dropped by the first maintenance after a restart", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-isolation-adopt-unsaved-restart-"));
+  const statePath = join(directory, "state.json");
+  const paths = statePaths(statePath);
+  const options = { statePath, isOwnerLive: () => false, snapshotIntervalMs: 60_000 };
+  let ids = null;
+  let crashed = null;
+  try {
+    const first = harness(options);
+    try {
+      await first.service.init();
+      const a = await open(first.service, A);
+      ids = { session: a.session.id, done: await finished(first.service, a, A) };
+      await first.service.flushPersist();
+      await restoresInPlace(first.service, a.session, A2);
+      failSnapshots(first.service);
+      await first.service.call("session", { action: "close", sessionId: ids.session }, A2);
+      // The directory takes snapshots again, and the debounced writer gets there
+      // before any drop does: its snapshot holds the record, closed and adopted.
+      healSnapshots(first.service);
+      await first.service.flushPersist();
+      assert.equal(first.service.persistError, null);
+      assert.equal(await closedInLog(paths, ids.session), false);
+      crashed = { snapshot: await readFile(paths.snapshot), wal: await readFile(paths.wal) };
+    } finally {
+      healSnapshots(first.service);
+      await first.service.shutdown();
+    }
+    await writeFile(paths.snapshot, crashed.snapshot, { mode: 0o600 });
+    await writeFile(paths.wal, crashed.wal, { mode: 0o600 });
+    await rm(paths.rotating, { force: true });
+
+    const recovered = harness(options);
+    try {
+      await recovered.service.init();
+      assert.equal(recovered.service.store.get(ids.session), undefined, "the startup maintenance owed it the drop");
+      assert.equal(await closedInLog(paths, ids.session), true);
+      assert.deepEqual(await taskIds(recovered.service, A2), [ids.done]);
+      assert.deepEqual(await taskIds(recovered.service, A), []);
+    } finally {
+      await recovered.service.shutdown();
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("a session the log brings back newer than its tasks' snapshot still takes them along", async () => {
   const directory = await mkdtemp(join(tmpdir(), "acp-isolation-adopt-wal-"));
   const statePath = join(directory, "state.json");

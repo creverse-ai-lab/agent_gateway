@@ -1,14 +1,20 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { chmod, link, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import {
+  chmod, copyFile, link, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, symlink, unlink, writeFile
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { inspect } from "node:util";
 import { AcpClient } from "../src/acp-client.js";
 import { readTextHead, readTextLines } from "../src/bounded-utf8.js";
+import { GatewayService } from "../src/gateway-service.js";
+import { GatewayRpcClient } from "../src/socket-rpc.js";
 import { openWorkerFile } from "../src/worker-files.js";
+import { startDaemon, writeMockProviders } from "./helpers/daemon-harness.js";
 
 // W8: fs/read_text_file and fs/write_text_file used to check a path and then
 // open it by name again. Each race below is the swap a Worker that can rename
@@ -284,8 +290,8 @@ test("a FIFO or a directory is refused at once, without waiting for a writer", {
   });
 });
 
-async function withCapabilityClient(cwd, run) {
-  const client = new AcpClient({ provider: "mock", command: process.execPath, args: [capabilityAgent], permissionPolicy: "auto_approve" });
+async function withCapabilityClient(cwd, run, options = {}) {
+  const client = new AcpClient({ provider: "mock", command: process.execPath, args: [capabilityAgent], permissionPolicy: "auto_approve" }, options);
   try {
     await client.start();
     const session = await client.sessionNew({ cwd, permissionPolicy: "auto_approve" });
@@ -498,5 +504,146 @@ test("a legitimate new-file write creates the file and keeps it", async () => {
       await created.close();
     }
     assert.equal(await readFile(join(root, "d", "fresh.txt"), "utf8"), "content", "a verified new file is created where it was asked for and kept");
+  });
+});
+
+// N3 (release-gate review): the inode check knows the files a protected
+// directory holds now. A hard link a Worker made to install.json keeps the old
+// inode once a non-rotating installer run replaces install.json by rename, with
+// the same token in it, and a copy never had a protected inode at all. So a
+// read is also judged by what it would return: text that carries the Control
+// token the daemon accepts is refused, before anything is returned.
+
+const CREDENTIAL = /^File holds a Gateway credential; the Gateway does not return its content$/;
+
+function installState(token) {
+  return `${JSON.stringify({ version: 1, identity: { token, rootId: "main-test" }, managedMcp: {} }, null, 2)}\n`;
+}
+
+// The answer to a read-file prompt (mock-capability-agent.js), which holds no
+// part of the token whatever the outcome.
+async function readThrough(prompt, request) {
+  const { stopReason } = await prompt(`read-file:${request}`);
+  assert.equal(stopReason.includes(TOKEN), false, `${request}: the answer holds no part of the token`);
+  return JSON.parse(stopReason);
+}
+
+test("N3: a hard link that outlived an atomic rewrite of install.json is refused by what it holds", async () => {
+  await withLayout(async ({ root, guarded, secret, options }) => {
+    await writeFile(secret, installState(TOKEN));
+    const notes = join(root, "notes.json");
+    await link(secret, notes);
+    // A non-rotating installer run: the same token, written beside install.json
+    // and renamed over it.
+    await writeFile(`${secret}.4242.tmp`, installState(TOKEN));
+    await rename(`${secret}.4242.tmp`, secret);
+    // The link keeps the old inode, which no protected file has any more, so
+    // the name and inode checks let it through as they would any in-root file.
+    const opened = await openWorkerFile(notes, options);
+    await opened.close();
+    await withCapabilityClient(root, async (prompt) => {
+      const refused = await readThrough(prompt, "notes.json");
+      assert.match(refused.error, CREDENTIAL);
+      assert.equal(refused.bytes, null, "nothing of the file was returned");
+      // Line 4 is the one that holds the token.
+      assert.match((await readThrough(prompt, "notes.json:4:1")).error, CREDENTIAL);
+    }, { protectedPaths: [guarded], protectedSecrets: [TOKEN] });
+  });
+});
+
+test("N3: a copy of the token file is refused, a file without the token is served, and a window is judged by what it returns", async () => {
+  await withLayout(async ({ root, guarded, secret }) => {
+    await writeFile(secret, installState(TOKEN));
+    await copyFile(secret, join(root, "copy.json"));
+    await writeFile(join(root, "mixed.txt"), `plain line\n${TOKEN}\nafter\n`);
+    await withCapabilityClient(root, async (prompt) => {
+      assert.match((await readThrough(prompt, "copy.json")).error, CREDENTIAL);
+      const served = await readThrough(prompt, "a.txt");
+      assert.equal(served.error, null);
+      assert.equal(served.bytes, Buffer.byteLength("inside\nsecond line"));
+      assert.match((await readThrough(prompt, "mixed.txt")).error, CREDENTIAL);
+      assert.match((await readThrough(prompt, "mixed.txt:2:1")).error, CREDENTIAL);
+      const around = await readThrough(prompt, "mixed.txt:1:1");
+      assert.equal(around.error, null, "a line without the token is served");
+      assert.equal(around.head, "plain line");
+    }, { protectedPaths: [guarded], protectedSecrets: [TOKEN] });
+    // An empty secret refuses nothing: it would be in every text.
+    await withCapabilityClient(root, async (prompt) => {
+      assert.equal((await readThrough(prompt, "a.txt")).error, null);
+    }, { protectedPaths: [guarded], protectedSecrets: [""] });
+  });
+});
+
+test("N3: the service hands every client the token to refuse, and nothing it persists or shows holds it", async () => {
+  await withLayout(async ({ directory, root, guarded, secret }) => {
+    await writeFile(secret, installState(TOKEN));
+    await copyFile(secret, join(root, "copy.json"));
+    const stateDirectory = join(directory, "state");
+    const handed = [];
+    const service = new GatewayService({
+      statePath: join(stateDirectory, "state.json"),
+      protectedPaths: [guarded],
+      protectedSecrets: [TOKEN],
+      createClient: (_provider, clientOptions) => {
+        handed.push(clientOptions.protectedSecrets);
+        return new AcpClient(
+          { provider: "mock", command: process.execPath, args: [capabilityAgent], permissionPolicy: "auto_approve" },
+          clientOptions
+        );
+      }
+    });
+    const context = { rootId: "main-n3" };
+    try {
+      await service.init();
+      const { sessionId } = await service.call("session_open", { provider: "claude", cwd: root, permissionPolicy: "auto_approve" }, context);
+      assert.deepEqual(handed, [[TOKEN]], "an injected client factory receives it too");
+      const ran = await service.call("run", { sessionId, prompt: "read-file:copy.json", waitMs: 10_000 }, context);
+      assert.match(JSON.parse(ran.result.stopReason).error, CREDENTIAL, "the real client refuses it");
+      const got = await service.call("session", { action: "get", sessionId, includeEvents: true, includeTranscript: true }, context);
+      for (const shown of [ran, got, service.stateSnapshot()]) assert.equal(JSON.stringify(shown).includes(TOKEN), false);
+      assert.equal(inspect(service, { depth: 4 }).includes(TOKEN), false, "nor the service, its clients or their options");
+      assert.equal(inspect([...service.clients.values()], { depth: 4 }).includes(TOKEN), false);
+    } finally {
+      await service.shutdown();
+    }
+    // What a clean shutdown leaves in the state directory: snapshot, log, artifacts.
+    const files = (await readdir(stateDirectory, { recursive: true, withFileTypes: true }))
+      .filter((entry) => entry.isFile())
+      .map((entry) => join(entry.parentPath, entry.name));
+    assert.ok(files.length > 0);
+    for (const file of files) assert.equal((await readFile(file, "utf8")).includes(TOKEN), false, file);
+  });
+});
+
+test("N3: the daemon refuses a Worker's read of a file that holds the Control token it accepts", async () => {
+  await withLayout(async ({ directory, root }) => {
+    const stateDirectory = join(directory, "state");
+    const daemon = await startDaemon({
+      directory,
+      env: {
+        ...await writeMockProviders(directory, { provider: "mockcap", agent: capabilityAgent, permissionPolicy: "auto_approve" }),
+        // Its protected paths are this layout's, and none of them holds the root.
+        HOME: join(directory, "home"),
+        ACP_GATEWAY_STATE: join(stateDirectory, "state.json"),
+        ACP_GATEWAY_INSTALL_STATE: join(stateDirectory, "install.json")
+      }
+    });
+    const client = new GatewayRpcClient({
+      socketPath: daemon.socketPath,
+      token: daemon.token,
+      rootId: daemon.rootId,
+      statePath: join(stateDirectory, "state.json"),
+      autoStart: false
+    });
+    try {
+      await writeFile(join(root, "pasted.txt"), `ACP_GATEWAY_CONTROL_TOKEN=${daemon.token}\n`);
+      const { sessionId } = await client.call("session_open", { provider: "mockcap", cwd: root, permissionPolicy: "auto_approve" });
+      const read = async (name) => JSON.parse((await client.call("run", { sessionId, prompt: `read-file:${name}`, waitMs: 10_000 })).result.stopReason);
+      assert.match((await read("pasted.txt")).error, CREDENTIAL);
+      assert.equal((await read("a.txt")).error, null);
+    } finally {
+      client.close();
+      await daemon.stop();
+    }
   });
 });
