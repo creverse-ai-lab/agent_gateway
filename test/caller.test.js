@@ -537,7 +537,10 @@ test("overlapping front-door calls from one Codex process each keep their own th
 // W5: since 1.8.0 the installer registers the Control MCP with no identity in its
 // env, so the agent CLI's config holds no token. The front door finds it in install.json.
 test("through the real front door registered without identity, the token and root id come from install.json", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "acp-caller-installed-identity-"));
+  // A short prefix: the daemon binds the socket's canonical path, which on macOS
+  // gains /private in front of the temp directory, and a Unix socket path must
+  // fit in 103 bytes there (Node 22 on macOS 14 does not take a longer one).
+  const directory = await mkdtemp(join(tmpdir(), "acp-caller-id-"));
   let daemon = null;
   let mcpClient = null;
   try {

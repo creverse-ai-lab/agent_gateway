@@ -164,7 +164,10 @@ test("socket client reconnects subscriptions with the last delivered cursor", as
 });
 
 test("socket client removes only the failed subscription on subscription_error", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "acp-gateway-subscription-error-"));
+  // A short prefix: the client connects to the socket's canonical path, which on
+  // macOS gains /private in front of the temp directory, and a Unix socket path
+  // must fit in 103 bytes there (Node 22 on macOS 14 does not take a longer one).
+  const directory = await mkdtemp(join(tmpdir(), "acp-sub-error-"));
   const socketPath = join(directory, "gateway.sock");
   const received = [];
   let fixture;

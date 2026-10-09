@@ -444,7 +444,7 @@ test("characterization: structured errors retain details and drop foreign codes"
 });
 
 test("characterization: the socket error envelope carries a stable error code and details", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "acp-characterization-wire-"));
+  const directory = await mkdtemp(join(tmpdir(), "acp-char-wire-"));
   let daemon = null;
   let main = null;
   let wrong = null;

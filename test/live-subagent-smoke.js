@@ -9,7 +9,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { GatewayRpcClient } from "../src/socket-rpc.js";
 
-const directory = await mkdtemp(join(tmpdir(), "acp-gateway-subagent-smoke-"));
+const directory = await mkdtemp(join(tmpdir(), "acp-subagent-smoke-"));
 // The Gateway protects the directory its state lives in, and a Claude worker is
 // denied Read of everything under a protected path, so the workspace has to be
 // a sibling of that directory and never inside it. The socket stays in
