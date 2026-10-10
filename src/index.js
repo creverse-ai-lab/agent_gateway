@@ -5,11 +5,14 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   CallToolRequestSchema,
   CancelTaskRequestSchema,
+  ErrorCode,
   GetTaskPayloadRequestSchema,
   GetTaskRequestSchema,
   ListTasksRequestSchema,
   ListToolsRequestSchema,
-  RELATED_TASK_META_KEY
+  McpError,
+  RELATED_TASK_META_KEY,
+  TaskStatusNotificationSchema
 } from "@modelcontextprotocol/sdk/types.js";
 import { callerForCall, callerFromProcess } from "./caller.js";
 import { controlIdentity } from "./config.js";
@@ -17,6 +20,7 @@ import { errorEnvelope } from "./errors.js";
 import { staleFrontDoorNotice } from "./front-door.js";
 import { GatewayRpcClient } from "./socket-rpc.js";
 import { PERMISSION_POLICIES } from "./acp-client.js";
+import { TaskFollower, taskHeartbeatMs } from "./task-follower.js";
 import { GATEWAY_VERSION } from "./version.js";
 import { WORKER_TREE_EXIT_CODE, workerTreeReason, workerTreeRefusalMessage } from "./worker-tree.js";
 
@@ -32,20 +36,34 @@ if (workerTree) {
 const processCaller = callerFromProcess();
 // The installer registers this server without the token: it comes from
 // install.json unless the entry's env still sets it (config.js controlIdentity).
-const rpc = new GatewayRpcClient({ ...controlIdentity(), caller: processCaller });
+const identity = controlIdentity();
+const rpc = new GatewayRpcClient({ ...identity, caller: processCaller });
 const tools = controlTools();
 const server = new Server(
   { name: "acp-gateway-control", version: GATEWAY_VERSION },
   {
     capabilities: {
       tools: {},
-      // Tasks are opt-in: legacy MCP clients keep using prompt + poll.
-      // No current tool has task semantics yet: agent_acp_prompt returns a start
-      // acknowledgement, so advertising it as a Task would change its result.
-      tasks: { list: {}, cancel: {} }
+      // Task augmentation is the client's choice, per call: a tools/call with
+      // no task waits and answers as it always has, and legacy clients keep
+      // using prompt + poll. Of the tools only agent_acp_run declares
+      // taskSupport ("optional"), because only its Task result is the same
+      // object as its direct return; agent_acp_prompt's start acknowledgement
+      // never was, so it declares none.
+      tasks: { list: {}, cancel: {}, requests: { tools: { call: {} } } }
     }
   }
 );
+// The tasks this client creates through a task-augmented call, followed so
+// their status changes reach it as notifications/tasks/status. On a
+// connection of their own that never starts a daemon: following must not
+// bring back a daemon someone stopped, and when one comes back that
+// connection's reconnect restores the task subscriptions.
+const taskFollower = new TaskFollower({
+  connect: () => new GatewayRpcClient({ ...identity, caller: processCaller, autoStart: false }),
+  notify: (task) => server.notification(taskStatusNotification(task)),
+  heartbeatMs: taskHeartbeatMs()
+});
 
 // The daemon's version, learned from whatever setup or session response ran
 // last. The tool array is frozen at module load and this process cannot
@@ -69,8 +87,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     agent_acp_session: "session",
     agent_acp_inbox: "inbox"
   };
+  const method = methods[request.params.name];
+  // A tool whose execution.taskSupport is absent ("forbidden", which is every
+  // tool but agent_acp_run) is not called as a task. The 2025-11-25 Tasks spec
+  // has the server refuse such a call with -32601 (Method not found): an error
+  // of the request, never a tool result the model would read as the tool's
+  // answer. _meta.task, the older form, keeps its tool error below.
+  if (request.params.task != null && method !== "run") {
+    throw new McpError(ErrorCode.MethodNotFound, `Tool ${request.params.name} does not support task-augmented calls`);
+  }
   try {
-    const method = methods[request.params.name];
     if (!method) throw new Error(`Unknown tool: ${request.params.name}`);
     const caller = callerOf(request, extra);
     const task = taskOptions(request.params);
@@ -81,6 +107,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         30_000,
         { caller }
       );
+      taskFollower.follow(created);
       return { task: created, ...relatedTask(created.taskId) };
     }
     if (task) throw new Error(`Tool ${request.params.name} does not support task execution`);
@@ -93,6 +120,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         : 30_000;
     return toolResult(withFrontDoorNotice(method, await rpc.call(method, args, timeoutMs, { caller })));
   } catch (error) {
+    // A task-augmented call answers with a CreateTaskResult or fails as a
+    // request, as tasks/get does: the SDK would refuse a tool error result here
+    // as an invalid CreateTaskResult, and the Gateway's error with it.
+    if (request.params.task != null) throw error;
     return toolResult({
       ok: false,
       ...errorEnvelope(error)
@@ -141,8 +172,16 @@ server.setRequestHandler(CancelTaskRequestSchema, async (request, extra) => {
   return record;
 });
 
-process.once("SIGTERM", () => rpc.close());
-process.once("SIGINT", () => rpc.close());
+const stop = () => {
+  taskFollower.close();
+  rpc.close();
+};
+process.once("SIGTERM", stop);
+process.once("SIGINT", stop);
+// The client is gone once its stdin ends (the stdio transport does not report
+// that itself): nothing it created is followed for it any more.
+process.stdin.once("end", () => taskFollower.close());
+server.onclose = () => taskFollower.close();
 await server.connect(new StdioServerTransport());
 
 // agent_acp_run, in two rpc calls on purpose. The first one only admits the work
@@ -276,6 +315,17 @@ function taskOptions(params) {
   if (!task) return null;
   if (typeof task !== "object" || Array.isArray(task)) throw new Error("task must be an object");
   return { ttl: task.ttl, pollInterval: task.pollInterval };
+}
+
+// notifications/tasks/status for a task as the Gateway reports it (task_get,
+// or a task subscription's event). Parsing keeps the spec's Task fields, the
+// ones a client reads from tasks/get, and adds no related-task _meta: the spec
+// leaves it off this notification, whose params already name the task.
+function taskStatusNotification(task) {
+  return TaskStatusNotificationSchema.parse({
+    method: "notifications/tasks/status",
+    params: { ...task, statusMessage: task.statusMessage ?? undefined, pollInterval: task.pollInterval ?? undefined }
+  });
 }
 
 function controlTools() {

@@ -102,6 +102,8 @@ const DEFAULT_POLL_EVENT_TYPES = new Set(["permission_request", "elicitation_req
 const EVENT_PAYLOAD_CAP_BYTES = 4000;
 // Bounds the setup alert; count still carries the total.
 const MAX_STALL_ALERT_SESSION_IDS = 16;
+// How many tasks one subscription may follow by id (subscribe taskIds).
+const MAX_SUBSCRIBED_TASKS = 100;
 const CLOSED_STATUSES = new Set(["closed"]);
 // A live client is not enough to start work in these states: the record is
 // known to be out of sync with the worker, so it has to be resumed first.
@@ -744,10 +746,19 @@ export class GatewayService {
     if (requested != null && !Array.isArray(requested)) {
       throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "sessionIds must be an array");
     }
+    // Additive: taskIds follows those tasks instead of sessions. A task
+    // subscription names no session, so a caller sends sessionIds: [] with it,
+    // which an older Gateway (one that ignores taskIds) takes as a
+    // subscription to nothing rather than to every session.
+    if (args.taskIds != null && requested?.length) {
+      throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "taskIds follows tasks instead of sessions: sessionIds must be empty");
+    }
+    const tasks = args.taskIds == null ? [] : this.#subscribedTasks(args.taskIds, context);
     const requester = requesterOf(context);
-    const sessions = requested == null
+    const watchAll = requested == null && args.taskIds == null;
+    const sessions = watchAll
       ? this.store.list().filter((session) => session.ownerRootId === rootId && isVisibleTo(session.openedBy, requester))
-      : requested.map((id) => requireOwnedSession(this.requireSession(id), context));
+      : (requested ?? []).map((id) => requireOwnedSession(this.requireSession(id), context));
     if (context.access !== "observer") for (const session of sessions) this.touchSessionOwner(session);
     const cursors = args.cursors ?? {};
     if (typeof cursors !== "object" || Array.isArray(cursors)) {
@@ -760,8 +771,9 @@ export class GatewayService {
       // Who a watch-all subscription watches for: a session another Main opens
       // later must not start streaming to it (publishEvent).
       requester,
-      watchAll: requested == null,
+      watchAll,
       sessionIds: new Set(sessions.map((session) => session.id)),
+      taskIds: new Set(tasks.map((task) => task.taskId)),
       includeThoughts: args.includeThoughts === true,
       // Same default as poll: tool events are opt-in on every delivery channel.
       includeToolEvents: args.includeToolEvents === true,
@@ -803,14 +815,33 @@ export class GatewayService {
       for (let index = from; index < candidates.length; index += 1) this.store.markDelivered(candidates[index]);
       for (const event of kept) events.push(event);
     }
+    // A task has no ring of its own: what it replays is where it stands now,
+    // which is also what a resubscribe after a reconnect or a restart needs.
+    for (const task of tasks) events.push(taskStatusEvent(this.publicTask(task, requester)));
     this.subscriptions.set(subscriptionId, subscription);
     return {
       subscriptionId,
       sessions: sessions.map((item) => this.#publicSession(item)),
       events,
       replay,
-      cursorTruncated
+      cursorTruncated,
+      // Present only on a task subscription, and only from a Gateway that knows
+      // taskIds: its absence tells the caller nothing will be streamed.
+      ...(args.taskIds == null ? {} : { taskIds: tasks.map((task) => task.taskId) })
     };
+  }
+
+  // The tasks a subscription follows by id: each one a task the caller may
+  // read, decided as task_get decides it.
+  #subscribedTasks(taskIds, context) {
+    if (!Array.isArray(taskIds) || taskIds.length === 0 || taskIds.length > MAX_SUBSCRIBED_TASKS
+      || !taskIds.every((taskId) => typeof taskId === "string" && taskId !== "")) {
+      throw new GatewayError(
+        ERROR_CODES.INVALID_ARGUMENT,
+        `taskIds must be an array of 1 to ${MAX_SUBSCRIBED_TASKS} task ids`
+      );
+    }
+    return [...new Set(taskIds)].map((taskId) => this.#requireTask(taskId, context));
   }
 
   unsubscribe(subscriptionId, context = {}) {
@@ -3754,6 +3785,7 @@ export class GatewayService {
 
   #publishTaskStatus(task) {
     if (!task) return;
+    this.#publishToTaskSubscribers(task);
     const session = this.store.get(task.sessionId);
     if (!session || CLOSED_STATUSES.has(session.status)) return;
     this.store.push(session, {
@@ -3762,6 +3794,23 @@ export class GatewayService {
       status: task.status,
       statusMessage: task.statusMessage
     });
+  }
+
+  // A subscription that follows a task by id (subscribe taskIds) hears every
+  // status it takes, also one committed once its session is closed or gone: a
+  // handle outlives its session, whose ring takes no more events.
+  #publishToTaskSubscribers(task) {
+    for (const subscription of this.subscriptions.values()) {
+      if (!subscription.taskIds.has(task.taskId)) continue;
+      // Asked again on every status, not only at subscribe: the task's session
+      // can have changed hands since (an adoption).
+      if (task.ownerRootId !== subscription.rootId || !isVisibleTo(this.#taskOwner(task), subscription.requester)) continue;
+      try {
+        subscription.emit(taskStatusEvent(this.publicTask(task, subscription.requester)));
+      } catch {
+        this.subscriptions.delete(subscription.subscriptionId);
+      }
+    }
   }
 
   #onTaskChange(change) {
@@ -5065,6 +5114,13 @@ function publicEvent(session, event) {
     sequence: event.i,
     ...event
   };
+}
+
+// What a task subscription delivers: the task as task_get reads it, typed
+// task_status. It has no sequence because it is no ring's, so no client cursor
+// moves past it.
+function taskStatusEvent(task) {
+  return { type: "task_status", ...task };
 }
 
 // Oldest first, by when the row stopped being an obligation.

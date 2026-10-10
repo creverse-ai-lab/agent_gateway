@@ -17,5 +17,7 @@ export const RUNTIME_IDENTITY = Object.freeze({ runtimeRoot, gatewayBuildId: has
 export const MANAGEMENT_CAPABILITIES = Object.freeze({
   version: 1, observer: true, gatewayConfig: true, providerPolicy: true,
   retentionPreview: true, safeShutdown: true, runtimeIdentity: true,
-  settingsApply: "restart", replayCompleteness: true, resultRecovery: "task_result"
+  settingsApply: "restart", replayCompleteness: true, resultRecovery: "task_result",
+  // subscribe with taskIds (gateway-service.js).
+  taskSubscriptions: true
 });

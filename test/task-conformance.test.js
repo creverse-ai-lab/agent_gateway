@@ -465,8 +465,14 @@ test("conformance: MCP tasks block for results, enforce cancel semantics, and us
     const sessionId = opened.structuredContent?.sessionId;
     assert.match(String(sessionId), /^acp-/);
 
-    assert.equal(mcpClient.getServerCapabilities()?.tasks?.requests, undefined,
-      "prompt acknowledgement is not advertised as a Task result");
+    assert.deepEqual(mcpClient.getServerCapabilities()?.tasks?.requests, { tools: { call: {} } },
+      "task-augmented tools/call is declared, so agent_acp_run's taskSupport is usable");
+    const { tools } = await mcpClient.listTools();
+    assert.deepEqual(
+      tools.filter((tool) => tool.execution?.taskSupport).map((tool) => [tool.name, tool.execution.taskSupport]),
+      [["agent_acp_run", "optional"]],
+      "prompt acknowledgement is not advertised as a Task result"
+    );
 
     const created = await rpcClient.call("task_prompt", { sessionId, prompt: "go", ttl: 600_000 });
     const taskId = created.taskId;
