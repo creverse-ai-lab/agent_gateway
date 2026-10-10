@@ -96,8 +96,8 @@ Grok 4.5 に、現在の設計のセキュリティ上の弱点を red-team レ�
 1. `agent_acp_setup` で provider を確認
 2. `agent_acp_session_open` で Worker セッションを作成
 3. 必要に応じて `agent_acp_config` で、Worker が対応するモデル・モード・推論レベルなどのパラメーターを取得・設定
-4. `agent_acp_prompt` で作業を渡す
-5. `agent_acp_poll` でイベントと状態を確認
+4. `agent_acp_run` で作業を渡す
+5. `agent_acp_poll` でポーリングする代わりに、`agent_acp_wait` で Worker が終わるか応答が必要になるまで待つ
 6. 必要に応じて `agent_acp_permission` または `agent_acp_answer` で応答
 7. 完了後はセッションを再利用するか、`agent_acp_session` で終了
 
@@ -164,7 +164,7 @@ flowchart LR
 3. **Worker の実行** — Gateway が該当する provider のプロセスを起動するか、既存のプロセス・セッションを再利用します。
 4. **ACP による作業の受け渡し** — prompt、ファイル操作、tool event、途中結果が ACP を通じてやり取りされます。
 5. **権限・質問の処理** — Worker の権限リクエストや質問は Gateway Inbox を経由してオーケストレーターに届き、その応答が Worker に戻ります。
-6. **結果の取得・再利用** — オーケストレーターは MCP Task または poll で状態と結果を受け取り、必要なら同じセッションを再び呼び出したり復旧したりします。
+6. **結果の取得・再利用** — オーケストレーターは `agent_acp_wait` で待つか、MCP Task または poll で状態と結果を受け取り、必要なら同じセッションを再び呼び出したり復旧したりします。
 
 ### 信頼性
 
@@ -173,6 +173,7 @@ Gateway は委任した作業の状況も伝えるため、再起動の後や Wo
 - **セッションがその状態にある理由** — 状態が変わるたびに理由と時刻を記録します。実行中の Worker がしばらく（デフォルト 5 分）何も送ってこない場合は、停止の疑いとして印を付けます。これはヒントにすぎず、何もキャンセルしません。
 - **中断で分からなくなったこと** — 再起動や Worker の喪失で打ち切られたタスクは、Worker がすでに prompt に基づいて動いた可能性があるかどうかと、次に取るべき手順を示します。`agent_acp_session {action: "check"}` は何も起動せず読み取りだけで、セッションを復旧できるかどうかを報告します。
 - **attention inbox** — `agent_acp_inbox {action: "attention"}` は、オーケストレーターを待っているリクエストと、まだ受け取っていない完了結果を一覧にします。`ack` で確認済みにできます。
+- **ポーリングせずに待つ** — オーケストレーターは `agent_acp_wait` で待ちます。この呼び出しは、開始したタスクが終わると（結果とともに）、または Worker が何かを尋ねるとすぐに戻り、それ以外は、ホストがツール呼び出し 1 回に許す時間に合わせた heartbeat で戻ります。AgenLynk のようなアプリは、こうして待っているオーケストレーターを idle ではなく、自分のタスクを待っている状態として表示します（`main_list` と `main_status` イベント）。
 - **タスク間の関係の宣言** — run は、引き継ぐタスク（`parentTaskId`）と結果を利用したタスク（`inputTaskIds`）を明示できます。`scope: "mine"` を指定すると、セッションとタスクの一覧には呼び出したオーケストレーター自身の作業だけが表示されます。
 - **オーケストレーターごとに自分の作業だけ** — 複数のオーケストレーターが Gateway を共有するとき（Claude Code の会話が二つ、Codex の thread が二つなど）、各オーケストレーターが見て操作できるのは、自分が開いたセッションとそのタスク・リクエスト・結果、そしてオーケストレーターを名乗らないツールが開いたセッションだけです。AgenLynk のようにオーケストレーターを名乗らないアプリや管理ツールは、これまでどおりすべてを見られます。新しい会話として戻ってきたオーケストレーターは、以前のオーケストレーターの接続が切れた後、`agent_acp_session_restore`（provider、acpSessionId、cwd）を明示的に呼び出して以前のセッションを取り戻します。これは協調して動くエージェント同士の作業を分けるためのもので、Control token を持つプロセスに対するセキュリティ境界ではありません。詳しくは [Per-Main isolation](docs/management-api.md#per-main-isolation)(英語) を参照してください。
 - **復旧の連続失敗による隔離** — 復旧が続けて失敗すると（デフォルト 3 回）、Gateway はそのセッションを自動で復旧するのをやめ、残りの選択肢とともに `SESSION_QUARANTINED` を返します。明示的な復旧に成功すると隔離は解除されます。
@@ -245,7 +246,7 @@ Gateway 本体は、自分で更新したときにだけ変わります。npm �
 
 ## ドキュメント
 
-- [管理 API 契約](docs/management-api.md)(英語) — エンジン設定、provider ポリシー、安全なシャットダウン、公開クライアントの契約 (`acp-gateway-daemon/client`。アプリがマウントしたランタイムでは `acp-gateway/client`)
+- [管理 API 契約](docs/management-api.md)(英語) — エンジン設定、provider ポリシー、安全なシャットダウン、タスクの待機と Main の状態 (`wait`、`main_list`)、公開クライアントの契約 (`acp-gateway-daemon/client`。アプリがマウントしたランタイムでは `acp-gateway/client`)
 - [Live use cases](docs/live-usecases.md)(韓国語) — 実際の Claude・Codex・Grok Worker で動かしたユースケースの記録
 - [運用ガイド](docs/operations.md)(英語) — インストーラーのオプション、更新、ホストの再接続、Worker パラメーターの制御、セッションとデータの管理
 - [変更履歴](CHANGELOG.md)(英語) — バージョンごとの変更点

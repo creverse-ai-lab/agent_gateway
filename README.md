@@ -96,8 +96,8 @@ Internally it works in this order:
 1. `agent_acp_setup` checks the providers
 2. `agent_acp_session_open` creates a Worker session
 3. If needed, `agent_acp_config` reads and sets parameters the Worker supports, such as model, mode, and reasoning level
-4. `agent_acp_prompt` hands over the task
-5. `agent_acp_poll` checks events and status
+4. `agent_acp_run` hands over the task
+5. `agent_acp_wait` waits until the Worker finishes or needs a response, instead of polling with `agent_acp_poll`
 6. If needed, `agent_acp_permission` or `agent_acp_answer` responds
 7. When done, reuse the session or close it with `agent_acp_session`
 
@@ -164,7 +164,7 @@ The orchestrator directs work through MCP, and the Gateway talks to each Worker 
 3. **Worker execution** — The Gateway starts that provider's process, or reuses an existing process and session.
 4. **Task handover over ACP** — Prompts, file operations, tool events, and intermediate results flow through ACP.
 5. **Permission and question handling** — A Worker's permission requests and questions travel through the Gateway Inbox to the orchestrator, and the orchestrator's response goes back to the Worker.
-6. **Result retrieval and reuse** — The orchestrator receives status and results through an MCP Task or poll, and can call the same session again or recover it if needed.
+6. **Result retrieval and reuse** — The orchestrator receives status and results by waiting in `agent_acp_wait`, or through an MCP Task or poll, and can call the same session again or recover it if needed.
 
 ### Reliability
 
@@ -173,6 +173,7 @@ The Gateway also tells the orchestrator where delegated work stands, so it does 
 - **Why a session is in its status** — Each status change records a reason and a time. A running Worker that has sent nothing for a while (5 minutes by default) is flagged as a possible stall; this is only a hint, and nothing is cancelled.
 - **What an interruption left unknown** — A task cut short by a restart or a lost Worker says whether the Worker may already have acted on the prompt, and what to do next. `agent_acp_session {action: "check"}` reports, read-only and without starting anything, whether a session can come back.
 - **Attention inbox** — `agent_acp_inbox {action: "attention"}` lists the requests waiting on the orchestrator and the finished results it has not received yet; `ack` marks them as seen.
+- **Waiting without polling** — The orchestrator waits in `agent_acp_wait`, which returns as soon as a task it started finishes (with the result) or a Worker asks it something, and otherwise after a heartbeat sized to what its host allows one tool call. Apps such as AgenLynk show an orchestrator that waits this way as waiting on its tasks (`main_list` and the `main_status` event), not idle.
 - **Declared task links** — A run can name the task it follows up (`parentTaskId`) and the tasks whose results it used (`inputTaskIds`). With `scope: "mine"`, session and task lists show only the calling orchestrator's own work.
 - **Each orchestrator's work stays its own** — When several orchestrators share the Gateway (two Claude Code conversations, or two Codex threads), each one sees and acts on only the sessions it opened, with their tasks, requests and results, plus sessions opened by tools that do not name an orchestrator. Apps and admin tools that do not name one, such as AgenLynk, keep the whole view. An orchestrator that comes back as a new conversation takes its earlier sessions back with an explicit `agent_acp_session_restore` (provider, acpSessionId, cwd) once the old one is no longer connected. This keeps cooperating agents apart; it is not a security boundary against a process that holds the Control token. See [Per-Main isolation](docs/management-api.md#per-main-isolation).
 - **Quarantine after repeated restore failures** — After 3 failed restores in a row (by default), the Gateway stops restoring the session on its own and returns `SESSION_QUARANTINED` with the remaining options; a successful explicit restore lifts it.
@@ -245,7 +246,7 @@ The Gateway itself changes only when you update it: an npm install with `npm ins
 
 ## Documentation
 
-- [Management API contract](docs/management-api.md) — engine settings, provider policy, safe shutdown, and the public client contract (`acp-gateway-daemon/client`; `acp-gateway/client` in a runtime an app mounts)
+- [Management API contract](docs/management-api.md) — engine settings, provider policy, safe shutdown, waiting on tasks and Main status (`wait`, `main_list`), and the public client contract (`acp-gateway-daemon/client`; `acp-gateway/client` in a runtime an app mounts)
 - [Live use cases](docs/live-usecases.md) (Korean) — a record of use cases run with real Claude, Codex, and Grok Workers
 - [Operations guide](docs/operations.md) — installer options, updating, host reconnection, Worker parameter control, and session and data management
 - [Changelog](CHANGELOG.md) — changes by version

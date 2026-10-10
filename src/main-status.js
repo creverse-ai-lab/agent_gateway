@@ -9,10 +9,16 @@ import { normalizeCaller } from "./caller.js";
 // entry and a Codex one is an entry per thread it served. In memory only: a
 // daemon restart ends every connection, and with them every Main.
 //
-// waiting_tasks while at least one wait of the Main blocks, active while a
-// connection that named it is open and none does. Once neither holds the entry
-// is gone, which only its last event says.
+// waiting_tasks while at least one wait of the Main blocks, or for a grace
+// after one answered with a heartbeat; active while a connection that named it
+// is open and neither holds. Once nothing holds the entry it is gone, which only
+// its last event says.
 export const MAIN_STATUSES = Object.freeze(["active", "waiting_tasks"]);
+// How long a heartbeat keeps its Main waiting_tasks. A Main that sleeps in a
+// loop answers each heartbeat with the next wait a moment later, and shown as
+// active in between it would flicker on every heartbeat; asleep is what it is.
+// The grace ends early when the Main makes another call (activity) or leaves.
+export const WAIT_GRACE_MS = 60_000;
 // Past this many callers a connection lists no more of them: a Codex front door
 // names one per thread. CallerPresence bounds a connection the same way.
 const MAX_MAINS_PER_CONNECTION = 1_024;
@@ -25,12 +31,14 @@ export class MainRegistry {
   // consumer keeps, per Main, whichever it read with the higher revision.
   #revision = 0;
   #now;
+  #graceMs;
   #onChange;
 
   // onChange(rootId, main) gets the entry as list() reads it, or {caller,
   // status: "gone", since, revision} once it is gone.
-  constructor({ now = () => Date.now(), onChange = () => {} } = {}) {
+  constructor({ now = () => Date.now(), graceMs = WAIT_GRACE_MS, onChange = () => {} } = {}) {
     this.#now = now;
+    this.#graceMs = graceMs;
     this.#onChange = onChange;
   }
 
@@ -61,30 +69,50 @@ export class MainRegistry {
   }
 
   /**
-   * A wait of `caller` blocks on `taskIds`. Returns the handle updateWait and
-   * endWait take, or null for a requester that is no Main.
+   * A wait of `caller` begins. Returns the handle blockWait and closeWait take,
+   * or null for a requester that is no Main. Nothing shows until it blocks.
    */
-  startWait(rootId, caller, taskIds) {
+  openWait(rootId, caller) {
     const normalized = normalizeCaller(caller);
     if (!normalized || typeof rootId !== "string" || !rootId) return null;
-    const handle = { key: mainKey(rootId, normalized) };
-    this.#entry(handle.key, rootId, normalized).waits.set(handle, [...taskIds]);
-    this.#settle(handle.key);
-    return handle;
+    return { key: mainKey(rootId, normalized), rootId, caller: normalized };
   }
 
-  /** The tasks a blocked wait still watches changed (one of them went away). */
-  updateWait(handle, taskIds) {
-    const entry = handle ? this.#mains.get(handle.key) : null;
-    if (!entry?.waits.has(handle)) return;
+  /** The wait blocks on `taskIds` (again, after a wake that changed nothing): its Main is waiting_tasks. */
+  blockWait(handle, taskIds) {
+    if (!handle) return;
+    const entry = this.#entry(handle.key, handle.rootId, handle.caller);
     entry.waits.set(handle, [...taskIds]);
+    // Within a heartbeat's grace this is the same sleep going on.
+    this.#endGrace(entry);
     this.#settle(handle.key);
   }
 
-  endWait(handle) {
+  /**
+   * The wait answered for `reason`, or failed or was aborted (null). A
+   * heartbeat keeps its Main waiting_tasks for the grace, whether this wait
+   * blocked or answered within the grace of an earlier one; anything else
+   * means the Main is at work on what woke it, and ends the grace now.
+   */
+  closeWait(handle, reason) {
     const entry = handle ? this.#mains.get(handle.key) : null;
-    if (!entry?.waits.delete(handle)) return;
+    if (!entry) return;
+    const taskIds = entry.waits.get(handle);
+    entry.waits.delete(handle);
+    if (reason !== "heartbeat") this.#endGrace(entry);
+    else if (taskIds || entry.grace) this.#startGrace(handle.key, entry, taskIds ?? entry.grace.taskIds);
     this.#settle(handle.key);
+  }
+
+  /** The Main made another call: it is awake, so a heartbeat's grace ends at once. */
+  activity(rootId, caller) {
+    const normalized = normalizeCaller(caller);
+    if (!normalized || typeof rootId !== "string" || !rootId) return;
+    const key = mainKey(rootId, normalized);
+    const entry = this.#mains.get(key);
+    if (!entry?.grace) return;
+    this.#endGrace(entry);
+    this.#settle(key);
   }
 
   /** The Mains of a root: every one for requester null (management, observer), else the requester's own. */
@@ -100,7 +128,7 @@ export class MainRegistry {
       // The identity only: a Codex caller's turnId is the call's, not the Main's.
       const { provider, sessionId, pid, instanceId } = caller;
       entry = {
-        rootId, caller: { provider, sessionId, pid, instanceId }, connections: 0, waits: new Map(),
+        rootId, caller: { provider, sessionId, pid, instanceId }, connections: 0, waits: new Map(), grace: null,
         status: null, since: null, shown: null, revision: 0
       };
       this.#mains.set(key, entry);
@@ -108,11 +136,32 @@ export class MainRegistry {
     return entry;
   }
 
+  #startGrace(key, entry, taskIds) {
+    this.#endGrace(entry);
+    const grace = { taskIds: [...taskIds], timer: null };
+    grace.timer = setTimeout(() => {
+      if (entry.grace !== grace) return;
+      entry.grace = null;
+      this.#settle(key);
+    }, this.#graceMs);
+    grace.timer.unref?.();
+    entry.grace = grace;
+  }
+
+  #endGrace(entry) {
+    if (!entry.grace) return;
+    clearTimeout(entry.grace.timer);
+    entry.grace = null;
+  }
+
   // Where the entry stands now; reported only when what list() reads changed.
   #settle(key) {
     const entry = this.#mains.get(key);
     if (!entry) return;
-    const status = entry.waits.size > 0 ? "waiting_tasks" : entry.connections > 0 ? "active" : null;
+    // A grace holds a Main that is still there: one whose last connection
+    // closed is gone, not asleep.
+    if (entry.connections <= 0) this.#endGrace(entry);
+    const status = entry.waits.size > 0 || entry.grace ? "waiting_tasks" : entry.connections > 0 ? "active" : null;
     const at = new Date(this.#now()).toISOString();
     if (!status) {
       this.#mains.delete(key);
@@ -144,9 +193,12 @@ function mainKey(rootId, caller) {
   return `${rootId}\u0000${caller.sessionId ?? ""}\u0000${caller.instanceId}`;
 }
 
-// The tasks are those its blocked waits still watch, each once.
+// The tasks are those its blocked waits, or the heartbeat it is in the grace
+// of, still watch, each once.
 function publicMain(entry) {
-  const taskIds = entry.status === "waiting_tasks" ? [...new Set([...entry.waits.values()].flat())] : null;
+  const taskIds = entry.status === "waiting_tasks"
+    ? [...new Set([...entry.waits.values(), entry.grace?.taskIds ?? []].flat())]
+    : null;
   return {
     caller: { ...entry.caller },
     status: entry.status,

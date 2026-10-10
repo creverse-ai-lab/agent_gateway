@@ -427,6 +427,67 @@ test("main_list and main_status: active while connected, waiting_tasks while a w
   }
 });
 
+test("a heartbeat keeps its Main waiting_tasks for a grace: a re-wait goes on with the span, another call, the grace's end or a wake ends it", async () => {
+  const { service, clock } = harness({ waitGraceMs: 150 });
+  try {
+    const { session, worker } = await open(service);
+    const taskId = await start(service, session, A);
+    const events = [];
+    service.subscribe({}, MANAGEMENT, (event) => {
+      if (event.type === "main_status") events.push(event);
+    });
+    const statuses = () => events.map((event) => event.status);
+    const connection = {};
+    service.attachCaller(connection, ROOT, claudeCaller);
+    const strip = ({ revision: _revision, ...main }) => main;
+
+    // heartbeat, then the next wait within the grace: one span, no active.
+    clock.now = EPOCH + 1_000;
+    assert.equal((await wait(service, A, { timeoutMs: 20 })).reason, "heartbeat");
+    const span = { caller: claudeCaller, status: "waiting_tasks", since: iso(EPOCH + 1_000), taskIds: [taskId], count: 1 };
+    assert.deepEqual(strip(await mainOf(service, A)), span, "still waiting_tasks after its heartbeat");
+    clock.now = EPOCH + 2_000;
+    // What a host reads on its own about its Tasks does not wake the Main.
+    await service.call("task_get", { taskId }, A);
+    await service.call("task_list", {}, A);
+    assert.equal((await wait(service, A, { timeoutMs: 20 })).reason, "heartbeat");
+    assert.deepEqual(strip(await mainOf(service, A)), span, "the same span: same since, no event");
+    assert.deepEqual(statuses(), ["active", "waiting_tasks"]);
+
+    // heartbeat, then another call: active at once.
+    clock.now = EPOCH + 3_000;
+    await service.call("session", { action: "list" }, A);
+    assert.deepEqual(statuses(), ["active", "waiting_tasks", "active"]);
+    assert.equal(events.at(-1).since, iso(EPOCH + 3_000));
+
+    // heartbeat, then nothing for the grace: active once it ends.
+    clock.now = EPOCH + 4_000;
+    await wait(service, A, { timeoutMs: 20 });
+    clock.now = EPOCH + 5_000;
+    await eventually(() => events.length === 5, "the grace to run out");
+    assert.deepEqual(statuses().slice(3), ["waiting_tasks", "active"]);
+    assert.equal(events.at(-1).since, iso(EPOCH + 5_000));
+
+    // A wait that answers for anything but a heartbeat ends the span at once.
+    await wait(service, A, { timeoutMs: 20 });
+    await finish(service, worker, taskId);
+    assert.equal(statuses().at(-1), "waiting_tasks", "a task finishing between two waits ends no grace");
+    assert.equal((await wait(service, A)).reason, "task_finished");
+    assert.deepEqual(statuses().slice(5), ["waiting_tasks", "active"]);
+
+    // heartbeat, then the connection goes: gone, never active.
+    await start(service, session, A);
+    await wait(service, A, { timeoutMs: 20 });
+    service.detachCaller(connection);
+    assert.deepEqual(statuses().slice(7), ["waiting_tasks", "gone"]);
+    assert.deepEqual(await mainsOf(service, MANAGEMENT), []);
+    await pause(200);
+    assert.equal(events.length, 9, "nothing after it left, its grace's timer included");
+  } finally {
+    await service.shutdown().catch(() => {});
+  }
+});
+
 test("the heartbeat and its ceiling follow the host the front door serves, and ACP_GATEWAY_WAIT_LIMIT_MS replaces both", () => {
   // Measured: Codex 0.162.0 gives up on a tool call at 300s, Claude Code
   // 2.1.287 waited 300s; anything else gets the usual 60s.
@@ -609,6 +670,40 @@ test("front door: the host's clientInfo picks the wait's default and ceiling, an
     assert.equal(heartbeat.reason, "heartbeat");
     assert.deepEqual(heartbeat.tasks.map((row) => [row.taskId, row.status]), [[taskId, "working"]]);
     assert.deepEqual(heartbeat.next, { wait: { tool: "agent_acp_wait", arguments: {} } });
+  } finally {
+    await closeAll(clients);
+    await daemon?.stop().catch(() => {});
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("over the control socket a Main that sleeps in a loop shows no active between its heartbeats", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-wt-"));
+  const clients = [];
+  let daemon = null;
+  try {
+    const providers = await writeMockProviders(directory);
+    daemon = await startDaemon({ directory, env: providers });
+    const management = rpcClient(clients, daemon);
+    const events = [];
+    await management.subscribe({}, (event) => {
+      if (event.type === "main_status" && event.caller.instanceId === "mcp-y") events.push(event.status);
+    });
+    const { sessionId } = await management.call("session_open", { provider: "mock", cwd: directory, permissionPolicy: "read_only" });
+    await management.call("run", { sessionId, prompt: "sleep:60000", waitMs: 0 });
+    const sleeper = rpcClient(clients, daemon, { caller: { provider: "codex", sessionId: "wait-y", instanceId: "mcp-y" } });
+    for (let round = 0; round < 3; round += 1) {
+      assert.equal((await sleeper.call("wait", { timeoutMs: 150 })).reason, "heartbeat");
+    }
+    await pause(100);
+    assert.deepEqual(events, ["active", "waiting_tasks"], "three heartbeats, one span");
+    await sleeper.call("inbox", { action: "attention" });
+    await eventually(() => events.length === 3, "the other call to wake it");
+    assert.equal(events[2], "active");
+    assert.equal((await sleeper.call("wait", { timeoutMs: 150 })).reason, "heartbeat");
+    sleeper.close();
+    await eventually(() => events.length === 5, "it to be gone");
+    assert.deepEqual(events.slice(3), ["waiting_tasks", "gone"]);
   } finally {
     await closeAll(clients);
     await daemon?.stop().catch(() => {});

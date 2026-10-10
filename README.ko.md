@@ -96,8 +96,8 @@ Grok 4.5에게 현재 설계의 보안 취약점을 red-team 검토시키고, pe
 1. `agent_acp_setup`으로 provider 확인
 2. `agent_acp_session_open`으로 Worker 세션 생성
 3. 필요한 경우 `agent_acp_config`로 Worker가 지원하는 모델·모드·추론 수준 등의 파라미터 조회·설정
-4. `agent_acp_prompt`로 작업 전달
-5. `agent_acp_poll`로 이벤트와 상태 확인
+4. `agent_acp_run`으로 작업 전달
+5. `agent_acp_poll`로 폴링하는 대신 `agent_acp_wait`으로 Worker가 끝나거나 응답이 필요할 때까지 대기
 6. 필요한 경우 `agent_acp_permission` 또는 `agent_acp_answer`로 응답
 7. 완료 후 세션을 재사용하거나 `agent_acp_session`으로 종료
 
@@ -164,7 +164,7 @@ flowchart LR
 3. **Worker 실행** — Gateway가 해당 provider 프로세스를 시작하거나 기존 프로세스·세션을 재사용합니다.
 4. **ACP 작업 전달** — prompt, 파일 작업, tool event와 중간 결과가 ACP를 통해 오갑니다.
 5. **권한·질문 처리** — Worker의 permission 요청이나 질문은 Gateway Inbox를 거쳐 오케스트레이터에게 전달되고, 그 응답이 다시 Worker로 돌아갑니다.
-6. **결과 회수·재사용** — 오케스트레이터는 MCP Task 또는 poll로 상태와 결과를 받고, 필요하면 같은 세션을 다시 호출하거나 복구합니다.
+6. **결과 회수·재사용** — 오케스트레이터는 `agent_acp_wait`에서 기다리거나 MCP Task 또는 poll로 상태와 결과를 받고, 필요하면 같은 세션을 다시 호출하거나 복구합니다.
 
 ### 신뢰성
 
@@ -173,6 +173,7 @@ Gateway는 맡긴 작업이 어디까지 왔는지도 알려 주므로, 재시�
 - **세션이 그 상태인 이유** — 상태가 바뀔 때마다 이유와 시각을 기록합니다. 실행 중인 Worker가 한동안(기본 5분) 아무것도 보내지 않으면 멈춤 의심으로 표시합니다. 힌트일 뿐이며 아무것도 취소하지 않습니다.
 - **중단으로 모르게 된 것** — 재시작이나 Worker 유실로 끊긴 작업은 Worker가 이미 prompt를 받아 움직였을 수 있는지와 다음에 할 일을 알려 줍니다. `agent_acp_session {action: "check"}`는 아무것도 띄우지 않고 읽기만 해서 세션을 되살릴 수 있는지 알려 줍니다.
 - **attention inbox** — `agent_acp_inbox {action: "attention"}`은 오케스트레이터를 기다리는 요청과 아직 받지 못한 완료 결과를 모아 보여 줍니다. `ack`로 확인한 것으로 표시할 수 있습니다.
+- **폴링 없이 기다리기** — 오케스트레이터는 `agent_acp_wait`에서 기다립니다. 이 호출은 시작한 작업이 끝나면(결과와 함께) 또는 Worker가 무언가를 물으면 곧바로 돌아오고, 그렇지 않으면 호스트가 도구 호출 하나에 허용하는 시간에 맞춘 heartbeat로 돌아옵니다. AgenLynk 같은 앱은 이렇게 기다리는 오케스트레이터를 idle이 아니라 자기 작업을 기다리는 중으로 보여 줍니다(`main_list`와 `main_status` 이벤트).
 - **작업 연결 선언** — run은 이어받는 작업(`parentTaskId`)과 결과를 활용한 작업(`inputTaskIds`)을 밝힐 수 있습니다. `scope: "mine"`을 주면 세션·작업 목록에 호출한 오케스트레이터의 작업만 나옵니다.
 - **오케스트레이터마다 자기 작업만** — 여러 오케스트레이터가 Gateway를 함께 쓸 때(Claude Code 대화 두 개, Codex thread 두 개 등) 각 오케스트레이터는 자신이 연 세션과 그 작업·요청·결과, 그리고 오케스트레이터를 밝히지 않는 도구가 연 세션만 보고 다룰 수 있습니다. AgenLynk처럼 오케스트레이터를 밝히지 않는 앱과 관리 도구는 지금처럼 전체를 봅니다. 새 대화로 돌아온 오케스트레이터는 이전 오케스트레이터의 연결이 끊긴 뒤 `agent_acp_session_restore`(provider, acpSessionId, cwd)를 명시적으로 호출해 이전 세션을 되찾습니다. 이는 함께 일하는 에이전트끼리 서로의 작업을 건드리지 않게 하려는 것이며, Control token을 가진 프로세스를 막는 보안 경계는 아닙니다. 자세한 내용은 [Per-Main isolation](docs/management-api.md#per-main-isolation)(영어)을 참고하세요.
 - **복구가 거듭 실패한 세션 격리** — 복구가 연달아 실패하면(기본 3회) Gateway가 더 이상 알아서 복구하지 않고, 남은 선택지와 함께 `SESSION_QUARANTINED`를 돌려줍니다. 명시적 복구에 성공하면 격리가 풀립니다.
@@ -245,7 +246,7 @@ Gateway 자체는 직접 업데이트할 때만 바뀝니다. npm 설치본은 `
 
 ## 문서
 
-- [관리 API 계약](docs/management-api.md)(영어) — 엔진 설정, provider 정책, 안전 종료와 공개 client 계약(`acp-gateway-daemon/client`, 앱이 마운트한 runtime에서는 `acp-gateway/client`)
+- [관리 API 계약](docs/management-api.md)(영어) — 엔진 설정, provider 정책, 안전 종료, 작업 기다리기와 Main 상태(`wait`, `main_list`), 공개 client 계약(`acp-gateway-daemon/client`, 앱이 마운트한 runtime에서는 `acp-gateway/client`)
 - [Live use cases](docs/live-usecases.md) — 실제 Claude·Codex·Grok Worker로 돌려 본 사용 사례 기록
 - [운영 가이드](docs/operations.ko.md) — installer 옵션, 업데이트, 호스트 재연결, Worker 파라미터 제어, 세션·데이터 관리
 - [변경 이력](CHANGELOG.ko.md) — 버전별 변경 사항

@@ -96,8 +96,8 @@ acp-gateway-bootstrap --install-all --refresh-registry
 1. 用 `agent_acp_setup` 确认 provider
 2. 用 `agent_acp_session_open` 创建 Worker 会话
 3. 如有需要，用 `agent_acp_config` 查询、设置 Worker 支持的模型、模式、推理级别等参数
-4. 用 `agent_acp_prompt` 传递任务
-5. 用 `agent_acp_poll` 查看事件和状态
+4. 用 `agent_acp_run` 传递任务
+5. 用 `agent_acp_wait` 等到 Worker 完成或需要回应，而不是用 `agent_acp_poll` 轮询
 6. 如有需要，用 `agent_acp_permission` 或 `agent_acp_answer` 作出响应
 7. 完成后可以复用会话，或用 `agent_acp_session` 结束
 
@@ -164,7 +164,7 @@ flowchart LR
 3. **运行 Worker** — Gateway 启动对应 provider 的进程，或复用已有的进程和会话。
 4. **通过 ACP 传递任务** — prompt、文件操作、tool event 和中间结果都经由 ACP 传递。
 5. **处理权限与提问** — Worker 的权限请求或提问经过 Gateway Inbox 转给编排器，编排器的回应再返回给 Worker。
-6. **回收与复用结果** — 编排器通过 MCP Task 或 poll 获取状态和结果，必要时可以再次调用或恢复同一个会话。
+6. **回收与复用结果** — 编排器在 `agent_acp_wait` 中等待，或通过 MCP Task 或 poll 获取状态和结果，必要时可以再次调用或恢复同一个会话。
 
 ### 可靠性
 
@@ -173,6 +173,7 @@ Gateway 还会告诉编排器委派出去的工作进展到了哪一步，因此
 - **会话为何处于当前状态** — 每次状态变化都会记录原因和时间。运行中的 Worker 若一段时间（默认 5 分钟）没有发送任何内容，会被标记为疑似卡住；这只是提示，不会取消任何操作。
 - **中断留下了哪些未知** — 因重启或 Worker 丢失而被中断的任务，会说明 Worker 是否可能已经根据 prompt 采取了行动，以及下一步该做什么。`agent_acp_session {action: "check"}` 只读、不启动任何进程，报告会话能否恢复。
 - **attention inbox** — `agent_acp_inbox {action: "attention"}` 列出正在等待编排器处理的请求，以及编排器尚未收到的已完成结果；可用 `ack` 将其标记为已读。
+- **无需轮询的等待** — 编排器在 `agent_acp_wait` 中等待：它启动的任务一完成（连同结果），或 Worker 有问题要问，这个调用就立即返回；否则会在一个 heartbeat 后返回，其时长按宿主允许单次工具调用的时长确定。AgenLynk 这类应用会把这样等待的编排器显示为正在等待自己的任务（`main_list` 和 `main_status` 事件），而不是空闲。
 - **声明任务之间的关联** — run 可以指明它所跟进的任务（`parentTaskId`）以及使用了其结果的任务（`inputTaskIds`）。指定 `scope: "mine"` 时，会话和任务列表只显示发起调用的编排器自己的工作。
 - **各编排器只处理自己的工作** — 多个编排器共用 Gateway 时（例如两个 Claude Code 对话，或两个 Codex thread），每个编排器只能查看和操作自己打开的会话及其任务、请求和结果，以及由不标明编排器的工具打开的会话。AgenLynk 这类不标明编排器的应用和管理工具仍然能看到全部内容。以新对话身份回来的编排器，可以在原来的编排器断开连接之后，显式调用 `agent_acp_session_restore`（provider、acpSessionId、cwd）取回之前的会话。这是为了让协同工作的 agent 互不干扰，并不是针对持有 Control token 的进程的安全边界。详见 [Per-Main isolation](docs/management-api.md#per-main-isolation)（英文）。
 - **多次恢复失败后隔离** — 恢复连续失败（默认 3 次）后，Gateway 不再自动恢复该会话，而是返回 `SESSION_QUARANTINED` 并附上可选的后续操作；显式恢复成功后即解除隔离。
@@ -245,7 +246,7 @@ Gateway 本身只会在你主动更新时才改变：npm 安装用 `npm install 
 
 ## 文档
 
-- [管理 API 契约](docs/management-api.md)（英文）— 引擎设置、provider 策略、安全关闭以及公开 client 的契约（`acp-gateway-daemon/client`；在应用挂载的 runtime 中为 `acp-gateway/client`）
+- [管理 API 契约](docs/management-api.md)（英文）— 引擎设置、provider 策略、安全关闭、任务等待与 Main 状态（`wait`、`main_list`）以及公开 client 的契约（`acp-gateway-daemon/client`；在应用挂载的 runtime 中为 `acp-gateway/client`）
 - [Live use cases](docs/live-usecases.md)（韩文）— 用真实的 Claude、Codex、Grok Worker 跑过的使用案例记录
 - [运维指南](docs/operations.md)（英文）— 安装程序选项、更新、宿主重新连接、Worker 参数控制、会话与数据管理
 - [变更日志](CHANGELOG.md)（英文）— 各版本的变更

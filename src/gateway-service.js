@@ -37,7 +37,7 @@ import {
   updateKey
 } from "./attention.js";
 import { CONTROL_IDENTITY_ENV, normalizeCaller } from "./caller.js";
-import { MainRegistry } from "./main-status.js";
+import { MainRegistry, WAIT_GRACE_MS } from "./main-status.js";
 import { MANAGEMENT_CAPABILITIES, RUNTIME_IDENTITY } from "./runtime-identity.js";
 import { validateSetting } from "./settings.js";
 
@@ -116,6 +116,11 @@ const WAIT_MAX_MS = 600_000;
 // they stay unseen for the next wait.
 const WAIT_RESULT_BUDGET_BYTES = 65_536;
 const WAIT_MAX_FINISHED_ROWS = 50;
+// The calls that leave a Main in the grace a heartbeat gave it (main-status.js):
+// its next wait, and the task reads made for it without it waking, by its host
+// (MCP tasks/get, tasks/list, tasks/result) or by its front door, which reads
+// every MCP Task it follows every 30 seconds. Any other call means it is awake.
+const ASLEEP_METHODS = new Set(["wait", "task_get", "task_list", "task_result"]);
 const CLOSED_STATUSES = new Set(["closed"]);
 // A live client is not enough to start work in these states: the record is
 // known to be out of sync with the worker, so it has to be resumed first.
@@ -221,6 +226,9 @@ export class GatewayService {
     // With the WAL on, the shortest gap between two debounced snapshot writes
     // (see #persistDelay). Not a setting; injectable so a test need not wait.
     snapshotIntervalMs = SNAPSHOT_INTERVAL_MS,
+    // How long a wait's heartbeat keeps its Main waiting_tasks (main-status.js).
+    // Not a setting either; injectable so a test need not wait a minute.
+    waitGraceMs = WAIT_GRACE_MS,
     // Gateway-wide default for how much worker reasoning a session retains.
     // Per-session overrides ride session_open/session_restore.
     thoughtCapture = "tail",
@@ -343,9 +351,12 @@ export class GatewayService {
     this.shutdownReport = null;
     this.now = now;
     // The Mains the daemon's control connections named, and whether a wait of
-    // theirs blocks (main_list, main_status). Fed by the daemon (attachCaller)
-    // and by waitTasks; an embedded service only ever sees the waits.
-    this.mains = new MainRegistry({ now, onChange: (rootId, main) => this.#publishMainStatus(rootId, main) });
+    // theirs blocks (main_list, main_status). Fed by the daemon (attachCaller),
+    // by waitTasks and by every other call (call); an embedded service only ever
+    // sees the waits and the calls.
+    this.mains = new MainRegistry({
+      now, graceMs: waitGraceMs, onChange: (rootId, main) => this.#publishMainStatus(rootId, main)
+    });
     // Task semantics (TTL from createdAt, budgets, waiters, keyset pagination)
     // live in the store. Budgets stay module defaults on purpose: they are a
     // safety valve, not a per-deployment knob, so they are not on the wire.
@@ -669,6 +680,9 @@ export class GatewayService {
     const mutating = !isReadOnlyCall(method, args);
     if (this.draining && mutating) throw new GatewayError(ERROR_CODES.GATEWAY_DRAINING, "Gateway is draining");
     if (context.access !== "observer") this.touchOwnerActivity(args, context);
+    // A Main that calls anything but its next wait (or a task read made for
+    // it) is awake: a heartbeat's grace ends at once.
+    if (!ASLEEP_METHODS.has(method)) this.mains.activity(context.rootId, requesterOf(context));
     // Only the daemon states access, so an embedded caller never counts.
     if (context.access === "control" && !context.caller && ATTRIBUTED_METHODS.has(method)) {
       this.legacyControlRequests += 1;
@@ -2593,20 +2607,24 @@ export class GatewayService {
       for (const taskId of watched) this.touchOwnerActivity({ taskId }, context);
     }
     const deadline = performance.now() + timeoutMs;
-    let blocked = null;
+    // Only a front-door Main has a status this wait can make.
+    const sleep = this.mains.openWait(rootId, requester);
+    let answered = null;
     try {
       for (;;) {
         const view = this.#waitView(watched, running, context);
         const reason = waitReason(view);
         // Timers do not fire early, but a fraction of a millisecond left is no
         // wait worth registering.
-        if (reason || deadline - performance.now() < 1) return this.#waitAnswer(reason ?? "heartbeat", view, named, context);
+        if (reason || deadline - performance.now() < 1) {
+          const answer = this.#waitAnswer(reason ?? "heartbeat", view, named, context);
+          answered = answer.reason;
+          return answer;
+        }
         if (context.signal?.aborted) throw waitAborted();
         const pending = view.working.map((task) => task.taskId);
-        // Only a wait that blocks makes its Main waiting_tasks, and only a
-        // front-door Main has a status to make.
-        if (blocked) this.mains.updateWait(blocked, pending);
-        else if (requester) blocked = this.mains.startWait(rootId, requester, pending);
+        // Only a wait that blocks makes its Main waiting_tasks.
+        this.mains.blockWait(sleep, pending);
         try {
           await this.taskStore.waitForAny(pending, {
             ownerRootId: rootId,
@@ -2622,7 +2640,9 @@ export class GatewayService {
         }
       }
     } finally {
-      if (blocked) this.mains.endWait(blocked);
+      // A heartbeat leaves the Main waiting_tasks for a grace, for the next
+      // wait of a Main that sleeps in a loop; any other end, at once not.
+      this.mains.closeWait(sleep, answered);
     }
   }
 
