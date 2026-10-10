@@ -324,15 +324,18 @@ export async function runInstaller(options, dependencies = {}) {
     .filter((item) => item?.kind === "control" && availableTargets.includes(item.agent))
     .map((item) => item.agent))];
   // An update or a token rotation works on the Control entries this installer
-  // manages; a rotation must not add a front door nobody chose.
+  // manages; a rotation must not add a front door nobody chose, so with none
+  // (an app-managed install keeps only the identity) it registers nothing.
   const controlTargets = options.installControl
     ? (options.targets.length
         ? requestedTargets
         : options.installAll
           ? [options.frontDoor ?? "codex"]
-          : (options.update || options.rotateToken) && managedControlTargets.length
+          : options.rotateToken
             ? managedControlTargets
-            : [availableTargets.includes("codex") ? "codex" : availableTargets[0]].filter(Boolean))
+            : options.update && managedControlTargets.length
+              ? managedControlTargets
+              : [availableTargets.includes("codex") ? "codex" : availableTargets[0]].filter(Boolean))
     : [];
   const guideTargets = options.installGuide ? requestedTargets : [];
   const installedProviderIds = new Set([

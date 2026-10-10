@@ -1,9 +1,12 @@
-import { fstatSync, readFileSync, realpathSync } from "node:fs";
+import { fstatSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { defaultProviderRegistryPath, defaultRegistryCachePath, providerRegistryReadPath } from "./acp-registry.js";
 import { CONTROL_IDENTITY_ENV } from "./caller.js";
 import { ERROR_CODES, GatewayError } from "./errors.js";
 import { resolveSettings, SETTING_DEFINITIONS, settingsPaths } from "./settings.js";
+import { statePaths } from "./state-store.js";
+import { isWithin } from "./worker-files.js";
 
 const uid = typeof process.getuid === "function" ? process.getuid() : "user";
 
@@ -19,6 +22,16 @@ export function gatewayStatePath() {
 // directories holding the Control token (install.json), engine settings and
 // Gateway state, and the control socket. Stripping the token from the worker's
 // environment is not enough when the file that stores it is readable.
+//
+// Then the files whose content decides what the daemon runs or whom it
+// trusts, wherever their canonical path is, when none of those directories
+// holds it: the provider definitions a provider start reads its command from,
+// and the official registry cache an install takes packages from (both
+// anywhere ACP_GATEWAY_PROVIDERS or ACP_GATEWAY_REGISTRY_CACHE puts them, a
+// session root included; from process.env, as acp-registry.js reads them),
+// and install.json, the settings and the state files when one is a symbolic
+// link to a file elsewhere. A Worker that could write one would run its own
+// command at the next start, or hand a later front door its own Control token.
 export function gatewayProtectedPaths({ statePath = gatewayStatePath(), env = process.env } = {}) {
   const { legacy, path: settingsPath } = settingsPaths(env);
   const candidates = [
@@ -28,27 +41,63 @@ export function gatewayProtectedPaths({ statePath = gatewayStatePath(), env = pr
     dirname(statePath),
     gatewaySocketPath()
   ];
-  // Canonical by the system realpath, the one worker-files.js resolves a
-  // requested path with (through fs/promises) before isWithin compares it with
-  // these, lexically; and nothing lexical first, as for the socket's own check
-  // (private-socket.js): a resolve() would drop a ".." together with the link
-  // in front of it, which the kernel follows before it. The JavaScript
-  // realpathSync resolve()s first itself and, on a case-insensitive macOS
-  // volume, keeps the case it was given where the system's returns the case on
-  // disk. What does not exist yet, the socket usually, resolves through its
-  // parent: on macOS the temp directory is itself a symlink into /private.
-  const canonical = candidates.map((path) => {
+  const protectedPaths = [...new Set(candidates.map(canonicalPath))];
+  const state = statePaths(statePath);
+  const files = [
+    providerRegistryReadPath(), defaultProviderRegistryPath(), defaultRegistryCachePath(), legacy, settingsPath,
+    state.state, state.snapshot, state.wal, state.rotating, state.lock, state.marker
+  ];
+  for (const file of files) {
+    const target = canonicalTarget(file);
+    if (!protectedPaths.some((path) => isWithin(path, target))) protectedPaths.push(target);
+  }
+  return protectedPaths;
+}
+
+// Canonical by the system realpath, the one worker-files.js resolves a
+// requested path with (through fs/promises) before isWithin compares it with
+// these, lexically; and nothing lexical first, as for the socket's own check
+// (private-socket.js): a resolve() would drop a ".." together with the link
+// in front of it, which the kernel follows before it. The JavaScript
+// realpathSync resolve()s first itself and, on a case-insensitive macOS
+// volume, keeps the case it was given where the system's returns the case on
+// disk. What does not exist yet, the socket usually, resolves through its
+// parent: on macOS the temp directory is itself a symlink into /private.
+function canonicalPath(path) {
+  try {
+    return realpathSync.native(path);
+  } catch {
     try {
-      return realpathSync.native(path);
+      return join(realpathSync.native(dirname(path)), basename(path));
     } catch {
-      try {
-        return join(realpathSync.native(dirname(path)), basename(path));
-      } catch {
-        return resolve(path);
-      }
+      return resolve(path);
     }
-  });
-  return [...new Set(canonical)];
+  }
+}
+
+// The file path leads to, canonical: the realpath, and through a symbolic link
+// that dangles, which the realpath refuses, where it points, link by link as
+// far as the kernel would follow them. The Gateway would create a missing
+// target in writing through the link, and read whatever a Worker put there.
+function canonicalTarget(path) {
+  let current = path;
+  for (let links = 0; links < 40; links += 1) {
+    try {
+      return realpathSync.native(current);
+    } catch {
+      // Missing, or a link that dangles.
+    }
+    let link;
+    try {
+      link = readlinkSync(current);
+    } catch {
+      break;
+    }
+    // Joined as text, not by join(), which would drop a ".." with the link in
+    // front of it: the realpath above resolves it as the kernel does.
+    current = isAbsolute(link) ? link : `${dirname(current)}${sep}${link}`;
+  }
+  return canonicalPath(current);
 }
 
 const TOKEN_REQUIRED = "ACP_GATEWAY_CONTROL_TOKEN must be set to at least 24 characters";

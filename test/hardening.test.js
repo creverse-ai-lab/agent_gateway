@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, realpath, symlink, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -16,6 +16,7 @@ import { partialPolicyEnforcement, providerConfig, setProviderEnabled, workerSes
 import { prepareGrokSandbox } from "../src/grok-sandbox.js";
 import { GatewayRpcClient } from "../src/socket-rpc.js";
 import { runSourceCommand } from "../src/source-update.js";
+import { openWorkerFile } from "../src/worker-files.js";
 import { createSnapshot, removeSnapshot, snapshotDiff } from "../src/workspace.js";
 import { startDaemon, writeMockProviders } from "./helpers/daemon-harness.js";
 import { withEnv, withTemp } from "./helpers/scratch.js";
@@ -252,6 +253,79 @@ test("protected paths are canonical as the kernel resolves them: a link is follo
     assert.ok(paths.includes(join(await realpath(join(directory, "real")), "g.sock")), paths.join("\n"));
     assert.equal(paths.includes(join(directory, "g.sock")), false, "not the lexical spelling");
     assert.ok(paths.every((path) => path.startsWith(`${directory}/`)), "nothing outside the temp directory, the home included");
+  });
+});
+
+const HARD_LINKED = /hard link to a Gateway-protected file/;
+
+// Astra I1: a provider start runs the command its definition names, outside
+// every check of the Gateway's. ACP_GATEWAY_PROVIDERS can put the definitions
+// anywhere, a session root included, where nothing protected them from a
+// Worker's fs/write_text_file.
+test("the provider registry in effect is protected wherever it lives, by name and by inode", { skip: process.platform === "win32" }, async () => {
+  await withTemp("acp-preg-", async (directory) => {
+    const root = join(directory, "root");
+    await mkdir(root);
+    const registry = join(root, "providers.json");
+    const cache = join(root, "registry.json");
+    await writeFile(registry, JSON.stringify({ version: 1, providers: {} }));
+    const paths = await withEnv({
+      HOME: join(directory, "home"),
+      ACP_GATEWAY_SOCKET: join(directory, "g.sock"),
+      ACP_GATEWAY_STATE: join(directory, "state", "state.json"),
+      ACP_GATEWAY_PROVIDERS: registry,
+      ACP_GATEWAY_REGISTRY_CACHE: cache
+    }, () => gatewayProtectedPaths({ env: { ACP_GATEWAY_INSTALL_STATE: join(directory, "install", "install.json") } }));
+    assert.ok(paths.includes(registry), paths.join("\n"));
+    assert.ok(paths.includes(cache), "the registry cache too, before anything has written it");
+    const options = { roots: [root], protectedPaths: paths };
+    for (const write of [false, true]) {
+      await assert.rejects(openWorkerFile(registry, { ...options, write }), /protected by the Gateway/);
+    }
+    await assert.rejects(openWorkerFile(cache, { ...options, write: true }), /protected by the Gateway/);
+    assert.equal(existsSync(cache), false, "a refused write created nothing");
+    await link(registry, join(root, "notes.json"));
+    await assert.rejects(openWorkerFile(join(root, "notes.json"), { ...options, write: true }), HARD_LINKED);
+    // Only those files: the rest of the root is the Worker's as before.
+    await (await openWorkerFile(join(root, "other.json"), { ...options, write: true })).close();
+  });
+});
+
+// Astra I9: install.json, the settings or a state file can be a symbolic link
+// to a file in a session root. The Gateway reads and writes the file it leads
+// to, which neither the protected directory nor its inode check (which skipped
+// links) covered: a Worker could rewrite the identity a later start hands out.
+test("a control file that is a symbolic link protects the file it leads to, and the inode check follows it", { skip: process.platform === "win32" }, async () => {
+  await withTemp("acp-plink-", async (directory) => {
+    const root = join(directory, "root");
+    const guard = join(directory, "guard");
+    const state = join(directory, "state");
+    for (const path of [root, guard, state]) await mkdir(path);
+    const identity = join(root, "identity.json");
+    await writeFile(identity, JSON.stringify({ identity: { token: "t".repeat(32), rootId: "main-x" } }));
+    await symlink(identity, join(guard, "install.json"));
+    // Two that lead nowhere yet: a write through either would create the file there.
+    await symlink(join(root, "settings.json"), join(guard, "settings.json"));
+    await symlink(join("..", "root", "wal.ndjson"), join(state, "state.wal.ndjson"));
+    const paths = await withEnv({ HOME: join(directory, "home"), ACP_GATEWAY_SOCKET: join(directory, "g.sock") }, () => gatewayProtectedPaths({
+      statePath: join(state, "state.json"),
+      env: { ACP_GATEWAY_INSTALL_STATE: join(guard, "install.json") }
+    }));
+    const targets = [identity, join(root, "settings.json"), join(root, "wal.ndjson")];
+    for (const target of targets) assert.ok(paths.includes(target), `${target}\n${paths.join("\n")}`);
+    const options = { roots: [root], protectedPaths: paths };
+    for (const target of targets) {
+      await assert.rejects(openWorkerFile(target, { ...options, write: true }), /protected by the Gateway/, target);
+    }
+    assert.equal(existsSync(join(root, "settings.json")), false);
+    assert.equal(JSON.parse(await readFile(identity, "utf8")).identity.rootId, "main-x");
+
+    // A link made after the protected paths were resolved: the inode check of
+    // the directory follows it to the file, by any name.
+    const before = { roots: [root], protectedPaths: [guard] };
+    for (const write of [false, true]) await assert.rejects(openWorkerFile(identity, { ...before, write }), HARD_LINKED);
+    await link(identity, join(root, "notes.json"));
+    await assert.rejects(openWorkerFile(join(root, "notes.json"), before), HARD_LINKED);
   });
 });
 

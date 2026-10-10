@@ -2127,6 +2127,32 @@ test("W5: --rotate-token re-registers nothing that reads install.json, and warns
   }
 });
 
+// Astra I14: with no installer-managed Control entry (an app-managed install
+// keeps only the identity), a rotation fell through to Codex, or the first CLI
+// found, and registered a Control front door nobody had asked for.
+test("--rotate-token registers no Control entry where the installer manages none, dry run included", async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "acp-installer-rotate-unmanaged-")));
+  const statePath = join(directory, "install.json");
+  try {
+    await writeManagedState(statePath, []);
+    for (const dryRun of [true, false]) {
+      const calls = [];
+      const argv = ["--rotate-token", "--skip-health-check", ...(dryRun ? ["--dry-run"] : [])];
+      const result = await withNode(() => runInstaller(parseInstallerArgs(argv), updateDependencies(statePath, directory, () => null, calls)));
+      const label = dryRun ? "dry run" : "run";
+      assert.deepEqual(result.targets.control, [], label);
+      assert.deepEqual(result.actions.filter((action) => action.type === "mcp"), [], label);
+      assert.deepEqual(calls.filter((call) => ["codex", "claude", "grok"].includes(call[0])), [], label);
+    }
+    // The rotation itself is install.json's alone.
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    assert.notEqual(state.identity.token, identityEnv.ACP_GATEWAY_CONTROL_TOKEN);
+    assert.deepEqual(state.managedMcp, {});
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 // ------------------------------------------- install.json always says what is live
 
 test("W5: each entry is recorded as soon as it is rewritten, so a later failure cannot strand it", async () => {

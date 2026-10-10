@@ -3,17 +3,61 @@
 // ordering matrix lives in test/crash-matrix.test.js.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { closeSync } from "node:fs";
+import { link, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { AcpClient } from "../src/acp-client.js";
 import { GatewayService } from "../src/gateway-service.js";
-import { decodeRecord, encodeRecord, statePaths, WAL_TYPES } from "../src/state-store.js";
+import { claimStateLock, decodeRecord, encodeRecord, StateStore, statePaths, WAL_TYPES } from "../src/state-store.js";
 
 const mockAgent = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 const MAIN = { rootId: "main-a" };
+const fs = createRequire(import.meta.url)("fs");
+
+// Replaces node:fs functions for the length of run(), each by wrap(original).
+// The store imports them by name, and syncing the builtin ESM exports moves
+// those bindings too (test/helpers/fault-fs.js does the same for a daemon).
+async function withFs(wrappers, run) {
+  const originals = Object.fromEntries(Object.keys(wrappers).map((name) => [name, fs[name]]));
+  for (const [name, wrap] of Object.entries(wrappers)) fs[name] = wrap(originals[name]);
+  syncBuiltinESMExports();
+  try {
+    return await run();
+  } finally {
+    Object.assign(fs, originals);
+    syncBuiltinESMExports();
+  }
+}
+
+// A disk that fills halfway through the next write of a WAL record naming key:
+// half of the record reaches the file, then the write fails.
+function halfThenNoSpace(key) {
+  let armed = true;
+  return (original) => function writeSync(fd, buffer, offset = 0, length = buffer.length - offset, ...rest) {
+    if (!armed || !Buffer.isBuffer(buffer) || !buffer.includes(`"key":${JSON.stringify(key)}`)) {
+      return original.call(this, fd, buffer, offset, length, ...rest);
+    }
+    armed = false;
+    original.call(this, fd, buffer, offset, Math.floor(length / 2));
+    throw Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" });
+  };
+}
+
+// Every line of the log decodes, and the seqs run without a gap.
+async function assertWholeLog(paths) {
+  const lines = (await readFile(paths.wal, "utf8")).split("\n");
+  assert.equal(lines.pop(), "", "the log ends with a whole record");
+  const records = lines.map((line) => decodeRecord(Buffer.from(line, "utf8")));
+  assert.ok(records.every((record) => record != null), "every record passes its crc32");
+  records.forEach((record, index) => {
+    if (index > 0) assert.equal(record.seq, records[index - 1].seq + 1, "no seq is skipped");
+  });
+  return records;
+}
 
 function makeService(directory, { permissionPolicy = "read_only", ...options } = {}) {
   return new GatewayService({
@@ -346,6 +390,57 @@ test("replay resolves a result reference, and degrades to the preview when the f
   });
 });
 
+// Astra I13: the artifact a large result was meant for failed, the log got its
+// preview alone, and the commit of that preview cleared the artifact's failure:
+// Main read the whole result beside healthy persistence, while a crash before
+// the next snapshot would have brought back only the preview.
+test("a result whose artifact failed says it is not durable, as health does, until the snapshot that holds it lands", async () => {
+  await withDirectory("state-ref-failed", async (directory) => {
+    const paths = statePaths(join(directory, "state.json"));
+    const options = { persistence: { walInlineResultBytes: 64 }, maxArtifactBytes: 100, maxArtifactTotalBytes: 100 };
+    // The debounced writer stays quiet until the flush below.
+    const service = makeService(directory, { ...options, snapshotIntervalMs: 60_000 });
+    const notDurable = { persisted: false, errorCode: "PERSISTENCE_UNHEALTHY" };
+    let taskId = null;
+    let text = null;
+    try {
+      await service.init();
+      const { task } = await runTask(service, "large-result");
+      taskId = task.taskId;
+      const committed = (await readWal(paths)).find((record) => record.type === "task.result_committed");
+      assert.equal(committed.payload.ref, undefined, "the artifact was cut short at 100 bytes");
+      assert.equal(committed.payload.result, undefined);
+      assert.ok(committed.payload.preview.length > 0, "the log holds the preview alone");
+
+      const persistence = (await service.call("setup", { mode: "summary" }, MAIN)).persistence;
+      assert.equal(persistence.healthy, false);
+      assert.match(persistence.error, /Task result artifact failed/);
+      const result = await service.call("task_result", { taskId }, MAIN);
+      assert.deepEqual(result.durability, notDurable);
+      text = result.result.text;
+      assert.equal(text, "가나다".repeat(32), "the whole result is what is delivered");
+      assert.deepEqual((await service.call("run", { taskId }, MAIN)).durability, notDurable);
+
+      // The next snapshot holds it whole: both go.
+      await service.flushPersist();
+      assert.equal((await service.call("setup", { mode: "summary" }, MAIN)).persistence.healthy, true);
+      assert.equal(Object.hasOwn(await service.call("task_result", { taskId }, MAIN), "durability"), false);
+    } finally {
+      await service.shutdown();
+    }
+    const reloaded = makeService(directory, options);
+    try {
+      await reloaded.init();
+      const result = await reloaded.call("task_result", { taskId }, MAIN);
+      assert.equal(result.result.text, text);
+      assert.equal(result.resultDegraded, undefined);
+      assert.equal(Object.hasOwn(result, "durability"), false);
+    } finally {
+      await reloaded.shutdown();
+    }
+  });
+});
+
 test("rotation rolls the log, bumps the epoch, and the seq watermark filters a duplicate replay", async () => {
   await withDirectory("state-rotate", async (directory) => {
     const paths = statePaths(join(directory, "state.json"));
@@ -377,6 +472,80 @@ test("rotation rolls the log, bumps the epoch, and the seq watermark filters a d
       assert.equal((await reloaded.call("task_list", {}, MAIN)).tasks.length, 1, "no duplicated handle");
     } finally {
       await reloaded.shutdown();
+    }
+  });
+});
+
+// Astra I2: the inode check refuses a hard link to the live log, but a rotation
+// only unlinked the segment it retired, and the link went on holding its task
+// results and inbox payloads on an inode nothing protected any more.
+test("a hard link to the log holds nothing once a rotation retires its segment", async () => {
+  await withDirectory("state-rotate-link", async (directory) => {
+    const paths = statePaths(join(directory, "state.json"));
+    const service = makeService(directory);
+    try {
+      await service.init();
+      const opened = await openSession(service);
+      service.stateStore.barrier();
+      // A Worker's name for the live log, outside the state directory.
+      const held = join(directory, "held.ndjson");
+      await link(paths.wal, held);
+      assert.ok((await readFile(held, "utf8")).includes(opened.sessionId));
+      service.stateStore.rotate();
+      assert.equal(await readFile(held, "utf8"), "", "emptied, not only unlinked");
+      await assert.rejects(stat(paths.rotating), /ENOENT/);
+
+      // A segment an interrupted rotation left behind goes the same way.
+      await writeFile(paths.rotating, `${encodeRecord({ v: 1, seq: 1, type: "wal.opened", key: "old", payload: {} })}`, { mode: 0o600 });
+      const leftover = join(directory, "leftover.ndjson");
+      await link(paths.rotating, leftover);
+      service.stateStore.rotate();
+      assert.equal(await readFile(leftover, "utf8"), "");
+    } finally {
+      await service.shutdown();
+    }
+  });
+});
+
+// Astra I5: the debounced snapshot replaced the synced one without a sync of
+// its own, so once a rotation had retired the segments the synced one covered,
+// power loss could leave a torn base and a log that only goes on from it.
+test("every snapshot, the debounced one included, is synced before its rename, and the rename after", async () => {
+  await withDirectory("state-snapshot-sync", async (directory) => {
+    const paths = statePaths(join(directory, "state.json"));
+    const service = makeService(directory, { snapshotIntervalMs: 60_000 });
+    try {
+      await service.init();
+      await openSession(service);
+      service.stateStore.barrier();
+      const opened = new Map();
+      const calls = [];
+      await withFs({
+        openSync: (original) => function openSync(path, ...rest) {
+          const fd = original.call(this, path, ...rest);
+          opened.set(fd, String(path));
+          return fd;
+        },
+        fsyncSync: (original) => function fsyncSync(fd) {
+          calls.push(`fsync ${opened.get(fd)}`);
+          return original.call(this, fd);
+        },
+        renameSync: (original) => function renameSync(from, to) {
+          calls.push(`rename ${from} -> ${to}`);
+          return original.call(this, from, to);
+        }
+      }, async () => {
+        service.persistDirty = true;
+        await service.flushPersist();
+      });
+      const temporary = `${paths.snapshot}.${process.pid}.tmp`;
+      assert.deepEqual(calls, [
+        `fsync ${temporary}`,
+        `rename ${temporary} -> ${paths.snapshot}`,
+        `fsync ${paths.directory}`
+      ]);
+    } finally {
+      await service.shutdown();
     }
   });
 });
@@ -588,6 +757,126 @@ test("a newline-terminated bad CRC and a sequence gap both halt WAL replay", asy
       });
     });
   }
+});
+
+// Astra I3: a write that failed partway left half a record in the log and used
+// up its seq. The next append landed right behind those bytes and could sync
+// and clear health, and a restart then met a damaged record mid-log, or a seq
+// gap, and refused to start (STATE_WAL_CORRUPT).
+// A task on the session, run to its end: its records are the ones a restart
+// must find after a failed append.
+async function runTaskOn(service, sessionId) {
+  const task = await service.call("task_prompt", { sessionId, prompt: "narrated-result", ttl: 600_000 }, MAIN);
+  await waitForIdle(service, sessionId);
+  service.stateStore.barrier();
+  return task;
+}
+
+test("an append that fails partway takes nothing: later records land whole, and a crash replays them", async () => {
+  await withDirectory("state-append-failure", async (directory) => {
+    const paths = statePaths(join(directory, "state.json"));
+    const service = makeService(directory);
+    let opened = null;
+    let task = null;
+    try {
+      await service.init();
+      opened = await openSession(service);
+      service.stateStore.barrier();
+      const seq = service.stateStore.walSeq;
+      const bytes = (await stat(paths.wal)).size;
+      await withFs({ writeSync: halfThenNoSpace("task-ghost") }, () => {
+        assert.equal(service.stateStore.append(WAL_TYPES.TASK_SEEN, "task-ghost", { seenAt: new Date().toISOString() }), false);
+      });
+      assert.match(service.persistError, /ENOSPC/);
+      assert.equal(service.stateStore.walSeq, seq, "the failed record took no seq");
+      assert.equal((await stat(paths.wal)).size, bytes, "nor left any of its bytes");
+      // A write that lands answers the failure, and the task's records follow.
+      await service.flushPersist();
+      task = await runTaskOn(service, opened.sessionId);
+      const records = await assertWholeLog(paths);
+      assert.equal(records.some((record) => record.key === "task-ghost"), false);
+    } finally {
+      await keepLogAcrossShutdown(service, paths);
+    }
+    // From the log alone, as a crash leaves it.
+    const restarted = makeService(directory);
+    try {
+      await restarted.init();
+      assert.equal((await restarted.call("task_get", { taskId: task.taskId }, MAIN)).status, "completed");
+      assert.equal((await restarted.call("setup", {}, MAIN)).persistence.lastRecovery.droppedTail, 0);
+    } finally {
+      await restarted.shutdown();
+    }
+  });
+});
+
+test("a log that cannot be cut back takes no record until a rotation behind a synced snapshot replaces it", async () => {
+  await withDirectory("state-append-torn", async (directory) => {
+    const statePath = join(directory, "state.json");
+    const paths = statePaths(statePath);
+    // The debounced writer stays quiet: the rotation below is the flush's.
+    const service = makeService(directory, { snapshotIntervalMs: 60_000 });
+    let first = null;
+    let task = null;
+    let torn = null;
+    try {
+      await service.init();
+      first = await openSession(service);
+      service.stateStore.barrier();
+      const noTruncate = () => function ftruncateSync() {
+        throw Object.assign(new Error("EIO: i/o error, ftruncate"), { code: "EIO" });
+      };
+      await withFs({ writeSync: halfThenNoSpace("task-ghost"), ftruncateSync: noTruncate }, async () => {
+        const seen = { seenAt: new Date().toISOString() };
+        assert.equal(service.stateStore.append(WAL_TYPES.TASK_SEEN, "task-ghost", seen), false);
+        // Nothing may land behind the half record the log could not shed.
+        assert.equal(service.stateStore.append(WAL_TYPES.TASK_SEEN, "task-later", seen), false);
+        assert.match(service.persistError, /could not be cut back/);
+        await assert.rejects(
+          service.call("task_prompt", { sessionId: first.sessionId, prompt: "narrated-result" }, MAIN),
+          { code: "PERSISTENCE_UNHEALTHY" }
+        );
+        // What a crash right now leaves: the snapshot from the start, and a log
+        // that ends in the torn bytes.
+        torn = { snapshot: await readFile(paths.snapshot), wal: await readFile(paths.wal) };
+        // Due at once: a synced snapshot, then a new log, while the old one still
+        // cannot be cut.
+        service.persistDirty = true;
+        await service.flushPersist();
+      });
+      assert.equal(service.persistError, null);
+      const restarted = await readWal(paths);
+      assert.equal(restarted[0].type, "wal.opened", "a new log");
+      assert.equal(restarted[0].seq, (await readSnapshot(paths)).header.walSeq + 1);
+      task = await runTaskOn(service, first.sessionId);
+      await assertWholeLog(paths);
+    } finally {
+      await keepLogAcrossShutdown(service, paths, { dropSnapshot: false });
+    }
+    const afterRepair = makeService(directory);
+    try {
+      await afterRepair.init();
+      const listed = (await afterRepair.call("session", { action: "list" }, MAIN)).sessions.map((session) => session.sessionId);
+      assert.deepEqual(listed, [first.sessionId]);
+      assert.equal((await afterRepair.call("task_get", { taskId: task.taskId }, MAIN)).status, "completed");
+    } finally {
+      await afterRepair.shutdown();
+    }
+    // The crash before the rotation: the torn bytes are the end of the live
+    // log, the one place replay drops a damaged record.
+    await writeFile(paths.snapshot, torn.snapshot, { mode: 0o600 });
+    await writeFile(paths.wal, torn.wal, { mode: 0o600 });
+    const beforeRepair = makeService(directory);
+    try {
+      await beforeRepair.init();
+      assert.equal((await beforeRepair.call("setup", {}, MAIN)).persistence.lastRecovery.droppedTail, 1);
+      const listed = (await beforeRepair.call("session", { action: "list" }, MAIN)).sessions.map((session) => session.sessionId);
+      assert.deepEqual(listed, [first.sessionId]);
+      assert.deepEqual((await beforeRepair.call("task_list", {}, MAIN)).tasks, []);
+    } finally {
+      await beforeRepair.shutdown();
+    }
+  });
 });
 
 test("a corrupt snapshot halts instead of starting empty; snapshot-drop starts from the log and a leftover v4 file", async () => {
@@ -917,6 +1206,70 @@ test("the state directory is locked against a second live writer", async () => {
     } finally {
       await reclaiming.shutdown();
     }
+  });
+});
+
+// Astra I4: two starters that read the same stale lock each unlinked it by
+// name, so the second removed the lock the first had just made, and both wrote
+// the same log. And a second store in the same process read its own pid in
+// the first one's lock and took it.
+test("two starters over one stale state lock: exactly one takes it", async () => {
+  await withDirectory("state-lock-race", async (directory) => {
+    const lock = statePaths(join(directory, "state.json")).lock;
+    await writeFile(lock, "999999\n", { mode: 0o600 });
+    const isAlive = (pid) => pid === 1001 || pid === 1002;
+    const take = (pid, beforeClaim) => {
+      try {
+        return { fd: claimStateLock(lock, { pid, isAlive, beforeClaim }) };
+      } catch (error) {
+        return { error };
+      }
+    };
+    // The second starter judged the same stale lock, and gets through first.
+    let second = null;
+    const first = take(1001, () => {
+      second ??= take(1002);
+    });
+    try {
+      assert.equal([first, second].filter((outcome) => outcome.fd != null).length, 1, "one holder");
+      assert.equal(typeof second.fd, "number");
+      assert.equal(first.error?.code, "STATE_DIR_LOCKED");
+      assert.match(first.error.message, /pid=1002/);
+      assert.equal((await readFile(lock, "utf8")).trim(), "1002", "the holder's lock is where it was");
+      assert.deepEqual(await readdir(directory), ["state.lock"], "no claimed lock is left behind");
+    } finally {
+      closeSync(second.fd);
+    }
+    // A lock that names no pid yet is one being made, never stale.
+    await writeFile(lock, "");
+    assert.throws(() => claimStateLock(lock, { pid: 1003, isAlive }), { code: "STATE_DIR_LOCKED" });
+  });
+});
+
+test("a second store for one state directory in one process is refused, under any spelling", async () => {
+  await withDirectory("state-lock-twice", async (directory) => {
+    const state = join(directory, "state");
+    await mkdir(state);
+    await symlink(state, join(directory, "link"));
+    const statePath = join(state, "state.json");
+    const first = new StateStore({ statePath });
+    first.open();
+    try {
+      for (const spelled of [statePath, join(directory, "link", "state.json")]) {
+        assert.throws(() => new StateStore({ statePath: spelled }).open(), (error) => {
+          assert.equal(error.code, "STATE_DIR_LOCKED");
+          assert.match(error.message, /already has the Gateway state directory/);
+          return true;
+        });
+      }
+      assert.equal((await readFile(statePaths(statePath).lock, "utf8")).trim(), String(process.pid));
+    } finally {
+      first.close();
+    }
+    await assert.rejects(stat(statePaths(statePath).lock), /ENOENT/, "released with its store");
+    const next = new StateStore({ statePath });
+    next.open();
+    next.close();
   });
 });
 

@@ -13,11 +13,11 @@
 // takes fsync(2), which for the group-commit window is a 5ms exposure.
 import { createHash } from "node:crypto";
 import {
-  closeSync, copyFileSync, existsSync, fstatSync, fsyncSync, ftruncateSync, mkdirSync, openSync,
-  readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeSync
+  closeSync, copyFileSync, existsSync, fstatSync, fsyncSync, ftruncateSync, linkSync, mkdirSync, openSync,
+  readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeSync
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { replaceFile } from "./atomic-json.js";
+import { removeFile, replaceFile } from "./atomic-json.js";
 import { ERROR_CODES, GatewayError } from "./errors.js";
 import { GATEWAY_API_VERSION, GATEWAY_VERSION, STATE_SCHEMA_VERSION } from "./version.js";
 
@@ -37,6 +37,11 @@ const QUARANTINE_NAME = /^(corrupt|downgraded|gap)-(\d{4}-\d{2}-\d{2})T(\d{2})-(
 // Any write finishes in milliseconds; this is far past that.
 const STALE_TEMPORARY_MS = 10 * 60_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+// The state locks this process holds, by canonical path. A lock says which
+// process holds it, so it cannot tell two stores of one process apart: a
+// second store for the same directory would read its own pid and take the
+// lock the first still holds.
+const LOCKED_HERE = new Set();
 
 // The complete write-ahead vocabulary. session.owner_changed is deliberately
 // absent: ownerRootId is assigned once at registration and never reassigned, so
@@ -146,6 +151,11 @@ export class StateStore {
   #onError;
   #fd = null;
   #lockFd = null;
+  #lockKey = null;
+  // Set when a failed append left part of its record at the end of the log
+  // and the log could not be cut back (append): no record may follow those
+  // bytes, so none is written until rotate() has replaced the log.
+  #walTorn = null;
   #seq = 0;
   #walBytes = 0;
   #walRecords = 0;
@@ -243,9 +253,11 @@ export class StateStore {
     };
     // Under the lock, so no live writer of ours owns any of these. What a dead
     // one left behind is either a torn copy of state (a temporary) or an old
-    // forensic copy, and both hold payloads retention has already let go of.
+    // forensic copy, and both hold payloads retention has already let go of;
+    // or a stale lock a dead starter had claimed (claimStateLock).
     sweepStaleTemporaries(this.paths.snapshot);
     sweepStaleTemporaries(this.paths.state);
+    sweepStaleTemporaries(this.paths.lock);
     this.#pruneQuarantine();
     let snapshot = this.#readSnapshot(recovery);
     const legacy = this.#readLegacyState();
@@ -257,9 +269,9 @@ export class StateStore {
     if (snapshot && legacy && !legacy.marked && legacy.mtimeMs >= snapshot.mtimeMs) {
       this.#quarantine(this.paths.snapshot, "downgraded", recovery);
       this.#quarantine(this.paths.wal, "downgraded", recovery);
-      unlinkSafe(this.paths.snapshot);
-      unlinkSafe(this.paths.wal);
-      unlinkSafe(this.paths.rotating);
+      removeFile(this.paths.snapshot);
+      removeFile(this.paths.wal);
+      removeFile(this.paths.rotating);
       snapshot = null;
       recovery.source = "downgrade-remigrated";
       recovery.alerts.push({
@@ -609,7 +621,7 @@ export class StateStore {
       group.forEach((copy, index) => {
         if (index < QUARANTINE_KEEP && !(now - copy.at > QUARANTINE_MAX_AGE_MS)) return;
         try {
-          unlinkSync(join(this.paths.directory, copy.name));
+          removeFile(join(this.paths.directory, copy.name));
         } catch {
           // Already gone, or not removable by us: the next start tries again.
         }
@@ -637,6 +649,10 @@ export class StateStore {
   // Never throws. A T1 caller is usually a session callback in the middle of
   // applying an ACP update, and failing the durable write must not also break the
   // session. Failures go out through onError (unhealthy) and come back as false.
+  //
+  // A failed write takes nothing: the seq goes to the next record that lands,
+  // and the log is cut back to the length it had (#takeBack), so replay never
+  // meets a gap or part of a record in the middle of the log.
   append(type, key, payload) {
     // Inert, not failed. Before open() nothing has promised durability yet, and
     // after close() the daemon has already accounted for its final state (§9.12);
@@ -645,10 +661,11 @@ export class StateStore {
     if (!this.#opened || this.#closed) return true;
     this.#snapshotDirty = true;
     if (!this.#config.wal) return true;
-    this.#seq += 1;
+    if (this.#walTorn) return this.#appendFailed(this.#walTorn);
+    const seq = this.#seq + 1;
     const line = Buffer.from(encodeRecord({
       v: WAL_RECORD_VERSION,
-      seq: this.#seq,
+      seq,
       at: new Date(this.#now()).toISOString(),
       type,
       key,
@@ -656,17 +673,52 @@ export class StateStore {
     }), "utf8");
     try {
       writeAll(this.#fd, line);
-      this.#walBytes += line.length;
-      this.#walRecords += 1;
-      this.#pendingFsync = true;
-      this.#armGroupCommit();
-      return true;
     } catch (error) {
-      this.#failures += 1;
-      this.#writeError = error;
-      this.#onError(error);
+      this.#takeBack(error);
+      return this.#appendFailed(error);
+    }
+    this.#seq = seq;
+    this.#walBytes += line.length;
+    this.#walRecords += 1;
+    this.#pendingFsync = true;
+    this.#armGroupCommit();
+    return true;
+  }
+
+  #appendFailed(error) {
+    this.#failures += 1;
+    this.#writeError = error;
+    this.#onError(error);
+    return false;
+  }
+
+  // A write can fail after part of its record reached the file (ENOSPC midway).
+  // The next record would land right behind those bytes and turn them into a
+  // damaged record in the middle of the log, which replay refuses
+  // (STATE_WAL_CORRUPT) rather than drop as it drops a torn last line. So the
+  // file goes back to the length it had before the write. Where it cannot, the
+  // log takes no record until rotate() has replaced it, behind a synced
+  // snapshot, with a new one.
+  #takeBack(error) {
+    if (this.#fd == null || this.#cutTornTail()) return;
+    this.#walTorn = new Error(
+      `Gateway write-ahead log ${this.paths.wal} could not be cut back after a failed write `
+      + `(${error?.message ?? error}); it takes no more records until it is rotated`
+    );
+  }
+
+  // Cuts the log back to the bytes of its whole records. Not synced: the next
+  // barrier syncs the file as it is, and until then a crash leaves at most a
+  // torn last line, which replay drops.
+  #cutTornTail() {
+    if (this.#fd == null) return false;
+    try {
+      ftruncateSync(this.#fd, this.#walBytes);
+    } catch {
       return false;
     }
+    this.#walTorn = null;
+    return true;
   }
 
   // T0: the caller is holding a response until these bytes survive a crash.
@@ -687,7 +739,7 @@ export class StateStore {
       this.#timer = null;
     }
     if (!this.#config.wal) {
-      if (this.#snapshotDirty) this.writeSnapshot({ sync: true });
+      if (this.#snapshotDirty) this.writeSnapshot();
       return;
     }
     if (!this.#pendingFsync) return;
@@ -719,11 +771,13 @@ export class StateStore {
 
   // --------------------------------------------------------------- snapshot
 
-  // tmp -> (fsync) -> rename -> (dir fsync). Unsynced on the debounced path,
-  // where the WAL (or, with it off, the synced barrier) already holds every
-  // fact a restart must keep; synced when it is the file that makes a WAL
-  // rotation safe.
-  writeSnapshot({ sync = false } = {}) {
+  // tmp -> fsync -> rename -> dir fsync, on every path, the debounced one
+  // included. Each snapshot replaces the one before it as the base the log
+  // replays onto, and once a rotation has retired the segments that base
+  // covers, it is the only copy of them: an unsynced replacement could leave
+  // power loss with a torn base and a log that only goes on from it. Two
+  // fsyncs a write, at most about one write a second with the WAL on.
+  writeSnapshot() {
     if (!this.#opened || this.#closed) return null;
     if (this.#config.wal) this.barrier();
     const body = Buffer.from(JSON.stringify(this.#durableBody(this.#snapshotProvider())), "utf8");
@@ -743,17 +797,17 @@ export class StateStore {
     const fd = openSync(temporary, "w", 0o600);
     try {
       writeAll(fd, Buffer.concat([header, body, Buffer.from("\n", "utf8")]));
-      if (sync) this.#fsync(fd);
+      this.#fsync(fd);
     } finally {
       closeSync(fd);
     }
     // The snapshot this replaces is emptied, when a hard link still holds it,
-    // once the rename stands, and on the synced path once it is durable
-    // (replaceFile): the link would otherwise keep that state, task results and
-    // inbox payloads included, beyond the inode check of the state directory.
-    // Nothing keeps that file on purpose; a quarantine copy is a copy.
-    replaceFile(temporary, this.paths.snapshot, { afterRename: sync ? () => this.#syncDirectory() : null });
-    if (sync) this.#retireLegacyState();
+    // once the rename stands and is durable (replaceFile): the link would
+    // otherwise keep that state, task results and inbox payloads included,
+    // beyond the inode check of the state directory. Nothing keeps that file on
+    // purpose; a quarantine copy is a copy.
+    replaceFile(temporary, this.paths.snapshot, { afterRename: () => this.#syncDirectory() });
+    this.#retireLegacyState();
     this.#snapshotDirty = false;
     this.#lastSnapshotAt = performance.now();
     return { bytes: body.length, walSeq: this.#seq, epoch: this.#epoch };
@@ -784,29 +838,34 @@ export class StateStore {
   #retireLegacyState() {
     if (!this.#legacyPending) return;
     try {
-      unlinkSafe(this.paths.state);
+      removeFile(this.paths.state);
       this.#legacyPending = false;
       this.#syncDirectory();
     } catch {
-      // Kept for the next synced snapshot; the file is only stale, not wrong.
+      // Kept for the next snapshot; the file is only stale, not wrong.
     }
   }
 
   // Roll, never truncate in place: the old segment keeps its bytes under .rot
   // until a snapshot that covers them is on disk, so every crash point in here
   // leaves one complete story on disk plus at most a replayable duplicate.
+  //
+  // A retired segment goes through removeFile: emptied first when a hard link
+  // still holds it, which would otherwise keep task results and inbox payloads
+  // on an inode the state directory's inode check no longer finds.
   rotate() {
     if (!this.#opened || this.#closed) return null;
-    if (!this.#config.wal) return this.writeSnapshot({ sync: true });
+    if (!this.#config.wal) return this.writeSnapshot();
     this.barrier();
+    if (this.#walTorn && !this.#cutTornTail()) return this.#replaceTornWal();
     // A segment left by an interrupted rotation still holds records that no
     // snapshot covers (open() replayed them into memory, nothing has written them
     // down). Fold it into a snapshot before the rename below can overwrite it.
     if (existsSync(this.paths.rotating)) {
-      this.writeSnapshot({ sync: true });
-      unlinkSafe(this.paths.rotating);
+      this.writeSnapshot();
+      removeFile(this.paths.rotating);
     }
-    closeSync(this.#fd);
+    if (this.#fd != null) closeSync(this.#fd);
     this.#fd = null;
     try {
       renameSync(this.paths.wal, this.paths.rotating);
@@ -825,8 +884,31 @@ export class StateStore {
     // The snapshot is what makes the rolled-aside segment redundant, so it is
     // written (and fsynced) before that segment is unlinked. A crash in between
     // replays the segment into a snapshot that already covers it.
-    const written = this.writeSnapshot({ sync: true });
-    unlinkSafe(this.paths.rotating);
+    const written = this.writeSnapshot();
+    removeFile(this.paths.rotating);
+    this.#rotatedAt = this.#now();
+    this.#failures = 0;
+    return written;
+  }
+
+  // The rotation of a log that ends in part of a record (#walTorn). It is not
+  // rolled aside: replay takes a damaged last record for a crash's torn write
+  // only in the live log, and in .rot for corruption. A synced snapshot makes
+  // every whole record in it redundant first, and only then does it go and a
+  // new log start. A crash before that leaves the torn bytes where replay drops
+  // them; one after, that snapshot and no log, or the new one.
+  #replaceTornWal() {
+    this.#epoch += 1;
+    const written = this.writeSnapshot();
+    if (this.#fd != null) closeSync(this.#fd);
+    this.#fd = null;
+    removeFile(this.paths.rotating);
+    removeFile(this.paths.wal);
+    this.#syncDirectory();
+    this.#walTorn = null;
+    this.#openWal();
+    this.#walRecords = 0;
+    this.#writeOpenedMarker();
     this.#rotatedAt = this.#now();
     this.#failures = 0;
     return written;
@@ -834,7 +916,9 @@ export class StateStore {
 
   rotateIfNeeded() {
     if (!this.#opened || this.#closed || !this.#config.wal) return null;
-    const due = this.#walBytes >= this.#config.walRotateBytes
+    // A log that takes no records, torn or not open, is replaced at once.
+    const due = this.#walTorn != null || this.#fd == null
+      || this.#walBytes >= this.#config.walRotateBytes
       || this.#walRecords >= this.#config.walRotateRecords
       || (this.#config.walRotateIntervalMs > 0 && this.#rotatedAt + this.#config.walRotateIntervalMs <= this.#now());
     return due ? this.rotate() : null;
@@ -973,29 +1057,21 @@ export class StateStore {
   // The daemon lock is keyed to the socket path, so two daemons on different
   // sockets could share one state directory and interleave O_APPEND writes into
   // one WAL. This lock is keyed to the state directory, which is what actually
-  // has to be exclusive.
+  // has to be exclusive: between processes (claimStateLock), and between two
+  // stores of this one, which the pid in the lock cannot tell apart.
   #acquireLock() {
     mkdirSync(this.paths.directory, { recursive: true, mode: 0o700 });
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      try {
-        this.#lockFd = openSync(this.paths.lock, "wx", 0o600);
-        writeAll(this.#lockFd, Buffer.from(`${process.pid}\n`, "utf8"));
-        return;
-      } catch (error) {
-        if (error?.code !== "EEXIST") throw error;
-        const owner = Number(String(readFileSafe(this.paths.lock) ?? "").trim());
-        // Same pid means this process already holds the directory (two services
-        // in one test process): single-threaded, so there is nothing to serialize.
-        if (Number.isInteger(owner) && owner !== process.pid && processIsAlive(owner)) {
-          throw new GatewayError(
-            ERROR_CODES.STATE_DIR_LOCKED,
-            `Another Gateway (pid=${owner}) is using the state directory ${this.paths.directory}`
-          );
-        }
-        unlinkSafe(this.paths.lock);
-      }
+    // Canonical, so two spellings of one directory are one lock.
+    const key = join(realpathSync.native(this.paths.directory), basename(this.paths.lock));
+    if (LOCKED_HERE.has(key)) {
+      throw new GatewayError(
+        ERROR_CODES.STATE_DIR_LOCKED,
+        `This process already has the Gateway state directory ${this.paths.directory} open`
+      );
     }
-    throw new GatewayError(ERROR_CODES.STATE_DIR_LOCKED, `Could not lock the Gateway state directory ${this.paths.directory}`);
+    this.#lockFd = claimStateLock(this.paths.lock);
+    this.#lockKey = key;
+    LOCKED_HERE.add(key);
   }
 
   #releaseLock() {
@@ -1006,8 +1082,139 @@ export class StateStore {
       // Already closed.
     }
     this.#lockFd = null;
+    LOCKED_HERE.delete(this.#lockKey);
+    this.#lockKey = null;
     if (Number(String(readFileSafe(this.paths.lock) ?? "").trim()) === process.pid) unlinkSafe(this.paths.lock);
   }
+}
+
+/**
+ * Takes the state lock at path for pid and returns its descriptor, or throws
+ * STATE_DIR_LOCKED while a live process holds it. The lock is created with
+ * O_EXCL and the pid written right after, so one that names no pid yet is
+ * being made and counts as held. One whose process is gone, or that names pid
+ * itself (StateStore asks only when no store of this process holds it, so a
+ * dead process had the number), is claimed rather than unlinked: two starters
+ * that judged the same stale lock would each unlink it by name, the second
+ * removing the lock the first had just made, and both go on as its only
+ * writer. A claim renames the lock to a name of its own, which only one
+ * starter can take a file to, and drops it only when the file taken is the one
+ * it judged stale; a lock made since goes back, by link(2), which never
+ * replaces one made meanwhile either. Only then is a new lock created. isAlive
+ * and beforeClaim, which runs between the judgement and the rename, are test
+ * seams.
+ */
+export function claimStateLock(path, { pid = process.pid, isAlive = processIsAlive, beforeClaim = null } = {}) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const fd = createLock(path, pid);
+    if (fd != null) return fd;
+    const judged = readLock(path);
+    if (judged == null) continue;
+    if (!lockIsStale(judged.text, pid, isAlive)) throw lockedBy(path, judged.text);
+    beforeClaim?.();
+    // A pid-named temporary, swept at a later start if this process dies
+    // holding it.
+    const claimed = `${path}.${pid}.tmp`;
+    try {
+      renameSync(path, claimed);
+    } catch (error) {
+      if (error?.code === "ENOENT") continue; // claimed by another starter first
+      throw error;
+    }
+    if (sameLock(readLock(claimed), judged)) unlinkSafe(claimed);
+    else restoreLock(claimed, path);
+  }
+  throw new GatewayError(ERROR_CODES.STATE_DIR_LOCKED, `Could not lock the Gateway state directory ${dirname(path)}`);
+}
+
+// The lock, created and naming pid; null when one is there already.
+function createLock(path, pid) {
+  let fd;
+  try {
+    fd = openSync(path, "wx", 0o600);
+  } catch (error) {
+    if (error?.code === "EEXIST") return null;
+    throw error;
+  }
+  try {
+    writeAll(fd, Buffer.from(`${pid}\n`, "utf8"));
+    return fd;
+  } catch (error) {
+    // It never named us (a full disk), and would read as a lock being made
+    // for good: taken away while the path still holds it.
+    try {
+      const created = fstatSync(fd, { bigint: true });
+      const current = statSync(path, { bigint: true, throwIfNoEntry: false });
+      if (current?.dev === created.dev && current?.ino === created.ino) unlinkSync(path);
+    } catch {
+      // Left for an operator; the write's own error says why.
+    }
+    closeSync(fd);
+    throw error;
+  }
+}
+
+// The lock at path as one file: its device, inode, mtime and text, through one
+// descriptor. null when it is gone.
+function readLock(path) {
+  let fd;
+  try {
+    fd = openSync(path, "r");
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+  try {
+    const { dev, ino, mtimeNs } = fstatSync(fd, { bigint: true });
+    return { dev, ino, mtimeNs, text: readFileSync(fd, "utf8") };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+// Whether two reads of a lock are one lock. Not by inode alone: a file system
+// may give the inode number of the stale lock, unlinked by another claim, to
+// the lock made right after it (ext4, tmpfs), and only what that one holds,
+// a live pid, tells them apart.
+function sameLock(left, right) {
+  return left != null && right != null && left.dev === right.dev && left.ino === right.ino
+    && left.mtimeNs === right.mtimeNs && left.text === right.text;
+}
+
+// Whether a lock names no live holder: a process that is gone, pid itself, or
+// nothing a process could be. Empty is a lock its maker has not written yet.
+function lockIsStale(text, pid, isAlive) {
+  const value = text.trim();
+  if (value === "") return false;
+  const owner = Number(value);
+  if (!Number.isSafeInteger(owner) || owner <= 0) return true;
+  return owner === pid || !isAlive(owner);
+}
+
+function lockedBy(path, text) {
+  const owner = text.trim();
+  return new GatewayError(
+    ERROR_CODES.STATE_DIR_LOCKED,
+    owner
+      ? `Another Gateway (pid=${owner}) is using the state directory ${dirname(path)}`
+      : `Another Gateway is taking the state directory ${dirname(path)}`
+  );
+}
+
+// Puts back a live lock a claim took instead of the stale one it judged. A
+// file system without hard links gets the rename back. A lock made in the
+// moment its path stood empty (a third starter) stays, and then two hold one:
+// what lock files cannot rule out without an OS lock, which Node does not have.
+function restoreLock(claimed, path) {
+  try {
+    linkSync(claimed, path);
+  } catch (error) {
+    if (error?.code !== "EEXIST") {
+      renameSync(claimed, path);
+      return;
+    }
+  }
+  unlinkSafe(claimed);
 }
 
 function emptyBody() {
@@ -1088,10 +1295,11 @@ export function sweepStaleTemporaries(path, { minAgeMs = STALE_TEMPORARY_MS } = 
       continue;
     }
     try {
-      unlinkSync(file);
-      removed += 1;
+      // Emptied first when a hard link holds it: a temporary is a whole copy of
+      // what it was written for, state or the Control token.
+      if (removeFile(file)) removed += 1;
     } catch {
-      // Gone already, or not ours to remove.
+      // Not ours to remove.
     }
   }
   return removed;

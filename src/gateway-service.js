@@ -339,6 +339,12 @@ export class GatewayService {
     // task that was still in flight at restart is failed, and a terminal one
     // already has its envelope built.
     this.taskDelivery = new Map();
+    // taskId -> performance.now() of a terminal commit that put only the
+    // result's preview in the log, its artifact having failed: a restart before
+    // the next snapshot, which holds the whole result, would bring back no more.
+    // Said on the result until that snapshot lands (#resultDurability). In
+    // memory only, like the gap it describes.
+    this.resultsNotDurable = new Map();
     // v5 durability. Absent for the many callers that run without a state path:
     // then every append is a no-op and nothing is fail-closed.
     this.stateStore = statePath
@@ -1317,7 +1323,7 @@ export class GatewayService {
     if (!session.adoptedFrom || this.stateStore?.mode !== "wal") return true;
     if (!this.persistDirty && this.persistError == null) return true;
     try {
-      this.stateStore.writeSnapshot({ sync: true });
+      this.stateStore.writeSnapshot();
       this.persistError = null;
       return true;
     } catch (error) {
@@ -2441,16 +2447,33 @@ export class GatewayService {
       if (stored == null) {
         return { ok: false, taskId: task.taskId, error: task.statusMessage ?? "Task completed without a result" };
       }
+      if (typeof stored !== "object" || Array.isArray(stored)) return stored;
       // Every envelope names its own handle. Envelopes built by this gateway
       // already carry it; this covers the ones recovered from an older snapshot
       // and the degraded previews recovery rebuilds from a WAL head.
-      if (typeof stored !== "object" || Array.isArray(stored) || Object.hasOwn(stored, "taskId")) return stored;
-      return { taskId: task.taskId, ...stored };
+      const named = Object.hasOwn(stored, "taskId") ? stored : { taskId: task.taskId, ...stored };
+      // Additive, only while the whole result is not durable; never stored.
+      const durability = this.#resultDurability(task.taskId);
+      return durability ? { ...named, durability } : named;
     });
     // agent_acp_run (start and attach) and tasks/result all end here. After the
     // envelope is built, so the bookkeeping cannot change what is delivered.
     this.#markDelivered(task.taskId, context);
     return delivered;
+  }
+
+  // What a result says of its own durability while only its preview is in the
+  // log (resultsNotDurable): the same fact a restore whose write did not hold
+  // carries. Gone once a snapshot written after the commit, which holds the
+  // whole result, has landed.
+  #resultDurability(taskId) {
+    const committedAt = this.resultsNotDurable.get(taskId);
+    if (committedAt === undefined) return null;
+    if (this.stateStore.lastSnapshotAt > committedAt) {
+      this.resultsNotDurable.delete(taskId);
+      return null;
+    }
+    return { persisted: false, errorCode: ERROR_CODES.PERSISTENCE_UNHEALTHY };
   }
 
   // A terminal result reaching the Main that started the task (or took its
@@ -2953,6 +2976,23 @@ export class GatewayService {
           .map((item) => this.#publicSession(item))
       };
     }
+    // Collection-wide like list, so before the one-session lookup: clean names
+    // no session, and a sessionId sent with it changes nothing.
+    if (args.action === "clean") {
+      const closed = [];
+      // A front-door Main cleans up only what it opened: a session nobody is
+      // recorded for may be management's (an app's), and not this Main's to close.
+      const cleanable = (candidate) => candidate.ownerRootId === root
+        && (requester == null || isSameCaller(candidate.openedBy, requester));
+      for (const item of this.store.list().filter(cleanable)) {
+        // The list was a snapshot; by the time the n-th session is reached the
+        // earlier awaits have let it start a turn or disappear entirely.
+        if (!this.store.get(item.id) || ACTIVE_STATUSES.has(item.status) || item.status === "idle") continue;
+        if (item._reserved) continue;
+        if (await this.closeSession(item)) closed.push(item.id);
+      }
+      return { ok: true, closed };
+    }
     const session = requireOwnedSession(this.requireSession(args.sessionId), context);
     if (args.action === "get") {
       return {
@@ -3015,21 +3055,6 @@ export class GatewayService {
       session.updatedAt = new Date(this.now()).toISOString();
       this.schedulePersist();
       return { ok: true, ...this.#publicSession(session) };
-    }
-    if (args.action === "clean") {
-      const closed = [];
-      // A front-door Main cleans up only what it opened: a session nobody is
-      // recorded for may be management's (an app's), and not this Main's to close.
-      const cleanable = (candidate) => candidate.ownerRootId === root
-        && (requester == null || isSameCaller(candidate.openedBy, requester));
-      for (const item of this.store.list().filter(cleanable)) {
-        // The list was a snapshot; by the time the n-th session is reached the
-        // earlier awaits have let it start a turn or disappear entirely.
-        if (!this.store.get(item.id) || ACTIVE_STATUSES.has(item.status) || item.status === "idle") continue;
-        if (item._reserved) continue;
-        if (await this.closeSession(item)) closed.push(item.id);
-      }
-      return { ok: true, closed };
     }
     throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `Unknown action: ${args.action}`);
   }
@@ -3546,6 +3571,10 @@ export class GatewayService {
     if (!before || TERMINAL_TASK_STATUSES.has(before.status)) return before;
     const lastUpdatedAt = new Date(this.now()).toISOString();
     const durable = result === undefined ? null : this.#durableResultRecord(session, taskId, result);
+    // The artifact a large result was meant for failed, so the record below
+    // carries its preview alone (#durableResultRecord). Without the WAL the
+    // commit is a synced snapshot, which holds the whole result anyway.
+    const previewOnly = this.stateStore?.mode === "wal" && durable?.preview !== undefined && durable.ref == null;
     let provisional = null;
     if (this.stateStore?.mode === "snapshot") {
       provisional = this.taskStore.transition(taskId, status, statusMessage, {
@@ -3563,7 +3592,10 @@ export class GatewayService {
         ...(durable ?? { result: null }),
         ...(interruption ? { interruption } : {})
       });
-      if (this.stateStore) this.persistError = null;
+      // A preview that held is not the result that failed: the artifact's
+      // failure stays in persistence health until a later write answers it, as
+      // the next snapshot, which holds the whole result, does.
+      if (this.stateStore && !previewOnly) this.persistError = null;
     } catch (error) {
       this.persistError = error?.message ?? String(error);
       // Never publish a success that failed its durability barrier. The created
@@ -3594,6 +3626,8 @@ export class GatewayService {
       this.#publishTaskStatus(provisional);
       return provisional;
     }
+    // Before the waiters wake, so the first delivery already says it.
+    if (previewOnly) this.resultsNotDurable.set(taskId, performance.now());
     // Publish only after the WAL barrier. waitForTerminal therefore cannot
     // observe an outcome that a process restart can take back.
     const committed = this.taskStore.transition(taskId, status, statusMessage, {
@@ -3625,6 +3659,8 @@ export class GatewayService {
     if (!metadata?.path || metadata.error || metadata.truncated) {
       // ArtifactWriter records I/O failures instead of throwing, so this check is
       // the only thing between a swallowed ENOSPC and a reference to nothing.
+      // The log gets the preview and the snapshot the whole result, inline; until
+      // that snapshot lands, health and the result say so (#commitTaskTerminal).
       this.persistError = `Task result artifact failed: ${metadata?.error ?? "result was truncated"}`;
       this.stateStore.rememberResultRef(taskId, null);
       return { preview };
@@ -3663,6 +3699,7 @@ export class GatewayService {
     // replay: the create record is still in the log, and nothing contradicts it.
     if (change?.type === "removed" && change.taskId) {
       this.taskDelivery.delete(change.taskId);
+      this.resultsNotDurable.delete(change.taskId);
       this.stateStore?.forgetTask(change.taskId);
       this.stateStore?.append(WAL_TYPES.TASK_REMOVED, change.taskId, {});
     }
@@ -4413,13 +4450,14 @@ export class GatewayService {
   }
 
   // flushPersist's body, unchanged in name and meaning: the debounced writer. It
-  // barriers the WAL and writes the v5 snapshot (unsynced), or rotates when the
-  // log is due. The v4 state.json it also wrote until 1.7.x (downgrade insurance
-  // promised through 1.5.x) is gone: the store reads and migrates a leftover one
-  // at startup, then deletes it.
+  // barriers the WAL and writes the v5 snapshot (synced, as every snapshot is:
+  // StateStore#writeSnapshot), or rotates when the log is due. The v4
+  // state.json it also wrote until 1.7.x (downgrade insurance promised through
+  // 1.5.x) is gone: the store reads and migrates a leftover one at startup, then
+  // deletes it.
   async persist() {
     if (!this.stateStore) return;
-    if (!this.stateStore.rotateIfNeeded()) this.stateStore.writeSnapshot({ sync: false });
+    if (!this.stateStore.rotateIfNeeded()) this.stateStore.writeSnapshot();
   }
 
   // Returns shutdownReport: null when everything stopped in time, else what was

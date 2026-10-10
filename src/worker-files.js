@@ -243,12 +243,16 @@ async function verifyOpened(handle, requested, path, { roots, protectedPaths, is
  * A directory cannot be hard-linked and the socket is not a regular file, so
  * comparing regular files is enough, and the walk stays one level deep: those
  * files sit directly in the directory, and recursing would stat the snapshot and
- * workspace trees on every read. Resolved per call, so a file recreated with a
- * new inode is never matched by a stale one. Fails closed: a protected path,
- * directory, or child the Gateway cannot stat or list could be the file the
- * descriptor holds under a mode or a fault that hides it, so it throws rather
- * than wave the open through. Only a path that is genuinely absent (ENOENT)
- * protects nothing and is skipped.
+ * workspace trees on every read. A symbolic link among them is followed: an
+ * install.json, settings or state file that is a link keeps what it holds in
+ * the file it leads to, wherever that is, and the Gateway reads and writes it
+ * there. Resolved per call, so a file recreated with a new inode, or a link
+ * made or re-pointed since the protected paths were resolved, is never matched
+ * by a stale one. Fails closed: a protected path, directory, or child the
+ * Gateway cannot stat or list could be the file the descriptor holds under a
+ * mode or a fault that hides it, so it throws rather than wave the open
+ * through. Only a path that is genuinely absent (ENOENT), a link that dangles
+ * included, protects nothing and is skipped.
  */
 async function descriptorIsProtected(opened, protectedPaths) {
   const sameFile = (info) => info?.isFile() && info.dev === opened.dev && info.ino === opened.ino;
@@ -275,8 +279,9 @@ async function descriptorIsProtected(opened, protectedPaths) {
     }
     for (const entry of entries) {
       // A dirent of a known other kind is skipped without a stat; an unknown one
-      // (some filesystems leave the type out) is settled by the stat.
-      if (entry.isDirectory() || entry.isSymbolicLink() || entry.isSocket()
+      // (some filesystems leave the type out) is settled by the stat, and so is
+      // a link, by the file it leads to.
+      if (entry.isDirectory() || entry.isSocket()
         || entry.isBlockDevice() || entry.isCharacterDevice() || entry.isFIFO()) continue;
       if (sameFile(await statOrRefuse(join(base, entry.name)))) return true;
     }

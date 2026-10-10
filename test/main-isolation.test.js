@@ -102,7 +102,10 @@ test("another Main's session answers NOT_SESSION_OWNER to every call that names 
     await refuse("permission", { sessionId: id, requestId: 1, optionId: "allow-once" });
     await refuse("answer", { sessionId: id, requestId: 1, action: "cancel" });
     await refuse("cancel", { sessionId: id });
-    for (const action of ["close", "pin", "unpin", "clean"]) await refuse("session", { action, sessionId: id });
+    for (const action of ["close", "pin", "unpin"]) await refuse("session", { action, sessionId: id });
+    // clean names no session: one sent with it changes nothing, and B's clean
+    // reaches B's own sessions alone.
+    assert.deepEqual((await service.call("session", { action: "clean", sessionId: id }, B)).closed, []);
     // Restoring it in place would take it over.
     await refuse("session_restore", { provider: "claude", acpSessionId: a.session.acpSessionId, cwd: process.cwd() });
     // Another thread of B's own Codex process is another Main too.
@@ -290,12 +293,13 @@ test("clean closes only the caller's own sessions; management cleans the root", 
       opened.worker.turns.at(-1).reject(new Error("worker failed"));
       await until(() => opened.session.status === "error", "turn failed");
     }
-    // clean has always named one session of the caller's (it is checked first).
-    assert.deepEqual((await service.call("session", { action: "clean", sessionId: b.session.id }, B)).closed, [b.session.id]);
-    assert.deepEqual((await service.call("session", { action: "clean", sessionId: a.session.id }, A)).closed, [a.session.id]);
+    // clean names no session (the schema never required one; before 1.8.0 it
+    // failed without one), and a sessionId sent with it, even one the caller
+    // may not clean, changes nothing.
+    assert.deepEqual((await service.call("session", { action: "clean" }, B)).closed, [b.session.id]);
+    assert.deepEqual((await service.call("session", { action: "clean", sessionId: shared.session.id }, A)).closed, [a.session.id]);
     assert.equal(service.store.get(shared.session.id)?.status, "error", "nobody's session is not a front door's to clean");
-    assert.deepEqual((await service.call("session", { action: "clean", sessionId: shared.session.id }, MANAGEMENT)).closed,
-      [shared.session.id]);
+    assert.deepEqual((await service.call("session", { action: "clean" }, MANAGEMENT)).closed, [shared.session.id]);
   } finally {
     await service.shutdown().catch(() => {});
   }

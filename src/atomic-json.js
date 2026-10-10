@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
-  closeSync, constants, fstatSync, fsyncSync, ftruncateSync, mkdirSync, openSync, readFileSync, renameSync, statSync,
-  unlinkSync, writeFileSync
+  closeSync, constants, fstatSync, fsyncSync, ftruncateSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync,
+  statSync, unlinkSync, writeFileSync
 } from "node:fs";
 import { dirname } from "node:path";
 import { ERROR_CODES, GatewayError } from "./errors.js";
@@ -118,4 +118,44 @@ function emptyReplaced(fd, path) {
   } catch {
     // The replacement stands; only the old file keeps its bytes.
   }
+}
+
+/**
+ * Unlinks the file at path, emptied first when another name still holds it:
+ * what replaceFile does for a file it replaces, for one that goes without a
+ * replacement (a retired log segment, a forensic copy, a dead writer's
+ * temporary). A hard link made to it would otherwise keep its bytes past the
+ * unlink, outside the protected directory and its inode check. Emptied before
+ * the unlink, so a crash in between never leaves the link holding them, and
+ * through a descriptor opened without following a link and checked to be the
+ * file the lstat found. One no other name holds is only unlinked, whole for a
+ * reader that has it open. Returns false when nothing was there. Throws when
+ * the file cannot be emptied or removed, and then leaves it where it is: under
+ * its name in the protected directory, the inode check still refuses a link to
+ * it.
+ */
+export function removeFile(path) {
+  let info;
+  try {
+    info = lstatSync(path, { bigint: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  if (info.isFile() && info.nlink > 1n) {
+    const fd = openSync(path, O_WRONLY | O_NOFOLLOW | O_NONBLOCK);
+    try {
+      const opened = fstatSync(fd, { bigint: true });
+      if (opened.dev === info.dev && opened.ino === info.ino) ftruncateSync(fd, 0);
+    } finally {
+      closeSync(fd);
+    }
+  }
+  try {
+    unlinkSync(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  return true;
 }
