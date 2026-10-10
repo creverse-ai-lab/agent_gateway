@@ -16,6 +16,7 @@ import { GatewayService } from "../src/gateway-service.js";
 import { SETTING_DEFINITIONS, validateSetting } from "../src/settings.js";
 import { decodeRecord, statePaths, WAL_TYPES } from "../src/state-store.js";
 import { EPOCH, finish, harness, permission, start, TERMINAL, until } from "./helpers/fake-worker.js";
+import { writeFreshBase } from "./helpers/state-files.js";
 
 const ROOT = "main-root";
 const iso = (ms) => new Date(ms).toISOString();
@@ -540,11 +541,12 @@ test("caller and seenAt survive a restart; an interrupted task comes back as an 
       await before.service.shutdown();
     }
 
-    // Twice: from the snapshot a clean shutdown wrote, then from the WAL alone.
+    // Twice: from the snapshot a clean shutdown wrote, then from the WAL alone,
+    // on the empty snapshot it goes on from.
     for (const source of ["snapshot", "wal"]) {
       if (source === "wal") {
         await writeFile(paths.wal, wal, { mode: 0o600 });
-        await rm(paths.snapshot, { force: true });
+        await writeFreshBase(statePath, wal);
       }
       const after = harness({ statePath, artifactRoot });
       after.clock.now = EPOCH + 10_000;

@@ -10,6 +10,11 @@ const DEFAULT_MAX_FILE_BYTES = 100 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES = 512 * 1024 * 1024;
 const ARTIFACT_PREFIX = "acp-artifact-";
 const { O_NOFOLLOW = 0, O_NONBLOCK = 0, O_WRONLY } = constants;
+// What a directory sync fails with where the file system cannot sync a
+// directory at all (some network and FUSE mounts: EINVAL, ENOTSUP), or where a
+// directory cannot be opened or synced to try (Windows: EISDIR, EPERM). A name
+// there is as durable as that file system makes it, sync or no sync.
+const DIRECTORY_SYNC_UNSUPPORTED = new Set(["EINVAL", "ENOTSUP", "EOPNOTSUPP", "EISDIR", "EPERM"]);
 
 export function defaultArtifactRoot() {
   return process.env.ACP_GATEWAY_ARTIFACTS || join(homedir(), ".acp-gateway", "artifacts");
@@ -159,15 +164,18 @@ export class ArtifactStore {
   }
 
   // Makes the directory entry itself durable. A file whose name a WAL record
-  // points at is only reachable after its parent directory is on disk.
+  // points at is only reachable after its parent directory is on disk. Returns
+  // null once it is, or where the file system cannot sync a directory at all
+  // (DIRECTORY_SYNC_UNSUPPORTED), else the error: a sync that failed (EIO)
+  // leaves the name to a power loss, and the caller must not count on it.
   syncDirectory() {
     let fd = null;
     try {
       fd = openSync(this.root, "r");
       fsyncSync(fd);
-      return true;
-    } catch {
-      return false;
+      return null;
+    } catch (error) {
+      return DIRECTORY_SYNC_UNSUPPORTED.has(error?.code) ? null : error;
     } finally {
       if (fd != null) closeSync(fd);
     }

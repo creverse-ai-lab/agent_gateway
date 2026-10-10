@@ -32,7 +32,11 @@ const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
 // and inbox payloads that retention let go of long ago.
 const QUARANTINE_KEEP = 3;
 const QUARANTINE_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
-const QUARANTINE_NAME = /^(corrupt|downgraded|gap)-(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z$/u;
+const QUARANTINE_NAME = /^(corrupt|downgraded|gap|cold)-(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z$/u;
+// The halts ACP_GATEWAY_STATE_RECOVERY=cold starts past (#startCold): state
+// that is there but cannot be read, or not all of it. Not a version mismatch,
+// which a matching Gateway reads as it is.
+const COLD_STARTS = new Set([ERROR_CODES.STATE_SNAPSHOT_CORRUPT, ERROR_CODES.STATE_WAL_CORRUPT]);
 // A uuid-named temporary says nothing about its writer, so only its age can.
 // Any write finishes in milliseconds; this is far past that.
 const STALE_TEMPORARY_MS = 10 * 60_000;
@@ -259,6 +263,31 @@ export class StateStore {
     sweepStaleTemporaries(this.paths.state);
     sweepStaleTemporaries(this.paths.lock);
     this.#pruneQuarantine();
+    let state;
+    try {
+      state = this.#recover(recovery);
+    } catch (error) {
+      if (this.#config.stateRecovery !== "cold" || !COLD_STARTS.has(error?.code)) throw error;
+      state = this.#startCold(recovery, error);
+    }
+    this.#restoreResultRefs(state);
+    this.#rotatedAt = this.#now();
+    this.#openWal();
+    this.#opened = true;
+    this.#writeOpenedMarker();
+    this.#lastRecovery = recovery;
+    for (const alert of recovery.alerts) this.#onAlert(alert);
+    return {
+      sessions: [...state.sessions.values()],
+      tasks: [...state.tasks.values()].sort((left, right) => String(left.createdAt).localeCompare(String(right.createdAt))),
+      inbox: [...state.inbox.values()],
+      recovery
+    };
+  }
+
+  // The state on disk: the snapshot (or a v4 state.json) and the log replayed
+  // onto it. Throws to halt.
+  #recover(recovery) {
     let snapshot = this.#readSnapshot(recovery);
     const legacy = this.#readLegacyState();
     this.#legacyPending = legacy != null;
@@ -296,21 +325,48 @@ export class StateStore {
     // half record into the middle of the log, where truncation is no longer a
     // provably harmless kill -9 artifact.
     this.#seq = baseWalSeq;
-    this.#consume(this.paths.rotating, state, baseWalSeq, recovery, false);
-    this.#consume(this.paths.wal, state, baseWalSeq, recovery, true);
-    this.#restoreResultRefs(state);
-    this.#rotatedAt = this.#now();
-    this.#openWal();
-    this.#opened = true;
-    this.#writeOpenedMarker();
-    this.#lastRecovery = recovery;
-    for (const alert of recovery.alerts) this.#onAlert(alert);
-    return {
-      sessions: [...state.sessions.values()],
-      tasks: [...state.tasks.values()].sort((left, right) => String(left.createdAt).localeCompare(String(right.createdAt))),
-      inbox: [...state.inbox.values()],
-      recovery
-    };
+    const base = snapshot ? "snapshot" : legacy ? "v4" : null;
+    this.#consume(this.paths.rotating, state, baseWalSeq, base, recovery, false);
+    this.#consume(this.paths.wal, state, baseWalSeq, base, recovery, true);
+    return state;
+  }
+
+  // ACP_GATEWAY_STATE_RECOVERY=cold, once the state on disk could not be
+  // recovered as it is (error, one of COLD_STARTS): every file of it is set
+  // aside and nothing of it is read, so nothing of it comes back, not even what
+  // a log or a v4 file still holds of a snapshot dropped here. Each goes as the
+  // copies a halt leaves do, a copy beside it under the same limits
+  // (#pruneQuarantine) and the file itself through removeFile, and a file that
+  // cannot be kept that way halts the start with it still in place.
+  #startCold(recovery, error) {
+    const stamp = new Date(this.#now()).toISOString().replace(/[:.]/g, "-");
+    const aside = [];
+    for (const path of [this.paths.snapshot, this.paths.rotating, this.paths.wal, this.paths.state]) {
+      const target = `${path}.cold-${stamp}`;
+      try {
+        copyFileSync(path, target);
+      } catch (copyError) {
+        if (copyError?.code === "ENOENT") continue;
+        throw copyError;
+      }
+      removeFile(path);
+      aside.push(target);
+    }
+    this.#syncDirectory();
+    this.#pruneQuarantine();
+    // What the attempt read before it stopped goes with it.
+    this.#seq = 0;
+    this.#epoch = 0;
+    this.#legacyPending = false;
+    this.#resultRefs.clear();
+    Object.assign(recovery, { source: "cold", replayed: 0, skipped: 0, droppedTail: 0, unknownTypes: 0 });
+    if (aside.length) recovery.quarantined = aside.at(-1);
+    recovery.alerts.push({
+      code: "STATE_COLD_STARTED",
+      message: `${error.reason ?? error.message}; started from an empty state (ACP_GATEWAY_STATE_RECOVERY=cold)`
+        + (aside.length ? `, with the state files set aside as ${aside.join(", ")}` : "")
+    });
+    return { sessions: new Map(), tasks: new Map(), inbox: new Map() };
   }
 
   #readSnapshot(recovery) {
@@ -325,21 +381,21 @@ export class StateStore {
     const split = raw.indexOf(0x0a);
     // Since 1.8.0 nothing writes state.json any more, so snapshot-drop falls
     // back to the write-ahead log alone, plus a v4 file only if one is left.
+    // cold halts here like no choice at all, and #openLocked starts past it.
     const fail = (reason) => {
-      if (this.#config.stateRecovery === "cold" || this.#config.stateRecovery === "snapshot-drop") {
-        this.#quarantine(this.paths.snapshot, "corrupt", recovery);
+      const quarantined = this.#quarantine(this.paths.snapshot, "corrupt", recovery);
+      if (this.#config.stateRecovery === "snapshot-drop") {
         recovery.alerts.push({
           code: "STATE_SNAPSHOT_DROPPED",
-          message: `${reason}; started from ${this.#config.stateRecovery === "cold" ? "empty state" : "the write-ahead log (and a v4 state.json, if one was left)"}`
+          message: `${reason}; started from the write-ahead log (and a v4 state.json, if one was left)`
         });
         return null;
       }
-      const quarantined = this.#quarantine(this.paths.snapshot, "corrupt", recovery);
-      throw new GatewayError(
+      throw recoveryHalt(
         ERROR_CODES.STATE_SNAPSHOT_CORRUPT,
-        `Gateway state snapshot is unusable (${reason}). A copy is at ${quarantined}. `
-        + "Start with ACP_GATEWAY_STATE_RECOVERY=snapshot-drop to start from the write-ahead log alone "
-        + "(and a v4 state.json, if one was left), or =cold to start from an empty state."
+        `Gateway state snapshot is unusable (${reason})`,
+        `A copy is at ${quarantined}. Start with ACP_GATEWAY_STATE_RECOVERY=snapshot-drop to start from the `
+        + "write-ahead log alone (and a v4 state.json, if one was left), or =cold to start from an empty state."
       );
     };
     if (split < 0) return fail("no header line");
@@ -399,7 +455,7 @@ export class StateStore {
     try {
       document = JSON.parse(raw);
     } catch (error) {
-      throw new GatewayError(
+      throw recoveryHalt(
         ERROR_CODES.STATE_SNAPSHOT_CORRUPT,
         `Legacy Gateway state ${this.paths.state} is not valid JSON: ${error?.message}`
       );
@@ -410,7 +466,9 @@ export class StateStore {
   // Scans one log file, applies what is good, and leaves the file safe to append
   // to. `final` marks the file that is still being written: only there is a bad
   // last record the ordinary result of kill -9 rather than a hole in the log.
-  #consume(path, state, baseWalSeq, recovery, final) {
+  // base is what the log goes on from: "snapshot" (through baseWalSeq), "v4"
+  // (a state.json, which says no seq) or null.
+  #consume(path, state, baseWalSeq, base, recovery, final) {
     let raw;
     try {
       raw = readFileSync(path);
@@ -434,10 +492,10 @@ export class StateStore {
         }
         const quarantined = this.#quarantine(path, "corrupt", recovery);
         if (this.#config.stateRecovery !== "truncate") {
-          throw new GatewayError(
+          throw recoveryHalt(
             ERROR_CODES.STATE_WAL_CORRUPT,
-            `Gateway write-ahead log ${path} is damaged at byte ${offset} (last good seq ${this.#seq}). `
-            + `A copy is at ${quarantined}. Restart with ACP_GATEWAY_STATE_RECOVERY=truncate to replay up to `
+            `Gateway write-ahead log ${path} is damaged at byte ${offset} (last good seq ${this.#seq})`,
+            `A copy is at ${quarantined}. Restart with ACP_GATEWAY_STATE_RECOVERY=truncate to replay up to `
             + "the last intact record and continue, accepting the loss of everything after it."
           );
         }
@@ -467,19 +525,48 @@ export class StateStore {
         recovery.skipped += 1;
         continue;
       }
-      if (this.#seq !== 0 && record.seq !== this.#seq + 1) {
-        const quarantined = this.#quarantine(path, "gap", recovery);
-        throw new GatewayError(
-          ERROR_CODES.STATE_WAL_CORRUPT,
-          `Gateway write-ahead log ${path} has a sequence gap ${this.#seq} -> ${record.seq}. `
-          + `A copy is at ${quarantined}; refusing to replay incomplete durable state.`
-        );
-      }
+      if (record.seq !== this.#seq + 1) this.#discontinuity(path, record.seq, base, recovery);
       this.#seq = record.seq;
       if (this.#apply(state, record)) recovery.replayed += 1;
       else recovery.unknownTypes += 1;
     }
     if (final && good < raw.length) this.#truncate(path, good);
+  }
+
+  // A record that does not follow the one before it, or the base. Only a v4
+  // file, which says no seq, may be followed by any: a 1.7 Gateway wrote it
+  // beside the log, so it held what the log went on from. Anywhere else the
+  // records in between are missing. Without any base they are the ones before
+  // the log's first, which only a snapshot held once rotation had retired the
+  // segments they were in: the snapshot is gone, and the log alone would come
+  // back as the whole state without them (since 1.8.0 no state.json covers
+  // for it). That one halts too, unless snapshot-drop takes the log as it is.
+  #discontinuity(path, seq, base, recovery) {
+    if (this.#seq === 0 && base === "v4") return;
+    if (this.#seq === 0 && base == null) {
+      const before = seq === 2 ? "seq 1" : `seq 1 to ${seq - 1}`;
+      if (this.#config.stateRecovery === "snapshot-drop") {
+        recovery.alerts.push({
+          code: "STATE_WAL_TAIL_REPLAYED",
+          message: `The write-ahead log ${path} starts at seq ${seq} with no snapshot under it; replayed from there `
+            + `(ACP_GATEWAY_STATE_RECOVERY=snapshot-drop), so what only the snapshot held (${before}) is gone`
+        });
+        return;
+      }
+      throw recoveryHalt(
+        ERROR_CODES.STATE_SNAPSHOT_CORRUPT,
+        `Gateway state snapshot ${this.paths.snapshot} is missing, and the write-ahead log ${path} goes on from it at seq ${seq}`,
+        `What was recorded before (${before}) was only in that snapshot. Put it back, or start with `
+        + "ACP_GATEWAY_STATE_RECOVERY=snapshot-drop to start from the write-ahead log alone, accepting that loss, "
+        + "or =cold to start from an empty state."
+      );
+    }
+    const quarantined = this.#quarantine(path, "gap", recovery);
+    throw recoveryHalt(
+      ERROR_CODES.STATE_WAL_CORRUPT,
+      `Gateway write-ahead log ${path} has a sequence gap ${this.#seq} -> ${seq}`,
+      `A copy is at ${quarantined}; refusing to replay incomplete durable state.`
+    );
   }
 
   #apply(state, record) {
@@ -603,7 +690,7 @@ export class StateStore {
     const now = this.#now();
     const groups = new Map();
     const names = listDirectory(this.paths.directory);
-    for (const path of [this.paths.snapshot, this.paths.wal, this.paths.rotating]) {
+    for (const path of [this.paths.snapshot, this.paths.wal, this.paths.rotating, this.paths.state]) {
       const prefix = `${basename(path)}.`;
       for (const name of names) {
         // Anchored, so "state.wal.ndjson." never claims the .rot file's copies.
@@ -1102,15 +1189,17 @@ export class StateStore {
  * it judged stale; a lock made since goes back, by link(2), which never
  * replaces one made meanwhile either. Only then is a new lock created. isAlive
  * and beforeClaim, which runs between the judgement and the rename, are test
- * seams.
+ * seams. held(path, owner) makes the error for a lock this cannot take: owner
+ * is the pid it names, "" while it names none yet, null when claims kept
+ * losing races; the installer's lock on install.json says its own.
  */
-export function claimStateLock(path, { pid = process.pid, isAlive = processIsAlive, beforeClaim = null } = {}) {
+export function claimStateLock(path, { pid = process.pid, isAlive = processIsAlive, beforeClaim = null, held = lockedBy } = {}) {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const fd = createLock(path, pid);
     if (fd != null) return fd;
     const judged = readLock(path);
     if (judged == null) continue;
-    if (!lockIsStale(judged.text, pid, isAlive)) throw lockedBy(path, judged.text);
+    if (!lockIsStale(judged.text, pid, isAlive)) throw held(path, judged.text.trim());
     beforeClaim?.();
     // A pid-named temporary, swept at a later start if this process dies
     // holding it.
@@ -1124,7 +1213,7 @@ export function claimStateLock(path, { pid = process.pid, isAlive = processIsAli
     if (sameLock(readLock(claimed), judged)) unlinkSafe(claimed);
     else restoreLock(claimed, path);
   }
-  throw new GatewayError(ERROR_CODES.STATE_DIR_LOCKED, `Could not lock the Gateway state directory ${dirname(path)}`);
+  throw held(path, null);
 }
 
 // The lock, created and naming pid; null when one is there already.
@@ -1191,13 +1280,14 @@ function lockIsStale(text, pid, isAlive) {
   return owner === pid || !isAlive(owner);
 }
 
-function lockedBy(path, text) {
-  const owner = text.trim();
+function lockedBy(path, owner) {
   return new GatewayError(
     ERROR_CODES.STATE_DIR_LOCKED,
     owner
       ? `Another Gateway (pid=${owner}) is using the state directory ${dirname(path)}`
-      : `Another Gateway is taking the state directory ${dirname(path)}`
+      : owner === ""
+        ? `Another Gateway is taking the state directory ${dirname(path)}`
+        : `Could not lock the Gateway state directory ${dirname(path)}`
   );
 }
 
@@ -1219,6 +1309,14 @@ function restoreLock(claimed, path) {
 
 function emptyBody() {
   return { sessions: [], tasks: [], inbox: [] };
+}
+
+// A startup halt: what is wrong (reason), then what the operator can do about
+// it (advice). A cold start past it says the reason alone (#startCold).
+function recoveryHalt(code, reason, advice = null) {
+  const error = new GatewayError(code, advice ? `${reason}. ${advice}` : reason);
+  error.reason = reason;
+  return error;
 }
 
 function ingest(state, document) {

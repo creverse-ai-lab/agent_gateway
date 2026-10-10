@@ -16,7 +16,7 @@ import { CHECK_CAVEATS, GatewayService } from "../src/gateway-service.js";
 import { decodeRecord, encodeRecord, statePaths, WAL_TYPES } from "../src/state-store.js";
 import { EXECUTION_OUTCOMES, INTERRUPTION_REASONS } from "../src/task-store.js";
 import { createSnapshot } from "../src/workspace.js";
-import { readSnapshotBody } from "./helpers/state-files.js";
+import { readSnapshotBody, writeFreshBase } from "./helpers/state-files.js";
 import { until } from "./helpers/fake-worker.js";
 
 const MAIN = { rootId: "main-a" };
@@ -298,7 +298,7 @@ test("a restart before the prompt reached the worker reports not_started, and of
       await before.service.shutdown();
     }
     await writeFile(paths.wal, wal, { mode: 0o600 });
-    await rm(paths.snapshot, { force: true });
+    await writeFreshBase(statePath, wal);
 
     // What makes the missing stamp mean "never sent": the record says, durably,
     // that its dispatch was tracked.
@@ -618,13 +618,13 @@ test("a provider exit mid-turn reports provider_disconnected; the envelope keeps
     }
 
     // Terminal handles and their interruption survive a restart unchanged, from
-    // the snapshot and, with the snapshot gone, from the log alone.
+    // the snapshot and from the log alone, on the empty snapshot it goes on from.
     // Compared as the wire sees it: JSON drops the envelope's undefined fields.
     const wire = (value) => JSON.parse(JSON.stringify(value));
     for (const source of ["snapshot", "wal"]) {
       if (source === "wal") {
         await writeFile(statePaths(statePath).wal, wal, { mode: 0o600 });
-        await rm(statePaths(statePath).snapshot, { force: true });
+        await writeFreshBase(statePath, wal);
       }
       const after = harness({ statePath, artifactRoot });
       after.clock.now = EPOCH + 9_000;
@@ -679,9 +679,10 @@ test("an interrupted result that replay can only bring back as a preview still c
     assert.deepEqual(committed.payload.interruption, interruption);
     assert.throws(() => JSON.parse(committed.payload.preview), "the preview is an unparseable head");
 
-    // The log alone, with the artifact it names gone.
+    // The log alone, on the empty snapshot it goes on from, with the artifact
+    // it names gone.
     await writeFile(paths.wal, wal, { mode: 0o600 });
-    await rm(paths.snapshot, { force: true });
+    await writeFreshBase(statePath, wal);
     await rm(committed.payload.ref.path);
     // The second pass restarts from the snapshot the first recovery wrote.
     for (const source of ["wal", "snapshot"]) {

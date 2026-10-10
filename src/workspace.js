@@ -15,9 +15,12 @@ import { isWithin } from "./worker-files.js";
 // permission policy can make the real tree edit-proof.
 //
 // Layout: <root>/ws-<uuid>/tree is the worker's cwd, <root>/ws-<uuid>/base an
-// untouched copy taken at the same moment. The diff is base -> tree, so edits the
+// untouched copy of the same moment. The diff is base -> tree, so edits the
 // user makes to the original afterwards never show up as reversed worker edits.
-// Both copies are clonefile/reflink copies where the filesystem supports it.
+// The source is read once, into base, and tree is copied from base: two reads
+// of a source that changed in between would put that change in one copy only,
+// where the diff would show it reversed as if the worker had made it. Both
+// copies are clonefile/reflink copies where the filesystem supports it.
 //
 // It deliberately lives outside every Gateway-protected directory: a copy under
 // ~/.acp-gateway would be unreadable to the very worker it was made for.
@@ -78,8 +81,8 @@ export async function createSnapshot(source, root = defaultWorkspaceRoot(), { pr
     // Before the copy, so a crash mid-copy still leaves a copy its owner can
     // recognize and reclaim on the next start.
     if (owner != null) await writeOwner(home, owner);
-    const droppedLinks = await copyTree(canonicalSource, tree, excluded);
-    await copyTree(canonicalSource, base, excluded);
+    const droppedLinks = await copyTree(canonicalSource, base, excluded);
+    await cloneTree(base, tree);
     return {
       mode: "snapshot",
       source: canonicalSource,
@@ -135,6 +138,18 @@ async function copyTree(source, destination, excluded) {
     }
   }
   return dropped;
+}
+
+// A second copy of a copyTree copy. Its links are all relative and inside it
+// already, so they are copied as they are and land at the same place inside
+// the new copy.
+async function cloneTree(source, destination) {
+  await cp(source, destination, {
+    recursive: true,
+    verbatimSymlinks: true,
+    errorOnExist: true,
+    mode: constants.COPYFILE_FICLONE
+  });
 }
 
 // Only ever removes a directory this module created: a record whose home is not

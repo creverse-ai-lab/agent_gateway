@@ -11,8 +11,10 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { AcpClient } from "../src/acp-client.js";
+import { ArtifactStore } from "../src/artifacts.js";
 import { GatewayService } from "../src/gateway-service.js";
 import { claimStateLock, decodeRecord, encodeRecord, StateStore, statePaths, WAL_TYPES } from "../src/state-store.js";
+import { writeFreshBase } from "./helpers/state-files.js";
 
 const mockAgent = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 const MAIN = { rootId: "main-a" };
@@ -117,12 +119,16 @@ async function readSnapshot(paths) {
 // A daemon that died leaves an unrotated log behind. Reproduced without killing
 // anything: keep the log bytes, let the service shut down cleanly (its worker
 // child has to be reaped or the test runner never exits), then put the log back.
-async function keepLogAcrossShutdown(service, paths, { dropSnapshot = true } = {}) {
+// rewind also puts back the snapshot it went on from, the empty one of the
+// directory's first rotation (writeFreshBase), as a daemon killed before its
+// next snapshot leaves it; otherwise the shutdown's snapshot, which covers the
+// whole log, stays.
+async function keepLogAcrossShutdown(service, paths, { rewind = true } = {}) {
   await service.flushPersist();
   const wal = await readFile(paths.wal);
   await service.shutdown();
   await writeFile(paths.wal, wal, { mode: 0o600 });
-  if (dropSnapshot) await rm(paths.snapshot, { force: true });
+  if (rewind) await writeFreshBase(paths.state, wal);
   return wal;
 }
 
@@ -374,7 +380,7 @@ test("replay resolves a result reference, and degrades to the preview when the f
       await withRef.shutdown();
     }
 
-    await rm(paths.snapshot);
+    await writeFreshBase(statePath, wal);
     await writeFile(paths.wal, wal, { mode: 0o600 });
     await rm(committed.payload.ref.path);
     const degraded = makeService(directory, { persistence: { walInlineResultBytes: 64 } });
@@ -502,6 +508,58 @@ test("persistence stays unhealthy while a preview-only result waits for its snap
     } finally {
       await service.shutdown();
     }
+  });
+});
+
+// Astra I8 (f613b8e): the commit of a result by reference synced the artifact
+// but not whether its directory synced too, so a directory sync that failed
+// (EIO) still put a reference in the log, one a power loss could leave naming
+// nothing, beside a result reported durable.
+test("a result artifact whose directory did not sync is not durable either, until the snapshot that holds it", async () => {
+  await withDirectory("state-ref-dirsync", async (directory) => {
+    const paths = statePaths(join(directory, "state.json"));
+    const artifactRoot = join(directory, "artifacts");
+    await mkdir(artifactRoot, { mode: 0o700 });
+    const root = await stat(artifactRoot);
+    // The artifact directory's fsync fails with code; every other one syncs.
+    const failingRoot = (code) => (original) => function fsyncSync(fd, ...rest) {
+      const info = fs.fstatSync(fd);
+      if (info.isDirectory() && info.dev === root.dev && info.ino === root.ino) {
+        throw Object.assign(new Error(`${code}: directory sync failed, fsync`), { code });
+      }
+      return original.call(this, fd, ...rest);
+    };
+    const notDurable = { persisted: false, errorCode: "PERSISTENCE_UNHEALTHY" };
+    // The debounced writer stays quiet until the flush below.
+    const service = makeService(directory, { persistence: { walInlineResultBytes: 64 }, artifactRoot, snapshotIntervalMs: 60_000 });
+    try {
+      await service.init();
+      const { task } = await withFs({ fsyncSync: failingRoot("EIO") }, () => runTask(service, "large-result"));
+      const committed = (await readWal(paths)).find((record) => record.type === "task.result_committed");
+      assert.equal(committed.payload.ref, undefined, "no reference to a name that may not last");
+      assert.ok(committed.payload.preview.length > 0, "the log holds the preview alone");
+      const persistence = (await service.call("setup", { mode: "summary" }, MAIN)).persistence;
+      assert.equal(persistence.healthy, false);
+      assert.match(persistence.error, /Task result artifact failed: EIO/);
+      const result = await service.call("task_result", { taskId: task.taskId }, MAIN);
+      assert.deepEqual(result.durability, notDurable);
+      assert.equal(result.result.text, "가나다".repeat(32), "the whole result is what is delivered");
+
+      // The next snapshot holds it whole.
+      await service.flushPersist();
+      assert.equal((await service.call("setup", { mode: "summary" }, MAIN)).persistence.healthy, true);
+      assert.equal(Object.hasOwn(await service.call("task_result", { taskId: task.taskId }, MAIN), "durability"), false);
+    } finally {
+      await service.shutdown();
+    }
+
+    // A file system that cannot sync a directory at all is no failure, as before.
+    const store = new ArtifactStore({ root: artifactRoot });
+    for (const code of ["EINVAL", "ENOTSUP"]) {
+      assert.equal(await withFs({ fsyncSync: failingRoot(code) }, () => store.syncDirectory()), null, code);
+    }
+    assert.equal((await withFs({ fsyncSync: failingRoot("EIO") }, () => store.syncDirectory()))?.code, "EIO");
+    assert.equal(store.syncDirectory(), null);
   });
 });
 
@@ -770,7 +828,7 @@ test("a torn WAL tail starts silently; damage inside the log halts with a quaran
     const lines = intact.split("\n").filter(Boolean);
     lines[1] = lines[1].replace(/"type":"[a-z.]+"/, '"type":"task.created"');
     await writeFile(paths.wal, `${lines.join("\n")}\n`);
-    await rm(paths.snapshot, { force: true });
+    await writeFreshBase(statePath, intact);
     const halting = makeService(directory);
     await assert.rejects(halting.init(), (error) => {
       assert.equal(error.code, "STATE_WAL_CORRUPT");
@@ -915,7 +973,7 @@ test("a log that cannot be cut back takes no record until a rotation behind a sy
       task = await runTaskOn(service, first.sessionId);
       await assertWholeLog(paths);
     } finally {
-      await keepLogAcrossShutdown(service, paths, { dropSnapshot: false });
+      await keepLogAcrossShutdown(service, paths, { rewind: false });
     }
     const afterRepair = makeService(directory);
     try {
@@ -954,7 +1012,7 @@ test("a corrupt snapshot halts instead of starting empty; snapshot-drop starts f
       sessionId = (await openSession(service)).sessionId;
     } finally {
       // The log as a killed daemon leaves it, next to the snapshot damaged below.
-      await keepLogAcrossShutdown(service, paths, { dropSnapshot: false });
+      await keepLogAcrossShutdown(service, paths, { rewind: false });
     }
 
     const corrupt = async () => {
@@ -1003,6 +1061,184 @@ test("a corrupt snapshot halts instead of starting empty; snapshot-drop starts f
       await assert.rejects(stat(statePath), /ENOENT/);
     } finally {
       await fallback.shutdown();
+    }
+  });
+});
+
+// A state directory as a crash leaves it: a snapshot that holds task-snapshot,
+// rotated into before task-log and task-log-2 were logged, the log that went on
+// from it, and a v4 state.json a 1.7 Gateway left beside them. store() opens
+// it with the given persistence config.
+async function seedState(directory) {
+  const statePath = join(directory, "state.json");
+  const paths = statePaths(statePath);
+  const task = (taskId, day) => ({ taskId, sessionId: "s", status: "working", createdAt: `2026-01-0${day}T00:00:00.000Z` });
+  let body = { sessions: [], tasks: [], inbox: [] };
+  const store = (config = {}) => new StateStore({ statePath, config: { fsync: "off", ...config }, snapshotProvider: () => body });
+  const first = store();
+  first.open();
+  first.appendDurable(WAL_TYPES.TASK_CREATED, "task-snapshot", task("task-snapshot", 1));
+  // The rotation folds task-snapshot into the snapshot and retires the segment
+  // that held it.
+  body = { sessions: [], tasks: [task("task-snapshot", 1)], inbox: [] };
+  first.rotate();
+  first.appendDurable(WAL_TYPES.TASK_CREATED, "task-log", task("task-log", 2));
+  first.appendDurable(WAL_TYPES.TASK_CREATED, "task-log-2", task("task-log-2", 3));
+  const files = { snapshot: await readFile(paths.snapshot), wal: await readFile(paths.wal) };
+  first.close();
+  body = { sessions: [], tasks: [], inbox: [] };
+  await writeFile(paths.snapshot, files.snapshot, { mode: 0o600 });
+  await writeFile(paths.wal, files.wal, { mode: 0o600 });
+  files.state = Buffer.from(`${JSON.stringify({
+    version: 4, writerVersion: "1.7.2", sessions: [{ id: "session-v4" }], tasks: [], inbox: []
+  })}\n`, "utf8");
+  await writeFile(statePath, files.state, { mode: 0o600 });
+  return { statePath, paths, store, files };
+}
+
+// Astra I3 (f613b8e): rotation retires the log segments a snapshot covers, and
+// since 1.8.0 no state.json covers for that snapshot. With it gone, the log
+// that went on from it came back as the whole state: the task only the
+// snapshot held was gone, recovery said "empty", and nothing said so.
+test("a log whose snapshot is missing halts, and snapshot-drop takes the log alone and says what it lost", async () => {
+  await withDirectory("state-base-missing", async (directory) => {
+    const { statePath, paths, store, files } = await seedState(directory);
+    await rm(statePath);
+    await rm(paths.snapshot);
+    const firstSeq = decodeRecord(files.wal.subarray(0, files.wal.indexOf(0x0a))).seq;
+    assert.ok(firstSeq > 2, "the log starts where the rotation started it");
+
+    assert.throws(() => store().open(), (error) => {
+      assert.equal(error.code, "STATE_SNAPSHOT_CORRUPT");
+      assert.match(error.message, /state\.snapshot\.json is missing/);
+      assert.match(error.message, new RegExp(`goes on from it at seq ${firstSeq}\\b`));
+      assert.match(error.message, new RegExp(`seq 1 to ${firstSeq - 1}\\b`));
+      assert.match(error.message, /ACP_GATEWAY_STATE_RECOVERY=snapshot-drop/);
+      assert.match(error.message, /=cold/);
+      return true;
+    });
+    assert.deepEqual(await readFile(paths.wal), files.wal, "the halt changes nothing");
+
+    const dropping = store({ stateRecovery: "snapshot-drop" });
+    try {
+      const loaded = dropping.open();
+      assert.deepEqual(loaded.tasks.map((task) => task.taskId), ["task-log", "task-log-2"]);
+      assert.deepEqual(loaded.recovery.alerts.map((alert) => alert.code), ["STATE_WAL_TAIL_REPLAYED"]);
+      assert.match(loaded.recovery.alerts[0].message, new RegExp(`seq 1 to ${firstSeq - 1}\\)`));
+    } finally {
+      dropping.close();
+    }
+  });
+});
+
+test("the log alone is the whole state only from seq 1, or on a v4 file", async () => {
+  await withDirectory("state-base-other", async (directory) => {
+    const { paths, store } = await seedState(directory);
+    // A v4 file says no seq: a 1.7 Gateway wrote it beside the log, so the log
+    // goes on from it at whatever seq, as it did then.
+    await rm(paths.snapshot);
+    const legacy = store();
+    try {
+      const loaded = legacy.open();
+      assert.deepEqual(loaded.sessions.map((session) => session.id), ["session-v4"]);
+      assert.deepEqual(loaded.tasks.map((task) => task.taskId), ["task-log", "task-log-2"]);
+      assert.deepEqual(loaded.recovery.alerts, []);
+    } finally {
+      legacy.close();
+    }
+    // A log from seq 1 holds everything: a crash before the first snapshot.
+    await rm(directory, { recursive: true, force: true });
+    await mkdir(directory);
+    const fresh = store();
+    fresh.open();
+    fresh.appendDurable(WAL_TYPES.TASK_CREATED, "task-first", { taskId: "task-first", status: "working", createdAt: "2026-01-04" });
+    const wal = await readFile(paths.wal);
+    fresh.close();
+    await writeFile(paths.wal, wal, { mode: 0o600 });
+    await rm(paths.snapshot);
+    assert.equal(decodeRecord(wal.subarray(0, wal.indexOf(0x0a))).seq, 1);
+    const restarted = store();
+    try {
+      const loaded = restarted.open();
+      assert.deepEqual(loaded.tasks.map((task) => task.taskId), ["task-first"]);
+      assert.equal(loaded.recovery.source, "empty");
+      assert.deepEqual(loaded.recovery.alerts, []);
+    } finally {
+      restarted.close();
+    }
+  });
+});
+
+// Astra I6 (f613b8e): cold said it started from an empty state, then read the
+// leftover v4 file and replayed the log onto it anyway; and a damaged log still
+// halted it.
+test("cold sets every state file aside and replays none of them, whichever one stopped the recovery", async () => {
+  for (const fault of ["snapshot", "log"]) {
+    await withDirectory(`state-cold-${fault}`, async (directory) => {
+      const { statePath, paths, store } = await seedState(directory);
+      if (fault === "snapshot") {
+        const raw = await readFile(paths.snapshot, "utf8");
+        await writeFile(paths.snapshot, raw.replace("task-snapshot", "task-snapshoT"), { mode: 0o600 });
+      } else {
+        // The middle record, so it is damage and not a torn last write.
+        const lines = (await readFile(paths.wal, "utf8")).split("\n");
+        lines[1] = lines[1].replace("task-log", "task-loG");
+        await writeFile(paths.wal, lines.join("\n"), { mode: 0o600 });
+      }
+      const before = new Map(await Promise.all([paths.snapshot, paths.wal, statePath]
+        .map(async (path) => [path, await readFile(path)])));
+      const cold = store({ stateRecovery: "cold" });
+      try {
+        const loaded = cold.open();
+        assert.deepEqual([loaded.sessions, loaded.tasks, loaded.inbox], [[], [], []]);
+        assert.equal(loaded.recovery.source, "cold");
+        assert.equal(loaded.recovery.replayed, 0);
+        assert.deepEqual(loaded.recovery.alerts.map((alert) => alert.code), ["STATE_COLD_STARTED"]);
+        const { message } = loaded.recovery.alerts[0];
+        assert.match(message, fault === "snapshot" ? /^Gateway state snapshot is unusable \(body checksum mismatch\); started from an empty state/
+          : /^Gateway write-ahead log .* is damaged at byte \d+ \(last good seq \d+\); started from an empty state/);
+        // Each file is set aside whole, under the quarantine copies' name, and
+        // gone from where recovery reads it: the log is a new one.
+        const names = await readdir(directory);
+        for (const [path, bytes] of before) {
+          const prefix = `${path.slice(directory.length + 1)}.cold-`;
+          const copies = names.filter((name) => name.startsWith(prefix));
+          assert.equal(copies.length, 1, prefix);
+          assert.deepEqual(await readFile(join(directory, copies[0])), bytes, prefix);
+          assert.ok(message.includes(join(directory, copies[0])), prefix);
+        }
+        await assert.rejects(stat(statePath), /ENOENT/);
+        await assert.rejects(stat(paths.snapshot), /ENOENT/);
+        assert.deepEqual((await readWal(paths)).map((record) => [record.seq, record.type]), [[1, "wal.opened"]]);
+      } finally {
+        cold.close();
+      }
+      // The next start reads the cold start's own state.
+      const again = store();
+      try {
+        const loaded = again.open();
+        assert.deepEqual([loaded.sessions, loaded.tasks], [[], []]);
+        assert.equal(loaded.recovery.source, "snapshot");
+      } finally {
+        again.close();
+      }
+    });
+  }
+});
+
+test("cold is a choice for a state that cannot be read: one that reads back whole is kept", async () => {
+  await withDirectory("state-cold-healthy", async (directory) => {
+    const { paths, store } = await seedState(directory);
+    const cold = store({ stateRecovery: "cold" });
+    try {
+      const loaded = cold.open();
+      assert.deepEqual(loaded.tasks.map((task) => task.taskId), ["task-snapshot", "task-log", "task-log-2"]);
+      assert.equal(loaded.recovery.source, "snapshot");
+      assert.deepEqual(loaded.recovery.alerts, []);
+      assert.equal((await readdir(directory)).some((name) => name.includes(".cold-")), false);
+      assert.ok((await readWal(paths)).length > 1);
+    } finally {
+      cold.close();
     }
   });
 });

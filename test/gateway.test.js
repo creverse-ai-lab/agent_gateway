@@ -1531,6 +1531,41 @@ test("Gateway surfaces persistence failures", async () => {
   }
 });
 
+// Astra I7 (f613b8e): a failed snapshot had already cleared persistDirty, so
+// once the storage came back with nothing changing after it, the final flush
+// handed back the old failure: shutdown threw before stateStore.close(), the
+// state directory stayed locked, and what only the snapshot carries was lost.
+test("a snapshot that failed stays owed, and shutdown writes it afresh and still closes the store", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-gateway-persist-retry-"));
+  const statePath = join(directory, "state.json");
+  const { snapshot } = statePaths(statePath);
+  const service = new GatewayService({ statePath, gcIntervalMs: 0 });
+  try {
+    await service.init();
+    // A change only the snapshot carries: no log record names this row.
+    const at = new Date().toISOString();
+    service.inbox.set("inbox-snapshot-only", {
+      inboxId: "inbox-snapshot-only", sessionId: "session-gone", kind: "permission", status: "resolved", createdAt: at, resolvedAt: at
+    });
+    await rm(snapshot, { force: true });
+    await mkdir(join(snapshot, "blocker"), { recursive: true });
+    service.persistDirty = true;
+    await assert.rejects(service.flushPersist());
+    assert.equal(service.persistDirty, true, "what the failed write was to save is still owed");
+    // The storage comes back, and nothing changes after it.
+    await rm(snapshot, { recursive: true, force: true });
+    await service.shutdown();
+    assert.ok((await readSnapshotBody(statePath)).inbox.some((item) => item.inboxId === "inbox-snapshot-only"));
+    // close() ran, so this process may open the directory again.
+    const reopened = new GatewayService({ statePath, gcIntervalMs: 0 });
+    await reopened.init();
+    await reopened.shutdown();
+  } finally {
+    await service.shutdown().catch(() => {});
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("an older write in flight never clears a newer persistence failure, even one with the same message", async () => {
   const directory = await mkdtemp(join(tmpdir(), "acp-gateway-persist-generation-"));
   const service = new GatewayService({ statePath: join(directory, "state.json"), gcIntervalMs: 0 });

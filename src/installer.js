@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { accessSync, constants } from "node:fs";
+import { accessSync, closeSync, constants, readFileSync, unlinkSync } from "node:fs";
 import { access, chmod, cp, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, normalize, parse, resolve, sep } from "node:path";
@@ -21,6 +21,7 @@ import { childEnv, CONTROL_IDENTITY_ENV } from "./caller.js";
 import { GatewayRpcClient } from "./socket-rpc.js";
 import { gatewaySocketPath } from "./config.js";
 import { GatewaySettings, settingsPaths } from "./settings.js";
+import { claimStateLock, sweepStaleTemporaries } from "./state-store.js";
 import { compareReleases, GATEWAY_VERSION } from "./version.js";
 
 const CONTROL_NAME = "agent-acp";
@@ -192,8 +193,70 @@ export function parseInstallerArgs(argv) {
   return options;
 }
 
+// install.json is read once per run and written back whole: its first
+// identity, each entry as it is registered, and the end of the run. Two runs
+// that overlap would each write back a copy the other never read, and the last
+// one would drop the other's managedMcp and managedSkills records. So a run
+// that writes it holds install.json.lock from before that read to after its
+// last write, and a second one is refused, not made to wait on a run that may
+// install adapters for minutes. A lock whose holder is gone is claimed, as the
+// state directory's is (claimStateLock); runs in one process are told apart by
+// INSTALL_LOCKS_HERE, which that claim cannot do by pid.
+const INSTALL_LOCKS_HERE = new Set();
+
 export async function runInstaller(options, dependencies = {}) {
   const statePath = dependencies.statePath ?? defaultInstallStatePath();
+  const lock = writesInstallState(options) ? await lockInstallState(statePath) : null;
+  try {
+    return await runInstallation(options, { ...dependencies, statePath });
+  } finally {
+    if (lock) unlockInstallState(lock);
+  }
+}
+
+// Whether a run writes install.json: the same conditions as its writes below.
+function writesInstallState(options) {
+  return !options.dryRun && Boolean(options.installControl || options.installGuide || options.installSkill
+    || options.agentAutoUpdate != null || options.agentUpdateNotifications != null);
+}
+
+async function lockInstallState(statePath) {
+  const path = `${statePath}.lock`;
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  // Canonical, so two spellings of one file are one lock.
+  const key = join(await realpath(dirname(path)), basename(path));
+  if (INSTALL_LOCKS_HERE.has(key)) throw installBusy(statePath, String(process.pid));
+  const fd = claimStateLock(path, { held: (_path, owner) => installBusy(statePath, owner) });
+  INSTALL_LOCKS_HERE.add(key);
+  // A claim a dead run left half done (claimStateLock's <lock>.<pid>.tmp).
+  sweepStaleTemporaries(path);
+  return { fd, path, key };
+}
+
+function unlockInstallState({ fd, path, key }) {
+  try {
+    closeSync(fd);
+  } catch {
+    // Already closed.
+  }
+  INSTALL_LOCKS_HERE.delete(key);
+  try {
+    if (Number(readFileSync(path, "utf8").trim()) === process.pid) unlinkSync(path);
+  } catch {
+    // Gone already; a lock of a process that has exited is claimed by the next run.
+  }
+}
+
+function installBusy(statePath, owner) {
+  return new Error(owner
+    ? `Another installer run (pid ${owner}) is changing ${statePath}; run this again once it has finished`
+    : owner === ""
+      ? `Another installer run is starting to change ${statePath}; run this again once it has finished`
+      : `Could not lock ${statePath} for this run (${statePath}.lock)`);
+}
+
+async function runInstallation(options, dependencies) {
+  const statePath = dependencies.statePath;
   const detect = dependencies.detectProviders ?? detectProviders;
   const run = dependencies.runCommand ?? runCommand;
   const makeRpc = dependencies.rpcFactory ?? ((config) => new GatewayRpcClient(config));

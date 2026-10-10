@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { link, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -28,6 +29,9 @@ import { terminalSandboxOrStandIn } from "./helpers/terminal-sandbox.js";
 const mockAgent = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 const permissionAgent = fileURLToPath(new URL("./mock-permission-agent.js", import.meta.url));
 const context = { rootId: "main-a" };
+// node:fs as the modules under test import it, for a case that has to change
+// what one of its functions does (syncBuiltinESMExports moves their bindings).
+const fs = createRequire(import.meta.url)("fs");
 
 function permissionClientFactory(env = {}) {
   return (_provider, options) => new AcpClient(
@@ -680,6 +684,42 @@ test("Codex review: diff is against the snapshot baseline, keeps hunk bodies int
       await removeSnapshot(workspace);
     }
     assert.equal(existsSync(workspace.home), false);
+  });
+});
+
+// Astra I9 (f613b8e): the source was copied twice, into tree and then into
+// base, so a change to it between the two landed in base alone, and the diff
+// showed it reversed in tree, as an edit the worker never made.
+test("a source that changes while it is snapshotted never shows up reversed in the diff", async () => {
+  await withTemp("acp-ws-once-", async (directory) => {
+    const source = join(directory, "project");
+    await mkdir(source);
+    await writeFile(join(source, "a.txt"), "x=1\n");
+    const canonical = await realpath(source);
+    // The copy filter looks at the source root first whenever a copy of it
+    // starts: the source changes as a second copy would start.
+    let looks = 0;
+    const lstatSync = fs.lstatSync;
+    fs.lstatSync = function (path, ...rest) {
+      if (path === canonical && ++looks === 2) fs.writeFileSync(join(source, "a.txt"), "x=2\n");
+      return lstatSync.call(this, path, ...rest);
+    };
+    syncBuiltinESMExports();
+    let workspace;
+    try {
+      workspace = await createSnapshot(source, join(directory, "workspaces"));
+    } finally {
+      fs.lstatSync = lstatSync;
+      syncBuiltinESMExports();
+    }
+    try {
+      assert.equal(looks, 1, "the source is read once");
+      const diff = await snapshotDiff(workspace);
+      assert.equal(diff.changed, false, diff.patch);
+      assert.equal(await readFile(join(workspace.path, "a.txt"), "utf8"), await readFile(join(workspace.base, "a.txt"), "utf8"));
+    } finally {
+      await removeSnapshot(workspace);
+    }
   });
 });
 

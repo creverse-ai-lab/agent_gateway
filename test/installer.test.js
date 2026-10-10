@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { access, chmod, link, mkdir, mkdtemp, open, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -2378,6 +2379,64 @@ test("a replacement of install.json empties only a replaced file another name ho
       await reader.close();
     }
   } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+// Astra I12 (f613b8e): install.json is read once per run and written back
+// whole, so of two runs that overlapped, the one that wrote last dropped the
+// entry the other had registered from managedMcp, and later updates no longer
+// knew that entry as their own.
+test("a run that writes install.json holds it, so an overlapping run is refused instead of losing an entry", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-installer-lock-"));
+  const statePath = join(directory, "install.json");
+  const lock = `${statePath}.lock`;
+  const installed = [
+    { id: "codex", agentInstalled: true, adapterInstalled: true, install: null },
+    { id: "grok", agentInstalled: true, adapterInstalled: true, install: null }
+  ];
+  const guide = (target, { runCommand = nothingRegistered(), extra = ["--skip-health-check"] } = {}) => runInstaller(
+    parseInstallerArgs(["--install-guide", "--target", target, ...extra]),
+    { statePath, runtime, detectProviders: async () => installed, agentConfigPaths: agentConfigsIn(directory), runCommand }
+  );
+  const refused = (pid) => (error) => error.message.includes(`(pid ${pid}) is changing ${statePath}`);
+  let release = () => {};
+  const gate = new Promise((resolve) => { release = resolve; });
+  let parked = () => {};
+  const reached = new Promise((resolve) => { parked = resolve; });
+  let first = null;
+  try {
+    // The first run waits in the middle of registering its entry, with what it
+    // read of install.json in hand.
+    first = guide("codex", {
+      runCommand: async (command, args) => {
+        if (command === "codex" && args[1] === "add") {
+          parked();
+          await gate;
+        }
+        return nothingRegistered()(command, args);
+      }
+    });
+    await Promise.race([reached, first.then(() => { throw new Error("the first run ended before it registered its entry"); })]);
+    await assert.rejects(guide("grok"), refused(process.pid));
+    // A dry run writes nothing, so nothing holds it up.
+    assert.equal((await guide("grok", { extra: ["--dry-run"] })).dryRun, true);
+    release();
+    await first;
+    await guide("grok");
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    assert.deepEqual(Object.keys(state.managedMcp).sort(), ["codex:agent-acp-guide", "grok:agent-acp-guide"]);
+    await assert.rejects(access(lock), /ENOENT/, "the lock goes with the run");
+
+    // Another process's run: refused while that process runs, claimed once it is gone.
+    await writeFile(lock, `${process.ppid}\n`, { mode: 0o600 });
+    await assert.rejects(guide("grok"), refused(process.ppid));
+    await writeFile(lock, `${spawnSync(process.execPath, ["-e", ""]).pid}\n`, { mode: 0o600 });
+    await guide("grok");
+    await assert.rejects(access(lock), /ENOENT/);
+  } finally {
+    release();
+    await first?.catch(() => {});
     await rm(directory, { recursive: true, force: true });
   }
 });

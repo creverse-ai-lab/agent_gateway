@@ -22,6 +22,7 @@ import { statePaths } from "../src/state-store.js";
 import { requireTaskLinks, TaskStore } from "../src/task-store.js";
 import { startDaemon, writeMockProviders } from "./helpers/daemon-harness.js";
 import { EPOCH, finish, harness, start } from "./helpers/fake-worker.js";
+import { writeFreshBase } from "./helpers/state-files.js";
 
 const ROOT = "main-root";
 const claudeCaller = { provider: "claude", sessionId: "claude-session-a", pid: 4242, instanceId: "mcp-a" };
@@ -435,10 +436,11 @@ test("links, callers and scope mine survive a restart, from the snapshot and fro
       await before.service.shutdown();
     }
 
+    // The WAL alone: on the empty snapshot it goes on from.
     for (const source of ["snapshot", "wal"]) {
       if (source === "wal") {
         await writeFile(paths.wal, wal, { mode: 0o600 });
-        await rm(paths.snapshot, { force: true });
+        await writeFreshBase(statePath, wal);
       }
       const after = harness({ statePath, artifactRoot });
       after.clock.now = EPOCH + 10_000;

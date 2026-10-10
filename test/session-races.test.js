@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { AcpClient } from "../src/acp-client.js";
 import { GatewayService } from "../src/gateway-service.js";
 import { SESSION_CRITICAL_QUEUE_RESERVE, SESSION_QUEUE_LIMIT } from "../src/session-queue.js";
+import { FakeWorker } from "./helpers/fake-worker.js";
 import { readSnapshotBody } from "./helpers/state-files.js";
 
 const raceAgent = fileURLToPath(new URL("./mock-race-agent.js", import.meta.url));
@@ -1015,6 +1016,60 @@ test("R1 a command that waits on its own mailbox fails loudly instead of deadloc
     assert.equal(await queue.run("after", () => "ok"), "ok");
     assert.equal(queue.idle, true);
   });
+});
+
+// Astra I10 (f613b8e): maintenance stopped every client no registered session
+// referenced, and the client a provider's first session is being opened or
+// restored on is one: the open lost its worker halfway.
+test("R2 maintenance leaves a provider's client running while a session open or restore is still on it", async () => {
+  for (const operation of ["open", "restore"]) {
+    let release = null;
+    const gate = new Promise((resolve) => { release = resolve; });
+    let parked = null;
+    const reached = new Promise((resolve) => { parked = resolve; });
+    class GatedWorker extends FakeWorker {
+      async sessionNew(...args) {
+        if (operation === "open") { parked(); await gate; }
+        return super.sessionNew(...args);
+      }
+
+      async sessionRestore(args) {
+        if (operation === "restore") { parked(); await gate; }
+        return super.sessionRestore(args);
+      }
+    }
+    const workers = [];
+    const service = new GatewayService({
+      gcIntervalMs: 0,
+      createClient: (_provider, options) => {
+        workers.push(new GatedWorker(options));
+        return workers.at(-1);
+      }
+    });
+    try {
+      const pending = settle(operation === "open"
+        ? service.call("session_open", { provider: "claude", cwd: process.cwd() }, MAIN)
+        : service.call("session_restore", { provider: "claude", cwd: process.cwd(), acpSessionId: "acp-earlier" }, MAIN));
+      await Promise.race([reached, pending.then((outcome) => {
+        throw new Error(`the ${operation} ended before it reached the worker: ${outcome.error?.message ?? "ok"}`);
+      })]);
+      await service.runMaintenance();
+      assert.equal(workers.length, 1);
+      assert.equal(workers[0].alive, true, `${operation}: its client is still running`);
+      release();
+      const outcome = await pending;
+      assert.equal(outcome.ok, true, outcome.error?.message);
+      assert.equal(service.requireSession(outcome.value.sessionId).client, workers[0]);
+      // Held only while in flight: once nothing needs the client, it goes.
+      await service.call("session", { action: "close", sessionId: outcome.value.sessionId }, MAIN);
+      await service.runMaintenance();
+      assert.equal(workers[0].alive, false, `${operation}: an unused client is still reclaimed`);
+      assert.equal(service.clients.size, 0);
+    } finally {
+      release();
+      await service.shutdown().catch(() => {});
+    }
+  }
 });
 
 test("T18 a full happy path violates no transition and seals exactly one turn", async () => {

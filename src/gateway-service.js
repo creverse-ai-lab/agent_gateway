@@ -298,6 +298,13 @@ export class GatewayService {
     // hold; new sessions get a process of the current definition. gc stops each
     // one once no session references it.
     this.retiredClients = new Set();
+    // provider -> the session opens and restores in flight on it. Each one's
+    // client is referenced by no session from before it asks for it until the
+    // session it registers or restores does, so reclamation (runMaintenance,
+    // unloadSession) leaves every client of the provider alone meanwhile
+    // (#clientInUse). By provider, not client: held before getClient has
+    // chosen one, an open cannot lose it to a pass in between.
+    this.clientUsers = new Map();
     // The pid of every process a client of this service spawned for a worker,
     // its provider and its terminals, from the spawn until the exit. Each client
     // keeps its own children in it (AcpClient spawnedProcesses), so it does not
@@ -1096,6 +1103,27 @@ export class GatewayService {
   }
 
   async openSession(args, context) {
+    return this.#usingClients(requireProvider(args.provider), () => this.#openSession(args, context));
+  }
+
+  // Runs an open or restore on provider as one of its clientUsers.
+  async #usingClients(provider, operation) {
+    this.clientUsers.set(provider, (this.clientUsers.get(provider) ?? 0) + 1);
+    try {
+      return await operation();
+    } finally {
+      const remaining = this.clientUsers.get(provider) - 1;
+      if (remaining) this.clientUsers.set(provider, remaining); else this.clientUsers.delete(provider);
+    }
+  }
+
+  // Whether reclamation must leave client running: a session is on it, or an
+  // open or restore of its provider may be about to put one there.
+  #clientInUse(client) {
+    return this.clientUsers.has(client.gatewayProvider) || this.store.list().some((session) => session.client === client);
+  }
+
+  async #openSession(args, context) {
     const provider = requireProvider(args.provider);
     assertProviderEnabled(provider);
     const requestedCwd = await requireDirectory(args.cwd);
@@ -1406,6 +1434,13 @@ export class GatewayService {
   // attempt, when given, learns the method as soon as it is chosen, so a
   // restore that fails after that point can still say what it tried.
   async restoreSession(args, context, existing = null, attempt = null) {
+    return this.#usingClients(
+      requireProvider(args.provider ?? existing?.provider),
+      () => this.#restoreSession(args, context, existing, attempt)
+    );
+  }
+
+  async #restoreSession(args, context, existing, attempt) {
     const provider = requireProvider(args.provider ?? existing?.provider);
     if (!existing) assertProviderEnabled(provider);
     const cwd = await requireDirectory(args.cwd ?? existing?.cwd);
@@ -3687,16 +3722,21 @@ export class GatewayService {
     writer.append(json);
     writer.finalize(null, { sync: true });
     const metadata = writer.metadata();
-    if (!metadata?.path || metadata.error || metadata.truncated) {
+    // The file's name is durable only once its directory is: a directory sync
+    // that failed (EIO) would leave the reference below pointing at a name a
+    // power loss can take, so it counts as the artifact failing.
+    const failure = !metadata?.path || metadata.error || metadata.truncated
+      ? metadata?.error ?? "result was truncated"
+      : this.artifactStore.syncDirectory()?.message ?? null;
+    if (failure != null) {
       // ArtifactWriter records I/O failures instead of throwing, so this check is
       // the only thing between a swallowed ENOSPC and a reference to nothing.
       // The log gets the preview and the snapshot the whole result, inline; until
       // that snapshot lands, health and the result say so (#commitTaskTerminal).
-      this.persistError = `Task result artifact failed: ${metadata?.error ?? "result was truncated"}`;
+      this.persistError = `Task result artifact failed: ${failure}`;
       this.stateStore.rememberResultRef(taskId, null);
       return { preview };
     }
-    this.artifactStore.syncDirectory();
     const ref = {
       path: metadata.path,
       bytes: metadata.bytes,
@@ -4307,13 +4347,13 @@ export class GatewayService {
     await this.#reconcileWorkspaces();
 
     for (const [provider, client] of [...this.clients]) {
-      if (this.store.list().some((session) => session.client === client)) continue;
+      if (this.#clientInUse(client)) continue;
       await client.stop().catch(() => {});
       if (this.clients.get(provider) === client) this.clients.delete(provider);
       changed = true;
     }
     for (const client of [...this.retiredClients]) {
-      if (client.alive && this.store.list().some((session) => session.client === client)) continue;
+      if (client.alive && this.#clientInUse(client)) continue;
       this.retiredClients.delete(client);
       await client.stop().catch(() => {});
       changed = true;
@@ -4418,7 +4458,7 @@ export class GatewayService {
     // is neither a default poll type nor durable, and it must not move the
     // updatedAt that idle and retention clocks fall back on.
     this.store.push(session, { type: "session_unloaded" }, { touch: false });
-    if (!this.store.list().some((item) => item.client === client)) {
+    if (!this.#clientInUse(client)) {
       await client.stop().catch(() => {});
       for (const [key, candidate] of this.clients) {
         if (candidate === client) this.clients.delete(key);
@@ -4488,6 +4528,10 @@ export class GatewayService {
         // write that does clears it.
         () => { if (this.#persistFailures === observed) this.persistError = null; },
         (error) => {
+          // What this write was to save is still unsaved: dirty again, so the
+          // next flush, shutdown's final one included, writes it afresh instead
+          // of handing back this failure.
+          this.persistDirty = true;
           this.persistError = error?.message ?? String(error);
           throw error;
         }
@@ -4529,15 +4573,23 @@ export class GatewayService {
     );
     await Promise.all([...this.clients.values(), ...this.retiredClients].map((client) => client.stop()));
     this.retiredClients.clear();
-    await this.flushPersist();
-    // Clean shutdown always rotates, so a normal restart replays an empty log.
-    // close() is the last writer: appends after it are silent no-ops, which is
-    // what makes the clear() below safe.
-    this.stateStore?.close();
-    // After the final write: a blocked reader must be told the gateway is gone
-    // rather than hang on a waiter timer nobody will ever resolve. Clearing
-    // before the flush would persist an empty task set instead.
-    this.taskStore.clear();
+    // A write still in flight settles first. One that failed, then or earlier,
+    // left the state dirty (flushPersist), so the final write is a fresh
+    // attempt, never that failure handed back.
+    await this.persistChain.catch(() => {});
+    try {
+      await this.flushPersist();
+    } finally {
+      // Whether or not that write held. Clean shutdown always rotates, so a
+      // normal restart replays an empty log, and the rotation is one more
+      // attempt at the snapshot. close() is the last writer: appends after it
+      // are silent no-ops, which is what makes the clear() below safe.
+      this.stateStore?.close();
+      // After the final write: a blocked reader must be told the gateway is gone
+      // rather than hang on a waiter timer nobody will ever resolve. Clearing
+      // before the flush would persist an empty task set instead.
+      this.taskStore.clear();
+    }
     return this.shutdownReport;
   }
 
