@@ -672,6 +672,72 @@ test("every snapshot, the debounced one included, is synced before its rename, a
   });
 });
 
+// The store's directory sync swallowed every error, so a snapshot whose rename
+// was not durable was reported written, and a rotation went on to retire the
+// segment that snapshot was to cover.
+test("a directory sync that fails fails the snapshot or rotation it belongs to, which stays owed until one syncs", async () => {
+  await withDirectory("state-dirsync-fails", async (directory) => {
+    const paths = statePaths(join(directory, "state.json"));
+    // The debounced writer stays quiet until the flushes below.
+    const service = makeService(directory, { snapshotIntervalMs: 60_000 });
+    let taskId = null;
+    try {
+      await service.init();
+      taskId = (await runTask(service)).task.taskId;
+      await service.flushPersist();
+      const root = await stat(directory);
+      // The state directory's sync fails with code; every other one syncs.
+      const failing = (code) => ({
+        fsyncSync: (original) => function fsyncSync(fd, ...rest) {
+          const info = fs.fstatSync(fd);
+          if (info.isDirectory() && info.dev === root.dev && info.ino === root.ino) {
+            throw Object.assign(new Error(`${code}: directory sync failed, fsync`), { code });
+          }
+          return original.call(this, fd, ...rest);
+        }
+      });
+      const health = async () => (await service.call("setup", { mode: "summary" }, MAIN)).persistence;
+
+      // A file system that cannot sync a directory at all is no failure, as before.
+      await withFs(failing("EINVAL"), async () => {
+        service.persistDirty = true;
+        await service.flushPersist();
+      });
+      assert.equal((await health()).healthy, true);
+
+      // The snapshot is renamed into place but not reported written.
+      await withFs(failing("EIO"), async () => {
+        service.persistDirty = true;
+        await assert.rejects(service.flushPersist(), /EIO/);
+      });
+      assert.equal((await health()).healthy, false);
+      assert.match((await health()).error, /EIO/);
+      assert.equal(service.persistDirty, true, "the snapshot is still owed");
+      // A rotation stops before it retires the segment it rolled aside.
+      await withFs(failing("EIO"), () => {
+        assert.throws(() => service.stateStore.rotate(), /EIO/);
+      });
+      await stat(paths.rotating);
+
+      // Once the directory syncs again the owed snapshot lands, and the next
+      // rotation folds the segment in.
+      await service.flushPersist();
+      assert.equal((await health()).healthy, true);
+      service.stateStore.rotate();
+      await assert.rejects(stat(paths.rotating), /ENOENT/);
+    } finally {
+      await service.shutdown();
+    }
+    const restarted = makeService(directory);
+    try {
+      await restarted.init();
+      assert.equal((await restarted.call("task_get", { taskId }, MAIN)).status, "completed");
+    } finally {
+      await restarted.shutdown();
+    }
+  });
+});
+
 test("a v4 state.json migrates into v5 on first start", async () => {
   await withDirectory("state-migrate", async (directory) => {
     const statePath = join(directory, "state.json");
@@ -1383,6 +1449,53 @@ test("cold removes the state files in an order a stop at any point cannot leave 
         for (const path of originals.slice(0, -1)) await assert.rejects(stat(path), /ENOENT/, path);
       } finally {
         cold.close();
+      }
+    });
+  }
+});
+
+// Review of the fix above: the store's directory sync swallowed every error,
+// EIO included, so cold went on to the next removal after a sync that failed,
+// and a power loss could then keep the snapshot's unlink but not state.json's.
+test("cold halts on a directory sync that fails: before any removal after the copies, before the next one after a removal", async () => {
+  // The nth directory sync fails: the first follows the copies, each later one a removal.
+  for (const [failing, removed] of [[1, 0], [3, 2]]) {
+    await withDirectory(`state-cold-sync-${failing}`, async (directory) => {
+      const { store, originals, bytes } = await seedColdRotation(directory);
+      let clock = Date.now();
+      const now = () => clock;
+      let syncs = 0;
+      await withFs({
+        fsyncSync: (original) => function fsyncSync(fd, ...rest) {
+          if (fs.fstatSync(fd).isDirectory() && ++syncs === failing) {
+            throw Object.assign(new Error("EIO: i/o error, fsync"), { code: "EIO" });
+          }
+          return original.call(this, fd, ...rest);
+        }
+      }, () => {
+        assert.throws(() => store({ stateRecovery: "cold", fsync: "normal" }, { now }).open(), (error) => {
+          assert.equal(error.code, "STATE_SNAPSHOT_CORRUPT");
+          assert.match(error.message, removed === 0
+            ? /could not sync the state directory after copying the state files aside \(EIO.*\), so it removed none of the state files/
+            : /set the state files aside as .*, but could not sync the state directory once it removed .*state\.snapshot\.json \(EIO.*\)\. Start again with =cold to finish\.$/);
+          return true;
+        });
+      });
+      for (const [index, path] of originals.entries()) {
+        if (index < removed) await assert.rejects(stat(path), /ENOENT/, path);
+        else assert.deepEqual(await readFile(path), bytes.get(path), path);
+      }
+      const cold = (await readdir(directory)).filter((name) => name.includes(".cold-"));
+      assert.equal(cold.length, removed === 0 ? 0 : originals.length, "the copies stay once an original has gone");
+      // What is left still halts a plain start, and cold, started again, finishes.
+      clock += 1_000;
+      assert.throws(() => store({}, { now }).open(), { code: "STATE_SNAPSHOT_CORRUPT" });
+      clock += 1_000;
+      const finishing = store({ stateRecovery: "cold" }, { now });
+      try {
+        assertColdStarted(finishing.open());
+      } finally {
+        finishing.close();
       }
     });
   }

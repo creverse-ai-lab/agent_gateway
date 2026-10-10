@@ -8,6 +8,14 @@ import { ERROR_CODES, GatewayError } from "./errors.js";
 
 const { O_NOFOLLOW = 0, O_NONBLOCK = 0, O_WRONLY } = constants;
 
+// What a directory sync fails with where the file system cannot sync a
+// directory at all (some network and FUSE mounts: EINVAL, ENOTSUP), or where a
+// directory cannot be opened or synced to try (Windows: EISDIR, EPERM). A name
+// there is as durable as that file system makes it, sync or no sync. Any other
+// failure (EIO) leaves a rename, a new file or an unlink in that directory in
+// doubt (ArtifactStore#syncDirectory, StateStore#syncDirectory).
+export const DIRECTORY_SYNC_UNSUPPORTED = new Set(["EINVAL", "ENOTSUP", "EOPNOTSUPP", "EISDIR", "EPERM"]);
+
 export function readJsonFile(path, fallback) {
   try { return JSON.parse(readFileSync(path, "utf8")); }
   catch (error) {

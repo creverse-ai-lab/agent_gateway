@@ -5,16 +5,12 @@ import {
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { DIRECTORY_SYNC_UNSUPPORTED } from "./atomic-json.js";
 
 const DEFAULT_MAX_FILE_BYTES = 100 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES = 512 * 1024 * 1024;
 const ARTIFACT_PREFIX = "acp-artifact-";
 const { O_NOFOLLOW = 0, O_NONBLOCK = 0, O_WRONLY } = constants;
-// What a directory sync fails with where the file system cannot sync a
-// directory at all (some network and FUSE mounts: EINVAL, ENOTSUP), or where a
-// directory cannot be opened or synced to try (Windows: EISDIR, EPERM). A name
-// there is as durable as that file system makes it, sync or no sync.
-const DIRECTORY_SYNC_UNSUPPORTED = new Set(["EINVAL", "ENOTSUP", "EOPNOTSUPP", "EISDIR", "EPERM"]);
 
 export function defaultArtifactRoot() {
   return process.env.ACP_GATEWAY_ARTIFACTS || join(homedir(), ".acp-gateway", "artifacts");

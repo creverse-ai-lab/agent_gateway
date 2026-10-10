@@ -17,7 +17,7 @@ import {
   readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeSync
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { removeFile, replaceFile } from "./atomic-json.js";
+import { DIRECTORY_SYNC_UNSUPPORTED, removeFile, replaceFile } from "./atomic-json.js";
 import { ERROR_CODES, GatewayError } from "./errors.js";
 import { GATEWAY_API_VERSION, GATEWAY_VERSION, STATE_SCHEMA_VERSION } from "./version.js";
 
@@ -339,10 +339,11 @@ export class StateStore {
   // (#pruneQuarantine).
   //
   // Copied first, all of them, each copy synced and then the directory: a
-  // copy that fails (a disk too full for a large log) removes no original,
-  // only the copies made so far, and halts. Only then do the originals go,
-  // through removeFile and the directory synced after each, so that a stop
-  // anywhere in between (a crash, a power loss, a removal that fails) leaves
+  // copy that fails (a disk too full for a large log), or a sync of them that
+  // fails, removes no original, only the copies made so far, and halts. Then the
+  // originals go, through removeFile and the directory synced after each, a
+  // sync that fails halting before the next removal, so that a stop anywhere
+  // in between (a crash, a power loss, a removal or a sync that fails) leaves
   // one of the sets this order allows, never some other subset: the v4
   // state.json, then the snapshot, then the retired segment, then the log.
   // The v4 file goes first because a log may go on from it at any seq, so it
@@ -358,6 +359,22 @@ export class StateStore {
     const reason = error.reason ?? error.message;
     const originals = [];
     const copies = [];
+    // Nothing removed yet: the copies go, the originals stay, and the start halts.
+    const keepAll = (failed, cause) => {
+      for (const copy of copies) {
+        try {
+          removeFile(copy);
+        } catch {
+          // Only a copy: the originals are all still there.
+        }
+      }
+      return recoveryHalt(
+        error.code,
+        reason,
+        `ACP_GATEWAY_STATE_RECOVERY=cold could not ${failed} (${cause?.message ?? cause}), `
+        + "so it removed none of the state files. Start again once that is fixed."
+      );
+    };
     for (const path of [this.paths.state, this.paths.snapshot, this.paths.rotating, this.paths.wal]) {
       const target = `${path}.cold-${stamp}`;
       try {
@@ -377,35 +394,29 @@ export class StateStore {
           closeSync(fd);
         }
       } catch (copyError) {
-        for (const copy of copies) {
-          try {
-            removeFile(copy);
-          } catch {
-            // Only a copy: the originals are all still there.
-          }
-        }
-        throw recoveryHalt(
-          error.code,
-          reason,
-          `ACP_GATEWAY_STATE_RECOVERY=cold could not set ${path} aside (${copyError?.message ?? copyError}), `
-          + "so it removed none of the state files. Start again once that is fixed (a full disk, say)."
-        );
+        throw keepAll(`set ${path} aside`, copyError);
       }
       originals.push(path);
     }
-    this.#syncDirectory();
+    try {
+      this.#syncDirectory();
+    } catch (syncError) {
+      throw keepAll("sync the state directory after copying the state files aside", syncError);
+    }
     for (const path of originals) {
+      let step = "remove";
       try {
         removeFile(path);
+        step = "sync the state directory once it removed";
+        this.#syncDirectory();
       } catch (removeError) {
         throw recoveryHalt(
           error.code,
           reason,
           `ACP_GATEWAY_STATE_RECOVERY=cold set the state files aside as ${copies.join(", ")}, but could not `
-          + `remove ${path} (${removeError?.message ?? removeError}). Start again with =cold to finish.`
+          + `${step} ${path} (${removeError?.message ?? removeError}). Start again with =cold to finish.`
         );
       }
-      this.#syncDirectory();
     }
     this.#pruneQuarantine();
     // What the attempt read before it stopped goes with it.
@@ -947,6 +958,13 @@ export class StateStore {
     // otherwise keep that state, task results and inbox payloads included,
     // beyond the inode check of the state directory. Nothing keeps that file on
     // purpose; a quarantine copy is a copy.
+    //
+    // A directory sync that fails (#syncDirectory) fails the write as a failed
+    // write or fsync of the file does: the rename may not outlive a power loss,
+    // so the snapshot stays owed and its caller reports it (persistence
+    // unhealthy, a barrier with the WAL off thrown to its caller), a rotation
+    // keeps the segment it would have retired, a v4 file is not retired, and
+    // the file replaced is not emptied.
     replaceFile(temporary, this.paths.snapshot, { afterRename: () => this.#syncDirectory() });
     this.#retireLegacyState();
     this.#snapshotDirty = false;
@@ -983,7 +1001,11 @@ export class StateStore {
       this.#legacyPending = false;
       this.#syncDirectory();
     } catch {
-      // Kept for the next snapshot; the file is only stale, not wrong.
+      // Not reported, the directory sync included: the file is only stale, not
+      // wrong. One that could not be removed is tried again with the next
+      // snapshot. One whose removal a power loss undoes comes back beside the
+      // snapshot synced just before it went, which a start reads instead (a v4
+      // file older than the snapshot is no downgrade), and goes again then.
     }
   }
 
@@ -1020,6 +1042,9 @@ export class StateStore {
     this.#openWal();
     this.#walRecords = 0; // #openWal restat'd the byte count; the record count is ours
     this.#writeOpenedMarker();
+    // The rename and the new log's name, durable before the snapshot that
+    // makes the segment redundant. A sync that fails stops the rotation here,
+    // reported to its caller, with the segment kept for the next one to fold in.
     this.#syncDirectory();
     this.#epoch += 1;
     // The snapshot is what makes the rolled-aside segment redundant, so it is
@@ -1037,7 +1062,11 @@ export class StateStore {
   // only in the live log, and in .rot for corruption. A synced snapshot makes
   // every whole record in it redundant first, and only then does it go and a
   // new log start. A crash before that leaves the torn bytes where replay drops
-  // them; one after, that snapshot and no log, or the new one.
+  // them; one after, that snapshot and no log, or the new one. The new log's
+  // name is synced too, as rotate() syncs it, before a record in it can be
+  // promised. A directory sync that fails stops this and is reported to its
+  // caller: before the new log, with the log still taking no record, and
+  // retried by the next rotation; after it, with the new log in use.
   #replaceTornWal() {
     this.#epoch += 1;
     const written = this.writeSnapshot();
@@ -1050,6 +1079,7 @@ export class StateStore {
     this.#openWal();
     this.#walRecords = 0;
     this.#writeOpenedMarker();
+    this.#syncDirectory();
     this.#rotatedAt = this.#now();
     this.#failures = 0;
     return written;
@@ -1180,6 +1210,11 @@ export class StateStore {
     this.#fsyncCount += 1;
   }
 
+  // Throws when the sync fails, but not where the file system cannot sync a
+  // directory at all (DIRECTORY_SYNC_UNSUPPORTED): a rename is still atomic
+  // there, and as durable as that file system makes it. Any other failure
+  // (EIO) leaves the renames, new files and unlinks in the directory in doubt,
+  // and each caller says what that costs it.
   #syncDirectory() {
     if (this.#config.fsync === "off") return;
     let fd = null;
@@ -1187,9 +1222,8 @@ export class StateStore {
       fd = openSync(this.paths.directory, "r");
       fsyncSync(fd);
       this.#fsyncCount += 1;
-    } catch {
-      // Directory fsync is unavailable on some filesystems; the rename itself is
-      // still atomic there.
+    } catch (error) {
+      if (!DIRECTORY_SYNC_UNSUPPORTED.has(error?.code)) throw error;
     } finally {
       if (fd != null) closeSync(fd);
     }
