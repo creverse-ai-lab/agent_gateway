@@ -110,7 +110,7 @@ Worker와 다른 로컬 프로세스가 Gateway 제어 권한에 닿지 못하�
   - poll은 각 부분을 한 번만 직렬화해 poll당 직렬화 작업이 약 절반으로 줄었습니다. 요청이 취소되거나 연결이 닫힌 긴 poll은 `WAIT_ABORTED`로 waiter와 timer를 바로 정리합니다.
   - installer가 실행하는 모든 명령(자동 adapter 업데이트 포함)에는 10분 기한이 있고, 출력은 스트림마다 처음과 마지막 512KB까지만 남깁니다. 종료할 때는 adapter 업데이트를 최대 5초만 기다린 뒤 중단합니다. 스스로 끝난 명령은 기한이 늦게 와도 자기 종료 상태를 유지합니다.
   - Gateway 밖으로 나간 적 없는 대체된 `tool_call_update` payload 파일은 바로 지우고, 내구성 있는 Task 결과는 artifact 한도의 마지막 1/8(64MB)을 따로 확보합니다.
-- **테스트:** 38개 파일의 테스트 557개에서 46개 파일의 824개로 늘었습니다. 식별 정보 넘겨주기, Worker 감지, Main별 분리와 넘겨받기, 터미널 승인과 sandbox profile, 확인한 파일 handle, socket 소유자, 저장소 정리, 런타임 상한을 새 테스트로 다룹니다.
+- **테스트:** 38개 파일의 테스트 557개에서 46개 파일의 826개로 늘었습니다. 식별 정보 넘겨주기, Worker 감지, Main별 분리와 넘겨받기, 터미널 승인과 sandbox profile, 확인한 파일 handle, socket 소유자, 저장소 정리, 런타임 상한을 새 테스트로 다룹니다.
 - **호환성:**
   - 그대로인 것: API major 1, state schema 5, 설정, WAL 레코드 유형, 기본 socket 경로, `install.json` 형식. AgenLynk 같은 관리 소비자에게는 `GatewayRpcClient`, `install.json`의 `identity.{token,rootId}`, bootstrap 플래그, `caller` 없는 요청의 root 전체 접근, `agent-acp` 항목 이름으로 프론트 도어를 찾는 방식이 그대로입니다.
   - additive: 위의 오류 코드 네 개, 세션 응답의 `adoptedFrom`, 잘린 replay의 `budgetTruncated`·`omittedEvents`·`omittedBefore`, 작업 폴더 예산 오류의 `details`, 결과 전체가 아직 내구성 있게 저장되지 않은 동안 `task_result`와 `agent_acp_run`에 붙는 `durability`(영속성 참고), `STATE_WAL_TAIL_REPLAYED`·`STATE_COLD_STARTED` 경고(영속성 참고), daemon이 거부한 재구독의 `subscription_error` 이벤트에 붙는 `errorCode`, installer MCP action의 `removedEnv`(교체로 빠지는 식별 정보 변수 이름).

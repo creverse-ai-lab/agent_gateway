@@ -731,6 +731,100 @@ test("P2: once a terminal's group is found gone its SIGKILL is disarmed, and tha
   });
 });
 
+// stop() owns the teardown. The provider exits on the stdin EOF stop() sends,
+// and its close handler runs #fail while stop() still waits, which used to find
+// the terminals and the provider still on the client and end them again: a
+// second sequence on a terminal group the first had found gone, whose id could
+// by then be another group's, and a second endProvider. Here that close always
+// lands mid-stop(): the terminal ignores SIGTERM, and its group is found gone
+// only once the close has been handled (the client's close handler runs before
+// this test's).
+test("P2: a provider that exits on stop()'s stdin EOF ends nothing twice: one sequence for the terminal's group, one for the provider's", { skip: process.platform === "win32" }, async () => {
+  await withTemp("acp-p2-owned-", async (directory) => {
+    let terminalGroup = null;
+    let providerGroup = null;
+    let providerClosed = false;
+    const terminalSignals = [];
+    const providerSignals = [];
+    // The terminal's group: only the SIGTERM is really sent, which it ignores,
+    // and a check finds a member until the provider's close has been handled.
+    const killProcess = (pid, signal) => {
+      if (terminalGroup === null || pid !== -terminalGroup) return process.kill(pid, signal);
+      terminalSignals.push(signal);
+      if (signal === "SIGTERM") return process.kill(pid, signal);
+      if (signal !== 0) return true;
+      if (providerClosed) throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+      return true;
+    };
+    // The provider's group is signalled with process.kill itself.
+    const kill = process.kill;
+    process.kill = (pid, signal) => {
+      if (providerGroup !== null && pid === -providerGroup) providerSignals.push(signal);
+      return kill.call(process, pid, signal);
+    };
+    const client = new AcpClient(
+      { provider: "mock", command: process.execPath, args: [permissionAgent], permissionPolicy: "auto_approve" },
+      { protectedPaths: [], terminalSandbox: null, killProcess }
+    );
+    try {
+      await client.start();
+      const { sessionId } = await client.sessionNew({ cwd: directory, permissionPolicy: "auto_approve" });
+      // Ready only once it ignores SIGTERM: one still starting would die of it,
+      // and a terminal that has exited is not ended again anyway.
+      const ready = join(directory, "terminal.ready");
+      const ignoreTerm = `process.on('SIGTERM', () => {}); setInterval(() => {}, 1000); require('node:fs').writeFileSync(${JSON.stringify(ready)}, '');`;
+      const held = await client.sessionPrompt({
+        sessionId,
+        prompt: JSON.stringify({ steps: [{ terminal: { command: process.execPath, args: ["-e", ignoreTerm], hold: true } }] })
+      });
+      assert.deepEqual(JSON.parse(held.stopReason), ["terminal-held"]);
+      await until(() => existsSync(ready), "the terminal to ignore SIGTERM");
+      terminalGroup = [...client.terminals.values()][0].child.pid;
+      const provider = client.proc;
+      providerGroup = provider.pid;
+      provider.once("close", () => {
+        providerClosed = true;
+      });
+      await client.stop();
+      assert.equal(providerClosed, true, "the provider's close landed while stop() waited");
+      assert.equal(terminalSignals[0], "SIGTERM");
+      assert.ok(terminalSignals.length > 1 && terminalSignals.slice(1).every((signal) => signal === 0),
+        `one sequence for the terminal's group, ended once it was found gone: ${JSON.stringify(terminalSignals)}`);
+      assert.deepEqual(providerSignals.filter((signal) => signal !== 0), ["SIGTERM"],
+        `one sequence for the provider's group: ${JSON.stringify(providerSignals)}`);
+      assert.equal(processGone(providerGroup), true);
+      // Nothing else reaches either group afterwards.
+      const settled = [terminalSignals.length, providerSignals.length];
+      await delay(150);
+      assert.deepEqual([terminalSignals.length, providerSignals.length], settled);
+    } finally {
+      process.kill = kill;
+      await client.stop().catch(() => {});
+      if (terminalGroup && !processGone(terminalGroup)) process.kill(-terminalGroup, "SIGKILL");
+    }
+  });
+});
+
+test("P2: a stop() while another runs waits for that one, and one after it starts afresh", async () => {
+  const client = new AcpClient(
+    { provider: "mock", command: process.execPath, args: [permissionAgent], permissionPolicy: "auto_approve" },
+    { protectedPaths: [], terminalSandbox: null }
+  );
+  try {
+    await client.start();
+    const provider = client.proc.pid;
+    const first = client.stop();
+    assert.equal(client.stop(), first, "one teardown for both callers");
+    await first;
+    assert.equal(processGone(provider), true, "which returns only once the provider is gone");
+    const again = client.stop();
+    assert.notEqual(again, first);
+    await again;
+  } finally {
+    await client.stop().catch(() => {});
+  }
+});
+
 test("P2: a terminal's group that keeps a member through the grace still gets the SIGKILL", async () => {
   await withTemp("acp-p2-armed-", async (directory) => {
     // Every check of the group finds a member left; only the SIGTERM is sent.

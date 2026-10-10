@@ -74,6 +74,8 @@ export class AcpClient {
   // Control token, through GatewayService). Private, so nothing that prints or
   // serializes a client can show them.
   #protectedSecrets = [];
+  // The teardown a stop() is running, while it runs (stop).
+  #stopping = null;
 
   constructor(config, options = {}) {
     this.config = config;
@@ -219,7 +221,18 @@ export class AcpClient {
     return this.initResult;
   }
 
-  async stop() {
+  // One teardown, however many callers ask for it: a stop() while another is
+  // still ending the processes waits for that one, since the first owns them
+  // (#stop) and a second would find nothing left to end and return before
+  // they are gone.
+  stop() {
+    this.#stopping ??= this.#stop().finally(() => {
+      this.#stopping = null;
+    });
+    return this.#stopping;
+  }
+
+  async #stop() {
     // Best effort, and first because it is the courtesy: a worker blocked on a
     // permission gets an answer before its transport goes away. Each response is
     // a write to a bounded channel that can refuse the frame, and a throw here
@@ -241,10 +254,10 @@ export class AcpClient {
       }
     }
     const stopped = new Error("ACP client stopped");
-    // Synchronous, and before anything can await: stop() clears `alive`, so the
-    // child's own exit will not run #fail, and a provider that ignores SIGTERM
-    // would otherwise leave session/prompt pending forever — a turn nobody can
-    // finish or cancel. (PR2 M7.)
+    // Synchronous, and before anything can await: a turn must not wait out the
+    // teardown, and a provider that ignores SIGTERM would leave session/prompt
+    // pending until the SIGKILL, or forever if that fails as well — a turn
+    // nobody can finish or cancel. (PR2 M7.)
     for (const pending of this.pending.values()) pending.reject(stopped);
     this.pending.clear();
     for (const operation of this.pendingOperations.values()) operation.reject(stopped);
@@ -254,23 +267,34 @@ export class AcpClient {
     this.rl?.close();
     // Cleared before the flush so a child that dies while the channel drains is
     // not reported to onExit as a provider failure: this stop is the reason.
+    // With it cleared no terminal can be added any more (#createTerminal).
     this.alive = false;
+    // From here this stop owns the teardown: the provider, the terminals and
+    // the channel leave the client now, before the first await, so nothing that
+    // runs while it waits ends them a second time. The provider's own exit,
+    // which it usually takes on the stdin EOF below, lands in #fail through its
+    // close handler, and used to find them all still here: the terminals got a
+    // second SIGTERM -> SIGKILL sequence, and the provider a second endProvider,
+    // on groups the first sequence may already have found gone, whose ids can
+    // by then be another group's. So could a release, a cancel or a second
+    // stop() (stop).
+    const proc = this.proc;
+    const terminals = [...this.terminals.values()];
     const channel = this.channel;
+    this.proc = null;
+    this.terminals.clear();
     this.channel = null;
     await channel?.close({ flushMs: 250 });
     // SIGTERM, then SIGKILL after the grace, and each one waited for (bounded):
     // a provider or a terminal that ignores SIGTERM, or what either started in
     // its process group, must not outlive the stop that unloads them. The
-    // references are dropped only after that wait, so the SIGKILL still has a
-    // process to reach. The provider usually exits on the stdin EOF first.
-    const proc = this.proc;
+    // handles taken above are held until that wait is over, so the SIGKILL
+    // still has a process to reach.
     proc?.stdin?.end();
     await Promise.all([
       proc ? endProvider(proc, this.killGraceMs) : null,
-      ...[...this.terminals.values()].map((terminal) => endTerminal(terminal, this.killGraceMs, this.killProcess))
+      ...terminals.map((terminal) => endTerminal(terminal, this.killGraceMs, this.killProcess))
     ]);
-    this.terminals.clear();
-    this.proc = null;
     this.initResult = null;
   }
 
@@ -1539,6 +1563,9 @@ export class AcpClient {
     for (const operation of this.pendingOperations.values()) operation.reject(error);
     this.pendingOperations.clear();
     this.sessionOperationGrants.clear();
+    // Only what no stop() has taken: one that is running owns the provider and
+    // the terminals already (stop), and the provider's own exit during it lands
+    // here, where it must end nothing a second time.
     for (const terminal of this.terminals.values()) this.#terminate(terminal);
     this.terminals.clear();
     // The same bounded SIGTERM -> SIGKILL teardown stop() uses, so a provider

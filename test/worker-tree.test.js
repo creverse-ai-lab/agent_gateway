@@ -801,14 +801,16 @@ test("R4: a provider whose start fails stays a spawned pid while its client is i
         await service.init();
         const starting = service.getClient("mockreg", "fixed-model");
         starting.catch(() => {});
-        await waitFor(() => created[0]?.proc && !created[0].alive, () => "the failed start to stop its client");
-        const provider = created[0].proc;
-        const exited = once(provider, "exit");
+        // stop() takes the provider's handle off the client as it begins; the
+        // pid is what the client still counts.
+        await waitFor(() => created[0] && !created[0].alive && created[0].spawnedPids().length > 0,
+          () => "the failed start to stop its client");
+        const [provider] = created[0].spawnedPids();
         assert.equal(service.clients.size + service.retiredClients.size, 0, "the client is in no list");
-        assert.equal(processGone(provider.pid), false, "its stop() is still ending the provider");
-        assert.deepEqual([...service.spawnedPids()], [provider.pid]);
-        process.kill(provider.pid, "SIGKILL");
-        await exited;
+        assert.equal(processGone(provider), false, "its stop() is still ending the provider");
+        assert.deepEqual([...service.spawnedPids()], [provider]);
+        process.kill(provider, "SIGKILL");
+        await waitFor(() => service.spawnedPids().size === 0, () => "the provider's exit to take its pid out");
         await assert.rejects(starting, /required model=fixed-model, actual=<missing>/);
         assert.equal(service.spawnedPids().size, 0);
       } finally {

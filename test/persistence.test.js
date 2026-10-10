@@ -1680,7 +1680,9 @@ test("a replayed run of status changes lands on the last one", async () => {
       assert.equal(got.status, "failed");
       assert.match(got.statusMessage, /Gateway restarted/);
     } finally {
-      await service.shutdown().catch(() => {});
+      // The reloaded service, whose restart conversion armed a snapshot write
+      // that would otherwise land while the directory is being removed.
+      await reloaded.shutdown().catch(() => {});
     }
   });
 });
