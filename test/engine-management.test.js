@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -23,6 +24,16 @@ async function temporary(run) {
   try { return await run(directory); } finally { await rm(directory, { recursive: true, force: true }); }
 }
 const makeSession = service => service.store.create({ provider: "mock", acpSessionId: "mock", cwd: "/", ownerRootId: context.rootId, turnId: "test-turn", status: "running", permissionPolicy: "ask" });
+// Replaces node:fs functions for the length of run(), each by wrap(original);
+// syncing the builtin ESM exports moves the bindings src/ imports by name.
+const fs = createRequire(import.meta.url)("fs");
+async function withFs(wrappers, run) {
+  const originals = Object.fromEntries(Object.keys(wrappers).map(name => [name, fs[name]]));
+  for (const [name, wrap] of Object.entries(wrappers)) fs[name] = wrap(originals[name]);
+  syncBuiltinESMExports();
+  try { return await run(); } finally { Object.assign(fs, originals); syncBuiltinESMExports(); }
+}
+const errno = code => Object.assign(new Error(`${code}: directory sync failed`), { code });
 
 test("settings migrate supported legacy values, preserve identity, and distinguish applied revision", async () => temporary(async directory => {
   const path = join(directory, "settings.json"), legacy = join(directory, "install.json");
@@ -47,6 +58,40 @@ test("settings migrate supported legacy values, preserve identity, and distingui
   assert.throws(() => locked.update({ expectedRevision: 1, values: { idleUnloadMs: 1 } }), { code: "CONFIG_CONFLICT" });
   store.update({ expectedRevision: 1, resetIds: ["idleUnloadMs"] });
   assert.equal(new GatewaySettings({ path, legacy, env: {} }).activeValues.idleUnloadMs, 1800000, "reset must not resurrect a legacy value");
+}));
+
+// Astra I6 (161cb41): a settings write synced its directory after the rename
+// whatever the file system, so where a directory cannot be synced at all
+// (Windows: EISDIR opening it, EPERM syncing it) a write that had taken effect
+// was reported as failed, and its retry with the same revision met
+// CONFIG_CONFLICT. A sync that fails (EIO) still fails the write.
+test("a settings write stands where its directory cannot be synced, and a failed directory sync still fails it", async () => temporary(async directory => {
+  const path = join(directory, "settings.json"), legacy = join(directory, "install.json");
+  const store = new GatewaySettings({ path, legacy, env: {} });
+  const root = await stat(directory);
+  const failSync = code => ({
+    fsyncSync: original => function fsyncSync(fd, ...rest) {
+      const info = fs.fstatSync(fd);
+      if (info.isDirectory() && info.dev === root.dev && info.ino === root.ino) throw errno(code);
+      return original.call(this, fd, ...rest);
+    }
+  });
+  const failOpen = code => ({
+    openSync: original => function openSync(target, ...rest) {
+      if (String(target) === directory) throw errno(code);
+      return original.call(this, target, ...rest);
+    }
+  });
+  const unsupported = [["EISDIR", failOpen("EISDIR")], ["EPERM", failSync("EPERM")], ["EINVAL", failSync("EINVAL")]];
+  for (const [index, [code, wrappers]] of unsupported.entries()) {
+    const changed = await withFs(wrappers, () => store.update({ expectedRevision: index, values: { idleUnloadMs: 100_000 + index } }));
+    assert.equal(changed.revision, index + 1, `${code}: the write is reported as it stands`);
+    assert.equal(JSON.parse(await readFile(path, "utf8")).values.idleUnloadMs, 100_000 + index, code);
+  }
+  assert.equal(store.update({ expectedRevision: 3, values: { idleUnloadMs: 123_456 } }).revision, 4, "the next revision follows");
+  // An I/O error is a failure: the rename may not outlive a power loss.
+  await withFs(failSync("EIO"), () => assert.throws(() => store.update({ expectedRevision: 4, values: { idleUnloadMs: 654_321 } }), { code: "EIO" }));
+  await assert.rejects(stat(`${path}.write.lock`), /ENOENT/, "no write lock is left behind");
 }));
 
 test("malformed settings halt instead of silently discarding configured policy", async () => temporary(async directory => {

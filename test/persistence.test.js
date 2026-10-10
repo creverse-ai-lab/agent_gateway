@@ -3,7 +3,7 @@
 // ordering matrix lives in test/crash-matrix.test.js.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { closeSync } from "node:fs";
+import { closeSync, linkSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { link, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
@@ -1847,6 +1847,94 @@ test("a second store for one state directory in one process is refused, under an
     const next = new StateStore({ statePath });
     next.open();
     next.close();
+  });
+});
+
+// Astra I2 (161cb41): of three Gateways on different sockets that start over
+// one stale state lock, a claim that lost its race can move the first one's
+// lock aside, and the third makes its own while the path stands empty
+// (restoreLock). Two then wrote the directory, and nothing checked the lock
+// again. Lock files cannot prevent that, so the store finds it out before it
+// writes: it stops writing, names the Gateway that has the lock, and replaces
+// neither the snapshot nor the log.
+test("a store whose state lock another Gateway took stops writing, names that Gateway, and replaces nothing", async () => {
+  await withDirectory("state-lock-lost", async (directory) => {
+    const paths = statePaths(join(directory, "state.json"));
+    // The debounced writer stays quiet until the flushes below.
+    const service = makeService(directory, { snapshotIntervalMs: 60_000 });
+    const health = async () => (await service.call("setup", { mode: "summary" }, MAIN)).persistence;
+    const lostLock = (error) => {
+      assert.match(error.message, /Another Gateway \(pid=1\) has taken the lock of the state directory .*, so this one \(pid=\d+\) stopped writing state there/);
+      return true;
+    };
+    let taskId = null;
+    let stopped = false;
+    try {
+      await service.init();
+      const { opened, task } = await runTask(service);
+      taskId = task.taskId;
+      await service.flushPersist();
+      assert.equal((await health()).healthy, true);
+
+      // A claim that lost its race takes this store's lock aside and puts it
+      // back by link(2): the same file, still this store's.
+      const aside = `${paths.lock}.4242.tmp`;
+      renameSync(paths.lock, aside);
+      linkSync(aside, paths.lock);
+      unlinkSync(aside);
+      await runTaskOn(service, opened.sessionId);
+      await service.flushPersist();
+      assert.equal((await health()).healthy, true, "a lock put back is still this store's");
+
+      // One that has not put it back yet leaves the path empty: the next
+      // write makes the lock again, so a Gateway starting then finds it held,
+      // and the claim's link back meets it and drops what it took.
+      renameSync(paths.lock, aside);
+      await runTaskOn(service, opened.sessionId);
+      assert.equal((await readFile(paths.lock, "utf8")).trim(), String(process.pid), "made again");
+      assert.throws(() => claimStateLock(paths.lock, { pid: 1003, isAlive: (pid) => pid === process.pid }), { code: "STATE_DIR_LOCKED" });
+      unlinkSync(aside);
+      await service.flushPersist();
+      assert.equal((await health()).healthy, true, "and this store goes on with it");
+
+      // One that found a third starter's lock there drops it instead, and the
+      // path holds another Gateway's (pid 1 is always alive).
+      renameSync(paths.lock, aside);
+      writeFileSync(paths.lock, "1\n", { mode: 0o600 });
+      unlinkSync(aside);
+      const before = { wal: await readFile(paths.wal), snapshot: await readFile(paths.snapshot) };
+      await assert.rejects(
+        service.call("task_prompt", { sessionId: opened.sessionId, prompt: "narrated-result" }, MAIN),
+        (error) => error.code === "PERSISTENCE_UNHEALTHY" && lostLock(error)
+      );
+      const persistence = await health();
+      assert.equal(persistence.healthy, false);
+      lostLock({ message: persistence.error });
+      // Every write after it fails the same way, and none touches a file.
+      assert.equal(service.stateStore.append(WAL_TYPES.TASK_SEEN, taskId, { seenAt: new Date().toISOString() }), false);
+      service.persistDirty = true;
+      await assert.rejects(service.flushPersist(), (error) => error.code === "STATE_DIR_LOCKED" && lostLock(error));
+      assert.throws(() => service.stateStore.rotate(), (error) => error.code === "STATE_DIR_LOCKED" && lostLock(error));
+      // Shutdown included: its last snapshot and rotation are refused too.
+      stopped = true;
+      await assert.rejects(service.shutdown(), { code: "STATE_DIR_LOCKED" });
+      assert.deepEqual(await readFile(paths.wal), before.wal, "nothing more in the log");
+      assert.deepEqual(await readFile(paths.snapshot), before.snapshot, "the snapshot is not replaced");
+      assert.deepEqual((await readdir(directory)).filter((name) => name.endsWith(".tmp")), [], "nor left beside it");
+      assert.equal(await readFile(paths.lock, "utf8"), "1\n", "the other Gateway's lock stays");
+    } finally {
+      if (!stopped) await service.shutdown().catch(() => {});
+    }
+
+    // Once that Gateway is gone, what this one wrote before is all there.
+    await rm(paths.lock);
+    const restarted = makeService(directory);
+    try {
+      await restarted.init();
+      assert.equal((await restarted.call("task_get", { taskId }, MAIN)).status, "completed");
+    } finally {
+      await restarted.shutdown();
+    }
   });
 });
 

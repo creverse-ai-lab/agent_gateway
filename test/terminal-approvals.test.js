@@ -869,6 +869,152 @@ test("P2: a terminal's group that keeps a member through the grace still gets th
   });
 });
 
+// ------------------------------------------------------------------ Astra I4
+
+// Astra I4 (161cb41): every teardown went by the command's exit status alone,
+// so once a terminal's command had exited, a release, a cancel, a closed
+// session, the provider's exit and stop() all left its process group alone,
+// and a job the command had put in the background (its output sent elsewhere,
+// so the terminal's closed with the command) ran on after every one of them.
+
+// A terminal whose command puts a job in the background and exits at once,
+// printing the job's pid.
+const backgroundJob = (seconds, how = {}) => ({
+  terminal: { command: "/bin/sh", args: ["-c", `sleep ${seconds} </dev/null >/dev/null 2>&1 & echo $!`], ...how }
+});
+
+test("I4: a job a terminal's command left in its group is ended with the terminal, by every teardown", { skip: process.platform === "win32" }, async () => {
+  // A held terminal once its command has exited, then end(); the job's pid.
+  const held = (end) => async (session) => {
+    assert.deepEqual(await session.run([backgroundJob(3600, { hold: true })]), ["terminal-held"]);
+    const [terminal] = session.client.terminals.values();
+    await until(() => terminal.exitStatus !== null, "the command to exit");
+    const pid = Number(terminal.outputBuffer.toString());
+    assert.equal(processGone(pid), false, "the job it left runs on");
+    await end(session);
+    return pid;
+  };
+  const endings = [
+    // The Worker's own: it waits for the exit, reads the output and releases.
+    ["terminal/release", async ({ run }) => {
+      const [ran] = await run([backgroundJob(3600)]);
+      assert.deepEqual(ran.exitStatus, { exitCode: 0, signal: null });
+      return Number(ran.output);
+    }],
+    ["cancel", held(({ client, sessionId }) => client.cancelSession(sessionId))],
+    ["session close", held(({ client, sessionId }) => client.clearSession(sessionId))],
+    ["provider exit", held(({ client }) => client.proc.kill("SIGKILL"))],
+    ["stop()", held(({ client }) => client.stop())]
+  ];
+  await withTemp("acp-i4-job-", async (directory) => {
+    for (const [ending, end] of endings) {
+      let pid = null;
+      try {
+        await withClient({ cwd: directory, policy: "auto_approve", protectedPaths: [] }, async (session) => {
+          pid = await end(session);
+          await until(() => processGone(pid), `${ending}: the job to end`);
+        });
+      } finally {
+        if (pid && !processGone(pid)) process.kill(pid, "SIGKILL");
+      }
+    }
+  });
+});
+
+test("I4: a group found empty after its terminal's command exited is never signalled, whatever ends the terminal", { skip: process.platform === "win32" }, async () => {
+  // Each teardown, once the job the command left (a fifth of a second) has
+  // ended on its own and a check (every 250 ms) has found its group empty.
+  const job = (how) => backgroundJob(0.2, how);
+  const endings = [
+    // The Worker releases well after that.
+    ["terminal/release", job({ lingerMs: 1_200 }), async () => {}],
+    ["cancel", job({ hold: true }), async ({ client, sessionId }) => client.cancelSession(sessionId)],
+    ["session close", job({ hold: true }), async ({ client, sessionId }) => client.clearSession(sessionId)],
+    ["provider exit", job({ hold: true }), async ({ client }) => {
+      client.proc.kill("SIGKILL");
+      await until(() => !client.alive, "the provider exit");
+    }],
+    ["stop()", job({ hold: true }), async ({ client }) => client.stop()]
+  ];
+  await withTemp("acp-i4-empty-", async (directory) => {
+    for (const [ending, step, end] of endings) {
+      // What the client signals and checks the terminal's group with, all of
+      // it really sent, and whether a check found the group empty.
+      let group = null;
+      let emptied = false;
+      const signals = [];
+      const killProcess = (pid, signal) => {
+        if (group === null && pid < 0) group = -pid;
+        if (pid !== -group) return process.kill(pid, signal);
+        signals.push(signal);
+        try {
+          return process.kill(pid, signal);
+        } catch (error) {
+          if (signal === 0 && error?.code === "ESRCH") emptied = true;
+          throw error;
+        }
+      };
+      await withClient({ cwd: directory, policy: "auto_approve", protectedPaths: [], killGraceMs: 100, killProcess }, async (session) => {
+        const turn = session.run([step]);
+        await until(() => emptied, `${ending}: the group found empty`);
+        const checked = signals.length;
+        await turn;
+        await end(session);
+        // Past the next check, and the grace a SIGKILL would follow.
+        await delay(300);
+        assert.deepEqual(signals, new Array(checked).fill(0), `${ending}: checked until found empty, and nothing reaches the id since`);
+      });
+    }
+  });
+});
+
+// The group is watched from the command's exit, not from when its output
+// closes: a process that left the group can hold the output open long after
+// the group has emptied and its id is free.
+test("I4: a group found empty is not signalled while a process that left it still holds the terminal's output", { skip: process.platform === "win32" }, async () => {
+  // The command starts a process in a session of its own that keeps the
+  // command's output open, prints its pid and exits.
+  const script = [
+    "const { spawn } = require('node:child_process');",
+    "const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { detached: true, stdio: ['ignore', 'inherit', 'inherit'] });",
+    "console.log(child.pid);",
+    "child.unref();"
+  ].join("\n");
+  let group = null;
+  let emptied = false;
+  const signals = [];
+  const killProcess = (pid, signal) => {
+    if (group === null && pid < 0) group = -pid;
+    if (pid !== -group) return process.kill(pid, signal);
+    signals.push(signal);
+    try {
+      return process.kill(pid, signal);
+    } catch (error) {
+      if (signal === 0 && error?.code === "ESRCH") emptied = true;
+      throw error;
+    }
+  };
+  let escaped = null;
+  await withTemp("acp-i4-escaped-", async (directory) => {
+    try {
+      await withClient({ cwd: directory, policy: "auto_approve", protectedPaths: [], killGraceMs: 100, killProcess }, async ({ client, run }) => {
+        assert.deepEqual(await run([{ terminal: { command: process.execPath, args: ["-e", script], hold: true } }]), ["terminal-held"]);
+        const [terminal] = client.terminals.values();
+        await until(() => terminal.outputBuffer.toString().trim() !== "", "the pid of the process that left");
+        escaped = Number(terminal.outputBuffer.toString());
+        await until(() => emptied, "the group found empty");
+        assert.equal(terminal.exitStatus, null, "the output is still open");
+        const checked = signals.length;
+        await client.stop();
+        await delay(300);
+        assert.deepEqual(signals, new Array(checked).fill(0), "nothing reaches the id once its group was found empty");
+      });
+    } finally {
+      if (escaped && !processGone(escaped)) process.kill(escaped, "SIGKILL");
+    }
+  });
+});
+
 // ============================================================================
 // 1.8.0 final-review regressions (F1, F2, F3, F8, F9)
 // ============================================================================

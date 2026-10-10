@@ -50,6 +50,13 @@ const MAX_NOTED_FRAMES = 16;
 // How often a process group being ended, a terminal's or the provider's, is
 // checked for a member.
 const GROUP_POLL_MS = 25;
+// How often the process group of a terminal whose command has exited is
+// checked for a member while it keeps one (watchGroup). Its id is free once it
+// has none, so the group is taken for this one only until a check finds it
+// empty: a quarter second is far less than a system takes to hand out every
+// other pid before that one comes round again, and costs next to nothing while
+// a job the command left in the background runs for hours.
+const GROUP_WATCH_MS = 250;
 // Approvals that wait for their operation, per session. Main has to click each
 // one, so this only bounds what a long turn whose worker never consumes them
 // (Codex runs its own commands) keeps; the oldest goes first, and a dropped one
@@ -1196,8 +1203,17 @@ export class AcpClient {
       limit,
       truncated: false,
       exitStatus: null,
-      exited: null
+      exited: null,
+      // The command's process group, which can outlive the command: whether a
+      // check found it empty, the watch that checks it once the command has
+      // exited (watchGroup), and the one sequence that ends it (endGroup).
+      groupGone: false,
+      groupWatch: null,
+      ending: null
     };
+    // As Node reaps the command, which can be long before its output closes:
+    // a process that left the group may still hold it.
+    child.once("exit", () => watchGroup(terminal, this.killProcess));
     const stdoutDecoder = new StringDecoder("utf8");
     const stderrDecoder = new StringDecoder("utf8");
     terminal.exited = new Promise((done) => {
@@ -1447,10 +1463,10 @@ export class AcpClient {
     }
   }
 
-  // A terminal the Gateway is done with, ended through terminateChild without
-  // waiting for it. Only one whose output is still open (endTerminal).
+  // A terminal the Gateway is done with, ended through endGroup without
+  // waiting for it.
   #terminate(terminal) {
-    if (!terminal.exitStatus) void terminateChild(terminal, this.killGraceMs, { kill: this.killProcess });
+    void endGroup(terminal, this.killGraceMs, { kill: this.killProcess });
   }
 
   #addOperationGrant(sessionId, grant) {
@@ -1703,12 +1719,17 @@ function groupAlive(child, kill = signalProcess) {
 // command may exit while what it started has not, and the SIGKILL stays armed
 // only while the group still has a member: once the last one is gone its id is
 // free, and a group of the same user that takes it before the grace ends is
-// not this one. Resolves once the group is gone, or a second grace after the
-// SIGKILL; its timers keep the process up only for a caller that waits (hold).
-// Never throws or rejects: it runs on teardown paths and from timers.
+// not this one (groupGone). Resolves once the group is gone, or a second grace
+// after the SIGKILL; its timers keep the process up only for a caller that
+// waits (hold). Never throws or rejects: it runs on teardown paths and from
+// timers.
 function terminateChild(terminal, graceMs = KILL_GRACE_MS, { kill = signalProcess, hold = false } = {}) {
   const { child } = terminal;
-  const gone = () => !groupAlive(child, kill);
+  const gone = () => {
+    if (groupAlive(child, kill)) return false;
+    terminal.groupGone = true;
+    return true;
+  };
   quietly(() => killChild(child, "SIGTERM", kill));
   return new Promise((done) => {
     if (gone()) {
@@ -1737,13 +1758,49 @@ function terminateChild(terminal, graceMs = KILL_GRACE_MS, { kill = signalProces
   });
 }
 
-// stop(): a terminal through terminateChild, and waited for. Only one whose
-// output is still open, like every other teardown: a terminal that exited and
-// closed it long ago may have left a group id that is free again, and could by
-// now be anyone's.
+// stop(): a terminal through endGroup, and waited for.
 async function endTerminal(terminal, graceMs, kill) {
-  if (terminal.exitStatus) return;
-  await terminateChild(terminal, graceMs, { kill, hold: true });
+  await endGroup(terminal, graceMs, { kill, hold: true });
+}
+
+// From its command's exit on, a terminal's process group is watched while it
+// keeps a member: a job the command left running, such as a shell's `cmd &`.
+// A group id is not reused while the group has a member, so this is still the
+// terminal's group until a check finds it empty, and from then on nothing
+// signals it (endGroup), whether or not something still holds the terminal's
+// output open. Not while a sequence of endGroup's runs, which checks the group
+// itself.
+function watchGroup(terminal, kill) {
+  if (terminal.ending || terminal.groupGone) return;
+  if (!groupAlive(terminal.child, kill)) {
+    terminal.groupGone = true;
+    return;
+  }
+  terminal.groupWatch = setInterval(() => {
+    if (groupAlive(terminal.child, kill)) return;
+    terminal.groupGone = true;
+    stopWatchingGroup(terminal);
+  }, GROUP_WATCH_MS);
+  terminal.groupWatch.unref();
+}
+
+function stopWatchingGroup(terminal) {
+  clearInterval(terminal.groupWatch);
+  terminal.groupWatch = null;
+}
+
+// Ends a terminal the Gateway is done with (a release, a cancel, a closed
+// session, the provider's exit, stop()): its command with its process group,
+// or once the command has exited, what it left running in the group. One
+// SIGTERM -> SIGKILL sequence (terminateChild) for whichever teardown comes
+// first, which every later one gets as well; none for a group a check already
+// found empty (watchGroup), whose id may be another group's by now.
+function endGroup(terminal, graceMs, { kill, hold = false }) {
+  if (!terminal.ending) {
+    stopWatchingGroup(terminal);
+    terminal.ending = terminal.groupGone ? Promise.resolve() : terminateChild(terminal, graceMs, { kill, hold });
+  }
+  return terminal.ending;
 }
 
 // stop() and #fail(): the provider, detached like a terminal, through the same

@@ -156,6 +156,11 @@ export class StateStore {
   #fd = null;
   #lockFd = null;
   #lockKey = null;
+  // The state lock as this store took it (or made it again), by device, inode
+  // and mtime, and the error every write fails with once another Gateway's
+  // lock was found at its path (#checkLock).
+  #lock = null;
+  #lockLost = null;
   // Set when a failed append left part of its record at the end of the log
   // and the log could not be cut back (append): no record may follow those
   // bytes, so none is written until rotate() has replaced the log.
@@ -814,6 +819,15 @@ export class StateStore {
     this.#snapshotDirty = true;
     if (!this.#config.wal) return true;
     if (this.#walTorn) return this.#appendFailed(this.#walTorn);
+    // The first record after a barrier starts a batch, and the lock is checked
+    // there, once a batch (#checkLock); the barrier that ends it checks again.
+    if (this.#lockLost || !this.#pendingFsync) {
+      try {
+        this.#checkLock();
+      } catch (error) {
+        return this.#appendFailed(error);
+      }
+    }
     const seq = this.#seq + 1;
     const line = Buffer.from(encodeRecord({
       v: WAL_RECORD_VERSION,
@@ -896,6 +910,7 @@ export class StateStore {
     }
     if (!this.#pendingFsync) return;
     try {
+      this.#checkLock();
       this.#fsync(this.#fd);
       this.#pendingFsync = false;
       this.#writeError = null;
@@ -931,6 +946,7 @@ export class StateStore {
   // fsyncs a write, at most about one write a second with the WAL on.
   writeSnapshot() {
     if (!this.#opened || this.#closed) return null;
+    if (this.#lockLost) throw this.#lockLost;
     if (this.#config.wal) this.barrier();
     const body = Buffer.from(JSON.stringify(this.#durableBody(this.#snapshotProvider())), "utf8");
     const header = Buffer.from(`${JSON.stringify({
@@ -965,6 +981,19 @@ export class StateStore {
     // unhealthy, a barrier with the WAL off thrown to its caller), a rotation
     // keeps the segment it would have retired, a v4 file is not retired, and
     // the file replaced is not emptied.
+    //
+    // Never over the snapshot of another Gateway that took the lock meanwhile
+    // (#checkLock), checked as close to the rename as this can.
+    try {
+      this.#checkLock();
+    } catch (error) {
+      try {
+        removeFile(temporary);
+      } catch {
+        // A later start sweeps it once this process is gone.
+      }
+      throw error;
+    }
     replaceFile(temporary, this.paths.snapshot, { afterRename: () => this.#syncDirectory() });
     this.#retireLegacyState();
     this.#snapshotDirty = false;
@@ -1019,6 +1048,9 @@ export class StateStore {
   rotate() {
     if (!this.#opened || this.#closed) return null;
     if (!this.#config.wal) return this.writeSnapshot();
+    // Before anything here renames or removes a log that another Gateway,
+    // which took the lock meanwhile, may be writing (#checkLock).
+    this.#checkLock();
     this.barrier();
     if (this.#walTorn && !this.#cutTornTail()) return this.#replaceTornWal();
     // A segment left by an interrupted rotation still holds records that no
@@ -1247,6 +1279,72 @@ export class StateStore {
     this.#lockFd = claimStateLock(this.paths.lock);
     this.#lockKey = key;
     LOCKED_HERE.add(key);
+    // With the pid in it written (createLock), so nothing of this store's
+    // moves its mtime again.
+    const { dev, ino, mtimeNs } = fstatSync(this.#lockFd, { bigint: true });
+    this.#lock = { dev, ino, mtimeNs };
+  }
+
+  // Throws unless the lock at the state path is still this store's. Lock
+  // files cannot keep a third starter out (restoreLock): a claim of a stale
+  // lock can move this store's aside instead, and one made while the path
+  // stood empty then stands for another Gateway, on another socket, that
+  // writes this state directory too. Nothing here prevents that: Node has no
+  // OS lock, O_EXLOCK is macOS only, and the one file it could hold that no
+  // claim moves is the directory, which would lock out a store of another
+  // state file in it. So the store detects it: once a batch of appends, as it
+  // starts and at its barrier, before a rotation, and before a snapshot
+  // replaces the one there.
+  //
+  // One stat while nothing changed: the same file by device and inode, which
+  // no other file can have while this store holds it open, and by mtime,
+  // which anything written to it would move, so the pid in it too (sameLock).
+  // Otherwise what is there decides. Where there is none, the lock is made
+  // again (#retakeLock). One that names this process is this store's, put back
+  // by a rename (restoreLock without hard links) or made again. Any other is
+  // another Gateway's, and the store stops writing for good: every write fails
+  // with this error, which names that Gateway, persistence stays unhealthy,
+  // the snapshot is never replaced and the log never rotated. What both wrote
+  // until then may be lost to a restart.
+  #checkLock() {
+    if (this.#lockLost) throw this.#lockLost;
+    if (this.#lock == null) return;
+    const current = statSync(this.paths.lock, { bigint: true, throwIfNoEntry: false });
+    if (current?.dev === this.#lock.dev && current.ino === this.#lock.ino && current.mtimeNs === this.#lock.mtimeNs) return;
+    let found = current ? readLock(this.paths.lock) : null;
+    found ??= this.#retakeLock();
+    const owner = found?.text.trim() ?? "";
+    if (Number(owner) === process.pid) {
+      this.#lock = { dev: found.dev, ino: found.ino, mtimeNs: found.mtimeNs };
+      return;
+    }
+    this.#lockLost = new GatewayError(
+      ERROR_CODES.STATE_DIR_LOCKED,
+      `${owner ? `Another Gateway (pid=${owner}) has taken` : "Another Gateway is taking"} the lock of the state directory `
+      + `${this.paths.directory}, so this one (pid=${process.pid}) stopped writing state there. Run one Gateway per `
+      + "state directory, and restart this one once the other has stopped."
+    );
+    throw this.#lockLost;
+  }
+
+  // Makes the lock again where this store's is gone and none stands in its
+  // place: the state directory removed under a running Gateway, which writes
+  // it anew, or a claim that took the lock aside and has not put it back yet
+  // (which then finds this one there and drops what it took, restoreLock). By
+  // createLock, so of this store and a Gateway starting meanwhile only one
+  // has it. Returns the lock now at the path, whoever made it, or null.
+  #retakeLock() {
+    mkdirSync(this.paths.directory, { recursive: true, mode: 0o700 });
+    const fd = createLock(this.paths.lock, process.pid);
+    if (fd == null) return readLock(this.paths.lock);
+    try {
+      closeSync(this.#lockFd);
+    } catch {
+      // Already closed.
+    }
+    this.#lockFd = fd;
+    const { dev, ino, mtimeNs } = fstatSync(fd, { bigint: true });
+    return { dev, ino, mtimeNs, text: `${process.pid}\n` };
   }
 
   #releaseLock() {
@@ -1257,6 +1355,7 @@ export class StateStore {
       // Already closed.
     }
     this.#lockFd = null;
+    this.#lock = null;
     LOCKED_HERE.delete(this.#lockKey);
     this.#lockKey = null;
     if (Number(String(readFileSafe(this.paths.lock) ?? "").trim()) === process.pid) unlinkSafe(this.paths.lock);
@@ -1383,6 +1482,8 @@ function lockedBy(path, owner) {
 // file system without hard links gets the rename back. A lock made in the
 // moment its path stood empty (a third starter) stays, and then two hold one:
 // what lock files cannot rule out without an OS lock, which Node does not have.
+// The store whose lock this was finds that out before it writes again, and
+// stops writing (StateStore#checkLock).
 function restoreLock(claimed, path) {
   try {
     linkSync(claimed, path);

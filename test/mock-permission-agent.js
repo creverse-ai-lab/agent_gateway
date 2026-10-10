@@ -17,13 +17,15 @@ import { createInterface } from "node:readline";
 //                                           grant is bound to them; content is
 //                                           the tool call's, such as diffs)
 //     {"terminal": {..., "cwd"?, "env"?, "outputByteLimit"?, "pad"?, "hold"?,
-//                   "release"?, "kill"?}}
+//                   "release"?, "kill"?, "lingerMs"?}}
 //                                        -> {output, exitStatus}, or
 //                                           "terminal-error: <message>";
 //                                           hold: "terminal-held" without waiting;
 //                                           release: terminal/release without
 //                                           waiting, "terminal-released";
 //                                           kill: terminal/kill before the wait;
+//                                           lingerMs: a wait between the exit
+//                                           and the output and release;
 //                                           pad: an unused field of N bytes
 //     {"write": {"path", "content" | "bytes", "pad"?}} -> "write-ok" | "write-error: <message>"
 //     {"parallel": [step, ...]}             -> the steps at once, their outcomes
@@ -117,6 +119,7 @@ async function runStep(sessionId, step) {
     }
     if (step.terminal.kill) await request("terminal/kill", { sessionId, terminalId });
     const exited = await request("terminal/wait_for_exit", { sessionId, terminalId });
+    if (step.terminal.lingerMs) await new Promise((resolve) => setTimeout(resolve, step.terminal.lingerMs));
     const output = await request("terminal/output", { sessionId, terminalId });
     await request("terminal/release", { sessionId, terminalId });
     return { output: output.result?.output ?? null, exitStatus: exited.result ?? null };

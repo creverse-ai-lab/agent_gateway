@@ -13,7 +13,8 @@ const { O_NOFOLLOW = 0, O_NONBLOCK = 0, O_WRONLY } = constants;
 // directory cannot be opened or synced to try (Windows: EISDIR, EPERM). A name
 // there is as durable as that file system makes it, sync or no sync. Any other
 // failure (EIO) leaves a rename, a new file or an unlink in that directory in
-// doubt (ArtifactStore#syncDirectory, StateStore#syncDirectory).
+// doubt (ArtifactStore#syncDirectory, StateStore#syncDirectory, syncDirectory
+// below).
 export const DIRECTORY_SYNC_UNSUPPORTED = new Set(["EINVAL", "ENOTSUP", "EOPNOTSUPP", "EISDIR", "EPERM"]);
 
 export function readJsonFile(path, fallback) {
@@ -46,18 +47,30 @@ export function updateJsonFile(path, fallback, update) {
       writeFileSync(output, `${JSON.stringify(next, null, 2)}\n`);
       fsyncSync(output);
     } finally { if (output != null) closeSync(output); }
-    replaceFile(temporary, path, {
-      afterRename: () => {
-        let directory;
-        try { directory = openSync(dirname(path), "r"); fsyncSync(directory); }
-        finally { if (directory != null) closeSync(directory); }
-      }
-    });
+    replaceFile(temporary, path, { afterRename: () => syncDirectory(dirname(path)) });
     return next;
   } finally {
     closeSync(fd);
     try { unlinkSync(temporary); } catch (error) { if (error.code !== "ENOENT") throw error; }
     unlinkSync(lock);
+  }
+}
+
+// The sync that makes a rename in directory durable. Not where the file system
+// cannot sync a directory at all (DIRECTORY_SYNC_UNSUPPORTED): the rename has
+// replaced the file there already, as durable as that file system makes it,
+// and a write that took effect must not be reported as failed (a settings
+// retry with the revision it read would meet the new one: CONFIG_CONFLICT).
+// Any other failure (EIO) leaves the rename in doubt and fails the write.
+function syncDirectory(directory) {
+  let fd = null;
+  try {
+    fd = openSync(directory, "r");
+    fsyncSync(fd);
+  } catch (error) {
+    if (!DIRECTORY_SYNC_UNSUPPORTED.has(error?.code)) throw error;
+  } finally {
+    if (fd != null) closeSync(fd);
   }
 }
 
