@@ -883,6 +883,84 @@ test("T16e a mailbox whose reserve worker requests took still accepts the turn's
   });
 });
 
+// A worker request for a session the client does not serve, one it never
+// opened or one already closed, was kept and announced to no one: no inbox row,
+// no Main to answer it, a worker waiting on it for good, and nothing bounding
+// how many were kept, since the session id is the worker's to choose.
+test("T16f a worker request for a session the client does not serve is answered -32000 at once, and none is kept", async () => {
+  await withService({}, async (service) => {
+    const opened = await open(service);
+    const closed = await open(service);
+    const client = service.requireSession(opened.sessionId).client;
+    const closedAcpId = service.requireSession(closed.sessionId).acpSessionId;
+    await service.call("session", { action: "close", sessionId: closed.sessionId }, MAIN);
+    await client.request("test/ask", { sessionId: "not-a-session", id: 1 });
+    await client.request("test/ask", { sessionId: "not-a-session", id: 2, question: true });
+    await client.request("test/ask", { sessionId: closedAcpId, id: 3 });
+    const answers = (await client.request("test/answers")).answers;
+    assert.deepEqual(answers.map(({ id, result, error }) => [id, result, error?.code, error?.message]), [
+      [1, null, -32000, "Unknown ACP session: not-a-session"],
+      [2, null, -32000, "Unknown ACP session: not-a-session"],
+      [3, null, -32000, `Unknown ACP session: ${closedAcpId}`]
+    ]);
+    assert.equal(client.pendingPermissions.size + client.pendingElicitations.size, 0);
+    assert.equal(service.inbox.size, 0);
+  });
+});
+
+// One that arrived while a close waited on the worker was kept, and the close
+// then cleared the session without answering it.
+test("T16g a worker request a close leaves behind is answered when the session is cleared", async () => {
+  await withService({ hold: "close" }, async (service) => {
+    const opened = await open(service);
+    const session = service.requireSession(opened.sessionId);
+    const client = session.client;
+    const closing = service.call("session", { action: "close", sessionId: opened.sessionId }, MAIN);
+    await waitForMarker(service, opened.sessionId, "hold:close");
+    await client.request("test/ask", { sessionId: session.acpSessionId, id: "late-1" });
+    assert.equal(client.pendingSessionInput(session.acpSessionId).permissions, 1);
+    await release(client, "close");
+    await closing;
+    assert.equal(client.pendingPermissions.size, 0);
+    assert.deepEqual((await client.request("test/answers")).answers, [
+      { id: "late-1", result: { outcome: { outcome: "cancelled" } }, error: null }
+    ]);
+  });
+});
+
+// The per-session limit bounds one session; spread over sessions, a provider's
+// requests waiting for Main are bounded as a whole too.
+test("T16h worker requests waiting for Main are bounded across a provider's sessions, not only per session", async () => {
+  const client = new AcpClient(
+    { provider: "mock", command: process.execPath, args: [raceAgent], permissionPolicy: "ask" },
+    { maxPendingRequestsPerProvider: 3 }
+  );
+  try {
+    await client.start();
+    const sessions = [];
+    for (let index = 0; index < 2; index += 1) {
+      const { sessionId } = await client.sessionNew({ cwd: process.cwd(), permissionPolicy: "ask" });
+      client.onSessionUpdate(sessionId, () => {});
+      sessions.push(sessionId);
+    }
+    // Two in each session, each far under its own limit: the fourth is one
+    // more than the provider may keep.
+    for (const sessionId of sessions) await client.request("test/burst", { sessionId, count: 2 });
+    const [refused, ...rest] = (await client.request("test/answers")).answers;
+    assert.equal(rest.length, 0);
+    assert.equal(refused.error.code, -32000);
+    assert.equal(refused.error.message, "ACP provider pending request limit exceeded: 3");
+    assert.equal(client.pendingPermissions.size, 3);
+    // An answer makes room again.
+    const [first] = client.pendingPermissions.keys();
+    client.respondPermission(first, "allow-once", sessions[0]);
+    await client.request("test/ask", { sessionId: sessions[1], id: "room" });
+    assert.equal(client.pendingPermissions.has("room"), true);
+  } finally {
+    await client.stop();
+  }
+});
+
 test("T17 shutdown drains in-flight commands and stops arming the persist timer", async () => {
   const directory = await mkdtemp(join(tmpdir(), "acp-race-shutdown-"));
   const statePath = join(directory, "state.json");

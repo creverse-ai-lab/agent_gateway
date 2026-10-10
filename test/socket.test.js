@@ -196,6 +196,97 @@ test("socket client removes only the failed subscription on subscription_error",
   }
 });
 
+// The first resubscribe the daemon refused after a reconnect (its session gone)
+// ended the restore: every later subscription stayed without events, on a
+// socket that read as connected, so no reconnect ever restored them.
+test("socket client restores the other subscriptions when the daemon refuses one on reconnect", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-resub-"));
+  const socketPath = join(directory, "gateway.sock");
+  const received = { a: [], b: [] };
+  let first;
+  let second;
+  const client = new GatewayRpcClient({ socketPath, token: "token", rootId: "main-a", autoStart: false });
+  try {
+    first = await startSubscriptionServer(socketPath, 1, (request) => ({
+      ok: true,
+      result: { subscriptionId: `first-${request.args.sessionIds[0]}`, sessions: [], events: [], cursorTruncated: {} }
+    }));
+    await client.subscribe({ sessionIds: ["session-a"] }, (event) => received.a.push(event));
+    const kept = await client.subscribe({ sessionIds: ["session-b"] }, (event) => received.b.push(event));
+
+    for (const socket of first.sockets) socket.destroy();
+    first.server.close();
+    await once(first.server, "close");
+    await unlink(socketPath).catch(() => {});
+
+    second = await startSubscriptionServer(socketPath, 2, (request) => {
+      if (request.args.sessionIds[0] === "session-a") {
+        return { ok: false, error: "Unknown session: session-a", errorCode: "UNKNOWN_SESSION" };
+      }
+      return {
+        ok: true,
+        result: { subscriptionId: "second-b", sessions: [], events: [], cursorTruncated: {} },
+        event: { subscriptionId: "second-b", event: { sessionId: "session-b", sequence: 0, type: "live" } }
+      };
+    });
+
+    await waitFor(() => received.b.some((event) => event.type === "live"));
+    assert.deepEqual(received.a, [
+      { type: "subscription_error", error: "Unknown session: session-a", errorCode: "UNKNOWN_SESSION" }
+    ]);
+    assert.deepEqual([...client.subscriptions.keys()], [kept.subscriptionId]);
+    assert.equal(client.reconnectAttempt, 0);
+  } finally {
+    client.close();
+    for (const fixture of [first, second]) {
+      if (!fixture) continue;
+      for (const socket of fixture.sockets) socket.destroy();
+      if (fixture.server.listening) {
+        fixture.server.close();
+        await once(fixture.server, "close");
+      }
+    }
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+// close() did not reach a connection still being made: it went on to connect,
+// the call it was made for was sent after the close, and the socket, which no
+// cleanup knew of, could keep the process alive.
+test("socket client close() during a connection in progress connects nothing, sends nothing, and rejects the call", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-close-"));
+  const socketPath = join(directory, "gateway.sock");
+  const received = [];
+  let fixture;
+  try {
+    fixture = await startSubscriptionServer(socketPath, 1, (request) => {
+      received.push(request.method);
+      return { ok: true, result: {} };
+    });
+    // Closed in the same turn as the call, while the socket path is checked.
+    const early = new GatewayRpcClient({ socketPath, token: "token", rootId: "main-a", autoStart: false });
+    const earlyCall = early.call("setup");
+    early.close();
+    await assert.rejects(earlyCall, /Gateway client is closed/);
+    // Closed once the daemon took the connection, while the client checks it.
+    const late = new GatewayRpcClient({ socketPath, token: "token", rootId: "main-a", autoStart: false });
+    fixture.server.once("connection", () => late.close());
+    await assert.rejects(late.call("setup"), /Gateway client is closed/);
+    await waitFor(() => fixture.sockets.size === 0);
+    assert.equal(late.socket, null);
+    assert.deepEqual(received, [], "nothing was sent after the close");
+  } finally {
+    if (fixture) {
+      for (const socket of fixture.sockets) socket.destroy();
+      if (fixture.server.listening) {
+        fixture.server.close();
+        await once(fixture.server, "close");
+      }
+    }
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("concurrent daemon starts leave exactly one owner for a socket and state file", async () => {
   const directory = await mkdtemp(join(tmpdir(), "acp-dmn-lock-"));
   const socketPath = join(directory, "gateway.sock");

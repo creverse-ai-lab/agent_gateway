@@ -110,6 +110,26 @@ test("a Worker file is read and written through the descriptor the check approve
   });
 });
 
+// What a write approved for a new file opens: one it creates, never a file
+// put at the path since the approval, whichever kind.
+test("an exclusive write only creates its file; anything already at the path fails the open and is left as it is", async () => {
+  await withLayout(async ({ root, options }) => {
+    const exclusive = { ...options, write: true, exclusive: true };
+    const created = await openWorkerFile(join(root, "d", "fresh.txt"), exclusive);
+    await created.writeFile("fresh", "utf8");
+    await created.close();
+    assert.equal(await readFile(join(root, "d", "fresh.txt"), "utf8"), "fresh");
+    await link(join(root, "a.txt"), join(root, "d", "linked.txt"));
+    await symlink(join(root, "a.txt"), join(root, "d", "live.txt"));
+    await symlink(join(root, "missing.txt"), join(root, "d", "dangling.txt"));
+    for (const name of ["fresh.txt", "linked.txt", "live.txt", "dangling.txt"]) {
+      await assert.rejects(openWorkerFile(join(root, "d", name), exclusive), { code: "EEXIST" }, name);
+    }
+    assert.equal(await readFile(join(root, "a.txt"), "utf8"), "inside\nsecond line");
+    assert.equal(existsSync(join(root, "missing.txt")), false, "nor is a dangling link's target created");
+  });
+});
+
 test("a symlink swapped in as the last component after the check is never followed", async () => {
   await withLayout(async ({ root, secret, options }) => {
     const target = join(root, "a.txt");

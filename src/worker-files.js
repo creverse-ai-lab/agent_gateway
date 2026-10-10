@@ -10,7 +10,7 @@ import { basename, dirname, isAbsolute, join, relative } from "node:path";
 // for it. So the file is opened once, the descriptor is what gets verified, and
 // every read and write goes through that descriptor.
 
-const { O_CREAT, O_DIRECTORY = 0, O_NOFOLLOW = 0, O_NONBLOCK = 0, O_RDONLY, O_WRONLY } = constants;
+const { O_CREAT, O_DIRECTORY = 0, O_EXCL, O_NOFOLLOW = 0, O_NONBLOCK = 0, O_RDONLY, O_WRONLY } = constants;
 // macOS 11 and later refuse a symbolic link anywhere in the path, not only as
 // its last component (sys/fcntl.h; Node does not export the constant). The path
 // opened is canonical, so it holds a link only when one was swapped in after
@@ -75,7 +75,10 @@ export function workerFilePathSync(requestedPath, { allowMissing = false } = {})
  * writing, verified to be the file the path check approved; the caller closes
  * it. A write creates a missing file (0o666 before the umask, as writeFile
  * always did) but truncates nothing: emptying the file is the caller's step,
- * after this check. Refused: a symbolic link as the last component (one that
+ * after this check. With exclusive, a write only creates the file: anything
+ * already at the path, a file, a link or a hard link to another file put there
+ * since the caller saw none, fails the open with EEXIST and is left as it is.
+ * Refused: a symbolic link as the last component (one that
  * dangles would otherwise create its target wherever it points), anything but
  * a regular file, and a path that no longer leads to the opened file.
  * A write never creates a file outside the checked directory on macOS (the open
@@ -100,6 +103,7 @@ export async function openWorkerFile(requestedPath, {
   protectedPaths,
   isProtectedFile = null,
   write = false,
+  exclusive = false,
   platform = process.platform,
   beforeOpen = null,
   afterOpen = null,
@@ -107,7 +111,7 @@ export async function openWorkerFile(requestedPath, {
 }) {
   const path = await checkedPath(requestedPath, { roots, protectedPaths, allowMissing: write });
   await beforeOpen?.(path);
-  const handle = await openNoFollow(path, write, platform, beforeCreate);
+  const handle = await openNoFollow(path, write, exclusive, platform, beforeCreate);
   try {
     await afterOpen?.(path);
     await verifyOpened(handle, requestedPath, path, { roots, protectedPaths, isProtectedFile, platform });
@@ -118,11 +122,11 @@ export async function openWorkerFile(requestedPath, {
   }
 }
 
-async function openNoFollow(path, write, platform, beforeCreate) {
+async function openNoFollow(path, write, exclusive, platform, beforeCreate) {
   // O_NONBLOCK: opening a FIFO would otherwise park a libuv thread until a
   // writer appears, and four of those stall every file operation of the
   // daemon. It changes nothing for a regular file.
-  const flags = (write ? O_WRONLY | O_CREAT : O_RDONLY)
+  const flags = (write ? O_WRONLY | O_CREAT | (exclusive ? O_EXCL : 0) : O_RDONLY)
     | (platform === "darwin" ? O_NOFOLLOW_ANY : O_NOFOLLOW)
     | O_NONBLOCK;
   try {

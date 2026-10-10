@@ -117,7 +117,11 @@ function deliverText(session, text, { budget, delivery, spill }) {
 
 // Spill once, then remember. A budgeted poll runs on every tick of a Main's
 // loop; writing a fresh artifact per call would leak one file per poll for the
-// same unchanged answer.
+// same unchanged answer. Remembered for that text only: the session store drops
+// the memo when the text changes, with every chunk a running turn appends, when
+// the turn is finalized and when the next one starts (sessions.js), so the
+// spill of a running turn's transcript is never handed out for later text, nor
+// as the finished answer.
 //
 // The memo is a field of its own rather than resultFinalArtifact: writing there
 // would make one caller's budgeted read change what the NEXT caller's default

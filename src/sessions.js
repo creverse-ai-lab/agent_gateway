@@ -202,6 +202,10 @@ export class SessionStore {
     const state = textAccumulators.get(session);
     state?.resultBuffer.append(text);
     state?.segmentBuffer.append(text);
+    // A budgeted read of the running turn spilled its text as it was then
+    // (response-profile.js): that file lacks this chunk, so it is no longer
+    // the text a read would hand out.
+    if (text) session.resultBudgetArtifact = null;
   }
 
   // A work boundary (tool_call start, permission, elicitation) closes the
@@ -333,6 +337,10 @@ export class SessionStore {
       session.resultFinalArtifact = capped.artifact;
       session.resultInspection = [...state.inspection];
     }
+    // What a budgeted read spilled before this point was the running turn's
+    // transcript, never this answer: a read of the finished turn spills the
+    // answer itself.
+    session.resultBudgetArtifact = null;
     return session.resultArtifact ?? null;
   }
 

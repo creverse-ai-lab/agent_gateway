@@ -18,6 +18,7 @@ import { GatewayRpcClient } from "../src/socket-rpc.js";
 import { daemonPaths, startDaemon, writeMockProviders } from "./helpers/daemon-harness.js";
 
 const mockAgent = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
+const raceAgent = fileURLToPath(new URL("./mock-race-agent.js", import.meta.url));
 const MAIN = { rootId: "main-a" };
 // The inherited current-profile byte counts for flows an old skill produces.
 // PR 5 intentionally added bounded Inbox metadata, so the gate freezes the
@@ -640,6 +641,73 @@ test("T8b: budgets use the complete artifact and never reuse a prior turn's spil
   }
 });
 
+// A budgeted or artifact read of a running turn spills its transcript so far.
+// That spill was remembered until the next turn started: a later read of the
+// same turn got the old text, and once the turn ended the final poll, run and
+// task_result handed it out as the answer, a fragment with nothing marking it
+// as one.
+test("T8c: a running turn's spill is dropped when its text grows and when the turn ends, never handed out as the answer", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-budget-live-"));
+  const service = new GatewayService({
+    createClient: (_provider, options) => new AcpClient(
+      {
+        provider: "mock",
+        command: process.execPath,
+        args: [raceAgent],
+        permissionPolicy: "read_only",
+        modelScope: "session",
+        env: { ACP_MOCK_HOLD: "prompt" }
+      },
+      options
+    ),
+    gcIntervalMs: 0,
+    artifactRoot: join(directory, "artifacts")
+  });
+  try {
+    const opened = await open(service);
+    const session = service.requireSession(opened.sessionId);
+    const emit = (update) => session.client.request("test/emit", { sessionId: session.acpSessionId, update });
+    const say = (text) => emit({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } });
+    const livePoll = (args) => service.call("poll", { sessionId: opened.sessionId, cursor: 0, includeResult: true, ...args }, MAIN);
+    const spilled = (result) => readFile(result.textArtifact.path, "utf8");
+    // The turn says "RACE " and holds its reply.
+    const started = await service.call(
+      "run", { sessionId: opened.sessionId, prompt: "one", waitMs: 0, resultDelivery: "artifact" }, MAIN
+    );
+    await until(() => session.resultText === "RACE ", "the first chunk");
+    const first = await livePoll({ resultDelivery: "artifact" });
+    assert.equal(await spilled(first.result), "RACE ");
+    assert.deepEqual((await livePoll({ resultDelivery: "artifact" })).result.textArtifact, first.result.textArtifact,
+      "the same text, the same spill");
+    await say("MORE");
+    await until(() => session.resultText === "RACE MORE", "the second chunk");
+    const grown = await livePoll({ resultBudgetBytes: 2 });
+    assert.equal(grown.result.text, "RA");
+    assert.equal(await spilled(grown.result), "RACE MORE");
+    // Work, then the answer: the transcript is all of it, the answer only the
+    // part after the work.
+    await emit({ sessionUpdate: "tool_call", toolCallId: "tool-1", title: "Read file", kind: "read" });
+    await say("ANSWER");
+    await until(() => session.resultText === "RACE MOREANSWER", "the answer chunk");
+    assert.equal(await spilled((await livePoll({ resultDelivery: "artifact" })).result), "RACE MOREANSWER");
+    await session.client.request("test/release", { hold: "prompt" });
+
+    const ran = await service.call("run", { taskId: started.taskId, waitMs: 15_000 }, MAIN);
+    assert.equal(ran.result.text, "");
+    assert.equal(ran.result.totalBytes, 6);
+    assert.equal(await spilled(ran.result), "ANSWER");
+    assert.deepEqual(await service.call("task_result", { taskId: started.taskId }, MAIN), ran);
+    const final = await service.call("poll", { sessionId: opened.sessionId, cursor: 0, resultDelivery: "artifact" }, MAIN);
+    assert.equal(await spilled(final.result), "ANSWER");
+    const budgeted = await service.call("poll", { sessionId: opened.sessionId, cursor: 0, resultBudgetBytes: 3 }, MAIN);
+    assert.equal(budgeted.result.text, "ANS");
+    assert.equal(await spilled(budgeted.result), "ANSWER");
+  } finally {
+    await service.shutdown().catch(() => {});
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("T9: setup summary and session_open carry exactly the bind-time facts", async () => {
   const service = new GatewayService({ createClient: mockClient("read_only"), gcIntervalMs: 0 });
   try {
@@ -930,6 +998,14 @@ async function waitForInboxCount(service, expected) {
     await new Promise((done) => setTimeout(done, 20));
   }
   throw new Error(`inbox did not reach ${expected} items`);
+}
+
+async function until(predicate, description) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    if (predicate()) return;
+    await new Promise((done) => setTimeout(done, 10));
+  }
+  throw new Error(`Timed out waiting for ${description}`);
 }
 
 async function waitForIdle(service, sessionId) {

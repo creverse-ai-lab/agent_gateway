@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { constants, existsSync, openSync, readFileSync, renameSync, statSync, symlinkSync } from "node:fs";
-import { mkdir, readdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdir, readdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -1503,5 +1503,184 @@ test("I10: stop() and a fatal error end the provider's whole process group, the 
         if (adapter && !processGone(adapter)) process.kill(adapter, "SIGKILL");
       }
     }
+  });
+});
+
+// ---------------------------------------------------------------- reused request ids
+
+// A Worker request under an id another of its requests was still pending under
+// replaced that one's operation while the inbox kept showing the first: Main
+// approved the command it was shown and another one ran. The reverse, a
+// permission request under the id of a pending terminal, waited for good. Now
+// the second is answered -32600 and the first keeps the id.
+const ALLOW_ONCE_OPTIONS = [
+  { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+  { optionId: "reject-once", name: "Reject", kind: "reject_once" }
+];
+
+test("a request under the id of a permission request Main is shown is refused -32600, and the approval runs only what Main saw", async () => {
+  await withTemp("acp-reused-id-", (directory) => withClient({ cwd: directory, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
+    const touched = join(directory, "touched");
+    const written = join(directory, "written");
+    const turn = run([
+      {
+        parallel: [
+          // Offered with the option ids a pending operation has, so Main's
+          // allow-once would be one of the operation's own too.
+          { permission: { kind: "execute", command: ["/bin/echo", "benign"], options: ALLOW_ONCE_OPTIONS, id: 77 } },
+          { terminal: { command: "/usr/bin/touch", args: [touched], id: 77 } },
+          // The id that reads the same in the other JSON type.
+          { write: { path: written, content: "x", id: "77" } }
+        ]
+      },
+      // The approval covers the command Main saw, once.
+      { terminal: { command: "/bin/echo", args: ["benign"] } }
+    ]);
+    const asked = await request(requests, 1);
+    assert.equal(asked.requestId, 77);
+    assert.equal(asked.toolCall.rawInput.command.join(" "), "/bin/echo benign");
+    await until(() => client.droppedFrames >= 2 || requests.length > 1, "the two requests under the same id");
+    assert.equal(requests.length, 1, "neither reached Main");
+    client.respondPermission(asked.requestId, "allow-once", sessionId);
+    const refused = "Invalid Request: id is in use by a pending request";
+    assert.deepEqual(await turn, [
+      ["allow-once", `terminal-error: ${refused}`, `write-error: ${refused}`],
+      { output: "benign\n", exitStatus: { exitCode: 0, signal: null } }
+    ]);
+    assert.equal(existsSync(touched), false, "the terminal under the reused id never ran");
+    assert.equal(existsSync(written), false);
+    assert.equal(requests.length, 1);
+    assert.match(client.stderr, /dropped a frame from mock: Invalid Request: id is in use by a pending request/);
+  }));
+});
+
+test("a permission request under the id of a terminal waiting for Main is refused -32600, and nothing is left waiting", async () => {
+  await withTemp("acp-reused-op-", (directory) => withClient({ cwd: directory, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
+    const turn = run([{
+      parallel: [
+        { terminal: { command: "/bin/echo", args: ["shown"], id: 88 } },
+        { permission: { kind: "execute", command: ["/bin/echo", "other"], options: ALLOW_ONCE_OPTIONS, id: 88 } }
+      ]
+    }]);
+    const asked = await request(requests, 1);
+    assert.equal(asked.toolCall.title, "Run: /bin/echo shown");
+    await until(() => client.droppedFrames >= 1 || requests.length > 1, "the permission request under the same id");
+    assert.equal(requests.length, 1, "the permission request never reached Main");
+    await client.respondPermission(asked.requestId, "allow-once", sessionId);
+    assert.deepEqual(await turn, [[
+      { output: "shown\n", exitStatus: { exitCode: 0, signal: null } },
+      "permission-error: Invalid Request: id is in use by a pending request"
+    ]]);
+    assert.deepEqual(client.pendingSessionInput(sessionId), { permissions: 0, elicitations: 0 });
+  }));
+});
+
+// ---------------------------------------------------------------- grant identity
+
+// An approval of an edit or an execute request held only the paths it named,
+// and the write or terminal that spent it took the identity of whatever was at
+// them by then: a file or directory put at the same path while Main decided was
+// written to, or run in, on an approval given for another. Each path is now
+// bound to what was at it when the request arrived.
+test("an edit approval covers each file only while its path still holds the file that was there, or still none", async () => {
+  await withTemp("acp-grant-file-", (directory) => withClient({ cwd: directory, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
+    const kept = join(directory, "kept.txt");
+    const notes = join(directory, "notes.txt");
+    const fresh = join(directory, "fresh.txt");
+    const important = join(directory, "important.txt");
+    await writeFile(kept, "KEPT");
+    await writeFile(notes, "NOTES");
+    await writeFile(important, "IMPORTANT");
+    const turn = run([
+      { permission: { kind: "edit", path: kept } },
+      { write: { path: kept, content: "EDITED" } },
+      { permission: { kind: "edit", path: notes } },
+      { write: { path: notes, content: "PWNED" } },
+      { permission: { kind: "edit", path: fresh } },
+      { write: { path: fresh, content: "PWNED" } }
+    ]);
+    // Unchanged: the approval covers the write.
+    client.respondPermission((await request(requests, 1)).requestId, "allow", sessionId);
+    // While Main decides, the Worker puts at the approved path a hard link to a
+    // file it was never approved to edit.
+    const replaced = await request(requests, 2);
+    await rm(notes);
+    await link(important, notes);
+    client.respondPermission(replaced.requestId, "allow", sessionId);
+    const notesAgain = await request(requests, 3);
+    assert.equal(notesAgain.toolCall.title, `Write ${notes} (5 bytes)`);
+    await client.respondPermission(notesAgain.requestId, "reject-once", sessionId);
+    // A new file approved, and a file put where there was none.
+    const created = await request(requests, 4);
+    await link(important, fresh);
+    client.respondPermission(created.requestId, "allow", sessionId);
+    const freshAgain = await request(requests, 5);
+    assert.equal(freshAgain.toolCall.title, `Write ${fresh} (5 bytes)`);
+    await client.respondPermission(freshAgain.requestId, "reject-once", sessionId);
+    assert.deepEqual(await turn, [
+      "allow", "write-ok",
+      "allow", "write-error: Main rejected ACP operation",
+      "allow", "write-error: Main rejected ACP operation"
+    ]);
+    assert.equal(await readFile(kept, "utf8"), "EDITED");
+    assert.equal(await readFile(important, "utf8"), "IMPORTANT", "the file behind the swapped-in links is untouched");
+  }));
+});
+
+test("an execute approval covers its cwd only while the directory there is the one that was there", async () => {
+  await withTemp("acp-grant-cwd-", async (directory) => {
+    const approved = join(directory, "approved");
+    await mkdir(approved);
+    await withClient({ cwd: directory, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
+      const turn = run([
+        { permission: { kind: "execute", command: [recordCwd.command, ...recordCwd.args], cwd: approved } },
+        { terminal: { ...recordCwd, cwd: approved } }
+      ]);
+      const asked = await request(requests, 1);
+      // The same canonical path, but not the directory Main was asked about.
+      await rename(approved, `${approved}.seen`);
+      await mkdir(approved);
+      client.respondPermission(asked.requestId, "allow", sessionId);
+      const again = await request(requests, 2);
+      assert.equal(again.toolCall.rawInput.cwd, approved);
+      await client.respondPermission(again.requestId, "reject-once", sessionId);
+      assert.deepEqual(await turn, ["allow", "terminal-error: Main rejected ACP operation"]);
+    });
+    assert.equal(existsSync(join(approved, "ran.txt")), false, "it never ran in the directory put there");
+  });
+});
+
+// A write that found no file at its path when it arrived was let through to
+// whatever was at the path when it opened, Main's approval or a grant in
+// between: a hard link put there meanwhile had another file emptied and
+// rewritten. Such a write now only creates its file.
+test("a write approved as a new file only creates it; a file put at its path meanwhile is never written", async () => {
+  await withTemp("acp-new-file-", async (directory) => {
+    const fresh = join(directory, "fresh.txt");
+    const granted = join(directory, "granted.txt");
+    const important = join(directory, "important.txt");
+    await writeFile(important, "IMPORTANT");
+    const changed = (path) => `write-error: Write target changed since it was approved: ${path}`;
+    // While Main decides.
+    await withClient({ cwd: directory, protectedPaths: [] }, async ({ client, sessionId, requests, run }) => {
+      const turn = run([{ write: { path: fresh, content: "PWNED" } }]);
+      const asked = await request(requests, 1);
+      assert.deepEqual(asked.toolCall.locations, [{ path: fresh }]);
+      await link(important, fresh);
+      await client.respondPermission(asked.requestId, "allow-once", sessionId);
+      assert.deepEqual(await turn, [changed(fresh)]);
+    });
+    // On an approval given before the write, between its check and its open.
+    const beforeWriteOpen = (path) => (path === granted ? link(important, granted) : undefined);
+    await withClient({ cwd: directory, protectedPaths: [], beforeWriteOpen }, async ({ client, sessionId, requests, run }) => {
+      const turn = run([
+        { permission: { kind: "edit", path: granted } },
+        { write: { path: granted, content: "PWNED" } }
+      ]);
+      client.respondPermission((await request(requests, 1)).requestId, "allow", sessionId);
+      assert.deepEqual(await turn, ["allow", changed(granted)]);
+      assert.equal(requests.length, 1, "the approval covered the write, and the open refused it");
+    });
+    assert.equal(await readFile(important, "utf8"), "IMPORTANT");
   });
 });

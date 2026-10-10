@@ -54,6 +54,13 @@ const GROUP_POLL_MS = 25;
 // (Codex runs its own commands) keeps; the oldest goes first, and a dropped one
 // only means Main is asked again.
 const MAX_GRANTS_PER_SESSION = 64;
+// Worker requests waiting for Main across every session of one provider
+// process: permissions, questions, and writes and terminals waiting for
+// approval. maxPendingRequestsPerSession bounds each session, and this bounds
+// the process, so a provider that spreads its requests over many sessions
+// cannot grow the maps (and the scans over them) without end either. Sixteen
+// sessions at the per-session default; a safety valve, not a knob.
+const MAX_PENDING_REQUESTS_PER_PROVIDER = 1024;
 
 // Lane C has no droppable traffic. Responses to agent-initiated requests and
 // cancels are HIGH because the agent is blocked on them, so a dropped frame is a
@@ -75,6 +82,7 @@ export class AcpClient {
     this.artifactStore = options.artifactStore ?? null;
     this.maxTerminalsPerSession = options.maxTerminalsPerSession ?? 16;
     this.maxPendingRequestsPerSession = options.maxPendingRequestsPerSession ?? 64;
+    this.maxPendingRequestsPerProvider = options.maxPendingRequestsPerProvider ?? MAX_PENDING_REQUESTS_PER_PROVIDER;
     this.maxInboxItemBytes = options.maxInboxItemBytes ?? 64 * 1024;
     // The per-session byte budget of what waits for Main. A write or terminal
     // waiting for approval holds its whole payload (a write can carry most of a
@@ -122,6 +130,10 @@ export class AcpClient {
     this.pendingPermissions = new Map();
     this.pendingElicitations = new Map();
     this.pendingOperations = new Map();
+    // The ids of the Worker's requests this client is still handling, from
+    // their arrival until their handler is done (#dispatch); with the three
+    // maps above, every id a Worker request is pending under (#requestIdInUse).
+    this.inboundRequests = new Set();
     // sessionId -> approvals Main gave a worker's execute or edit request, each
     // bound to the command or the files it named, until the turn ends.
     this.sessionOperationGrants = new Map();
@@ -446,7 +458,14 @@ export class AcpClient {
     this.sessionHandlers.set(sessionId, handler);
   }
 
+  // Its handler goes, and with it every way to tell Main about the session, so
+  // what still waits for Main there is answered now: a permission request as
+  // cancelled, a question as cancel, and an operation with an error. Kept, it
+  // would wait for an answer no one can give.
   clearSession(sessionId) {
+    for (const [rpcId, pending] of this.pendingPermissions) {
+      if (pending.params.sessionId === sessionId) this.respondPermission(rpcId, null);
+    }
     for (const [rpcId, pending] of this.pendingElicitations) {
       if (pending.params.sessionId === sessionId) {
         this.respondElicitation(rpcId, { action: "cancel" }, sessionId);
@@ -594,12 +613,24 @@ export class AcpClient {
     }
 
     if (message.method && hasId) {
+      // An id the Worker already has a request pending under is not a new
+      // request: it is answered -32600 and the pending one keeps the id. Taken
+      // as new, a terminal or write under the id of a permission request Main
+      // is looking at would take its place, and Main's approval of what it was
+      // shown would run the other one; or the second would wait for good.
+      if (this.#requestIdInUse(message.id)) {
+        const reused = "Invalid Request: id is in use by a pending request";
+        this.#noteDroppedFrame(reused);
+        this.#respondError(message.id, -32600, reused);
+        return;
+      }
+      this.inboundRequests.add(message.id);
       // Each handler answers its own failures; what can still reject is an
       // answer the transport would not take, whose failure tears the transport
       // down on its own. Unhandled, that rejection would end the daemon.
       this.#handleAgentRequest(message).catch((error) => {
         this.#noteDroppedFrame(`its ${message.method} request failed: ${error?.message ?? String(error)}`);
-      });
+      }).finally(() => this.inboundRequests.delete(message.id));
       return;
     }
     if (!message.method) this.#noteDroppedFrame("it is neither a request, a response nor a notification");
@@ -620,9 +651,23 @@ export class AcpClient {
     this.stderr = `${this.stderr}[acp-gateway] dropped a frame from ${this.config.provider}: ${reason}${more}\n`.slice(-STDERR_TAIL_CHARS);
   }
 
+  // Whether a Worker request is pending under id: one still being handled
+  // (inboundRequests, which covers an operation from its arrival to its end,
+  // the waits before it is registered included), or one waiting for Main. Also
+  // under the id that reads the same in the other JSON type, 7 for "7": Main
+  // answers by id, and the Gateway takes Main's "7" for a pending 7
+  // (GatewayService#workerRequestId), so the two would be taken for each other.
+  #requestIdInUse(id) {
+    return sameReadingIds(id).some((candidate) => this.inboundRequests.has(candidate)
+      || this.pendingPermissions.has(candidate)
+      || this.pendingElicitations.has(candidate)
+      || this.pendingOperations.has(candidate));
+  }
+
   async #handleAgentRequest({ id, method, params = {} }) {
     // Only the handlers that do unbounded I/O are counted. Permission and
-    // elicitation requests are already bounded by maxPendingRequestsPerSession.
+    // elicitation requests are already bounded by the pending-request limits
+    // (#requirePendingInputCapacity).
     const bounded = CLIENT_REQUEST_PREFIXES.some((prefix) => method?.startsWith(prefix));
     if (bounded && !this.#admitClientRequest(params.sessionId)) {
       this.#respondError(
@@ -797,7 +842,11 @@ export class AcpClient {
   // The approval a worker's execute or edit permission request would become:
   // the command it names, or the files, in the form a later terminal/create or
   // fs/write_text_file is compared in. Null when it names none, and then
-  // approving it lets nothing through on its own.
+  // approving it lets nothing through on its own. Taken when the request
+  // arrives, from what is on disk then, which is what Main is asked about: a
+  // path names a file or directory only until another is put there, so each
+  // one is bound to what was at it then by device and inode, and a write or
+  // terminal that finds something else there is asked about anew.
   #grantFor(params) {
     const kind = grantKindForTool(params.toolCall?.kind);
     if (kind === "terminal") {
@@ -808,16 +857,25 @@ export class AcpClient {
       // Bound to the cwd and the whole env Main approved, not the command alone:
       // the same argv in another directory, or with any variable added, removed
       // or changed (PATH, PYTHONPATH, one the command interpolates), may run
-      // something Main did not see, so it is asked anew.
+      // something Main did not see, so it is asked anew. The cwd is the
+      // directory at that path now, as for a terminal waiting for Main
+      // (#requireApprovedCwd): another one put at the same path is another
+      // directory, and a cwd with no directory at it covers no terminal.
       const roots = this.sessionRoots.get(params.sessionId) ?? [];
-      return { kind, command, cwd: grantCwd(params.toolCall?.rawInput?.cwd, roots), env: envMap(params.toolCall?.rawInput?.env) };
+      const cwd = grantCwd(params.toolCall?.rawInput?.cwd, roots);
+      return { kind, command, cwd, cwdIdentity: directoryIdentity(cwd), env: envMap(params.toolCall?.rawInput?.env) };
     }
     if (kind === "write") {
       // A relative path goes on the root as written, as #permissionScope reads
       // it: join() would fold a ".." away before the realpath could follow the
-      // link in front of it, which the write it covers does follow.
+      // link in front of it, which the write it covers does follow. Each file
+      // with the one at its path now, the way the write records its target
+      // (#writeOperation), or null when there is none yet.
       const root = this.sessionRoots.get(params.sessionId)?.[0] ?? "";
-      const paths = new Set(requestedPaths(params.toolCall).map((path) => grantPath(isAbsolute(path) ? path : `${root}/${path}`)));
+      const paths = new Map(requestedPaths(params.toolCall).map((requested) => {
+        const path = grantPath(isAbsolute(requested) ? requested : `${root}/${requested}`);
+        return [path, fileIdentity(path)];
+      }));
       return paths.size ? { kind, paths } : null;
     }
     return null;
@@ -890,7 +948,18 @@ export class AcpClient {
       throw new Error(`Write target changed since it was approved: ${approvedPath}`);
     }
     await this.beforeWriteOpen?.(approvedPath);
-    const handle = await this.#openWorkerFile(params.sessionId, approvedPath, true);
+    let handle;
+    try {
+      // A path with no file at it when Main saw it is approved for a new file
+      // only: the open creates one or fails, so a file put at the path since,
+      // a hard link to another one included, is never opened, let alone emptied.
+      handle = await this.#openWorkerFile(params.sessionId, approvedPath, { write: true, exclusive: !approvedTarget });
+    } catch (error) {
+      if (!approvedTarget && error?.code === "EEXIST") {
+        throw new Error(`Write target changed since it was approved: ${approvedPath}`);
+      }
+      throw error;
+    }
     try {
       if (approvedTarget) {
         // A target that already existed when Main saw it must still be the same
@@ -1159,17 +1228,18 @@ export class AcpClient {
   }
 
   // The file a Worker's fs/ request names, opened once and verified
-  // (worker-files.js); a write creates it when missing. An artifact is refused
-  // by inode under any name: it sits deeper in the protected directory than the
-  // inode check looks, so a hard link a Worker made to one would pass that
-  // check (ArtifactStore#isArtifact).
-  #openWorkerFile(sessionId, requestedPath, write = false) {
+  // (worker-files.js); a write creates it when missing, and with exclusive only
+  // creates it. An artifact is refused by inode under any name: it sits deeper
+  // in the protected directory than the inode check looks, so a hard link a
+  // Worker made to one would pass that check (ArtifactStore#isArtifact).
+  #openWorkerFile(sessionId, requestedPath, { write = false, exclusive = false } = {}) {
     const artifacts = this.artifactStore;
     return openWorkerFile(requestedPath, {
       roots: this.sessionRoots.get(sessionId) ?? [],
       protectedPaths: this.protectedPaths,
       isProtectedFile: typeof artifacts?.isArtifact === "function" ? (info) => artifacts.isArtifact(info) : null,
-      write
+      write,
+      exclusive
     });
   }
 
@@ -1237,14 +1307,9 @@ export class AcpClient {
     });
     // The inode of the target as it is now, when Main is shown this path, so the
     // write can tell an unchanged file apart from one swapped onto the path
-    // later. A path with nothing at it yet (a new file) binds to the path alone.
-    let target = null;
-    try {
-      const info = statSync(path, { bigint: true });
-      if (info.isFile()) target = { dev: info.dev, ino: info.ino };
-    } catch {
-      // No pre-existing target.
-    }
+    // later. A path with nothing at it yet is a new file, which the write may
+    // only create (#writeTextFile).
+    const target = fileIdentity(path);
     const contentBytes = Buffer.byteLength(String(params.content ?? ""), "utf8");
     return {
       kind: "write",
@@ -1344,18 +1409,25 @@ export class AcpClient {
     const grants = this.sessionOperationGrants.get(sessionId);
     const index = grants?.findIndex((grant) => {
       if (grant.kind !== operation.kind) return false;
-      if (operation.kind === "write") return grant.paths.has(operation.path);
+      // A write to an approved path whose file is still the one that was there
+      // when Main was asked (operation.target, which the write is then held
+      // to), or still none: not a file put at the path since, a hard link to
+      // another file included, nor one created where there was none.
+      if (operation.kind === "write") {
+        return grant.paths.has(operation.path) && sameIdentity(grant.paths.get(operation.path), operation.target);
+      }
       // A terminal grant covers the operation only with the same command form
       // (a literal argv never matches a shell script, nor a login shell a
-      // non-login one), the same cwd, and the same explicit env, every name and
-      // every value. No list of the variables that make a program load code is
-      // complete (PYTHONPATH, RUBYOPT, a git config, a shell's startup file, and
-      // whatever a tool reads next), so a variable added, removed or changed is
-      // asked about anew, whichever it is. A command using dynamic expansion is
-      // never bound, so it never matches.
+      // non-login one), the same cwd, still the same directory, and the same
+      // explicit env, every name and every value. No list of the variables that
+      // make a program load code is complete (PYTHONPATH, RUBYOPT, a git config,
+      // a shell's startup file, and whatever a tool reads next), so a variable
+      // added, removed or changed is asked about anew, whichever it is. A
+      // command using dynamic expansion is never bound, so it never matches.
       if (usesDynamicExpansion(operation.command.text)) return false;
       return sameCommand(grant.command, operation.command)
         && grant.cwd === operation.cwd
+        && sameIdentity(grant.cwdIdentity, operation.cwdIdentity)
         && sameEnv(grant.env, operation.env);
     }) ?? -1;
     if (index === -1) return false;
@@ -1366,10 +1438,22 @@ export class AcpClient {
     return true;
   }
 
+  // Room for one more request to wait for Main: in a session this client
+  // serves, within that session's limit and the provider's. Every request that
+  // waits for Main passes here right before it is kept. A session with no
+  // handler, one never opened here or already cleared, has no Main to tell
+  // (#announcePending), so its request would wait for an answer that cannot
+  // come, and is refused instead; the session id a request names is the
+  // Worker's to choose, so a limit per session alone bounds nothing.
   #requirePendingInputCapacity(sessionId) {
+    if (!this.sessionHandlers.has(sessionId)) throw new Error(`Unknown ACP session: ${sessionId}`);
     const pending = this.pendingSessionInput(sessionId);
     if (pending.permissions + pending.elicitations >= this.maxPendingRequestsPerSession) {
       throw new Error(`ACP session pending request limit exceeded: ${this.maxPendingRequestsPerSession}`);
+    }
+    const held = this.pendingPermissions.size + this.pendingElicitations.size + this.pendingOperations.size;
+    if (held >= this.maxPendingRequestsPerProvider) {
+      throw new Error(`ACP provider pending request limit exceeded: ${this.maxPendingRequestsPerProvider}`);
     }
   }
 
@@ -1591,6 +1675,14 @@ function isJsonObject(value) {
 // would be answered as null.
 function isRequestId(value) {
   return typeof value === "string" || Number.isFinite(value);
+}
+
+// A request id (isRequestId) and the id that reads the same in the other JSON
+// type, when there is one: 7 and "7", "7" and 7, but "07" alone.
+function sameReadingIds(id) {
+  if (typeof id === "number") return [id, String(id)];
+  const number = Number(id);
+  return Number.isFinite(number) && String(number) === id ? [id, number] : [id];
 }
 
 // The message keeps its historical "ACP error <code>: <message>" text. What is new
@@ -1829,6 +1921,35 @@ function grantCwd(rawCwd, roots) {
   } catch {
     return resolve(base);
   }
+}
+
+// The regular file at a canonical path by device and inode, or null when there
+// is none: what a write is held to besides its path (#writeTextFile), and an
+// approved edit with it (#grantFor).
+function fileIdentity(path) {
+  try {
+    const info = statSync(path, { bigint: true });
+    return info.isFile() ? { dev: info.dev, ino: info.ino } : null;
+  } catch {
+    return null;
+  }
+}
+
+// The directory at a canonical path by device and inode, or null when there is
+// none: what an approved command's cwd is held to (#grantFor), the way a
+// terminal is held to its cwd (#terminalOperation).
+function directoryIdentity(path) {
+  try {
+    const info = statSync(path, { bigint: true });
+    return info.isDirectory() ? { dev: info.dev, ino: info.ino } : null;
+  } catch {
+    return null;
+  }
+}
+
+// Two of those that are the same file or directory, or both nothing.
+function sameIdentity(a, b) {
+  return a === null || b === null ? a === b : a.dev === b.dev && a.ino === b.ino;
 }
 
 // Env vars that change which program runs or make it load or run other code,

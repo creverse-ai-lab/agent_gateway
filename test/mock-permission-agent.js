@@ -25,6 +25,11 @@ import { createInterface } from "node:readline";
 //                                           pad: an unused field of N bytes
 //     {"write": {"path", "content" | "bytes", "pad"?}} -> "write-ok" | "write-error: <message>"
 //     {"parallel": [step, ...]}             -> the steps at once, their outcomes
+//   A permission, terminal or write step may name the JSON-RPC id its request
+//   goes out under ("id"), one another request is still waiting under
+//   included; an answer to a reused id goes to the newest request waiting under
+//   it. A permission request answered with an error reports
+//   "permission-error: <message>".
 // ACP_MOCK_PARAMS_LOG records every session/new|resume params object.
 // ACP_MOCK_ENV_LOG receives the environment this worker was started with.
 // ACP_MOCK_IGNORE_SIGTERM=1 makes this worker ignore SIGTERM and stay up after
@@ -44,10 +49,10 @@ function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
 }
 
-function request(method, params) {
-  const id = nextId++;
+// pending: id -> the resolvers of the requests waiting under it, newest last.
+function request(method, params, id = nextId++) {
   send({ jsonrpc: "2.0", id, method, params });
-  return new Promise((resolve) => pending.set(id, resolve));
+  return new Promise((resolve) => pending.set(id, [...(pending.get(id) ?? []), resolve]));
 }
 
 async function askPermission(sessionId, permission) {
@@ -70,7 +75,8 @@ async function askPermission(sessionId, permission) {
       { optionId: "allow", name: "Allow", kind: "allow_once" },
       { optionId: "reject", name: "Reject", kind: "reject_once" }
     ]
-  });
+  }, permission.id);
+  if (response.error) return `permission-error: ${response.error.message}`;
   const outcome = response.result?.outcome;
   return outcome?.outcome === "selected" ? outcome.optionId : "cancelled";
 }
@@ -86,7 +92,7 @@ async function runStep(sessionId, step) {
       content,
       // An unused field the Gateway ignores but the pending closure would retain.
       ...(step.write.pad ? { pad: "p".repeat(step.write.pad) } : {})
-    });
+    }, step.write.id);
     return response.error ? `write-error: ${response.error.message}` : "write-ok";
   }
   if (step.terminal) {
@@ -98,7 +104,7 @@ async function runStep(sessionId, step) {
       ...(step.terminal.env ? { env: step.terminal.env } : {}),
       ...(step.terminal.outputByteLimit !== undefined ? { outputByteLimit: step.terminal.outputByteLimit } : {}),
       ...(step.terminal.pad ? { pad: "p".repeat(step.terminal.pad) } : {})
-    });
+    }, step.terminal.id);
     if (created.error) return `terminal-error: ${created.error.message}`;
     const { terminalId } = created.result;
     if (step.terminal.hold) return "terminal-held";
@@ -118,8 +124,10 @@ async function runStep(sessionId, step) {
 rl.on("line", async (line) => {
   const message = JSON.parse(line);
   if (Object.hasOwn(message, "id") && (Object.hasOwn(message, "result") || message.error)) {
-    pending.get(message.id)?.(message);
-    pending.delete(message.id);
+    const waiting = pending.get(message.id) ?? [];
+    const resolve = waiting.pop();
+    if (!waiting.length) pending.delete(message.id);
+    resolve?.(message);
     return;
   }
   if (message.method === "initialize") {

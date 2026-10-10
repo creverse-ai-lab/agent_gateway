@@ -166,7 +166,7 @@ export class GatewayRpcClient {
   }
 
   async connect({ autoStart = this.autoStart } = {}) {
-    if (this.closed) throw new Error("Gateway client is closed");
+    this.#requireOpen();
     if (this.socket && !this.socket.destroyed) return;
     if (this.connecting) {
       // Joining is safe unless this caller may start a daemon and the attempt in
@@ -185,6 +185,10 @@ export class GatewayRpcClient {
     return this.connecting;
   }
 
+  // A close() that runs while this waits ends it: each step after an await
+  // first checks the client is still open (#requireOpen), so the attempt
+  // rejects with "Gateway client is closed", as do the calls waiting on it, and
+  // no daemon is started for it.
   async #connectAndRestore(autoStart = this.autoStart) {
     try {
       await this.#connectOnce();
@@ -192,24 +196,37 @@ export class GatewayRpcClient {
       // Someone else's file at the path, or a path too long for a socket, is
       // reported as such (SOCKET_PATH_REFUSALS).
       if (SOCKET_PATH_REFUSALS.has(error?.code)) throw error;
+      this.#requireOpen();
       if (!autoStart || !["ENOENT", "ECONNREFUSED"].includes(error?.code)) throw recoveryError(error, this.statePath);
       this.#startDaemon();
       let lastError = error;
       for (let attempt = 0; attempt < 40; attempt += 1) {
         await new Promise((done) => setTimeout(done, 50));
+        this.#requireOpen();
         try {
           await this.#connectOnce();
           lastError = null;
           break;
         } catch (retryError) {
           if (SOCKET_PATH_REFUSALS.has(retryError?.code)) throw retryError;
+          this.#requireOpen();
           lastError = retryError;
         }
       }
       if (lastError) throw recoveryError(lastError, this.statePath);
     }
     await this.#restoreSubscriptions();
+    this.#requireOpen();
     this.reconnectAttempt = 0;
+  }
+
+  #requireOpen() {
+    if (this.closed) throw new Error("Gateway client is closed");
+  }
+
+  // Whether socket is still this client's live connection.
+  #connectedTo(socket) {
+    return !this.closed && socket != null && this.socket === socket && !socket.destroyed && this.channel != null;
   }
 
   // Every request carries the token, so nothing is written to a socket before it
@@ -224,9 +241,13 @@ export class GatewayRpcClient {
   // check with ENOENT, as a missing socket fails the connect: no daemon either
   // way, so a shutdown is alreadyStopped and any other call may start one. A
   // canonical path too long for a socket fails it with SOCKET_PATH_TOO_LONG,
-  // before the connect Node would make to that path cut short.
+  // before the connect Node would make to that path cut short. A client closed
+  // during any of these awaits connects nothing: a socket it connected
+  // meanwhile is destroyed unused, so nothing is sent on it and it cannot keep
+  // the process alive.
   async #connectOnce() {
     const socketPath = await requireTrustedSocket(this.socketPath);
+    this.#requireOpen();
     const socket = await new Promise((resolve, reject) => {
       const candidate = createConnection(socketPath);
       const onError = (error) => {
@@ -242,7 +263,9 @@ export class GatewayRpcClient {
     const drop = () => socket.destroy();
     socket.on("error", drop);
     try {
+      this.#requireOpen();
       await requireOwnSocket(socketPath, { allowMissing: false });
+      this.#requireOpen();
     } catch (error) {
       socket.destroy();
       throw error;
@@ -325,8 +348,16 @@ export class GatewayRpcClient {
     });
   }
 
+  // Each subscription on its own. One the daemon refuses again (its session is
+  // gone or no longer this Main's, or no answer came in time) ends alone, the
+  // way a subscription_error ends one, and the rest are still restored: before,
+  // the first refusal left every later one without events, on a socket that
+  // reads as connected, so no reconnect ever came back for them. A connection
+  // lost (or a client closed) meanwhile stops here instead: what is left is
+  // restored on the next connect.
   async #restoreSubscriptions() {
     this.serverSubscriptions.clear();
+    const socket = this.socket;
     for (const record of this.subscriptions.values()) {
       const cursors = { ...(record.args.cursors ?? {}), ...record.cursors };
       // The replay does the real repair work: rewinding to the gap floor asks the
@@ -346,7 +377,14 @@ export class GatewayRpcClient {
         // at-least-once is the right trade against losing them silently.
         record.cursors[sessionId] = rewound;
       }
-      const result = await this.#requestConnected("subscribe", { ...record.args, cursors }, record.timeoutMs);
+      let result;
+      try {
+        result = await this.#requestConnected("subscribe", { ...record.args, cursors }, record.timeoutMs);
+      } catch (error) {
+        if (!this.#connectedTo(socket)) throw error;
+        this.#failSubscription(record, error.message, error.code);
+        continue;
+      }
       // Cleared only once the resubscribe carrying it succeeded.
       record.gapFloor = {};
       record.serverId = result.subscriptionId;
@@ -494,10 +532,12 @@ export class GatewayRpcClient {
     }
   }
 
-  #failSubscription(record, error) {
+  // errorCode, when the daemon gave one: a refused resubscribe carries it
+  // (#restoreSubscriptions), a subscription_error frame does not.
+  #failSubscription(record, error, errorCode = null) {
     this.serverSubscriptions.delete(record.serverId);
     this.subscriptions.delete(record.stableId);
-    record.onEvent({ type: "subscription_error", error });
+    record.onEvent({ type: "subscription_error", error, ...(errorCode ? { errorCode } : {}) });
   }
 
   #disconnect(error, socket) {
