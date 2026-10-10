@@ -56,12 +56,17 @@ export function harness(options = {}) {
   return { service, clock };
 }
 
-export async function until(predicate, description) {
-  for (let attempt = 0; attempt < 500; attempt += 1) {
-    if (predicate()) return;
+// Waits until predicate holds, checking it on every turn of the event loop,
+// for up to timeoutMs of wall time. A time budget, not a count of turns: a turn
+// costs next to nothing, so on a loaded machine 500 of them could pass before
+// the work they waited on (a provider start, a restore's file system calls on
+// the thread pool) was done.
+export async function until(predicate, description, timeoutMs = 10_000) {
+  const deadline = performance.now() + timeoutMs;
+  while (!predicate()) {
+    if (performance.now() > deadline) throw new Error(`Timed out waiting for ${description}`);
     await new Promise((resolve) => setImmediate(resolve));
   }
-  throw new Error(`Timed out waiting for ${description}`);
 }
 
 // Starts a run and returns at once (waitMs 0 is a handoff, never a delivery).
