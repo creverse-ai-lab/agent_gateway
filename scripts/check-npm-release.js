@@ -12,7 +12,7 @@
 //   checks out whatever the tag points at when it runs, which is not
 //   GITHUB_SHA if the tag was moved after the dispatch.
 //
-// Usage (the workflow sets the environment): VERSION=1.8.0 node scripts/check-npm-release.js
+// Usage (the workflow sets the environment): VERSION=1.9.0 node scripts/check-npm-release.js
 // GITHUB_REF and GITHUB_SHA come from GitHub Actions.
 
 import { spawnSync } from "node:child_process";
