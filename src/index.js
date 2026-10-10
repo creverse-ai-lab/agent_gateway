@@ -174,16 +174,27 @@ server.setRequestHandler(CancelTaskRequestSchema, async (request, extra) => {
   return record;
 });
 
-const stop = () => {
+// One way out, however the host goes: its stdin ends (the stdio transport does
+// not report that itself), the MCP connection closes, or a signal. Each closes
+// both Gateway connections, this front door's and the task follower's, and the
+// transport, which lets go of stdin, so nothing is left to keep the process up
+// and it exits. The daemon then sees every connection that named this Main
+// close: main_list reports the Main gone, and another Main may adopt its
+// sessions. The end of stdin used to close the follower alone, and the other
+// connection kept the process, and the Main, alive.
+let stopping = false;
+function stop() {
+  if (stopping) return;
+  stopping = true;
   taskFollower.close();
   rpc.close();
-};
+  // Its onclose is this function, which has already run.
+  void server.close().catch(() => {});
+}
 process.once("SIGTERM", stop);
 process.once("SIGINT", stop);
-// The client is gone once its stdin ends (the stdio transport does not report
-// that itself): nothing it created is followed for it any more.
-process.stdin.once("end", () => taskFollower.close());
-server.onclose = () => taskFollower.close();
+process.stdin.once("end", stop);
+server.onclose = stop;
 await server.connect(new StdioServerTransport());
 
 // agent_acp_run, in two rpc calls on purpose. The first one only admits the work

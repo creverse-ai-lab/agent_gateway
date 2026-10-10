@@ -284,16 +284,16 @@ test("a restart before the prompt reached the worker reports not_started, and of
       // task exists while nothing has been sent to the worker.
       let release;
       before.factory.restoreGate = new Promise((resolve) => { release = resolve; });
-      const pending = before.service.call("task_prompt", { sessionId, prompt: "go" }, MAIN);
+      // The handle comes back before the resume (taskPrompt).
+      ({ taskId } = await before.service.call("task_prompt", { sessionId, prompt: "go" }, MAIN));
       await until(() => before.factory.restores.length === 1, "resume in flight");
-      taskId = [...before.service.taskStore.records.values()][0].taskId;
       assert.equal(before.service.taskStore.find(taskId).promptDispatchedAt, undefined);
       // The crash point: the log as a killed daemon would leave it.
       await before.service.flushPersist();
       wal = await readFile(paths.wal);
       before.factory.restoreError = new Error("gone");
       release();
-      await assert.rejects(pending, /gone/);
+      assert.match((await before.service.call("task_result", { taskId }, MAIN)).error, /gone/);
     } finally {
       await before.service.shutdown();
     }
@@ -1044,8 +1044,12 @@ test("a failed resume never opens a fresh session in its place", async () => {
     factory.restoreError = new GatewayError(ERROR_CODES.ACP_ERROR, "Resource not found");
 
     await assert.rejects(service.call("prompt", { sessionId: session.id, prompt: "go" }, MAIN), /Resource not found/);
-    await assert.rejects(service.call("task_prompt", { sessionId: session.id, prompt: "go" }, MAIN), /Resource not found/);
-    await assert.rejects(service.call("run", { sessionId: session.id, prompt: "go", waitMs: 0 }, MAIN), /Resource not found/);
+    // A task_prompt or run gets its handle before the resume, and the resume's
+    // failure is that task's outcome.
+    for (const method of ["task_prompt", "run"]) {
+      const { taskId } = await service.call(method, { sessionId: session.id, prompt: "go", waitMs: 0 }, MAIN);
+      assert.match((await service.call("task_result", { taskId }, MAIN)).error, /Resource not found/);
+    }
     // Each attempt tried to resume the same ACP session, and only that.
     assert.deepEqual(factory.restores, ["session/resume", "session/resume", "session/resume"]);
     assert.equal(factory.opened, 1, "no session/new behind Main's back");
@@ -1119,4 +1123,114 @@ test("generation, lastRestore and the known capabilities survive a restart; pre-
       await old.service.shutdown();
     }
   });
+});
+
+// ------------------------------------------------ run admission and the restore
+
+// 1.9.0: a run on a session that had to be restored first answered only once
+// the restore was done and its prompt sent. A restore may take a provider start
+// and a session/resume of up to 30 s each, more than the 30 s the front door
+// gives the call: Main got an error and no handle, while the task, durable
+// already, went on and ran. Now the handle comes back before the restore.
+test("a run on a session that must be restored gets its handle before the restore, however long that takes", async () => {
+  const { service, factory } = harness();
+  try {
+    const { session } = await open(service);
+    assert.equal(await service.unloadSession(session), true);
+    // A malformed argument is still the call's error, before any handle or restore.
+    await assert.rejects(service.call("run", { sessionId: session.id, prompt: "go", model: 42, waitMs: 0 }, MAIN),
+      { code: "INVALID_ARGUMENT" });
+    assert.deepEqual([service.taskStore.records.size, factory.restores.length], [0, 0]);
+    let release;
+    factory.restoreGate = new Promise((resolve) => { release = resolve; });
+    let prompts = 0;
+    factory.onPrompt = () => { prompts += 1; };
+    const ack = await service.call("run", { sessionId: session.id, prompt: "go", waitMs: 0 }, MAIN);
+    assert.deepEqual([ack.ok, ack.status, ack.sessionId], [true, "working", session.id]);
+    // The restore goes on without the caller, and stays held here.
+    await until(() => factory.restores.length === 1, "the resume under way");
+    const handed = service.taskStore.find(ack.taskId);
+    assert.deepEqual([handed.status, handed.statusMessage, handed.turnId, handed.promptDispatchedAt],
+      ["working", "Prompt accepted", null, undefined]);
+    assert.equal(prompts, 0, "nothing has reached the worker");
+    // Meanwhile the session is taken, as by a running turn.
+    await assert.rejects(service.call("run", { sessionId: session.id, prompt: "again", waitMs: 0 }, MAIN), { code: "SESSION_ACTIVE" });
+
+    release();
+    await until(() => prompts === 1, "the prompt, once restored");
+    const running = await service.call("task_get", { taskId: ack.taskId }, MAIN);
+    assert.deepEqual([running.status, running.statusMessage, running.turnId], ["working", "Prompt running", session.turnId]);
+    assert.ok(service.taskStore.find(ack.taskId).promptDispatchedAt);
+    session.client.turns.at(-1).resolve({ stopReason: "end_turn" });
+    const done = await service.call("run", { taskId: ack.taskId, waitMs: 5_000 }, MAIN);
+    assert.deepEqual([done.ok, done.status, done.turnId], [true, "idle", session.turnId]);
+  } finally {
+    await service.shutdown().catch(() => {});
+  }
+});
+
+test("a restore that fails after the handle went back is that task's failure, durably, and the worker hears nothing", async () => {
+  await withDirectory(async (directory) => {
+    const statePath = join(directory, "state.json");
+    const artifactRoot = join(directory, "artifacts");
+    let taskId;
+    let failure;
+    const before = harness({ statePath, artifactRoot });
+    try {
+      await before.service.init();
+      const { session } = await open(before.service);
+      assert.equal(await before.service.unloadSession(session), true);
+      let prompts = 0;
+      before.factory.onPrompt = () => { prompts += 1; };
+      before.factory.restoreError = new GatewayError(ERROR_CODES.ACP_ERROR, "Resource not found", { acpCode: -32002 });
+      // An MCP Task, created as the front door creates one.
+      ({ taskId } = await before.service.call("task_run", { sessionId: session.id, prompt: "go" }, MAIN));
+      failure = await before.service.call("task_result", { taskId }, MAIN);
+      assert.deepEqual(failure, {
+        ok: false, sessionId: session.id, turnId: null, taskId, status: "unavailable",
+        error: "Resource not found", errorCode: "ACP_ERROR", details: { acpCode: -32002 }
+      });
+      assert.equal(prompts, 0);
+      assert.equal(session._reserved ?? null, null, "the session is free again");
+    } finally {
+      await before.service.shutdown();
+    }
+    // Committed before anyone could read it: a restart reads the same failure,
+    // not one of its own.
+    const after = harness({ statePath, artifactRoot });
+    try {
+      await after.service.init();
+      assert.deepEqual(await after.service.call("task_result", { taskId }, MAIN), failure);
+    } finally {
+      await after.service.shutdown();
+    }
+  });
+});
+
+test("a task cancelled while its session is being restored is cancelled at once, and its prompt is never sent", async () => {
+  const { service, factory } = harness();
+  try {
+    const { session } = await open(service);
+    assert.equal(await service.unloadSession(session), true);
+    let release;
+    factory.restoreGate = new Promise((resolve) => { release = resolve; });
+    let prompts = 0;
+    factory.onPrompt = () => { prompts += 1; };
+    const created = await service.call("task_run", { sessionId: session.id, prompt: "go" }, MAIN);
+    // Answered while the restore still holds the session's mailbox.
+    const cancelled = await service.call("task_cancel", { taskId: created.taskId }, MAIN);
+    assert.deepEqual([cancelled.status, cancelled.statusMessage], ["cancelled", "Task cancelled by Main"]);
+    assert.deepEqual(await service.call("task_result", { taskId: created.taskId }, MAIN), {
+      ok: true, taskId: created.taskId, sessionId: session.id, turnId: null, status: "cancelled"
+    });
+    release();
+    await until(() => session.status === "idle" && !session._reserved, "the restore to end");
+    assert.equal(prompts, 0, "the cancelled run never reached the worker");
+    // The session is restored and free for the next run.
+    const next = await service.call("run", { sessionId: session.id, prompt: "next", waitMs: 0 }, MAIN);
+    assert.equal(prompts, 1);
+    assert.deepEqual([next.status, service.taskStore.find(next.taskId).statusMessage], ["working", "Prompt running"]);
+  } finally {
+    await service.shutdown().catch(() => {});
+  }
 });

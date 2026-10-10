@@ -1,9 +1,10 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { realpathSync, statSync } from "node:fs";
 import { readlink, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { BoundedUtf8Text, readTextHead, readTextLines } from "./bounded-utf8.js";
+import { BoundedUtf8Text, readTextHead, readTextLines, trimIncompleteUtf8 } from "./bounded-utf8.js";
 import { workerEnv } from "./caller.js";
 import { ERROR_CODES, GatewayError } from "./errors.js";
 import { readNdjson } from "./ndjson.js";
@@ -54,6 +55,15 @@ const GROUP_POLL_MS = 25;
 // (Codex runs its own commands) keeps; the oldest goes first, and a dropped one
 // only means Main is asked again.
 const MAX_GRANTS_PER_SESSION = 64;
+// The diffs of one file an approval is bound to, at most: past it the approval
+// covers no content of that file and its write is asked about. A safety valve
+// on the work a write's check can cost, not a knob (approvedContent).
+const MAX_DIFFS_PER_FILE = 64;
+// How much of a write's content Main is shown while the write waits for it, in
+// bytes of whole characters: small enough that the operation Main is shown
+// stays inline in the event and the inbox row (the Gateway spills a tool call
+// over 4,000 bytes of JSON to an artifact), the sha256 standing for the rest.
+const WRITE_PREVIEW_BYTES = 2048;
 // Worker requests waiting for Main across every session of one provider
 // process: permissions, questions, and writes and terminals waiting for
 // approval. maxPendingRequestsPerSession bounds each session, and this bounds
@@ -870,7 +880,9 @@ export class AcpClient {
   // arrives, from what is on disk then, which is what Main is asked about: a
   // path names a file or directory only until another is put there, so each
   // one is bound to what was at it then by device and inode, and a write or
-  // terminal that finds something else there is asked about anew.
+  // terminal that finds something else there is asked about anew. A file the
+  // request also shows Main diffs of is bound to them as well: its write must
+  // make it what they make it (#consumeGrant).
   #grantFor(params) {
     const kind = grantKindForTool(params.toolCall?.kind);
     if (kind === "terminal") {
@@ -894,11 +906,19 @@ export class AcpClient {
       // it: join() would fold a ".." away before the realpath could follow the
       // link in front of it, which the write it covers does follow. Each file
       // with the one at its path now, the way the write records its target
-      // (#writeOperation), or null when there is none yet.
+      // (#writeOperation), or null when there is none yet; and with the diffs
+      // of it the request shows, in their order, or null when it shows none,
+      // which leaves the file bound to its path and identity alone.
       const root = this.sessionRoots.get(params.sessionId)?.[0] ?? "";
+      const canonical = (requested) => grantPath(isAbsolute(requested) ? requested : `${root}/${requested}`);
+      const diffs = new Map();
+      for (const diff of requestedDiffs(params.toolCall)) {
+        const path = canonical(diff.path);
+        diffs.set(path, [...(diffs.get(path) ?? []), diff]);
+      }
       const paths = new Map(requestedPaths(params.toolCall).map((requested) => {
-        const path = grantPath(isAbsolute(requested) ? requested : `${root}/${requested}`);
-        return [path, fileIdentity(path)];
+        const path = canonical(requested);
+        return [path, { identity: fileIdentity(path), diffs: diffs.get(path) ?? null }];
       }));
       return paths.size ? { kind, paths } : null;
     }
@@ -1291,7 +1311,12 @@ export class AcpClient {
       this.#respond(id, await run() ?? {});
       return;
     }
-    if (this.#consumeGrant(params.sessionId, operation)) {
+    // The file a write replaces, read first where an approval of it is bound to
+    // an edit of it: spending an approval does not wait (#consumeGrant).
+    const current = operation.kind === "write" && this.#grantEditsFile(params.sessionId, operation.path)
+      ? await this.#currentText(params.sessionId, operation)
+      : null;
+    if (this.#consumeGrant(params.sessionId, operation, current)) {
       this.#respond(id, await run() ?? {});
       return;
     }
@@ -1321,8 +1346,9 @@ export class AcpClient {
   }
 
   // A fs/write_text_file as Main is asked about it: the file, resolved the way
-  // the write will resolve it, and the size. Refused now when the write could
-  // not happen anyway (outside the roots, protected, no such directory).
+  // the write will resolve it, the size, the head of the content and the
+  // sha256 of all of it. Refused now when the write could not happen anyway
+  // (outside the roots, protected, no such directory).
   #writeOperation(id, params) {
     if (typeof params.path !== "string" || !params.path) throw new Error("Write path is required");
     const path = requireWorkerPath(workerFilePathSync(params.path, { allowMissing: true }), {
@@ -1334,21 +1360,32 @@ export class AcpClient {
     // later. A path with nothing at it yet is a new file, which the write may
     // only create (#writeTextFile).
     const target = fileIdentity(path);
-    const contentBytes = Buffer.byteLength(String(params.content ?? ""), "utf8");
+    // The text the write puts in the file, measured and hashed as the UTF-8
+    // it is written as.
+    const content = String(params.content ?? "");
+    const contentBytes = Buffer.byteLength(content, "utf8");
+    const toolCall = {
+      toolCallId: `client-${id}`,
+      title: `Write ${displayText(path)} (${contentBytes} ${contentBytes === 1 ? "byte" : "bytes"})`,
+      kind: "edit",
+      locations: [{ path }],
+      rawInput: {
+        path,
+        bytes: contentBytes,
+        sha256: createHash("sha256").update(content, "utf8").digest("hex"),
+        preview: contentPreview(content)
+      }
+    };
     return {
       kind: "write",
       path,
       target,
+      content,
       // What waiting for Main actually holds is the whole retained request, so a
-      // worker cannot pad it with an unused field it does not pay the budget for.
-      bytes: Buffer.byteLength(JSON.stringify(params)),
-      toolCall: {
-        toolCallId: `client-${id}`,
-        title: `Write ${displayText(path)} (${contentBytes} ${contentBytes === 1 ? "byte" : "bytes"})`,
-        kind: "edit",
-        locations: [{ path }],
-        rawInput: { path, bytes: contentBytes }
-      }
+      // worker cannot pad it with an unused field it does not pay the budget for,
+      // and the operation as Main is shown it, the preview included.
+      bytes: Buffer.byteLength(JSON.stringify(params)) + Buffer.byteLength(JSON.stringify(toolCall)),
+      toolCall
     };
   }
 
@@ -1429,16 +1466,23 @@ export class AcpClient {
   // Spends the approval that covers this operation, if one does: a terminal
   // whose command is the approved one, a write to an approved file. Each
   // approved file once, the command once. Anything else is asked about anew.
-  #consumeGrant(sessionId, operation) {
+  // current is the text of the file a write replaces, when an approval of it
+  // is bound to an edit of it (#currentText), else null.
+  #consumeGrant(sessionId, operation, current = null) {
     const grants = this.sessionOperationGrants.get(sessionId);
     const index = grants?.findIndex((grant) => {
       if (grant.kind !== operation.kind) return false;
       // A write to an approved path whose file is still the one that was there
       // when Main was asked (operation.target, which the write is then held
       // to), or still none: not a file put at the path since, a hard link to
-      // another file included, nor one created where there was none.
+      // another file included, nor one created where there was none. Where the
+      // request showed Main diffs of the file, the write must also make it what
+      // they make it: other content, however benign the diffs looked, is asked
+      // about, with its preview.
       if (operation.kind === "write") {
-        return grant.paths.has(operation.path) && sameIdentity(grant.paths.get(operation.path), operation.target);
+        const approved = grant.paths.get(operation.path);
+        return approved !== undefined && sameIdentity(approved.identity, operation.target)
+          && (approved.diffs === null || approvedContent(approved.diffs, operation.content, current));
       }
       // A terminal grant covers the operation only with the same command form
       // (a literal argv never matches a shell script, nor a login shell a
@@ -1460,6 +1504,41 @@ export class AcpClient {
     else grants.splice(index, 1);
     if (!grants.length) this.sessionOperationGrants.delete(sessionId);
     return true;
+  }
+
+  // Whether an approval this session holds for the file is bound to an edit of
+  // it, a diff with an oldText, which only the file as it is can decide.
+  #grantEditsFile(sessionId, path) {
+    return (this.sessionOperationGrants.get(sessionId) ?? []).some((grant) => grant.kind === "write"
+      && grant.paths.get(path)?.diffs?.some((diff) => typeof diff.oldText === "string"));
+  }
+
+  // The text of the file a write replaces, for an approval bound to an edit of
+  // it: read through a verified descriptor, as a Worker's own read is
+  // (#openWorkerFile), and only while it is the file the write was checked
+  // against (operation.target) and within what a Worker's read may return.
+  // Null otherwise, and for a file that holds a Gateway credential, which a
+  // read would refuse: then only a diff without an oldText can match.
+  async #currentText(sessionId, operation) {
+    if (!operation.target) return null;
+    let handle;
+    try {
+      handle = await this.#openWorkerFile(sessionId, operation.path);
+    } catch {
+      return null;
+    }
+    try {
+      const opened = await handle.stat({ bigint: true });
+      if (opened.dev !== operation.target.dev || opened.ino !== operation.target.ino) return null;
+      if (opened.size > BigInt(this.maxFileReadBytes)) return null;
+      const read = await readTextHead(handle, this.maxFileReadBytes);
+      if (read.truncated || this.#protectedSecrets.some((secret) => read.text.includes(secret))) return null;
+      return read.text;
+    } catch {
+      return null;
+    } finally {
+      await handle.close().catch(() => {});
+    }
   }
 
   // Room for one more request to wait for Main: in a session this client
@@ -1762,6 +1841,58 @@ function requestedPaths(toolCall) {
     for (const key of PATH_INPUT_KEYS) if (typeof input[key] === "string" && input[key]) paths.push(input[key]);
   }
   return paths;
+}
+
+// The diffs a permission request shows Main, in their order: the ACP tool call
+// content {type: "diff", path, oldText?, newText}, newText being the content
+// after the edit, of the whole file or of only the part it replaces. Each one
+// that names a file, whatever else it holds: one whose texts are not strings
+// lets no content of its file through (approvedContent).
+function requestedDiffs(toolCall) {
+  const content = Array.isArray(toolCall?.content) ? toolCall.content : [];
+  return content
+    .filter((item) => item?.type === "diff" && typeof item.path === "string" && item.path)
+    .map((item) => ({ path: item.path, oldText: item.oldText ?? null, newText: item.newText }));
+}
+
+// Whether a write's content is what the diffs Main approved make of its file,
+// applied in order to the file as the write finds it. A diff's newText is the
+// whole new file only when the diff says what the whole old one was: it has no
+// oldText (a new file, or the file written anew), or its oldText is the whole
+// file so far. Any other diff is a snippet: the one occurrence of its oldText
+// in the file is replaced by its newText, and no occurrence, or more than one
+// (overlapping ones too), is no edit; its newText alone never stands for the
+// file. current is the file as the write finds it, or null when there is none
+// or it could not be read (#currentText): then only a diff without an oldText
+// can make anything of it.
+function approvedContent(diffs, content, current) {
+  if (!diffs.length || diffs.length > MAX_DIFFS_PER_FILE) return false;
+  if (diffs.some(({ oldText, newText }) => typeof newText !== "string" || (oldText !== null && typeof oldText !== "string"))) {
+    return false;
+  }
+  let text = current;
+  for (const { oldText, newText } of diffs) {
+    if (oldText === null) text = newText;
+    else if (text !== null) text = text === oldText ? newText : replaceUnique(text, oldText, newText);
+  }
+  return text === content;
+}
+
+// What Main is shown of a write's content: all of it up to WRITE_PREVIEW_BYTES,
+// else its head, never ending in part of a character. Only the head is
+// encoded: every UTF-16 unit takes at least one byte, so that many units cover
+// it, and a surrogate pair those cut in two falls past the head or is trimmed.
+function contentPreview(content) {
+  const head = Buffer.from(content.slice(0, WRITE_PREVIEW_BYTES), "utf8");
+  return trimIncompleteUtf8(head.subarray(0, WRITE_PREVIEW_BYTES)).toString("utf8");
+}
+
+// text with the one occurrence of oldText replaced by newText, or null when
+// oldText occurs in it never or more than once.
+function replaceUnique(text, oldText, newText) {
+  const at = text.indexOf(oldText);
+  if (at === -1 || text.indexOf(oldText, at + 1) !== -1) return null;
+  return text.slice(0, at) + newText + text.slice(at + oldText.length);
 }
 
 // Resolves the path the way the kernel will: segment by segment, following each

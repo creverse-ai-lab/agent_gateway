@@ -6,7 +6,7 @@ import { homedir } from "node:os";
 import { AcpClient, PERMISSION_POLICIES, requirePermissionPolicy } from "./acp-client.js";
 import { ArtifactStore, defaultArtifactRoot } from "./artifacts.js";
 import { utf8ByteHead } from "./bounded-utf8.js";
-import { ERROR_CODES, GatewayError, isGatewayErrorCode } from "./errors.js";
+import { ERROR_CODES, errorEnvelope, GatewayError, isGatewayErrorCode } from "./errors.js";
 import {
   assertProviderEnabled, currentModelId, detectProviders, isGrokProvider, partialPolicyEnforcement, providerConfig,
   setProviderEnabled, workerSessionMeta
@@ -2015,6 +2015,9 @@ export class GatewayService {
     requireProfile(args.responseProfile);
     requireResultBudget(args.resultBudgetBytes);
     requireResultDelivery(args.resultDelivery);
+    // And the model's shape, so a run whose handle goes back before its session
+    // is restored (taskPrompt) is refused for it here, not failed for it later.
+    optionalString(args.model, "model");
     return this.#reserve(session, "prompt");
   }
 
@@ -2202,12 +2205,15 @@ export class GatewayService {
 
   // Registers a turn and returns. It must never await the turn itself: that one
   // rule is what keeps the mailbox from being held for a whole worker turn.
-  // taskId is the handle this turn answers to, when there is one.
+  // taskId is the handle this turn answers to, when there is one. A task that
+  // has ended by the time its session is ready, cancelled while a restore held
+  // it (taskCancel), starts no turn: null, and nothing reaches the worker.
   async #promptLocked(session, args, context, taskId = null) {
     if (CLOSED_STATUSES.has(session.status) || !this.store.get(session.id)) {
       throw new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`);
     }
     await this.ensureConnected(session, context);
+    if (this.#taskEnded(taskId)) return null;
     const requestedModel = optionalString(args.model, "model");
     if (requestedModel && requestedModel !== session.model) {
       if (session.client.config.modelScope === "process") {
@@ -2225,6 +2231,8 @@ export class GatewayService {
       session.model = configured.model;
       session.capabilities = configured.response;
       this.store.push(session, { type: "model_changed", model: session.model });
+      // Or ended while the model switched.
+      if (this.#taskEnded(taskId)) return null;
     }
     // Last thing before the worker can hear about this prompt, and nothing
     // between here and the send awaits. If it throws, the session is untouched.
@@ -2320,6 +2328,9 @@ export class GatewayService {
     // Before admission, so a bad link costs no reservation.
     const links = this.#visibleTaskLinks(args, context);
     const session = this.#admitTurn(args, context);
+    // Whether the handle went back before the turn started (below): the
+    // reservation then stays until the command that starts it is done.
+    let handedBack = false;
     // Everything past admission is inside the finally: a budget rejection must
     // release the reservation, or one refused task would leave the session
     // permanently unpromptable.
@@ -2359,14 +2370,28 @@ export class GatewayService {
       }
       crashAfter("task_create_durable");
       session.activeTaskId = task.taskId;
+      const queue = this.#queueFor(session);
+      // When the turn cannot start at once, because the session has to be
+      // restored first (a provider start, then session/resume or load, each
+      // allowed 30 s) or its mailbox is busy, the handle goes back before the
+      // turn starts. Answered only once the turn ran, the call could outlast its
+      // caller's own budget for it (the front door's is 30 s), and the caller
+      // would hold no handle for the turn the restore then starts. Otherwise the
+      // answer is the started turn's, as before. Decided before the command is
+      // queued: an idle mailbox starts it at once.
+      const handBack = !queue.idle || this.#needsRestore(session);
+      let starting;
       try {
         // One command covers starting the turn and recording the handle. Split
         // across two, the turn could already have finished and this bookkeeping
         // would drag a terminal task back to "working", so its result could never
         // be collected. The store enforces that itself now (terminal is final),
         // but the single command is still what keeps turnId and status agreeing.
-        return await this.#queueFor(session).run("task_prompt", async () => {
+        starting = queue.run("task_prompt", async () => {
           const started = await this.#promptLocked(session, args, context, task.taskId);
+          // Cancelled before its prompt was sent (taskCancel): there is no turn
+          // to record, and the handle already says what became of it.
+          if (!started) return this.publicTask(this.taskStore.find(task.taskId) ?? task, requesterOf(context));
           // The handle can already be gone: ttl=0 expires on the first read after
           // create. The turn is running either way, so the ack reports the handle
           // that was minted instead of failing work that has already started.
@@ -2382,6 +2407,7 @@ export class GatewayService {
           this.#publishTaskStatus(running);
           return { ...this.publicTask(running, requesterOf(context)), ...echo };
         });
+        if (!handBack) return await starting;
       } catch (error) {
         if (session.activeTaskId === task.taskId) {
           session.activeTaskId = null;
@@ -2389,9 +2415,53 @@ export class GatewayService {
         this.taskStore.remove(task.taskId);
         throw error;
       }
+      // The handle as minted (working, no turn yet), while the command goes on
+      // without the caller: a failure in it is the task's (#failUndispatched),
+      // and a cancel of the task meanwhile ends it before its prompt is sent
+      // (taskCancel).
+      handedBack = true;
+      session._preparingTask = task.taskId;
+      void starting
+        .catch((error) => this.#failUndispatched(session, task.taskId, error))
+        .finally(() => {
+          if (session._preparingTask === task.taskId) session._preparingTask = null;
+          this.#release(session, "prompt");
+        })
+        .catch(() => {});
+      const promptedBy = this.#attributed(context);
+      return { ...this.publicTask(task, requesterOf(context)), ...(promptedBy ? { promptedBy } : {}) };
     } finally {
-      this.#release(session, "prompt");
+      if (!handedBack) this.#release(session, "prompt");
     }
+  }
+
+  // A run whose handle went back before its turn started (taskPrompt), whose
+  // start then failed before its prompt was sent: the restore, the model switch,
+  // or the session closing meanwhile. Recorded on the task as any other failure
+  // is, and durably, so the handle Main holds answers with what the call would
+  // have thrown, its code and details included; the turn id is null, as no turn
+  // started. One whose prompt was sent is its turn's to settle (at worst, the
+  // provider's exit). During a shutdown it is left as a turn is (#finishTurn):
+  // the restart reports it failed, its prompt never sent.
+  #failUndispatched(session, taskId, error) {
+    if (this.stopped || this.draining) return;
+    const task = this.taskStore.find(taskId);
+    if (!task || TERMINAL_TASK_STATUSES.has(task.status) || task.promptDispatchedAt) return;
+    if (session.activeTaskId === taskId) session.activeTaskId = null;
+    this.#commitTaskTerminal(session, taskId, "failed", error?.message ?? String(error), {
+      ok: false,
+      sessionId: session.id,
+      turnId: null,
+      taskId,
+      status: session.status,
+      ...errorEnvelope(error)
+    });
+  }
+
+  // Whether the task a turn would answer to has already ended. One that is gone
+  // has not: its turn runs either way (taskPrompt).
+  #taskEnded(taskId) {
+    return taskId != null && TERMINAL_TASK_STATUSES.has(this.taskStore.find(taskId)?.status);
   }
 
   // Durable before the prompt leaves, like the create barrier: this stamp is
@@ -2843,9 +2913,17 @@ export class GatewayService {
     if (TERMINAL_TASK_STATUSES.has(task.status)) {
       throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `Cannot cancel task in terminal status: ${task.status}`);
     }
-    await this.sessionCancel({ sessionId: task.sessionId }, context);
-    const session = this.store.get(task.sessionId);
-    const result = session
+    let session = this.store.get(task.sessionId);
+    // A task whose handle went back before its session was ready (taskPrompt)
+    // and whose prompt has not been sent is cancelled here, at once, not behind
+    // the restore that holds the session's mailbox: its prompt is then never
+    // sent (#promptLocked), and there is no turn to tell the worker about.
+    const unsent = session?._preparingTask === task.taskId && !task.promptDispatchedAt;
+    if (!unsent) {
+      await this.sessionCancel({ sessionId: task.sessionId }, context);
+      session = this.store.get(task.sessionId);
+    }
+    const result = session && !unsent
       ? this.taskTerminalEnvelope(session, { ok: true, status: "cancelled", stopReason: "cancelled" })
       : { ok: true, taskId: task.taskId, sessionId: task.sessionId, turnId: task.turnId, status: "cancelled" };
     const cancelled = this.#commitTaskTerminal(session, task.taskId, "cancelled", "Task cancelled by Main", result);

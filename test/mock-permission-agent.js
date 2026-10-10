@@ -11,9 +11,11 @@ import { createInterface } from "node:readline";
 // "cancelled", "read-ok" or "read-error"), so a test asserts on the outcome.
 //   {"steps": [step, ...]} runs each step in turn and reports every outcome as
 //   a JSON array in stopReason. A step is one of:
-//     {"permission": {..., "cwd"?, "env"?}}  as above (a "command" may also be an
+//     {"permission": {..., "cwd"?, "env"?, "content"?}}
+//                                        as above (a "command" may also be an
 //                                           array; cwd/env ride rawInput so a
-//                                           grant is bound to them)
+//                                           grant is bound to them; content is
+//                                           the tool call's, such as diffs)
 //     {"terminal": {..., "cwd"?, "env"?, "outputByteLimit"?, "pad"?, "hold"?,
 //                   "release"?, "kill"?}}
 //                                        -> {output, exitStatus}, or
@@ -63,6 +65,7 @@ async function askPermission(sessionId, permission) {
       kind: permission.kind,
       title: `${permission.kind} ${permission.path ?? permission.command}`,
       ...(permission.path ? { locations: [{ path: permission.path }] } : {}),
+      ...(permission.content ? { content: permission.content } : {}),
       ...(permission.command ? {
         rawInput: {
           command: permission.command,

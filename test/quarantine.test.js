@@ -133,6 +133,8 @@ function get(service, sessionId) {
 }
 
 // A transparent restore through config list, expected to fail with the worker's own error.
+// A task_prompt or run gets its handle before the restore (1.9.0), and the
+// restore's failure is recorded on that task.
 async function failRestore(service, clock, session, how = "config") {
   clock.now += 1_000;
   const call = {
@@ -141,7 +143,14 @@ async function failRestore(service, clock, session, how = "config") {
     task_prompt: () => service.call("task_prompt", { sessionId: session.id, prompt: "go" }, MAIN),
     run: () => service.call("run", { sessionId: session.id, prompt: "go", waitMs: 0 }, MAIN)
   }[how];
-  await assert.rejects(call(), /Resource not found/);
+  if (how !== "task_prompt" && how !== "run") {
+    await assert.rejects(call(), /Resource not found/);
+    return;
+  }
+  const { taskId } = await call();
+  const failed = await service.call("task_result", { taskId }, MAIN);
+  assert.deepEqual([failed.ok, failed.turnId, failed.status, failed.errorCode], [false, null, "unavailable", "ACP_ERROR"]);
+  assert.match(failed.error, /Resource not found/);
 }
 
 // Unload, then fail `count` transparent restores in a row.
@@ -208,7 +217,9 @@ test("every failed transparent restore counts, from prompt, run, task_prompt and
     const got = await get(service, session.id);
     assert.equal(got.restoreFailures, 4);
     assert.equal(Object.hasOwn(got, "quarantined"), false, "below the limit nothing is stopped");
-    assert.equal(service.taskStore.records.size, 0, "the failed task handles were withdrawn");
+    const handles = [...service.taskStore.records.values()];
+    assert.deepEqual(handles.map((task) => [task.status, task.promptDispatchedAt ?? null]), [["failed", null], ["failed", null]],
+      "each failed restore is its task's failure, and no prompt was sent");
 
     factory.restoreError = null;
     await service.call("config", { sessionId: session.id, action: "list" }, MAIN);
