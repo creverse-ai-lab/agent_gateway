@@ -720,9 +720,10 @@ test("P2: once a terminal's group is found gone its SIGKILL is disarmed, and tha
   await withTemp("acp-p2-disarm-", async (directory) => {
     for (const [ending, steps, end] of endings) {
       // What the client signals and checks the terminal's group with. A check
-      // finds a member left the first time and none the second; after that the
-      // id answers as if another group of this user had taken it. Only the
-      // SIGTERM is really sent, so the terminal still ends.
+      // finds a member left the first two times (before the SIGTERM and right
+      // after it) and none the third, a poll's while the SIGKILL is armed;
+      // after that the id answers as if another group of this user had taken
+      // it. Only the SIGTERM is really sent, so the terminal still ends.
       let group = null;
       let checks = 0;
       const signals = [];
@@ -733,15 +734,15 @@ test("P2: once a terminal's group is found gone its SIGKILL is disarmed, and tha
         if (signal === "SIGTERM") return process.kill(pid, signal);
         if (signal !== 0) return true;
         checks += 1;
-        if (checks === 2) throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+        if (checks === 3) throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
         return true;
       };
       await withClient({ cwd: directory, policy: "auto_approve", protectedPaths: [], killGraceMs: graceMs, killProcess }, async (session) => {
         await session.run(steps);
         await end(session);
-        await until(() => checks >= 2 || signals.includes("SIGKILL"), `${ending}: the group found gone`);
+        await until(() => checks >= 3 || signals.includes("SIGKILL"), `${ending}: the group found gone`);
         await delay(graceMs * 3);
-        assert.deepEqual(signals, ["SIGTERM", 0, 0], `${ending}: nothing reaches the id once its group was found gone`);
+        assert.deepEqual(signals, [0, "SIGTERM", 0, 0], `${ending}: nothing reaches the id once its group was found gone`);
         await until(() => processGone(group), `${ending}: the terminal to end`);
       });
     }
@@ -804,8 +805,8 @@ test("P2: a provider that exits on stop()'s stdin EOF ends nothing twice: one se
       });
       await client.stop();
       assert.equal(providerClosed, true, "the provider's close landed while stop() waited");
-      assert.equal(terminalSignals[0], "SIGTERM");
-      assert.ok(terminalSignals.length > 1 && terminalSignals.slice(1).every((signal) => signal === 0),
+      assert.deepEqual(terminalSignals.slice(0, 2), [0, "SIGTERM"], "checked, then signalled");
+      assert.ok(terminalSignals.length > 2 && terminalSignals.slice(2).every((signal) => signal === 0),
         `one sequence for the terminal's group, ended once it was found gone: ${JSON.stringify(terminalSignals)}`);
       assert.deepEqual(providerSignals.filter((signal) => signal !== 0), ["SIGTERM"],
         `one sequence for the provider's group: ${JSON.stringify(providerSignals)}`);
@@ -856,8 +857,8 @@ test("P2: a terminal's group that keeps a member through the grace still gets th
     await withClient({ cwd: directory, policy: "auto_approve", protectedPaths: [], killGraceMs: 100, killProcess }, async ({ run }) => {
       assert.deepEqual(await run([{ terminal: { command: "/bin/sleep", args: ["30"], release: true } }]), ["terminal-released"]);
       await until(() => signals.includes("SIGKILL"), "the SIGKILL");
-      assert.equal(signals[0], "SIGTERM");
-      assert.ok(signals.slice(1, signals.indexOf("SIGKILL")).every((signal) => signal === 0), "checked until then");
+      assert.deepEqual(signals.slice(0, 2), [0, "SIGTERM"], "checked, then signalled");
+      assert.ok(signals.slice(2, signals.indexOf("SIGKILL")).every((signal) => signal === 0), "checked until then");
       // A grace (100 ms) after the SIGKILL the checks stop as well.
       await delay(500);
       const settled = signals.length;
@@ -1011,6 +1012,49 @@ test("I4: a group found empty is not signalled while a process that left it stil
       });
     } finally {
       if (escaped && !processGone(escaped)) process.kill(escaped, "SIGKILL");
+    }
+  });
+});
+
+// A teardown skipped the sequence only for a group a watch check had already
+// found empty, and the sequence sent its SIGTERM before its own first check: a
+// group that emptied after the last watch check (every 250 ms) was signalled,
+// and its SIGKILL armed for an id that answering again would be another
+// group's. The sequence now checks first, and an empty group gets no signal.
+test("a group that emptied since its last watch check gets no signal when its terminal is ended", { skip: process.platform === "win32" }, async () => {
+  let group = null;
+  // While true, a check finds a member left, as the last watch check before the
+  // job ended did; the job itself really ends.
+  let lastCheckSaysMember = true;
+  const signals = [];
+  const killProcess = (pid, signal) => {
+    if (group === null && pid < 0) group = -pid;
+    if (pid !== -group) return process.kill(pid, signal);
+    signals.push(signal);
+    if (signal === 0 && lastCheckSaysMember) return true;
+    return process.kill(pid, signal);
+  };
+  await withTemp("acp-group-stale-", async (directory) => {
+    let job = null;
+    try {
+      await withClient({ cwd: directory, policy: "auto_approve", protectedPaths: [], killGraceMs: 100, killProcess }, async ({ client, sessionId, run }) => {
+        assert.deepEqual(await run([backgroundJob(0.2, { hold: true })]), ["terminal-held"]);
+        const [terminal] = client.terminals.values();
+        await until(() => terminal.exitStatus !== null, "the command to exit");
+        job = Number(terminal.outputBuffer.toString());
+        await until(() => processGone(job) && signals.length > 0, "the job to end in a watched group");
+        assert.equal(terminal.groupGone, false, "no check has found the group empty");
+        lastCheckSaysMember = false;
+        const checked = signals.length;
+        // In the same turn as the change, so no watch check comes in between.
+        client.cancelSession(sessionId);
+        // Past a grace a SIGKILL would follow.
+        await delay(300);
+        assert.deepEqual(signals.slice(checked), [0], "checked, found empty, and never signalled");
+        assert.equal(terminal.groupGone, true);
+      });
+    } finally {
+      if (job && !processGone(job)) process.kill(job, "SIGKILL");
     }
   });
 });

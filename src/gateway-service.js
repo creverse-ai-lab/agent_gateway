@@ -2136,6 +2136,10 @@ export class GatewayService {
       ...(timedOut ? { incomplete: "wait_budget_exceeded" } : {}),
       taskId,
       sessionId: task.sessionId,
+      // No turn yet, while the session is still being made ready for it
+      // (taskPrompt): said, and why, so a reader can tell that apart from a
+      // turn that runs. A run whose turn has started keeps its shape.
+      ...(task.turnId == null ? { turnId: null, statusMessage: task.statusMessage } : {}),
       ...echo,
       next: {
         attach: { tool: "agent_acp_run", arguments: { taskId } },
@@ -2235,9 +2239,30 @@ export class GatewayService {
       if (this.#taskEnded(taskId)) return null;
     }
     // Last thing before the worker can hear about this prompt, and nothing
-    // between here and the send awaits. If it throws, the session is untouched.
-    if (taskId) this.#stampPromptDispatched(taskId);
-    session.turnId = `turn-${randomUUID()}`;
+    // between here and the send awaits. If it throws, the session is untouched:
+    // the turn is set up only once the frame is queued.
+    const stamped = taskId != null && this.#stampPromptDispatched(taskId);
+    // The token freezes which turn this callback may finalize; the ACP read
+    // loop hands the outcome to the mailbox instead of applying it inline.
+    const token = `turn-${randomUUID()}`;
+    let reply;
+    try {
+      // Throws, with the frame never queued, when the worker cannot take it:
+      // its process gone, its channel closed or full (AcpClient request).
+      reply = session.client.sessionPrompt({ sessionId: session.acpSessionId, prompt: args.prompt });
+    } catch (error) {
+      // Not sent, so not dispatched: the stamp is withdrawn, and a task whose
+      // handle went back fails as one that never started (#failUndispatched),
+      // committed after the stamp's record if that reached the log.
+      if (stamped) this.taskStore.clearPromptDispatched(taskId);
+      throw error;
+    }
+    const queue = this.#queueFor(session);
+    void reply.then(
+      (result) => queue.post("turn_end", () => this.#finishTurn(session, token, { result })),
+      (error) => queue.post("turn_fail", () => this.#finishTurn(session, token, { error }))
+    );
+    session.turnId = token;
     session.turnSeal = null;
     this.#setStatus(session, "running", "turn_start");
     session.stopReason = null;
@@ -2256,16 +2281,6 @@ export class GatewayService {
       turnId: session.turnId,
       ...(session.promptedBy ? { promptedBy: session.promptedBy } : {})
     });
-    // The token freezes which turn this callback may finalize; the ACP read
-    // loop hands the outcome to the mailbox instead of applying it inline.
-    const token = session.turnId;
-    const queue = this.#queueFor(session);
-    void session.client
-      .sessionPrompt({ sessionId: session.acpSessionId, prompt: args.prompt })
-      .then(
-        (result) => queue.post("turn_end", () => this.#finishTurn(session, token, { result })),
-        (error) => queue.post("turn_fail", () => this.#finishTurn(session, token, { error }))
-      );
     return {
       ok: true,
       sessionId: session.id,
@@ -2437,12 +2452,13 @@ export class GatewayService {
 
   // A run whose handle went back before its turn started (taskPrompt), whose
   // start then failed before its prompt was sent: the restore, the model switch,
-  // or the session closing meanwhile. Recorded on the task as any other failure
-  // is, and durably, so the handle Main holds answers with what the call would
-  // have thrown, its code and details included; the turn id is null, as no turn
-  // started. One whose prompt was sent is its turn's to settle (at worst, the
-  // provider's exit). During a shutdown it is left as a turn is (#finishTurn):
-  // the restart reports it failed, its prompt never sent.
+  // the session closing meanwhile, the dispatch stamp's write or the send.
+  // Recorded on the task as any other failure is, and durably, so the handle
+  // Main holds answers with what the call would have thrown, its code and
+  // details included; the turn id is null, as no turn started. One whose prompt
+  // was sent, its stamp standing (#stampPromptDispatched), is its turn's to
+  // settle (at worst, the provider's exit). During a shutdown it is left as a
+  // turn is (#finishTurn): the restart reports it failed, its prompt never sent.
   #failUndispatched(session, taskId, error) {
     if (this.stopped || this.draining) return;
     const task = this.taskStore.find(taskId);
@@ -2468,21 +2484,33 @@ export class GatewayService {
   // the only evidence that separates "the worker may have acted" from "it never
   // saw the prompt", and a crash must not be able to take it back after the
   // send. Without it a restart would call a prompt the worker received
-  // not_started, inviting Main to repeat its side effects.
+  // not_started, inviting Main to repeat its side effects. The task in memory
+  // takes the stamp only once its record holds: with a WAL the record carries
+  // it, and memory follows; without one the synced write is a snapshot taken
+  // from memory, so there the stamp goes in first, provisionally, and comes
+  // out again when the write fails (as a terminal commit does there). It is
+  // withdrawn as well when the send then fails (#promptLocked): a task whose
+  // prompt never left is never counted as sent (#failUndispatched). Whether it
+  // stamped: a task gone already (ttl 0) has nothing to stamp.
   #stampPromptDispatched(taskId) {
     const task = this.taskStore.find(taskId);
-    if (!task || TERMINAL_TASK_STATUSES.has(task.status)) return;
-    const stamped = this.taskStore.markPromptDispatched(taskId, new Date(this.now()).toISOString());
+    if (!task || TERMINAL_TASK_STATUSES.has(task.status)) return false;
+    const at = new Date(this.now()).toISOString();
+    const fromMemory = this.stateStore?.mode === "snapshot";
+    if (fromMemory) this.taskStore.markPromptDispatched(taskId, at);
     try {
-      this.stateStore?.appendDurable(WAL_TYPES.TASK_STATUS_CHANGED, taskId, taskStatusPayload(stamped));
+      this.stateStore?.appendDurable(WAL_TYPES.TASK_STATUS_CHANGED, taskId, taskStatusPayload({ ...task, promptDispatchedAt: at }));
       this.#appendHeld();
     } catch (error) {
+      if (fromMemory) this.taskStore.clearPromptDispatched(taskId);
       this.persistError = error?.message ?? String(error);
       throw new GatewayError(
         ERROR_CODES.PERSISTENCE_UNHEALTHY,
         `Gateway could not durably record that this Task's prompt was sent: ${this.persistError}`
       );
     }
+    if (!fromMemory) this.taskStore.markPromptDispatched(taskId, at);
+    return true;
   }
 
   async taskGet(args, context) {

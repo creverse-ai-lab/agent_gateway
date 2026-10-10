@@ -353,13 +353,15 @@ export class AcpClient {
     }
     const id = this.nextId++;
     const payload = { jsonrpc: "2.0", id, method, params };
-
+    // The frame goes out before the pending entry exists, and before the
+    // promise: a write that cannot happen (the channel closed or full, the
+    // frame too large) throws here, as a process that is gone does above. No
+    // entry is then left that nobody will ever settle, and the caller knows
+    // the request never left: a prompt's task counts as sent only past this
+    // (GatewayService #promptLocked). No reply can be observed in between: the
+    // read loop is a separate I/O turn.
+    this.channel.write(laneForRequest(method), payload);
     return new Promise((resolvePromise, reject) => {
-      // The frame goes out before the pending entry exists, so a write that
-      // cannot happen rejects this promise instead of leaving one nobody will
-      // ever settle. No reply can be observed in between: the read loop is a
-      // separate I/O turn.
-      this.channel.write(laneForRequest(method), payload);
       const timer = timeoutMs
         ? setTimeout(() => {
             this.pending.delete(id);
@@ -1719,10 +1721,12 @@ function groupAlive(child, kill = signalProcess) {
 // command may exit while what it started has not, and the SIGKILL stays armed
 // only while the group still has a member: once the last one is gone its id is
 // free, and a group of the same user that takes it before the grace ends is
-// not this one (groupGone). Resolves once the group is gone, or a second grace
-// after the SIGKILL; its timers keep the process up only for a caller that
-// waits (hold). Never throws or rejects: it runs on teardown paths and from
-// timers.
+// not this one (groupGone). Checked before the SIGTERM as well: a group that
+// emptied since its last check (watchGroup's, every GROUP_WATCH_MS) gets no
+// signal at all, nor a SIGKILL armed for an id that may be another group's by
+// then. Resolves once the group is gone, or a second grace after the SIGKILL;
+// its timers keep the process up only for a caller that waits (hold). Never
+// throws or rejects: it runs on teardown paths and from timers.
 function terminateChild(terminal, graceMs = KILL_GRACE_MS, { kill = signalProcess, hold = false } = {}) {
   const { child } = terminal;
   const gone = () => {
@@ -1730,6 +1734,7 @@ function terminateChild(terminal, graceMs = KILL_GRACE_MS, { kill = signalProces
     terminal.groupGone = true;
     return true;
   };
+  if (gone()) return Promise.resolve();
   quietly(() => killChild(child, "SIGTERM", kill));
   return new Promise((done) => {
     if (gone()) {

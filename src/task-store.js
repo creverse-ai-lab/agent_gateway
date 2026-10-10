@@ -503,6 +503,19 @@ export class TaskStore {
     return snapshot(record);
   }
 
+  // Takes back a stamp the gateway set for a prompt that then did not leave:
+  // the write that makes it durable failed, or the send did (gateway-service
+  // #stampPromptDispatched, #promptLocked). The record reads as never sent
+  // again, which it was. Never throws: it runs on those failure paths, where
+  // the record may be gone already. Whether there was a stamp to take back.
+  clearPromptDispatched(taskId) {
+    const record = this.#tasks.get(taskId);
+    if (!record?.promptDispatchedAt) return false;
+    delete record.promptDispatchedAt;
+    this.#emit("updated", record);
+    return true;
+  }
+
   // Ownership, not state (1.8.0): the Main every handle of a session answers to
   // once that session is gone, after another Main adopted the session
   // (gateway-service.js #adopt). Like turnId it moves no lastUpdatedAt, and it

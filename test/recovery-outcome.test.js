@@ -1146,13 +1146,17 @@ test("a run on a session that must be restored gets its handle before the restor
     let prompts = 0;
     factory.onPrompt = () => { prompts += 1; };
     const ack = await service.call("run", { sessionId: session.id, prompt: "go", waitMs: 0 }, MAIN);
-    assert.deepEqual([ack.ok, ack.status, ack.sessionId], [true, "working", session.id]);
+    // The handoff says there is no turn yet, and why.
+    assert.deepEqual([ack.ok, ack.status, ack.sessionId, ack.turnId, ack.statusMessage],
+      [true, "working", session.id, null, "Prompt accepted"]);
     // The restore goes on without the caller, and stays held here.
     await until(() => factory.restores.length === 1, "the resume under way");
     const handed = service.taskStore.find(ack.taskId);
     assert.deepEqual([handed.status, handed.statusMessage, handed.turnId, handed.promptDispatchedAt],
       ["working", "Prompt accepted", null, undefined]);
     assert.equal(prompts, 0, "nothing has reached the worker");
+    const attached = await service.call("run", { taskId: ack.taskId, waitMs: 0 }, MAIN);
+    assert.deepEqual([attached.turnId, attached.statusMessage], [null, "Prompt accepted"]);
     // Meanwhile the session is taken, as by a running turn.
     await assert.rejects(service.call("run", { sessionId: session.id, prompt: "again", waitMs: 0 }, MAIN), { code: "SESSION_ACTIVE" });
 
@@ -1161,9 +1165,15 @@ test("a run on a session that must be restored gets its handle before the restor
     const running = await service.call("task_get", { taskId: ack.taskId }, MAIN);
     assert.deepEqual([running.status, running.statusMessage, running.turnId], ["working", "Prompt running", session.turnId]);
     assert.ok(service.taskStore.find(ack.taskId).promptDispatchedAt);
+    // Once the turn has started the handoff keeps the shape it always had.
+    const started = await service.call("run", { taskId: ack.taskId, waitMs: 0 }, MAIN);
+    assert.deepEqual([started.status, Object.hasOwn(started, "turnId"), Object.hasOwn(started, "statusMessage")], ["working", false, false]);
     session.client.turns.at(-1).resolve({ stopReason: "end_turn" });
     const done = await service.call("run", { taskId: ack.taskId, waitMs: 5_000 }, MAIN);
     assert.deepEqual([done.ok, done.status, done.turnId], [true, "idle", session.turnId]);
+    // So does a run on a session that is ready, which answers once its turn started.
+    const ready = await service.call("run", { sessionId: session.id, prompt: "next", waitMs: 0 }, MAIN);
+    assert.deepEqual([ready.status, Object.hasOwn(ready, "turnId"), Object.hasOwn(ready, "statusMessage")], ["working", false, false]);
   } finally {
     await service.shutdown().catch(() => {});
   }
@@ -1233,4 +1243,142 @@ test("a task cancelled while its session is being restored is cancelled at once,
   } finally {
     await service.shutdown().catch(() => {});
   }
+});
+
+// A task was stamped as sent before the stamp's write held and before the
+// send: when either failed, the prompt never left, yet the stamp stayed, so a
+// handed-back task was taken for a sent one and left working until its TTL,
+// and a restart read it as a prompt the worker may have acted on. The stamp
+// now stands only once it is durable and the frame is queued; otherwise the
+// task fails as one that never started, committed after the stamp's record
+// where that reached the log. Each restart here is a crash's: it replays the
+// log as it was.
+test("a handed-back run whose dispatch stamp cannot be made durable fails at once, and a restart reads that failure", async () => {
+  for (const fault of ["append", "fsync", "snapshot"]) {
+    await withDirectory(async (directory) => {
+      const statePath = join(directory, "state.json");
+      const artifactRoot = join(directory, "artifacts");
+      const paths = statePaths(statePath);
+      // Without a WAL the synced write is the snapshot itself.
+      const persistence = fault === "snapshot" ? { wal: false } : {};
+      let taskId;
+      let failure;
+      let onDisk;
+      const before = harness({ statePath, artifactRoot, persistence });
+      try {
+        await before.service.init();
+        const { session } = await open(before.service);
+        const turnBefore = session.turnId;
+        assert.equal(await before.service.unloadSession(session), true);
+        let prompts = 0;
+        before.factory.onPrompt = () => { prompts += 1; };
+        const store = before.service.stateStore;
+        const isStamp = (type, payload) => type === WAL_TYPES.TASK_STATUS_CHANGED && Boolean(payload?.promptDispatchedAt);
+        if (fault === "append") {
+          // Nothing of the stamp is written: a full disk.
+          const appendDurable = store.appendDurable.bind(store);
+          store.appendDurable = (type, key, payload) => {
+            if (isStamp(type, payload)) throw Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" });
+            return appendDurable(type, key, payload);
+          };
+        } else if (fault === "fsync") {
+          // The record reaches the log, and the fsync after it fails, once.
+          const append = store.append.bind(store);
+          const barrier = store.barrier.bind(store);
+          let failNext = false;
+          store.append = (type, key, payload) => {
+            if (isStamp(type, payload)) failNext = true;
+            return append(type, key, payload);
+          };
+          store.barrier = () => {
+            if (!failNext) return barrier();
+            failNext = false;
+            throw Object.assign(new Error("EIO: i/o error, fsync"), { code: "EIO" });
+          };
+        } else {
+          // The first synced snapshot to hold a stamp fails.
+          const writeSnapshot = store.writeSnapshot.bind(store);
+          let failed = false;
+          store.writeSnapshot = () => {
+            const stamping = [...before.service.taskStore.records.values()].some((task) => task.promptDispatchedAt);
+            if (!stamping || failed) return writeSnapshot();
+            failed = true;
+            throw Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" });
+          };
+        }
+        ({ taskId } = await before.service.call("run", { sessionId: session.id, prompt: "go", waitMs: 0 }, MAIN));
+        failure = await before.service.call("task_result", { taskId, waitMs: 5_000 }, MAIN);
+        assert.deepEqual([failure.ok, failure.turnId, failure.status, failure.errorCode], [false, null, "idle", "PERSISTENCE_UNHEALTHY"], fault);
+        assert.match(failure.error, /could not durably record that this Task's prompt was sent/, fault);
+        assert.equal(prompts, 0, `${fault}: the worker never received the prompt`);
+        assert.equal(before.service.taskStore.find(taskId).promptDispatchedAt, undefined, `${fault}: never counted as sent`);
+        assert.deepEqual([session.status, session.turnId, session._reserved ?? null], ["idle", turnBefore, null],
+          `${fault}: the session as it was, and free`);
+        onDisk = await readFile(fault === "snapshot" ? paths.snapshot : paths.wal);
+        for (const method of ["append", "barrier", "appendDurable", "writeSnapshot"]) delete store[method];
+      } finally {
+        await before.service.shutdown();
+      }
+      // What a crash would have left: the log as it was, onto an empty base,
+      // or without one the last synced snapshot.
+      if (fault === "snapshot") {
+        await writeFile(paths.snapshot, onDisk, { mode: 0o600 });
+      } else {
+        await writeFile(paths.wal, onDisk, { mode: 0o600 });
+        await writeFreshBase(statePath, onDisk);
+      }
+      const after = harness({ statePath, artifactRoot, persistence });
+      try {
+        await after.service.init();
+        assert.deepEqual(await after.service.call("task_result", { taskId }, MAIN), failure, fault);
+      } finally {
+        await after.service.shutdown();
+      }
+    });
+  }
+});
+
+test("a prompt the worker cannot take is never counted as sent: no turn is left running, and a handed-back task fails", async () => {
+  await withDirectory(async (directory) => {
+    const statePath = join(directory, "state.json");
+    const artifactRoot = join(directory, "artifacts");
+    let taskId;
+    let failure;
+    let wal;
+    const before = harness({ statePath, artifactRoot });
+    try {
+      await before.service.init();
+      const { session } = await open(before.service);
+      const turnBefore = session.turnId;
+      // As AcpClient's request() throws when the frame cannot be queued: the
+      // process gone, the channel closed or full.
+      before.factory.onPrompt = () => { throw new Error("ACP process is not running"); };
+      // A ready session: the call fails, and leaves the session as it was.
+      await assert.rejects(before.service.call("run", { sessionId: session.id, prompt: "go", waitMs: 0 }, MAIN), /ACP process is not running/);
+      assert.deepEqual([session.status, session.turnId, session._reserved ?? null], ["idle", turnBefore, null]);
+      // One to restore first: the handle went back, so the task fails.
+      assert.equal(await before.service.unloadSession(session), true);
+      ({ taskId } = await before.service.call("run", { sessionId: session.id, prompt: "go", waitMs: 0 }, MAIN));
+      failure = await before.service.call("task_result", { taskId, waitMs: 5_000 }, MAIN);
+      assert.deepEqual(failure, { ok: false, sessionId: session.id, turnId: null, taskId, status: "idle", error: "ACP process is not running" });
+      assert.equal(before.service.taskStore.find(taskId).promptDispatchedAt, undefined, "never counted as sent");
+      assert.deepEqual([session.status, session.turnId, session._reserved ?? null], ["idle", turnBefore, null]);
+      wal = await readFile(statePaths(statePath).wal);
+      // The session takes the next prompt.
+      before.factory.onPrompt = null;
+      assert.equal((await before.service.call("run", { sessionId: session.id, prompt: "next", waitMs: 0 }, MAIN)).status, "working");
+    } finally {
+      await before.service.shutdown();
+    }
+    // The stamp's record is in the log, and the failure after it.
+    await writeFile(statePaths(statePath).wal, wal, { mode: 0o600 });
+    await writeFreshBase(statePath, wal);
+    const after = harness({ statePath, artifactRoot });
+    try {
+      await after.service.init();
+      assert.deepEqual(await after.service.call("task_result", { taskId }, MAIN), failure);
+    } finally {
+      await after.service.shutdown();
+    }
+  });
 });

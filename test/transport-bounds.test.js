@@ -175,6 +175,27 @@ test("stop rejects outstanding requests synchronously instead of wedging the tur
   client.proc?.kill("SIGKILL");
 });
 
+// A request whose frame the channel will not take never left, and says so at
+// once: request() throws, with no pending entry kept, so a caller can tell a
+// prompt that was never sent from a turn that failed after it went out (the
+// Gateway never counts the first as dispatched). It used to reject later,
+// like any other failure.
+test("a request whose frame the channel refuses throws at once and leaves nothing pending", async () => {
+  const client = new AcpClient(
+    { provider: "mock", command: process.execPath, args: [capabilityAgent], permissionPolicy: "read_only" },
+    { permissionPolicy: "read_only" }
+  );
+  try {
+    await client.start();
+    const session = await client.sessionNew({ cwd: process.cwd(), permissionPolicy: "read_only" });
+    void client.channel.close();
+    assert.throws(() => client.sessionPrompt({ sessionId: session.sessionId, prompt: "never sent" }), { code: "TRANSPORT_CLOSED" });
+    assert.equal(client.pending.size, 0);
+  } finally {
+    await client.stop();
+  }
+});
+
 // A reply the agent is blocking on must never be silently dropped: an unsendable
 // frame becomes a visible JSON-RPC error instead.
 test("a response frame over the cap surfaces to the worker as an error", async () => {
