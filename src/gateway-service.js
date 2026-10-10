@@ -344,8 +344,9 @@ export class GatewayService {
     // taskId -> performance.now() of a terminal commit that put only the
     // result's preview in the log, its artifact having failed: a restart before
     // the next snapshot, which holds the whole result, would bring back no more.
-    // Said on the result until that snapshot lands (#resultDurability). In
-    // memory only, like the gap it describes.
+    // Said on the result until that snapshot lands (#resultDurability), and kept
+    // in persistence health as long (#appendHeld). In memory only, like the gap
+    // it describes.
     this.resultsNotDurable = new Map();
     // v5 durability. Absent for the many callers that run without a state path:
     // then every append is a no-op and nothing is fail-closed.
@@ -2237,7 +2238,7 @@ export class GatewayService {
       // activity with no handle to report or cancel it.
       try {
         this.stateStore?.appendDurable(WAL_TYPES.TASK_CREATED, task.taskId, task);
-        if (this.stateStore) this.persistError = null;
+        this.#appendHeld();
       } catch (error) {
         // Compensate: the handle described work that will never start.
         this.taskStore.remove(task.taskId);
@@ -2295,7 +2296,7 @@ export class GatewayService {
     const stamped = this.taskStore.markPromptDispatched(taskId, new Date(this.now()).toISOString());
     try {
       this.stateStore?.appendDurable(WAL_TYPES.TASK_STATUS_CHANGED, taskId, taskStatusPayload(stamped));
-      if (this.stateStore) this.persistError = null;
+      this.#appendHeld();
     } catch (error) {
       this.persistError = error?.message ?? String(error);
       throw new GatewayError(
@@ -2476,6 +2477,24 @@ export class GatewayService {
       return null;
     }
     return { persisted: false, errorCode: ERROR_CODES.PERSISTENCE_UNHEALTHY };
+  }
+
+  // Whether a result is still waiting for the snapshot that holds it whole
+  // (resultsNotDurable): those a snapshot has covered since are let go here as
+  // they are on their next read (#resultDurability).
+  #awaitingSnapshot() {
+    for (const [taskId, committedAt] of this.resultsNotDurable) {
+      if (this.stateStore.lastSnapshotAt > committedAt) this.resultsNotDurable.delete(taskId);
+    }
+    return this.resultsNotDurable.size > 0;
+  }
+
+  // A durable append that held answers the failure persistence health reports,
+  // except a result's that only a snapshot can answer: while one waits for it,
+  // health stays unhealthy, as the result's own durability says, and only the
+  // snapshot clears it (flushPersist, #persistAdoption).
+  #appendHeld() {
+    if (this.stateStore && !this.#awaitingSnapshot()) this.persistError = null;
   }
 
   // A terminal result reaching the Main that started the task (or took its
@@ -3605,9 +3624,9 @@ export class GatewayService {
         ...(interruption ? { interruption } : {})
       });
       // A preview that held is not the result that failed: the artifact's
-      // failure stays in persistence health until a later write answers it, as
-      // the next snapshot, which holds the whole result, does.
-      if (this.stateStore && !previewOnly) this.persistError = null;
+      // failure stays in persistence health until the next snapshot, which
+      // holds the whole result, answers it (#appendHeld).
+      if (!previewOnly) this.#appendHeld();
     } catch (error) {
       this.persistError = error?.message ?? String(error);
       // Never publish a success that failed its durability barrier. The created
@@ -4052,7 +4071,7 @@ export class GatewayService {
     }
     try {
       this.stateStore.appendDurable(WAL_TYPES.SESSION_REGISTERED, session.id, checkpoint);
-      this.persistError = null;
+      this.#appendHeld();
       return null;
     } catch (error) {
       this.persistError = error?.message ?? String(error);

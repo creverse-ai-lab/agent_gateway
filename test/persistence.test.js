@@ -441,6 +441,70 @@ test("a result whose artifact failed says it is not durable, as health does, unt
   });
 });
 
+// Review of the I13 fix: the commit of the preview kept the artifact's failure in
+// persistence health, but the next durable append that held (another result,
+// a prompt's dispatch stamp, a restore outcome) cleared it, so setup said
+// healthy while the result still said it was not durable. Only the snapshot
+// that holds the whole result clears it now.
+test("persistence stays unhealthy while a preview-only result waits for its snapshot, whatever else the log takes", async () => {
+  await withDirectory("state-ref-wait", async (directory) => {
+    const paths = statePaths(join(directory, "state.json"));
+    const service = makeService(directory, {
+      permissionPolicy: "ask",
+      // The small result (about 270 bytes) is logged inline, the large one
+      // (about 560) goes to an artifact, which fails at 100 bytes.
+      persistence: { walInlineResultBytes: 400 },
+      maxArtifactBytes: 100,
+      maxArtifactTotalBytes: 100,
+      // The debounced writer stays quiet until the flush below.
+      snapshotIntervalMs: 60_000
+    });
+    const health = async () => (await service.call("setup", { mode: "summary" }, MAIN)).persistence;
+    try {
+      await service.init();
+      // A task whose turn waits on Main, started while persistence is healthy,
+      // on a provider of its own: the mock serves one session per process.
+      const waiting = await service.call("session_open", { provider: "codex", cwd: process.cwd(), permissionPolicy: "ask" }, MAIN);
+      const later = await service.call("task_prompt", { sessionId: waiting.sessionId, prompt: "go", ttl: 600_000 }, MAIN);
+      for (let attempt = 0; attempt < 40 && service.requireSession(waiting.sessionId).status !== "waiting_permission"; attempt += 1) {
+        await new Promise((done) => setTimeout(done, 25));
+      }
+      const pending = (await service.call("inbox", { action: "list", status: "pending" }, MAIN)).items
+        .find((item) => item.sessionId === waiting.sessionId);
+      assert.ok(pending);
+      // Then a result whose artifact fails: the log holds its preview alone.
+      const { task } = await runTask(service, "large-result");
+      assert.equal((await health()).healthy, false);
+
+      // The waiting task's result is committed, durably and whole: an append
+      // that held, not the snapshot the other result waits for.
+      await service.call("permission", { sessionId: waiting.sessionId, requestId: pending.requestId, optionId: "allow-once" }, MAIN);
+      for (let attempt = 0; attempt < 80 && service.requireSession(waiting.sessionId).status !== "idle"; attempt += 1) {
+        await new Promise((done) => setTimeout(done, 25));
+      }
+      assert.equal((await service.call("task_get", { taskId: later.taskId }, MAIN)).status, "completed");
+      const committed = new Map((await readWal(paths))
+        .filter((record) => record.type === "task.result_committed")
+        .map((record) => [record.key, record.payload]));
+      assert.ok(committed.get(later.taskId).result, "the later result is in the log whole");
+      assert.equal(committed.get(task.taskId).result, undefined, "the earlier one by its preview alone");
+      const unhealthy = await health();
+      assert.equal(unhealthy.healthy, false, "the append did not answer the result that waits");
+      assert.match(unhealthy.error, /Task result artifact failed/);
+      assert.deepEqual((await service.call("task_result", { taskId: task.taskId }, MAIN)).durability, {
+        persisted: false, errorCode: "PERSISTENCE_UNHEALTHY"
+      });
+
+      // The snapshot that holds it whole answers both.
+      await service.flushPersist();
+      assert.equal((await health()).healthy, true);
+      assert.equal(Object.hasOwn(await service.call("task_result", { taskId: task.taskId }, MAIN), "durability"), false);
+    } finally {
+      await service.shutdown();
+    }
+  });
+});
+
 test("rotation rolls the log, bumps the epoch, and the seq watermark filters a duplicate replay", async () => {
   await withDirectory("state-rotate", async (directory) => {
     const paths = statePaths(join(directory, "state.json"));

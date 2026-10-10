@@ -53,7 +53,7 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
   } else if (message.method === "session/prompt" && message.params.prompt[0].text === "garbage") {
     const sessionId = message.params.sessionId;
     const read = (id) => JSON.stringify({ jsonrpc: "2.0", id, method: "fs/read_text_file", params: { sessionId, path: cwd + "/ok.txt" } });
-    const expected = [7, 8, 9, "eleven", 12].map(answered);
+    const expected = [7, 8, 9, 10, "eleven", 12].map(answered);
     process.stdout.write([
       "null", "[]", "5", '"text"',
       '{"jsonrpc":"2.0","id":7,"method":5}',
@@ -65,6 +65,8 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
       '{"jsonrpc":"2.0","method":"session/update","params":5}',
       '{"jsonrpc":"2.0","method":"session/update","params":null}',
       '{"jsonrpc":"2.0","id":10}',
+      '{"jsonrpc":"2.0","id":98,"result":{}}',
+      '{"jsonrpc":"2.0","id":99,"error":{"code":-1,"message":"unasked"}}',
       JSON.stringify({ jsonrpc: "2.0", id: "eleven", method: "fs/read_text_file", params: { sessionId, path: 5 } }),
       read(12)
     ].join("\\n") + "\\n");
@@ -75,6 +77,10 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
     send({ jsonrpc: "2.0", id: message.id, result: { stopReason: JSON.stringify(answers) } });
   } else if (message.method === "session/prompt") {
     send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } });
+  } else if (message.method === "test/null-result") {
+    send({ jsonrpc: "2.0", id: message.id, result: null });
+  } else if (message.method === "test/error") {
+    send({ jsonrpc: "2.0", id: message.id, error: { code: -32001, message: "refused" } });
   }
 });
 `;
@@ -216,9 +222,11 @@ test("a provider's malformed frames are answered or dropped, and the client goes
       const answers = JSON.parse((await client.sessionPrompt({ sessionId, prompt: "garbage" })).stopReason);
       const byId = new Map(answers.map((answer) => [JSON.stringify(answer.id), answer]));
       // Only the requests that still had an id to answer on were answered, each
-      // under that id: none under null (1e999), {"x":1} or true.
-      assert.deepEqual([...byId.keys()].sort(), ["\"eleven\"", "12", "13", "7", "8", "9"]);
+      // under that id: none under null (1e999), {"x":1} or true, and no response
+      // (98, 99), which goes to the request it answers, here none.
+      assert.deepEqual([...byId.keys()].sort(), ["\"eleven\"", "10", "12", "13", "7", "8", "9"]);
       assert.equal(byId.get("7").code, -32600, "a method that is not a string");
+      assert.equal(byId.get("10").code, -32600, "an id with no method, result or error");
       assert.equal(byId.get("8").code, -32602, "null params");
       assert.equal(byId.get("9").code, -32602, "params that are an array");
       assert.equal(byId.get("\"eleven\"").code, -32000, "a well-formed request whose handler fails");
@@ -234,6 +242,15 @@ test("a provider's malformed frames are answered or dropped, and the client goes
       assert.equal(notes.length, 16);
       assert.match(notes.at(-1), /; any further ones are only counted$/);
       assert.equal((await client.sessionPrompt({ sessionId, prompt: "hello" })).stopReason, "end_turn");
+      // A response still settles the request it answers, a null result or an
+      // error included: only an id with no method, result or error is answered.
+      assert.equal(await client.request("test/null-result", {}, 5_000), null);
+      await assert.rejects(client.request("test/error", {}, 5_000), (error) => {
+        assert.equal(error.details.acpCode, -32001);
+        assert.equal(error.details.acpMessage, "refused");
+        return true;
+      });
+      assert.equal(client.droppedFrames, 26, "neither counted as a dropped frame");
     } finally {
       await client.stop();
     }

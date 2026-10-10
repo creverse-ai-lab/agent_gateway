@@ -536,7 +536,8 @@ export class AcpClient {
   // A JSON-RPC object whose id, when there is one, is a string or a number,
   // whose method, when there is one, is a string, and whose params, when there
   // are any, are an object, as ACP's are: a request with any of that wrong is
-  // answered with an error, since the worker waits on it, and anything else
+  // answered with an error, since the worker waits on it, and so is an id with
+  // no method, result or error, a request that lost its method; anything else
   // malformed is dropped (#noteDroppedFrame). A line that is not JSON at all is
   // ignored, as it always was: an adapter may print a banner.
   #dispatch(line) {
@@ -569,11 +570,17 @@ export class AcpClient {
       return;
     }
 
-    const invalid = Object.hasOwn(message, "method") && typeof message.method !== "string"
-      ? { code: -32600, message: "Invalid Request: method must be a string" }
-      : Object.hasOwn(message, "params") && !isJsonObject(message.params)
-        ? { code: -32602, message: "Invalid params: params must be an object" }
-        : null;
+    // An id and nothing else, no method, result or error, is a request that lost
+    // its method, and its sender may be waiting on that id; a response went to
+    // its request above.
+    const bareId = hasId && !["method", "result", "error"].some((key) => Object.hasOwn(message, key));
+    const invalid = bareId
+      ? { code: -32600, message: "Invalid Request: method is required" }
+      : Object.hasOwn(message, "method") && typeof message.method !== "string"
+        ? { code: -32600, message: "Invalid Request: method must be a string" }
+        : Object.hasOwn(message, "params") && !isJsonObject(message.params)
+          ? { code: -32602, message: "Invalid params: params must be an object" }
+          : null;
     if (invalid) {
       this.#noteDroppedFrame(invalid.message);
       if (hasId) this.#respondError(message.id, invalid.code, invalid.message);
