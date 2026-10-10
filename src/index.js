@@ -17,7 +17,7 @@ import {
 import { callerForCall, callerFromProcess } from "./caller.js";
 import { controlIdentity } from "./config.js";
 import { errorEnvelope } from "./errors.js";
-import { staleFrontDoorNotice, waitLimits, waitProgressMs } from "./front-door.js";
+import { raceAbort, staleFrontDoorNotice, waitLimits, waitProgressMs } from "./front-door.js";
 import { GatewayRpcClient } from "./socket-rpc.js";
 import { PERMISSION_POLICIES } from "./acp-client.js";
 import { TaskFollower, taskHeartbeatMs } from "./task-follower.js";
@@ -286,35 +286,6 @@ function reportProgress(extra, timeoutMs) {
   return () => clearInterval(timer);
 }
 
-// An abort abandons the WAIT, never the work: the worker keeps working and a
-// handle stays collectable, because "I stopped waiting" and "stop the work" are
-// different instructions and only agent_acp_cancel means the second one. The
-// wait resolves with `abandoned`, the handoff that says where to wait again.
-function raceAbort(pending, signal, abandoned, abandonWait = () => {}) {
-  if (!signal) return pending;
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const finish = (callback, value) => {
-      if (settled) return;
-      settled = true;
-      signal.removeEventListener("abort", abandon);
-      callback(value);
-    };
-    const abandon = () => {
-      finish(resolve, abandoned);
-      // Resolve the user-facing handoff first, then cancel only the outstanding
-      // wait RPC. The task and worker turn are untouched.
-      queueMicrotask(abandonWait);
-    };
-    pending.then(
-      (value) => finish(resolve, value),
-      (error) => finish(reject, error)
-    );
-    if (signal.aborted) abandon();
-    else signal.addEventListener("abort", abandon, { once: true });
-  });
-}
-
 // The handle, delivered before the wait can fail. A host whose transport times
 // out mid-run still has the id it needs to attach again — the only mitigation
 // available for a timeout we do not own.
@@ -495,7 +466,7 @@ function controlTools() {
     },
     {
       name: "agent_acp_wait",
-      description: "Sleep here instead of polling while your Workers run: start each run with agent_acp_run {waitMs: 0}, then call this. It returns as soon as something needs you - reason task_finished (a task you started finished; its result comes as outcome, the same object agent_acp_run {taskId} returns, or as a next.collect pointer), needs_input (a Worker asks a permission or a question: answer pending with the tool in next.answer), or nothing_pending (nothing left to wait for). After timeoutMs it returns reason heartbeat with what is still running: call it again. tasks lists each task with its status; next says what to call. Cancelling this call ends only the wait, never a task.",
+      description: "Sleep here instead of polling while your Workers run: start each run with agent_acp_run {waitMs: 0}, then call this. It returns as soon as something needs you - reason task_finished (a task you started finished; its result comes as outcome, the same object agent_acp_run {taskId} returns, or as a next.collect pointer), needs_input (a Worker asks a permission or a question: answer pending with the tool in next.answer), or nothing_pending (nothing left to wait for). After timeoutMs it returns reason heartbeat with what is still running: call it again. tasks lists each task with its status: handle every row whatever the reason (only a task_finished answer carries outcome; a finished row without one comes again later). next says what to call. Cancelling this call ends only the wait, never a task.",
       inputSchema: {
         type: "object",
         properties: {

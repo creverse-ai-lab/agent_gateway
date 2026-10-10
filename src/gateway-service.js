@@ -2688,15 +2688,21 @@ export class GatewayService {
     return view;
   }
 
-  // The answer. A finished task carries its result (outcome, the envelope a run
-  // attach returns, marked seen as that delivery would be) while the answer's
-  // budget lasts, the first one always; past it, next.collect points at it and
-  // it stays unseen. A task waiting on the Main carries its newest pending
-  // request, as a run's input_required handoff does.
+  // The answer. Only one whose reason is task_finished carries results: a
+  // finished task's (outcome, the envelope a run attach returns) while the
+  // answer's budget lasts, the first one always; past it, next.collect points
+  // at it. Any other answer lists a finished task without its result, so a
+  // Main that reads only what its reason says loses nothing: the result stays
+  // unseen, and the next wait answers task_finished with it. Only a result in
+  // this answer is marked seen, as a run attach would mark it, and only for a
+  // front-door Main: a wait with no caller delivers to nobody. A task waiting
+  // on the Main carries its newest pending request, as a run's input_required
+  // handoff does.
   #waitAnswer(reason, view, named, context) {
     // As a long poll: nobody is left to read it, so none is built.
     if (context.signal?.aborted) throw waitAborted();
     const rootId = requireRoot(context);
+    const requester = requesterOf(context);
     const row = (task) => ({
       taskId: task.taskId,
       sessionId: task.sessionId,
@@ -2708,18 +2714,23 @@ export class GatewayService {
     const tasks = [];
     const collect = [];
     const answer = [];
+    const delivered = new Set();
     let budget = WAIT_RESULT_BUDGET_BYTES;
     for (const task of view.finished.slice(0, WAIT_MAX_FINISHED_ROWS)) {
+      if (reason !== "task_finished") {
+        tasks.push(row(task));
+        continue;
+      }
       const outcome = this.#terminalEnvelope(task, rootId);
       const bytes = Buffer.byteLength(JSON.stringify(outcome));
-      if (tasks.length > 0 && bytes > budget) {
+      if (delivered.size > 0 && bytes > budget) {
         tasks.push(row(task));
         collect.push({ tool: "agent_acp_run", arguments: { taskId: task.taskId } });
         continue;
       }
       budget -= Math.min(budget, bytes);
       tasks.push({ ...row(task), outcome });
-      this.#markDelivered(task.taskId, context);
+      delivered.add(task.taskId);
     }
     for (const task of view.needsInput) {
       const pending = this.#pendingInboxRecord(task.sessionId);
@@ -2732,9 +2743,13 @@ export class GatewayService {
       }
     }
     for (const task of [...view.working, ...view.done]) tasks.push(row(task));
+    // Again, right before the seen marks: an answer nobody is left to read
+    // must not count as delivered.
+    if (context.signal?.aborted) throw waitAborted();
+    if (requester) for (const taskId of delivered) this.#markDelivered(taskId, context);
     // Waiting again is worth it while a task runs, or a finished one is still
-    // to be delivered (pointed at, or past the row limit).
-    const delivered = new Set(tasks.filter((entry) => Object.hasOwn(entry, "outcome")).map((entry) => entry.taskId));
+    // to be delivered (pointed at, past the row limit, or left for a
+    // task_finished answer).
     const again = [...view.finished.filter((task) => !delivered.has(task.taskId)), ...view.needsInput, ...view.working]
       .map((task) => task.taskId);
     return {

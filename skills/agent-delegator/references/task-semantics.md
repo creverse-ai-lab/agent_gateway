@@ -31,7 +31,8 @@ Treating either as a failure and re-sending the prompt is how one unit of work b
 ```
 
 - `reason` is the first that holds: `needs_input`, `task_finished`, `nothing_pending`; `heartbeat` when the sleep ran out first.
-- `outcome` is the run envelope above, and taking it marks the result seen, as `agent_acp_run {taskId}` does. One answer carries about 64 KB of outcomes; a finished task that did not fit has no `outcome` and is in `next.collect`. The next wait delivers it too.
+- `outcome` is the run envelope above, and taking it marks the result seen, as `agent_acp_run {taskId}` does. Only a `task_finished` answer carries outcomes, about 64 KB of them; a finished task that did not fit has no `outcome` and is in `next.collect`. Any other answer lists finished tasks without `outcome` and leaves them unseen. Either way the next wait delivers them.
+- Read every row, whatever the `reason`: a `needs_input` answer can list a finished task too.
 - A task waiting on you carries `pending`, and `next.answer` names the tool and its `sessionId` and `requestId`.
 - `taskIds` narrows the wait to those tasks; another Main's tasks are never watched. `gone` lists watched tasks whose TTL ran out.
 - The sleep is as long as your host allows one tool call (`timeoutMs` only shortens it). Leave it out.

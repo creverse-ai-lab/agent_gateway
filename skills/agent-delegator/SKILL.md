@@ -31,7 +31,7 @@ Call `agent_acp_setup` on a cold start, when choosing or installing a provider, 
 
 After a reconnect or Gateway restart, call `agent_acp_inbox {action: "attention"}`: it lists requests waiting on you and finished runs whose result never reached you (collect with `agent_acp_run {taskId}`, or call `agent_acp_wait`, which delivers them). In a new conversation you are a new Main and your earlier sessions are not listed: take each back with `agent_acp_session_restore` (provider, acpSessionId, cwd) once the earlier Main is gone, as `references/recovery.md` describes.
 
-**Capability rule: declaration only.** Decide from `responseProfiles` in this response and from whether `agent_acp_run` and `agent_acp_wait` are in the live tool list. Never probe by sending a new argument: an older Gateway ignores unknown arguments silently and answers in the old shape, so a probe cannot tell support from silence. `responseProfiles` or `agent_acp_run` missing means an older Gateway — use `agent_acp_prompt` + `agent_acp_poll` with no new arguments, which is fully supported. `agent_acp_wait` missing alone means a Gateway before 1.9: follow item 5 of step 3.
+**Capability rule: declaration only.** Decide from `responseProfiles` in this response, from whether `agent_acp_run` is in the live tool list, and for `agent_acp_wait` from `capabilities.taskWait` in the full setup answer (the `agent_acp_setup {provider}` call above returns it; summary mode does not). Never probe by sending a new argument: an older Gateway ignores unknown arguments silently and answers in the old shape, so a probe cannot tell support from silence. `responseProfiles` or `agent_acp_run` missing means an older Gateway — use `agent_acp_prompt` + `agent_acp_poll` with no new arguments, which is fully supported. Use `agent_acp_wait` only when `capabilities.taskWait` is `true`: a 1.9 front door lists the tool even when the Gateway behind it is older and cannot answer it. Otherwise follow item 5 of step 3.
 
 A response carrying `staleFrontDoor` means this front door and the running Gateway are different versions: do what its `action` says before continuing. With `reason: "gateway_older"` the daemon is the old side, and reconnecting would only reattach to it; otherwise reconnect the `agent-acp` MCP server (`references/recovery.md`).
 
@@ -50,13 +50,12 @@ Terminals the Gateway opens for a Worker run in a sandbox on macOS, where `ps` a
 1. Start: `agent_acp_run {sessionId, prompt, waitMs: 0}`. It returns at once with `status: "working"` and the `taskId`. Start every independent branch this way before you wait.
 2. Send one bounded Task Contract and require a compact Result Packet — conclusion, essential evidence, changed paths, test status. No progress narration or prompt recap. Pass `resultBudgetBytes` when the answer may be large: results arrive inside the wait's answer.
 3. Pass `idempotencyKey` when duplicated work would be expensive: a repeat with the same key attaches instead of prompting twice.
-4. Sleep: `agent_acp_wait {}`. With no arguments it watches every task you started, and sleeps as long as your host allows one tool call. Branch on `reason`:
-   - `task_finished` — each finished row of `tasks` carries `outcome`, the same object `agent_acp_run {taskId}` returns (`result.text`, `ok`, `error`); a finished row without one is in `next.collect`: take it with `agent_acp_run {taskId}`.
-   - `needs_input` — answer each row's `pending` with the tool and arguments in `next.answer` (adding `optionId`, or `action` and `content`), as section 5 says.
-   - `heartbeat` — nothing needs you yet; the rows say what still runs.
-   - `nothing_pending` — nothing is left to wait for.
+4. Sleep: `agent_acp_wait {}`. With no arguments it watches every task you started, and sleeps as long as your host allows one tool call. `reason` says why it returned (`task_finished`, `needs_input`, `heartbeat`: nothing needs you yet, `nothing_pending`: nothing is left to wait for), but handle every row of `tasks`, whatever the `reason`:
+   - a row with `outcome` — a finished task's result, the same object `agent_acp_run {taskId}` returns (`result.text`, `ok`, `error`). It is delivered once: read it now.
+   - a row with `pending` — a Worker waits on you: answer it with the tool and arguments in `next.answer` (adding `optionId`, or `action` and `content`), as section 5 says.
+   - a finished row without `outcome` — its result comes with a later wait; one listed in `next.collect` you can also take with `agent_acp_run {taskId}`.
    Call `agent_acp_wait` again while its answer has `next.wait`. Cancelling it, or a host timeout, ends only the wait: the tasks run on, and the next wait finds them.
-5. Without `agent_acp_wait` in the tool list, wait inside the run instead: `agent_acp_run {sessionId, prompt, waitMs: 25000}` for a session's first run, `55000` once a turn has completed normally, and branch on the returned `status`:
+5. Without `capabilities.taskWait`, wait inside the run instead: `agent_acp_run {sessionId, prompt, waitMs: 25000}` for a session's first run, `55000` once a turn has completed normally, and branch on the returned `status`:
    - `idle` / `cancelled` / `error` — terminal; collect `result`.
    - `input_required` — answer `pending` with the tool in `next.answerWith`, then `agent_acp_run {taskId}`.
    - `working` — the wait ran out and the worker is still going; `agent_acp_run {taskId}` again, optionally with a longer `waitMs`.

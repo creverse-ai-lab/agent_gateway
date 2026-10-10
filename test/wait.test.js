@@ -16,7 +16,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { CallToolResultSchema, CreateTaskResultSchema, ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { isReadOnlyCall } from "../src/access.js";
 import { withoutSessionMarkers } from "../src/caller.js";
-import { WAIT_PROGRESS_MS, waitLimits, waitProgressMs } from "../src/front-door.js";
+import { raceAbort, WAIT_PROGRESS_MS, waitLimits, waitProgressMs } from "../src/front-door.js";
 import { MAIN_STATUSES } from "../src/main-status.js";
 import { GatewayRpcClient } from "../src/socket-rpc.js";
 import { EPOCH, finish, harness, permission, start, until } from "./helpers/fake-worker.js";
@@ -355,6 +355,116 @@ test("cancelling a wait ends the wait alone: its waiter goes at once and the tas
   }
 });
 
+test("a wait with no caller delivers no result to anyone, a task no Main is recorded for included", async () => {
+  const { service } = harness();
+  try {
+    // Opened and started by management: a session and a task no Main is
+    // recorded for, so every Main's to receive.
+    const { session, worker } = await open(service, MANAGEMENT);
+    const taskId = await start(service, session, MANAGEMENT);
+    const watching = wait(service, MANAGEMENT, { timeoutMs: 600_000 });
+    const observing = wait(service, OBSERVER, { timeoutMs: 600_000 });
+    await pause(10);
+    await finish(service, worker, taskId);
+    for (const answer of await Promise.all([watching, observing])) {
+      assert.equal(answer.reason, "task_finished");
+      assert.equal(answer.tasks[0].outcome.taskId, taskId, "management reads the result");
+    }
+    assert.equal(seenAt(service, taskId), null, "and delivers it to nobody");
+    // Every Main still hears about it, and the first one to wait receives it.
+    for (const context of [A, B]) {
+      assert.deepEqual((await service.call("inbox", { action: "attention" }, context)).updates.map((row) => row.taskId), [taskId]);
+    }
+    const received = await wait(service, A);
+    assert.equal(received.reason, "task_finished");
+    assert.equal(received.tasks[0].outcome.taskId, taskId);
+    assert.ok(seenAt(service, taskId));
+  } finally {
+    await service.shutdown().catch(() => {});
+  }
+});
+
+test("only a task_finished answer carries results: a finished row in any other waits, unseen, for the next wait", async () => {
+  const { service } = harness();
+  try {
+    const first = await open(service);
+    const second = await open(service);
+    const done = await start(service, first.session, A);
+    const asking = await start(service, second.session, A);
+    first.worker.turns[0].resolve({ stopReason: "end_turn" });
+    await until(() => service.taskStore.find(done)?.status === "completed", "the first task to finish");
+    permission(second.worker, second.session, 9);
+    await until(() => service.taskStore.find(asking)?.status === "input_required", "the second to ask");
+
+    // A request nobody is left to read is answered with nothing, so nothing
+    // in it counts as delivered.
+    const aborted = new AbortController();
+    aborted.abort();
+    await assert.rejects(wait(service, { ...A, signal: aborted.signal }), { code: "WAIT_ABORTED" });
+    assert.equal(seenAt(service, done), null);
+
+    // A Worker waiting on the Main outranks a result, and the result is left
+    // for later, not handed over beside the request where it could be missed.
+    for (let round = 0; round < 2; round += 1) {
+      const answer = await wait(service, A);
+      assert.equal(answer.reason, "needs_input");
+      assert.deepEqual(answer.tasks.map((row) => [row.taskId, row.status, Object.hasOwn(row, "outcome")]), [
+        [done, "completed", false], [asking, "input_required", false]
+      ]);
+      assert.deepEqual(answer.counts, { finished: 1, needsInput: 1, working: 0 });
+      assert.deepEqual(answer.next, {
+        answer: [{ tool: "agent_acp_permission", arguments: { sessionId: second.session.id, requestId: 9 } }],
+        wait: { tool: "agent_acp_wait", arguments: {} }
+      });
+      assert.equal(seenAt(service, done), null, "not in the answer, so not delivered");
+    }
+    const named = await wait(service, A, { taskIds: [done, asking] });
+    assert.equal(named.reason, "needs_input");
+    assert.deepEqual(named.next.wait, { tool: "agent_acp_wait", arguments: { taskIds: [done, asking] } });
+
+    await service.call("permission", { sessionId: second.session.id, requestId: 9, optionId: "allow-once" }, A);
+    const finished = await wait(service, A);
+    assert.equal(finished.reason, "task_finished");
+    assert.deepEqual(finished.tasks.map((row) => [row.taskId, Object.hasOwn(row, "outcome")]), [[done, true], [asking, false]]);
+    assert.ok(seenAt(service, done));
+  } finally {
+    await service.shutdown().catch(() => {});
+  }
+});
+
+test("front door: an abort hands back the wait's own answer when it has already settled, and cancels the rpc only otherwise", async () => {
+  const turn = () => new Promise((resolve) => setImmediate(resolve));
+  let cancelled = 0;
+  const cancel = () => {
+    cancelled += 1;
+  };
+  // Settled before the abort is heard: that answer, and the rpc is left alone.
+  let settle;
+  const answered = new Promise((resolve) => {
+    settle = resolve;
+  });
+  const late = new AbortController();
+  const raced = raceAbort(answered, late.signal, { incomplete: "wait_abandoned" }, cancel);
+  settle({ ok: true, reason: "task_finished" });
+  late.abort();
+  assert.deepEqual(await raced, { ok: true, reason: "task_finished" });
+  await turn();
+  assert.equal(cancelled, 0);
+  // Nothing yet: the handoff, then the rpc is cancelled, once.
+  const never = new Promise(() => {});
+  const early = new AbortController();
+  const handoff = raceAbort(never, early.signal, { incomplete: "wait_abandoned" }, cancel);
+  early.abort();
+  assert.deepEqual(await handoff, { incomplete: "wait_abandoned" });
+  await turn();
+  assert.equal(cancelled, 1);
+  const before = new AbortController();
+  before.abort();
+  assert.equal(await raceAbort(never, before.signal, "abandoned"), "abandoned");
+  assert.equal(await raceAbort(Promise.resolve("plain"), undefined, "abandoned"), "plain");
+  await assert.rejects(raceAbort(Promise.reject(new Error("boom")), new AbortController().signal, "abandoned"), /boom/);
+});
+
 test("main_list and main_status: active while connected, waiting_tasks while a wait blocks, gone when it leaves", async () => {
   const { service, clock } = harness();
   try {
@@ -427,18 +537,25 @@ test("main_list and main_status: active while connected, waiting_tasks while a w
   }
 });
 
-test("a heartbeat keeps its Main waiting_tasks for a grace: a re-wait goes on with the span, another call, the grace's end or a wake ends it", async () => {
-  const { service, clock } = harness({ waitGraceMs: 150 });
+// The Main of a connected front door, for the grace cases: its main_status
+// events as management hears them.
+async function sleeper(service) {
+  const { session, worker } = await open(service);
+  const taskId = await start(service, session, A);
+  const events = [];
+  service.subscribe({}, MANAGEMENT, (event) => {
+    if (event.type === "main_status") events.push(event);
+  });
+  const connection = {};
+  service.attachCaller(connection, ROOT, claudeCaller);
+  return { session, worker, taskId, events, connection, statuses: () => events.map((event) => event.status) };
+}
+
+test("a heartbeat keeps its Main waiting_tasks for a grace: a re-wait goes on with the span, another call or a wake ends it, a disconnect makes it gone", async () => {
+  // A grace no step here can outlast, however slow the machine.
+  const { service, clock } = harness({ waitGraceMs: 600_000 });
   try {
-    const { session, worker } = await open(service);
-    const taskId = await start(service, session, A);
-    const events = [];
-    service.subscribe({}, MANAGEMENT, (event) => {
-      if (event.type === "main_status") events.push(event);
-    });
-    const statuses = () => events.map((event) => event.status);
-    const connection = {};
-    service.attachCaller(connection, ROOT, claudeCaller);
+    const { session, worker, taskId, events, connection, statuses } = await sleeper(service);
     const strip = ({ revision: _revision, ...main }) => main;
 
     // heartbeat, then the next wait within the grace: one span, no active.
@@ -460,29 +577,39 @@ test("a heartbeat keeps its Main waiting_tasks for a grace: a re-wait goes on wi
     assert.deepEqual(statuses(), ["active", "waiting_tasks", "active"]);
     assert.equal(events.at(-1).since, iso(EPOCH + 3_000));
 
-    // heartbeat, then nothing for the grace: active once it ends.
-    clock.now = EPOCH + 4_000;
-    await wait(service, A, { timeoutMs: 20 });
-    clock.now = EPOCH + 5_000;
-    await eventually(() => events.length === 5, "the grace to run out");
-    assert.deepEqual(statuses().slice(3), ["waiting_tasks", "active"]);
-    assert.equal(events.at(-1).since, iso(EPOCH + 5_000));
-
     // A wait that answers for anything but a heartbeat ends the span at once.
     await wait(service, A, { timeoutMs: 20 });
     await finish(service, worker, taskId);
     assert.equal(statuses().at(-1), "waiting_tasks", "a task finishing between two waits ends no grace");
     assert.equal((await wait(service, A)).reason, "task_finished");
-    assert.deepEqual(statuses().slice(5), ["waiting_tasks", "active"]);
+    assert.deepEqual(statuses().slice(3), ["waiting_tasks", "active"]);
 
     // heartbeat, then the connection goes: gone, never active.
     await start(service, session, A);
     await wait(service, A, { timeoutMs: 20 });
     service.detachCaller(connection);
-    assert.deepEqual(statuses().slice(7), ["waiting_tasks", "gone"]);
+    assert.deepEqual(statuses().slice(5), ["waiting_tasks", "gone"]);
     assert.deepEqual(await mainsOf(service, MANAGEMENT), []);
-    await pause(200);
-    assert.equal(events.length, 9, "nothing after it left, its grace's timer included");
+  } finally {
+    await service.shutdown().catch(() => {});
+  }
+});
+
+test("a heartbeat's grace that runs out with nothing makes its Main active, and its timer goes with a Main that left", async () => {
+  const { service, clock } = harness({ waitGraceMs: 50 });
+  try {
+    const { events, connection, statuses } = await sleeper(service);
+    clock.now = EPOCH + 1_000;
+    await wait(service, A, { timeoutMs: 20 });
+    clock.now = EPOCH + 2_000;
+    await eventually(() => events.length === 3, "the grace to run out");
+    assert.deepEqual(statuses(), ["active", "waiting_tasks", "active"]);
+    assert.equal(events.at(-1).since, iso(EPOCH + 2_000));
+    // Gone during a grace: its timer ends nothing more.
+    await wait(service, A, { timeoutMs: 20 });
+    service.detachCaller(connection);
+    await pause(150);
+    assert.deepEqual(statuses().slice(3), ["waiting_tasks", "gone"]);
   } finally {
     await service.shutdown().catch(() => {});
   }
@@ -490,15 +617,18 @@ test("a heartbeat keeps its Main waiting_tasks for a grace: a re-wait goes on wi
 
 test("the heartbeat and its ceiling follow the host the front door serves, and ACP_GATEWAY_WAIT_LIMIT_MS replaces both", () => {
   // Measured: Codex 0.162.0 gives up on a tool call at 300s, Claude Code
-  // 2.1.287 waited 300s; anything else gets the usual 60s.
+  // 2.1.287 completed a 540s one; anything else gets the usual 60s, and no
+  // more than its default even when it asks for more.
   assert.deepEqual(waitLimits("codex-mcp-client", {}), { defaultMs: 270_000, limitMs: 280_000 });
   assert.deepEqual(waitLimits("claude-code", {}), { defaultMs: 540_000, limitMs: 600_000 });
   for (const name of ["grok-cli", "Codex-MCP-Client", "", undefined, null, "constructor", "__proto__"]) {
-    assert.deepEqual(waitLimits(name, {}), { defaultMs: 55_000, limitMs: 600_000 }, String(name));
+    assert.deepEqual(waitLimits(name, {}), { defaultMs: 55_000, limitMs: 55_000 }, String(name));
   }
   assert.deepEqual(waitLimits("codex-mcp-client", { ACP_GATEWAY_WAIT_LIMIT_MS: "900000" }), { defaultMs: 600_000, limitMs: 600_000 });
   assert.deepEqual(waitLimits("claude-code", { ACP_GATEWAY_WAIT_LIMIT_MS: "120000" }), { defaultMs: 120_000, limitMs: 120_000 });
   assert.deepEqual(waitLimits("other", { ACP_GATEWAY_WAIT_LIMIT_MS: "1000" }), { defaultMs: 1_000, limitMs: 1_000 });
+  assert.deepEqual(waitLimits("grok-cli", { ACP_GATEWAY_WAIT_LIMIT_MS: "300000" }), { defaultMs: 300_000, limitMs: 300_000 },
+    "the env raises an unknown host's ceiling");
   for (const ignored of ["999", "0", "-5", "1.5", "soon", ""]) {
     assert.deepEqual(waitLimits("codex-mcp-client", { ACP_GATEWAY_WAIT_LIMIT_MS: ignored }), { defaultMs: 270_000, limitMs: 280_000 }, ignored);
   }
@@ -656,7 +786,10 @@ test("front door: the host's clientInfo picks the wait's default and ceiling, an
     const claude = await frontDoor(clients, daemon, directory, providers, { name: "claude-code" });
     assert.equal(await heartbeatOf(claude), 540_000);
     assert.equal(await heartbeatOf(claude, { timeoutMs: 600_000 }), 600_000);
-    assert.equal(await heartbeatOf(await frontDoor(clients, daemon, directory, providers, { name: "grok-cli" })), 55_000);
+    const unknown = await frontDoor(clients, daemon, directory, providers, { name: "grok-cli" });
+    assert.equal(await heartbeatOf(unknown), 55_000);
+    assert.equal(await heartbeatOf(unknown, { timeoutMs: 600_000 }), 55_000, "a host not measured gets no more than its default");
+    assert.equal(await heartbeatOf(unknown, { timeoutMs: 20_000 }), 20_000);
 
     // The limit a user raised (or lowered) in the entry's env: here 1s, so the
     // heartbeat answers after a second whatever was asked.
