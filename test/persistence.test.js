@@ -1068,13 +1068,15 @@ test("a corrupt snapshot halts instead of starting empty; snapshot-drop starts f
 // A state directory as a crash leaves it: a snapshot that holds task-snapshot,
 // rotated into before task-log and task-log-2 were logged, the log that went on
 // from it, and a v4 state.json a 1.7 Gateway left beside them. store() opens
-// it with the given persistence config.
+// it with the given persistence config, on the given clock if one is given.
 async function seedState(directory) {
   const statePath = join(directory, "state.json");
   const paths = statePaths(statePath);
   const task = (taskId, day) => ({ taskId, sessionId: "s", status: "working", createdAt: `2026-01-0${day}T00:00:00.000Z` });
   let body = { sessions: [], tasks: [], inbox: [] };
-  const store = (config = {}) => new StateStore({ statePath, config: { fsync: "off", ...config }, snapshotProvider: () => body });
+  const store = (config = {}, { now } = {}) => new StateStore({
+    statePath, ...(now ? { now } : {}), config: { fsync: "off", ...config }, snapshotProvider: () => body
+  });
   const first = store();
   first.open();
   first.appendDurable(WAL_TYPES.TASK_CREATED, "task-snapshot", task("task-snapshot", 1));
@@ -1221,6 +1223,166 @@ test("cold sets every state file aside and replays none of them, whichever one s
         assert.equal(loaded.recovery.source, "snapshot");
       } finally {
         again.close();
+      }
+    });
+  }
+});
+
+// seedState as a crash in the middle of a rotation leaves it, with a damaged
+// snapshot: the log renamed aside as the retired segment, and the new log,
+// which holds nothing yet but its opening record. All four state files are
+// there for cold to set aside. originals lists them in the order cold removes
+// them; files holds the bytes of each.
+async function seedColdRotation(directory) {
+  const seeded = await seedState(directory);
+  const { statePath, paths, files } = seeded;
+  const records = files.wal.toString("utf8").split("\n").filter(Boolean).map((line) => decodeRecord(Buffer.from(line, "utf8")));
+  await writeFile(paths.rotating, files.wal, { mode: 0o600 });
+  files.rotating = files.wal;
+  files.wal = Buffer.from(encodeRecord({
+    v: 1, seq: records.at(-1).seq + 1, at: new Date().toISOString(), type: "wal.opened", key: "4242", payload: { pid: 4242, epoch: 2 }
+  }), "utf8");
+  await writeFile(paths.wal, files.wal, { mode: 0o600 });
+  const raw = await readFile(paths.snapshot, "utf8");
+  files.snapshot = Buffer.from(raw.replace("task-snapshot", "task-snapshoT"), "utf8");
+  await writeFile(paths.snapshot, files.snapshot, { mode: 0o600 });
+  const originals = [statePath, paths.snapshot, paths.rotating, paths.wal];
+  const bytes = new Map([[statePath, files.state], [paths.snapshot, files.snapshot], [paths.rotating, files.rotating], [paths.wal, files.wal]]);
+  return { ...seeded, originals, bytes };
+}
+
+// What a cold start that went all the way leaves: nothing of the old state.
+function assertColdStarted(loaded) {
+  assert.deepEqual([loaded.sessions, loaded.tasks, loaded.inbox], [[], [], []]);
+  assert.equal(loaded.recovery.source, "cold");
+  assert.deepEqual(loaded.recovery.alerts.map((alert) => alert.code), ["STATE_COLD_STARTED"]);
+}
+
+// Review of the I6 fix: cold copied each file aside and removed it before it
+// copied the next, and synced none of it. A copy that failed later (a large log
+// on a full disk), a crash or a power loss could take the snapshot and leave
+// the v4 file with the log: a pair the next start read as a whole state, with
+// cold too, so the empty start never came and the snapshot was never read.
+test("cold removes no state file until each one is set aside, and a copy that fails halts with all of them in place", async () => {
+  await withDirectory("state-cold-copy-fails", async (directory) => {
+    const { paths, store, originals, bytes } = await seedColdRotation(directory);
+    let clock = Date.now();
+    const now = () => clock;
+    // The second copy cold makes fails for want of space, whichever way it copies.
+    let copies = 0;
+    const full = (target) => {
+      if (String(target).includes(".cold-") && ++copies === 2) {
+        throw Object.assign(new Error(`ENOSPC: no space left on device, open '${target}'`), { code: "ENOSPC" });
+      }
+    };
+    await withFs({
+      openSync: (original) => function openSync(path, ...rest) {
+        full(path);
+        return original.call(this, path, ...rest);
+      },
+      copyFileSync: (original) => function copyFileSync(source, target, ...rest) {
+        full(target);
+        return original.call(this, source, target, ...rest);
+      }
+    }, () => {
+      assert.throws(() => store({ stateRecovery: "cold" }, { now }).open(), (error) => {
+        assert.equal(error.code, "STATE_SNAPSHOT_CORRUPT");
+        assert.match(error.message, /^Gateway state snapshot is unusable \(body checksum mismatch\)\. ACP_GATEWAY_STATE_RECOVERY=cold could not set .*state\.snapshot\.json aside \(ENOSPC/);
+        assert.match(error.message, /so it removed none of the state files/);
+        return true;
+      });
+    });
+    for (const path of originals) assert.deepEqual(await readFile(path), bytes.get(path), path);
+    assert.deepEqual((await readdir(directory)).filter((name) => name.includes(".cold-")), [], "nor are its copies left");
+
+    // Once there is room, the same start goes through.
+    clock += 1_000;
+    const cold = store({ stateRecovery: "cold" }, { now });
+    try {
+      assertColdStarted(cold.open());
+      for (const path of originals.slice(0, -1)) await assert.rejects(stat(path), /ENOENT/, path);
+      assert.deepEqual((await readWal(paths)).map((record) => [record.seq, record.type]), [[1, "wal.opened"]]);
+    } finally {
+      cold.close();
+    }
+  });
+});
+
+test("cold removes the state files in an order a stop at any point cannot leave read back as something else", async () => {
+  // The order, and each removal synced before the next: copies first, each one
+  // synced, then the directory; then the v4 file, the snapshot, the retired
+  // segment and the log, the directory synced after each.
+  await withDirectory("state-cold-order", async (directory) => {
+    const { store, originals } = await seedColdRotation(directory);
+    const events = [];
+    const cold = store({ stateRecovery: "cold", fsync: "normal" });
+    try {
+      await withFs({
+        unlinkSync: (original) => function unlinkSync(path, ...rest) {
+          if (originals.includes(String(path))) events.push(`remove ${String(path).slice(directory.length + 1)}`);
+          return original.call(this, path, ...rest);
+        },
+        fsyncSync: (original) => function fsyncSync(fd, ...rest) {
+          events.push(fs.fstatSync(fd).isDirectory() ? "sync directory" : "sync file");
+          return original.call(this, fd, ...rest);
+        }
+      }, () => assertColdStarted(cold.open()));
+    } finally {
+      cold.close();
+    }
+    const start = events.indexOf("sync file");
+    assert.deepEqual(events.slice(start, start + 13), [
+      "sync file", "sync file", "sync file", "sync file", "sync directory",
+      "remove state.json", "sync directory",
+      "remove state.snapshot.json", "sync directory",
+      "remove state.wal.ndjson.rot", "sync directory",
+      "remove state.wal.ndjson", "sync directory"
+    ]);
+  });
+
+  // A stop after each removal (a crash, a power loss, a removal that fails):
+  // the next start refuses what is left rather than read it as a state, and
+  // cold, started again, finishes the empty start.
+  for (const removed of [1, 2, 3]) {
+    await withDirectory(`state-cold-stop-${removed}`, async (directory) => {
+      const { store, originals, bytes } = await seedColdRotation(directory);
+      let clock = Date.now();
+      const now = () => clock;
+      let removals = 0;
+      await withFs({
+        unlinkSync: (original) => function unlinkSync(path, ...rest) {
+          if (originals.includes(String(path)) && ++removals > removed) {
+            throw Object.assign(new Error(`EIO: i/o error, unlink '${path}'`), { code: "EIO" });
+          }
+          return original.call(this, path, ...rest);
+        }
+      }, () => {
+        assert.throws(() => store({ stateRecovery: "cold" }, { now }).open(), (error) => {
+          assert.equal(error.code, "STATE_SNAPSHOT_CORRUPT");
+          assert.match(error.message, /set the state files aside as .*, but could not remove .* \(EIO.*\)\. Start again with =cold to finish\.$/);
+          return true;
+        });
+      });
+      // The first ones in the order are gone, the rest are as they were.
+      for (const [index, path] of originals.entries()) {
+        if (index < removed) await assert.rejects(stat(path), /ENOENT/, path);
+        else assert.deepEqual(await readFile(path), bytes.get(path), path);
+      }
+      // Without cold, what is left halts the start: the damaged snapshot, or
+      // a log with no snapshot under it.
+      clock += 1_000;
+      assert.throws(() => store({}, { now }).open(), (error) => {
+        assert.equal(error.code, "STATE_SNAPSHOT_CORRUPT");
+        assert.match(error.message, removed === 1 ? /snapshot is unusable/ : /state\.snapshot\.json is missing/);
+        return true;
+      });
+      clock += 1_000;
+      const cold = store({ stateRecovery: "cold" }, { now });
+      try {
+        assertColdStarted(cold.open());
+        for (const path of originals.slice(0, -1)) await assert.rejects(stat(path), /ENOENT/, path);
+      } finally {
+        cold.close();
       }
     });
   }

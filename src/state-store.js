@@ -334,25 +334,79 @@ export class StateStore {
   // ACP_GATEWAY_STATE_RECOVERY=cold, once the state on disk could not be
   // recovered as it is (error, one of COLD_STARTS): every file of it is set
   // aside and nothing of it is read, so nothing of it comes back, not even what
-  // a log or a v4 file still holds of a snapshot dropped here. Each goes as the
-  // copies a halt leaves do, a copy beside it under the same limits
-  // (#pruneQuarantine) and the file itself through removeFile, and a file that
-  // cannot be kept that way halts the start with it still in place.
+  // a log or a v4 file still holds of a snapshot dropped here. Each is kept as
+  // the copies a halt leaves are, beside it and under the same limits
+  // (#pruneQuarantine).
+  //
+  // Copied first, all of them, each copy synced and then the directory: a
+  // copy that fails (a disk too full for a large log) removes no original,
+  // only the copies made so far, and halts. Only then do the originals go,
+  // through removeFile and the directory synced after each, so that a stop
+  // anywhere in between (a crash, a power loss, a removal that fails) leaves
+  // one of the sets this order allows, never some other subset: the v4
+  // state.json, then the snapshot, then the retired segment, then the log.
+  // The v4 file goes first because a log may go on from it at any seq, so it
+  // would carry the log as a whole state once the snapshot was gone. The
+  // snapshot goes before the log, and the retired segment before the live one,
+  // because a snapshot or a segment left without the log that goes on from it
+  // reads back as a whole state that lacks that log's records. So a later
+  // start meets either all of this state, and stops as this one did, or a log
+  // with no base under it, which it refuses (#discontinuity) until cold
+  // finishes, or takes whole when it starts at seq 1 and so holds everything.
   #startCold(recovery, error) {
     const stamp = new Date(this.#now()).toISOString().replace(/[:.]/g, "-");
-    const aside = [];
-    for (const path of [this.paths.snapshot, this.paths.rotating, this.paths.wal, this.paths.state]) {
+    const reason = error.reason ?? error.message;
+    const originals = [];
+    const copies = [];
+    for (const path of [this.paths.state, this.paths.snapshot, this.paths.rotating, this.paths.wal]) {
       const target = `${path}.cold-${stamp}`;
       try {
-        copyFileSync(path, target);
+        let bytes;
+        try {
+          bytes = readFileSync(path);
+        } catch (readError) {
+          if (readError?.code === "ENOENT") continue;
+          throw readError;
+        }
+        const fd = openSync(target, "wx", 0o600);
+        copies.push(target);
+        try {
+          writeAll(fd, bytes);
+          this.#fsync(fd);
+        } finally {
+          closeSync(fd);
+        }
       } catch (copyError) {
-        if (copyError?.code === "ENOENT") continue;
-        throw copyError;
+        for (const copy of copies) {
+          try {
+            removeFile(copy);
+          } catch {
+            // Only a copy: the originals are all still there.
+          }
+        }
+        throw recoveryHalt(
+          error.code,
+          reason,
+          `ACP_GATEWAY_STATE_RECOVERY=cold could not set ${path} aside (${copyError?.message ?? copyError}), `
+          + "so it removed none of the state files. Start again once that is fixed (a full disk, say)."
+        );
       }
-      removeFile(path);
-      aside.push(target);
+      originals.push(path);
     }
     this.#syncDirectory();
+    for (const path of originals) {
+      try {
+        removeFile(path);
+      } catch (removeError) {
+        throw recoveryHalt(
+          error.code,
+          reason,
+          `ACP_GATEWAY_STATE_RECOVERY=cold set the state files aside as ${copies.join(", ")}, but could not `
+          + `remove ${path} (${removeError?.message ?? removeError}). Start again with =cold to finish.`
+        );
+      }
+      this.#syncDirectory();
+    }
     this.#pruneQuarantine();
     // What the attempt read before it stopped goes with it.
     this.#seq = 0;
@@ -360,11 +414,11 @@ export class StateStore {
     this.#legacyPending = false;
     this.#resultRefs.clear();
     Object.assign(recovery, { source: "cold", replayed: 0, skipped: 0, droppedTail: 0, unknownTypes: 0 });
-    if (aside.length) recovery.quarantined = aside.at(-1);
+    if (copies.length) recovery.quarantined = copies.at(-1);
     recovery.alerts.push({
       code: "STATE_COLD_STARTED",
-      message: `${error.reason ?? error.message}; started from an empty state (ACP_GATEWAY_STATE_RECOVERY=cold)`
-        + (aside.length ? `, with the state files set aside as ${aside.join(", ")}` : "")
+      message: `${reason}; started from an empty state (ACP_GATEWAY_STATE_RECOVERY=cold)`
+        + (copies.length ? `, with the state files set aside as ${copies.join(", ")}` : "")
     });
     return { sessions: new Map(), tasks: new Map(), inbox: new Map() };
   }
