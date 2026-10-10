@@ -6,6 +6,8 @@ import { ERROR_CODES, GatewayError } from "./errors.js";
 // half-applied interleaving. The bound is a module constant on purpose: it is a
 // safety valve against a runaway caller, not a tuning knob on the wire.
 export const SESSION_QUEUE_LIMIT = 32;
+// The worker's side gets this much past the limit for its own requests
+// (offer), so Main's commands alone cannot crowd them out.
 export const SESSION_CRITICAL_QUEUE_RESERVE = 2;
 
 // Tracks which queue owns the current async context. Awaiting the same queue
@@ -41,14 +43,33 @@ export class SessionQueue {
         `Session queue ${this.id} re-entered by ${kind} from inside command ${this.running}`
       );
     }
+    const refused = this.#refusal(this.limit);
+    if (refused) return Promise.reject(refused);
     return this.#submit(kind, fn, false);
   }
 
-  // Fire-and-forget command (turn callbacks, provider exit, orphan cancel).
-  // There is no caller to reject to, and a closed queue must not turn into an
-  // unhandled rejection, so the outcome is swallowed by design.
+  // Fire-and-forget command for what a turn is owed from the worker's side: its
+  // outcome and the provider's exit. There is no caller to reject to, and a
+  // closed queue must not turn into an unhandled rejection, so the outcome is
+  // swallowed by design. Never refused for depth: dropped, the turn would stay
+  // running, or the session attached to a dead worker, for good, and there is
+  // at most one of each per turn and per provider, so they cannot grow the
+  // queue on their own.
   post(kind, fn) {
+    if (this.closedError) return;
     void this.#submit(kind, fn, true).catch(() => {});
+  }
+
+  // A worker's update, queued with the critical ones (in arrival order with the
+  // turn's outcome) but only within the limit and its reserve. Returns null
+  // once it is queued, or, synchronously, why it is not: a worker request this
+  // refuses never runs, so the caller has to answer the worker at once, or drop
+  // an update knowingly, rather than leave an RPC waiting on an inbox row that
+  // is never made.
+  offer(kind, fn) {
+    const refused = this.#refusal(this.limit + SESSION_CRITICAL_QUEUE_RESERVE);
+    if (!refused) void this.#submit(kind, fn, true).catch(() => {});
+    return refused;
   }
 
   // Rejects everything still waiting. A command queued behind a close would
@@ -78,18 +99,18 @@ export class SessionQueue {
     });
   }
 
+  // Why a command cannot be queued now, or null. The cap counts everything
+  // outstanding, the running command included, so the bound is on work this
+  // session still owes rather than on how much of it happens to be waiting at
+  // this instant.
+  #refusal(limit) {
+    if (this.closedError) return this.closedError;
+    if (this.depth < limit) return null;
+    return new GatewayError(ERROR_CODES.SESSION_ACTIVE, `Session ${this.id} has too many queued commands`);
+  }
+
+  // Admission is the caller's (#refusal, or a closed check): this only queues.
   #submit(kind, fn, critical) {
-    if (this.closedError) return Promise.reject(this.closedError);
-    // The cap counts everything outstanding, the running command included, so
-    // the bound is on work this session still owes rather than on how much of
-    // it happens to be waiting at this instant.
-    const limit = this.limit + (critical ? SESSION_CRITICAL_QUEUE_RESERVE : 0);
-    if (this.depth >= limit) {
-      return Promise.reject(new GatewayError(
-        ERROR_CODES.SESSION_ACTIVE,
-        `Session ${this.id} has too many queued commands`
-      ));
-    }
     return new Promise((resolve, reject) => {
       const item = { kind, fn, resolve, reject, critical };
       if (critical) this.criticalItems.push(item);

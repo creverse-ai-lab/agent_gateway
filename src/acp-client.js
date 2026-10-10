@@ -40,7 +40,14 @@ const CHILD_STDIN_QUEUE_BYTES = 128 * 1024 * 1024;
 // How long a process the Gateway ends gets after SIGTERM before SIGKILL, and
 // how long it then gets to be gone before a stop() stops waiting for it.
 const KILL_GRACE_MS = 2_000;
-// How often a terminal's process group being ended is checked for a member.
+// The provider's stderr kept for diagnostics, the newest characters.
+const STDERR_TAIL_CHARS = 100_000;
+// How many dropped provider frames a client notes in that tail; the rest are
+// only counted, so a provider writing garbage in a loop neither crowds its own
+// stderr out of the tail nor costs a copy of it per line.
+const MAX_NOTED_FRAMES = 16;
+// How often a process group being ended, a terminal's or the provider's, is
+// checked for a member.
 const GROUP_POLL_MS = 25;
 // Approvals that wait for their operation, per session. Main has to click each
 // one, so this only bounds what a long turn whose worker never consumes them
@@ -131,6 +138,8 @@ export class AcpClient {
     this.spawnedProcesses = options.spawnedProcesses ?? null;
     this.initResult = null;
     this.stderr = "";
+    // Frames from the provider this client dropped as malformed (#noteDroppedFrame).
+    this.droppedFrames = 0;
     this.alive = false;
   }
 
@@ -143,9 +152,14 @@ export class AcpClient {
     // CODEX_HOME, CLAUDE_HOME and the other config paths are not markers. The
     // worker marker goes over both: a Control front door the worker's CLI
     // starts from the user's own MCP config sees it and refuses to run.
+    // Detached on POSIX, like a terminal: the provider leads a process group of
+    // its own, so ending it (endProvider) reaches what it started as well, an
+    // adapter a launcher such as npx runs included. On Windows it is not, and
+    // only the provider process itself is ended, as before.
     this.proc = spawn(this.config.command, this.config.args, {
       stdio: ["pipe", "pipe", "pipe"],
       env: workerEnv({ ...this.config.env, NO_COLOR: "1" }),
+      detached: process.platform !== "win32",
       ...(this.config.cwd ? { cwd: this.config.cwd } : {})
     });
     this.#trackSpawned(this.proc);
@@ -156,7 +170,7 @@ export class AcpClient {
     });
     this.proc.stderr.setEncoding("utf8");
     this.proc.stderr.on("data", (chunk) => {
-      this.stderr = (this.stderr + chunk).slice(-100_000);
+      this.stderr = (this.stderr + chunk).slice(-STDERR_TAIL_CHARS);
     });
     this.rl = readNdjson(this.proc.stdout, {
       maxLineBytes: this.maxFrameBytes,
@@ -233,8 +247,8 @@ export class AcpClient {
     this.channel = null;
     await channel?.close({ flushMs: 250 });
     // SIGTERM, then SIGKILL after the grace, and each one waited for (bounded):
-    // a provider or a terminal that ignores SIGTERM, or what a terminal started
-    // in its process group, must not outlive the stop that unloads them. The
+    // a provider or a terminal that ignores SIGTERM, or what either started in
+    // its process group, must not outlive the stop that unloads them. The
     // references are dropped only after that wait, so the SIGKILL still has a
     // process to reach. The provider usually exits on the stdin EOF first.
     const proc = this.proc;
@@ -301,6 +315,7 @@ export class AcpClient {
         : null;
       this.pending.set(id, {
         method,
+        sessionId: params?.sessionId ?? null,
         resolve: (value) => {
           if (timer) clearTimeout(timer);
           resolvePromise(value);
@@ -391,7 +406,40 @@ export class AcpClient {
     }
     this.#rejectSessionOperations(sessionId, new Error("ACP session cancelled"));
     this.#closeSessionTerminals(sessionId);
+    // The cancel rides the HIGH lane and the prompt NORMAL, so behind a provider
+    // that is not reading its stdin a cancel would go out before its own prompt
+    // still queued here, find no turn to stop, and the prompt would then start
+    // the turn Main cancelled. Such a prompt never reached the worker: it is
+    // taken back and settled as the cancelled turn it is. A prompt already
+    // written is ahead of the cancel in the pipe, and the cancel follows it.
+    if (this.#retractQueuedPrompt(sessionId) && !this.#promptSent(sessionId)) return;
     this.notify("session/cancel", { sessionId });
+  }
+
+  // Takes this session's prompts that are still queued in the channel, not yet
+  // written to the provider, out of it, and settles each the way a worker
+  // settles a cancelled turn. Whether there was one.
+  #retractQueuedPrompt(sessionId) {
+    const ids = [];
+    this.channel?.dropWhere(LANE_NORMAL, (item) => {
+      if (item.message?.method !== "session/prompt" || item.message.params?.sessionId !== sessionId) return false;
+      ids.push(item.message.id);
+      return true;
+    });
+    for (const id of ids) {
+      const pending = this.pending.get(id);
+      this.pending.delete(id);
+      pending?.resolve({ stopReason: "cancelled" });
+    }
+    return ids.length > 0;
+  }
+
+  // Whether a prompt of this session is out with the provider, unanswered.
+  #promptSent(sessionId) {
+    for (const pending of this.pending.values()) {
+      if (pending.method === "session/prompt" && pending.sessionId === sessionId) return true;
+    }
+    return false;
   }
 
   onSessionUpdate(sessionId, handler) {
@@ -471,15 +519,45 @@ export class AcpClient {
     this.#respond(rpcId, response);
   }
 
+  // Every line the provider writes arrives here, inside its stdout "data"
+  // callback, where a throw is an uncaught exception: one bad line would end
+  // the daemon and every Main's sessions with it. So nothing a provider sends
+  // may throw out of here. The envelope is checked before anything reads it
+  // (#dispatch), and what can still fail once it is acted on, a session handler
+  // that throws, is caught here.
   #onLine(line) {
+    try {
+      this.#dispatch(line);
+    } catch (error) {
+      this.#noteDroppedFrame(`it could not be handled: ${error?.message ?? String(error)}`);
+    }
+  }
+
+  // A JSON-RPC object whose id, when there is one, is a string or a number,
+  // whose method, when there is one, is a string, and whose params, when there
+  // are any, are an object, as ACP's are: a request with any of that wrong is
+  // answered with an error, since the worker waits on it, and anything else
+  // malformed is dropped (#noteDroppedFrame). A line that is not JSON at all is
+  // ignored, as it always was: an adapter may print a banner.
+  #dispatch(line) {
     let message;
     try {
       message = JSON.parse(line);
     } catch {
       return;
     }
+    if (!isJsonObject(message)) {
+      this.#noteDroppedFrame("it is not a JSON-RPC object");
+      return;
+    }
+    const hasId = Object.hasOwn(message, "id");
+    // Nothing to match it to, and nothing to answer it on.
+    if (hasId && !isRequestId(message.id)) {
+      this.#noteDroppedFrame("its id is neither a string nor a number");
+      return;
+    }
 
-    if (Object.hasOwn(message, "id") && (Object.hasOwn(message, "result") || message.error)) {
+    if (hasId && (Object.hasOwn(message, "result") || message.error)) {
       const pending = this.pending.get(message.id);
       if (!pending) return;
       this.pending.delete(message.id);
@@ -491,15 +569,48 @@ export class AcpClient {
       return;
     }
 
+    const invalid = Object.hasOwn(message, "method") && typeof message.method !== "string"
+      ? { code: -32600, message: "Invalid Request: method must be a string" }
+      : Object.hasOwn(message, "params") && !isJsonObject(message.params)
+        ? { code: -32602, message: "Invalid params: params must be an object" }
+        : null;
+    if (invalid) {
+      this.#noteDroppedFrame(invalid.message);
+      if (hasId) this.#respondError(message.id, invalid.code, invalid.message);
+      return;
+    }
+
     if (message.method === "session/update") {
       const params = message.params ?? {};
       this.sessionHandlers.get(params.sessionId)?.(params.update ?? params);
       return;
     }
 
-    if (message.method && Object.hasOwn(message, "id")) {
-      void this.#handleAgentRequest(message);
+    if (message.method && hasId) {
+      // Each handler answers its own failures; what can still reject is an
+      // answer the transport would not take, whose failure tears the transport
+      // down on its own. Unhandled, that rejection would end the daemon.
+      this.#handleAgentRequest(message).catch((error) => {
+        this.#noteDroppedFrame(`its ${message.method} request failed: ${error?.message ?? String(error)}`);
+      });
+      return;
     }
+    if (!message.method) this.#noteDroppedFrame("it is neither a request, a response nor a notification");
+  }
+
+  // A frame from the provider this client could not act on: counted, and the
+  // first few noted in the stderr tail, which is where the Gateway shows a
+  // provider's own account of itself when it fails to start. Nothing more: a
+  // provider that writes garbage costs no more than one whose frames this
+  // client ignores (each is bounded by the frame cap and handled as it
+  // arrives), and what would cost more, a backlog it does not read or an
+  // oversized line, already ends it (onFatal, onOverflow). So garbage, however
+  // much, ends neither the provider nor the daemon.
+  #noteDroppedFrame(reason) {
+    this.droppedFrames += 1;
+    if (this.droppedFrames > MAX_NOTED_FRAMES) return;
+    const more = this.droppedFrames === MAX_NOTED_FRAMES ? "; any further ones are only counted" : "";
+    this.stderr = `${this.stderr}[acp-gateway] dropped a frame from ${this.config.provider}: ${reason}${more}\n`.slice(-STDERR_TAIL_CHARS);
   }
 
   async #handleAgentRequest({ id, method, params = {} }) {
@@ -1358,14 +1469,14 @@ function grantKindForTool(toolKind) {
   return null;
 }
 
-// What signals and checks a terminal's process group unless a test injects
-// its own (killProcess).
+// What signals and checks a process group: the provider's always, a terminal's
+// unless a test injects its own (killProcess).
 function signalProcess(pid, signal) {
   return process.kill(pid, signal);
 }
 
-// A terminal is detached, so it leads a process group of its own, and a signal
-// to the group reaches what the command started as well.
+// A terminal is detached, and so is the provider, so each leads a process group
+// of its own, and a signal to the group reaches what it started as well.
 function killChild(child, signal, kill = signalProcess) {
   try {
     if (process.platform !== "win32" && child.pid) kill(-child.pid, signal);
@@ -1375,10 +1486,10 @@ function killChild(child, signal, kill = signalProcess) {
   }
 }
 
-// Whether anything of a terminal's process group is still there, the command
-// or something it started, also after the command itself exited. A group id
-// is not reused while the group has a member, so a group that answers is this
-// one only until the group has once been found empty.
+// Whether anything of a terminal's (or the provider's) process group is still
+// there, the command or something it started, also after the command itself
+// exited. A group id is not reused while the group has a member, so a group
+// that answers is this one only until the group has once been found empty.
 function groupAlive(child, kill = signalProcess) {
   if (!child.pid) return false;
   if (process.platform === "win32") return !exited(child);
@@ -1390,14 +1501,14 @@ function groupAlive(child, kill = signalProcess) {
   }
 }
 
-// SIGTERM to the terminal's group now, SIGKILL to whatever of it is left after
-// the grace. Polled meanwhile, because the command may exit while what it
-// started has not, and the SIGKILL stays armed only while the group still has
-// a member: once the last one is gone its id is free, and a group of the same
-// user that takes it before the grace ends is not this one. Resolves once the
-// group is gone, or a second grace after the SIGKILL; its timers keep the
-// process up only for a caller that waits (hold). Never throws or rejects: it
-// runs on teardown paths and from timers.
+// SIGTERM to the terminal's group (or the provider's, endProvider) now, SIGKILL
+// to whatever of it is left after the grace. Polled meanwhile, because the
+// command may exit while what it started has not, and the SIGKILL stays armed
+// only while the group still has a member: once the last one is gone its id is
+// free, and a group of the same user that takes it before the grace ends is
+// not this one. Resolves once the group is gone, or a second grace after the
+// SIGKILL; its timers keep the process up only for a caller that waits (hold).
+// Never throws or rejects: it runs on teardown paths and from timers.
 function terminateChild(terminal, graceMs = KILL_GRACE_MS, { kill = signalProcess, hold = false } = {}) {
   const { child } = terminal;
   const gone = () => !groupAlive(child, kill);
@@ -1438,33 +1549,21 @@ async function endTerminal(terminal, graceMs, kill) {
   await terminateChild(terminal, graceMs, { kill, hold: true });
 }
 
-// stop(): the provider is not detached, so it has no process group of its own
-// and the signals go to it alone, the same SIGTERM, grace, SIGKILL.
+// stop() and #fail(): the provider, detached like a terminal, through the same
+// terminateChild, so the SIGTERM, the grace and the SIGKILL reach its whole
+// process group: a launcher that exits on the SIGTERM no longer leaves the
+// adapter it started running, deaf to the signal and to its closed stdin.
+// Also once the provider itself has exited, as long as its group has a member
+// left, since the group id is not reused until it has none. With process.kill,
+// not a test's killProcess, which stands in for a terminal's group. On Windows
+// the provider process alone, as before (killChild, groupAlive).
 async function endProvider(child, graceMs) {
-  if (!child.pid || exited(child)) return;
-  quietly(() => child.kill("SIGTERM"));
-  if (await exitWithin(child, graceMs)) return;
-  quietly(() => child.kill("SIGKILL"));
-  await exitWithin(child, graceMs);
+  if (!child.pid) return;
+  await terminateChild({ child }, graceMs, { hold: true });
 }
 
 function exited(child) {
   return child.exitCode !== null || child.signalCode !== null;
-}
-
-function exitWithin(child, ms) {
-  if (exited(child)) return Promise.resolve(true);
-  return new Promise((done) => {
-    const onExit = () => {
-      clearTimeout(timer);
-      done(true);
-    };
-    const timer = setTimeout(() => {
-      child.off("exit", onExit);
-      done(false);
-    }, ms);
-    child.once("exit", onExit);
-  });
 }
 
 function quietly(action) {
@@ -1473,6 +1572,18 @@ function quietly(action) {
   } catch {
     // Already gone, or not ours to signal: nothing more a teardown can do.
   }
+}
+
+// An object as JSON-RPC means it: not null, not an array.
+function isJsonObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+// A JSON-RPC id that can be matched and answered: ACP's are strings or
+// integers. A number past what JSON can carry back (1e999 parses to Infinity)
+// would be answered as null.
+function isRequestId(value) {
+  return typeof value === "string" || Number.isFinite(value);
 }
 
 // The message keeps its historical "ACP error <code>: <message>" text. What is new

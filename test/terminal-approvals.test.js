@@ -1457,3 +1457,51 @@ test("F9: a provider that ignores SIGTERM is SIGKILLed on a fatal error, and the
     if (providerPid && !processGone(providerPid)) process.kill(providerPid, "SIGKILL");
   }
 });
+
+// ---------------------------------------------------------------- I10: provider process groups
+
+// A provider started through a launcher, as npx starts an adapter: the launcher
+// exits on SIGTERM, and the adapter it started (here with the provider's own
+// stdio) ignores both the SIGTERM and its closed stdin. Only the launcher used
+// to be signalled, so the adapter went on running after every teardown. The
+// provider leads a process group of its own now, and the whole group is ended.
+test("I10: stop() and a fatal error end the provider's whole process group, the adapter its launcher started included", { skip: process.platform === "win32" }, async () => {
+  await withTemp("acp-i10-", async (directory) => {
+    for (const ending of ["stop", "fatal"]) {
+      const pidFile = join(directory, `${ending}.pid`);
+      const launcher = [
+        "const { spawn } = require('node:child_process');",
+        `const adapter = spawn(process.execPath, [${JSON.stringify(permissionAgent)}], { stdio: 'inherit', env: { ...process.env, ACP_MOCK_IGNORE_SIGTERM: '1' } });`,
+        `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(adapter.pid));`
+      ].join("\n");
+      const client = new AcpClient(
+        { provider: "mock", command: process.execPath, args: ["-e", launcher], permissionPolicy: "auto_approve" },
+        { maxFrameBytes: 4096, killGraceMs: 300 }
+      );
+      let adapter = null;
+      try {
+        await client.start();
+        const leader = client.proc.pid;
+        await until(async () => {
+          adapter = Number(await readFile(pidFile, "utf8").catch(() => "")) || null;
+          return adapter !== null;
+        }, "the launcher to record its adapter's pid");
+        assert.notEqual(adapter, leader, "the adapter is the launcher's child, not the process the client spawned");
+        assert.deepEqual(client.spawnedPids(), [leader], "the spawned pid tracked is the group leader's");
+        await client.sessionNew({ cwd: directory, permissionPolicy: "auto_approve" });
+        if (ending === "stop") {
+          await client.stop();
+          assert.equal(processGone(adapter), true, "stop() waits until the whole group is gone");
+        } else {
+          client.proc.stdout.emit("data", Buffer.alloc(5_000, 0x78));
+          await until(() => !client.alive, "the fatal transport error");
+          await until(() => processGone(adapter), "the adapter to be SIGKILLed with its group");
+        }
+        assert.equal(processGone(leader), true);
+      } finally {
+        await client.stop().catch(() => {});
+        if (adapter && !processGone(adapter)) process.kill(adapter, "SIGKILL");
+      }
+    }
+  });
+});

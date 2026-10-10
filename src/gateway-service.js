@@ -93,6 +93,8 @@ const WORKER_ACTIVITY_TYPES = new Set([
 // erase the final answer.
 const SEGMENT_BOUNDARY_TYPES = new Set(["tool_call", "permission_request", "elicitation_request"]);
 const ACTOR_UPDATE_TYPES = new Set(["permission_request", "elicitation_request", "config_option_update"]);
+// The updates that stand for a worker RPC waiting on Main's answer.
+const WORKER_REQUEST_TYPES = new Set(["permission_request", "elicitation_request"]);
 // A normal Main needs only a terminal result or a request it must answer.
 // Progress is available through explicit evidence options, but must not make
 // every streamed chunk into another frontdoor tool result.
@@ -2876,6 +2878,7 @@ export class GatewayService {
     if (session.status !== "waiting_permission") {
       throw new GatewayError(ERROR_CODES.SESSION_NOT_WAITING, "Session is not waiting for permission");
     }
+    requireRequestId(args.requestId);
     return this.#queueFor(session).run("permission", () => this.#permissionLocked(session, args));
   }
 
@@ -2883,13 +2886,14 @@ export class GatewayService {
     if (CLOSED_STATUSES.has(session.status) || !this.store.get(session.id)) {
       throw new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`);
     }
-    await session.client.respondPermission(Number(args.requestId), args.optionId ?? null, session.acpSessionId);
+    const requestId = this.#workerRequestId(session, args.requestId, "permission_request");
+    await session.client.respondPermission(requestId, args.optionId ?? null, session.acpSessionId);
     this.store.push(session, {
       type: "permission_response",
-      requestId: Number(args.requestId),
+      requestId,
       optionId: args.optionId ?? null
     });
-    this.resolveInbox(session, Number(args.requestId), "answered", "Main sent a permission response");
+    this.resolveInbox(session, requestId, "answered", "Main sent a permission response");
     this.syncSessionInputState(session);
     return { ok: true, sessionId: session.id, status: session.status };
   }
@@ -2899,6 +2903,7 @@ export class GatewayService {
     if (session.status !== "waiting_input") {
       throw new GatewayError(ERROR_CODES.SESSION_NOT_WAITING, "Session is not waiting for input");
     }
+    requireRequestId(args.requestId);
     return this.#queueFor(session).run("answer", () => this.#answerLocked(session, args));
   }
 
@@ -2906,7 +2911,7 @@ export class GatewayService {
     if (CLOSED_STATUSES.has(session.status) || !this.store.get(session.id)) {
       throw new GatewayError(ERROR_CODES.SESSION_CLOSED, `Session ${session.id} is closed`);
     }
-    const requestId = Number(args.requestId);
+    const requestId = this.#workerRequestId(session, args.requestId, "worker_question");
     const action = args.action ?? "accept";
     const response = action === "accept"
       ? { action, ...(args.content == null ? {} : { content: args.content }) }
@@ -3211,7 +3216,14 @@ export class GatewayService {
       session.lastWorkerActivityAt = new Date(this.now()).toISOString();
     }
     if (ACTOR_UPDATE_TYPES.has(type)) {
-      this.#queueFor(session).post(`update:${type}`, () => this.#handleUpdateLocked(session, update, type));
+      const refused = this.#queueFor(session).offer(`update:${type}`, () => this.#handleUpdateLocked(session, update, type));
+      // A worker request the mailbox cannot take (full, or closed) is refused to
+      // the worker now: AcpClient takes its registration back and answers the
+      // RPC with this error (#announcePending). Dropped instead, it would never
+      // get an inbox row for Main to answer, and the worker would wait on it for
+      // good. An update that asks nothing (config_option_update) is dropped, as
+      // before.
+      if (refused && WORKER_REQUEST_TYPES.has(type)) throw refused;
       return;
     }
     this.#handleUpdateLocked(session, update, type);
@@ -3912,6 +3924,21 @@ export class GatewayService {
       item.sessionId === session.id && item.turnId === session.turnId
       && item.requestId === requestId && item.type === type && item.status === "pending"
     );
+  }
+
+  // The worker's own id for the request Main answers, of the JSON type the
+  // worker chose: ACP ids are strings or integers, and the answer, the event
+  // and the inbox row all carry that id exactly. Main's id as given when a
+  // pending row has it; otherwise the one pending row whose id reads the same,
+  // so a host that sends 7 as "7" still answers request 7. Never through
+  // Number(): that turned "permission-1" into NaN, an id no request has.
+  #workerRequestId(session, requestId, type) {
+    if (this.#pendingInboxRow(session, requestId, type)) return requestId;
+    const spelled = [...this.inbox.values()].filter((item) =>
+      item.sessionId === session.id && item.turnId === session.turnId
+      && item.type === type && item.status === "pending" && String(item.requestId) === String(requestId)
+    );
+    return spelled.length === 1 ? spelled[0].requestId : requestId;
   }
 
   // What every new row starts as, ahead of what its kind of request carries.
@@ -5096,6 +5123,13 @@ function requireString(value, name) {
   if (typeof value !== "string" || !value.trim()) {
     throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, `${name} is required`);
   }
+}
+
+// A worker's JSON-RPC request id as Main hands it back: the string or the
+// number the worker sent (ACP allows both), taken as it is.
+function requireRequestId(value) {
+  if (typeof value === "string" || Number.isFinite(value)) return value;
+  throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "requestId must be a string or an integer");
 }
 
 function requireNonNegativeNumber(value, name, fallback) {

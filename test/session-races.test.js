@@ -10,7 +10,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { AcpClient } from "../src/acp-client.js";
 import { GatewayService } from "../src/gateway-service.js";
-import { SESSION_QUEUE_LIMIT } from "../src/session-queue.js";
+import { SESSION_CRITICAL_QUEUE_RESERVE, SESSION_QUEUE_LIMIT } from "../src/session-queue.js";
 import { readSnapshotBody } from "./helpers/state-files.js";
 
 const raceAgent = fileURLToPath(new URL("./mock-race-agent.js", import.meta.url));
@@ -438,6 +438,77 @@ test("T7b input-state sync refuses to reopen a turn that already ended", async (
   });
 });
 
+// ACP request ids are strings or integers. A string one used to reach Main
+// intact and come back through Number(), as NaN, which no request has: the
+// worker waited for good.
+test("T7c a worker request id keeps its type from the worker to Main and back", async () => {
+  await withService({ hold: "prompt" }, async (service) => {
+    const opened = await open(service);
+    const session = service.requireSession(opened.sessionId);
+    const client = session.client;
+    await service.call("prompt", { sessionId: opened.sessionId, prompt: "one" }, MAIN);
+    await waitForMarker(service, opened.sessionId, "hold:prompt");
+    const answers = async () => (await client.request("test/answers")).answers;
+    const ask = async (id, question = false) => {
+      await client.request("test/ask", { sessionId: session.acpSessionId, id, question });
+      await waitForStatus(service, opened.sessionId, question ? "waiting_input" : "waiting_permission");
+      const [row] = (await service.call("inbox", { action: "list", status: "pending" }, MAIN)).items;
+      assert.equal(row.requestId, id, "the inbox row carries the id as the worker sent it");
+    };
+
+    await ask("perm-1");
+    await service.call("permission", { sessionId: opened.sessionId, requestId: "perm-1", optionId: "allow-once" }, MAIN);
+    assert.deepEqual((await answers()).at(-1), {
+      id: "perm-1",
+      result: { outcome: { outcome: "selected", optionId: "allow-once" } },
+      error: null
+    });
+
+    await ask("question-1", true);
+    await service.call(
+      "answer",
+      { sessionId: opened.sessionId, requestId: "question-1", action: "accept", content: { choice: "socket" } },
+      MAIN
+    );
+    assert.deepEqual((await answers()).at(-1), {
+      id: "question-1",
+      result: { action: "accept", content: { choice: "socket" } },
+      error: null
+    });
+
+    // An integer one a host hands back as a string still answers it, under the
+    // worker's own integer.
+    await ask(77);
+    await service.call("permission", { sessionId: opened.sessionId, requestId: "77", optionId: "reject-once" }, MAIN);
+    assert.deepEqual((await answers()).at(-1), {
+      id: 77,
+      result: { outcome: { outcome: "selected", optionId: "reject-once" } },
+      error: null
+    });
+
+    // Neither a string nor a number is no id at all, and answers nothing.
+    await ask("perm-2");
+    await assert.rejects(
+      service.call("permission", { sessionId: opened.sessionId, requestId: { id: "perm-2" }, optionId: "allow-once" }, MAIN),
+      (error) => error.code === "INVALID_ARGUMENT" && /requestId must be a string or an integer/.test(error.message)
+    );
+    await service.call("permission", { sessionId: opened.sessionId, requestId: "perm-2", optionId: "allow-once" }, MAIN);
+
+    const responses = (service.store.get(opened.sessionId)?.events ?? [])
+      .filter((event) => event.type === "permission_response" || event.type === "elicitation_response")
+      .map((event) => event.requestId);
+    assert.deepEqual(responses, ["perm-1", "question-1", 77, "perm-2"]);
+    const answered = (await service.call("inbox", { action: "list", status: "answered" }, MAIN)).items;
+    assert.deepEqual(
+      answered.map((item) => JSON.stringify(item.requestId)).sort(),
+      ["\"perm-1\"", "\"perm-2\"", "\"question-1\"", "77"]
+    );
+
+    await release(client, "prompt");
+    await waitForStatus(service, opened.sessionId, "idle");
+  });
+});
+
 test("T8 a prompt is refused while a config set owns the session", async () => {
   await withService({ hold: "config" }, async (service) => {
     const opened = await open(service);
@@ -722,6 +793,93 @@ test("T16c a full external mailbox still accepts provider exit", async () => {
     await Promise.all(queued);
     assert.equal(eventsOfType(service, opened.sessionId, "provider_disconnected").length, 1);
     assert.equal(session.status, "disconnected");
+  });
+});
+
+// A command the mailbox holds until released, with no-ops queued behind it up
+// to the limit: what Main's own commands can fill it with.
+async function fillMailbox(session) {
+  let release = null;
+  const done = session._queue.run("test_block", () => new Promise((resolve) => {
+    release = resolve;
+  }));
+  await until(() => typeof release === "function", "mailbox blocker to start");
+  const queued = [];
+  for (let attempt = 1; attempt < SESSION_QUEUE_LIMIT; attempt += 1) {
+    queued.push(session._queue.run(`test_queued_${attempt}`, () => undefined));
+  }
+  assert.equal(session._queue.depth, SESSION_QUEUE_LIMIT);
+  return { release: () => release(), drained: async () => { await done; await Promise.all(queued); } };
+}
+
+// A worker request the mailbox has no room for used to be dropped there while
+// its RPC stayed registered: no inbox row for Main to answer, and a worker
+// waiting on it for good. It is refused to the worker instead, at once.
+test("T16d a worker request the mailbox cannot take is answered with an error at once, and none is left waiting", async () => {
+  await withService({ hold: "prompt" }, async (service) => {
+    const opened = await open(service);
+    const session = service.requireSession(opened.sessionId);
+    const client = session.client;
+    await service.call("prompt", { sessionId: opened.sessionId, prompt: "one" }, MAIN);
+    await waitForMarker(service, opened.sessionId, "hold:prompt");
+    const mailbox = await fillMailbox(session);
+
+    // Six in one write, as a worker with parallel tool calls asks: the reserve
+    // takes two, and the four the mailbox cannot hold are answered before the
+    // reply to the burst itself is read.
+    await client.request("test/burst", { sessionId: session.acpSessionId, count: 6 });
+    const refused = (await client.request("test/answers")).answers;
+    assert.equal(refused.length, 4);
+    for (const answer of refused) {
+      assert.equal(answer.result, null);
+      assert.equal(answer.error.code, -32000);
+      assert.match(answer.error.message, /has too many queued commands/);
+    }
+    assert.equal(session._queue.depth, SESSION_QUEUE_LIMIT + SESSION_CRITICAL_QUEUE_RESERVE);
+    assert.equal(client.pendingSessionInput(session.acpSessionId).permissions, 2, "only what was queued waits for Main");
+
+    mailbox.release();
+    await mailbox.drained();
+    await waitForStatus(service, opened.sessionId, "waiting_permission");
+    const pending = (await service.call("inbox", { action: "list", status: "pending" }, MAIN)).items;
+    assert.equal(pending.length, 2);
+    for (const item of pending) {
+      await service.call("permission", { sessionId: opened.sessionId, requestId: item.requestId, optionId: "allow-once" }, MAIN);
+    }
+    const answers = (await client.request("test/answers")).answers;
+    assert.equal(answers.length, 6, "every request of the burst is answered");
+    assert.equal(answers.filter((answer) => answer.result?.outcome?.optionId === "allow-once").length, 2);
+
+    await release(client, "prompt");
+    await waitForStatus(service, opened.sessionId, "idle");
+  });
+});
+
+// Worker requests may take the reserve, never the turn's end or the provider's
+// exit: one dropped there would leave the turn running for good.
+test("T16e a mailbox whose reserve worker requests took still accepts the turn's end and the provider's exit", async () => {
+  await withService({ hold: "prompt" }, async (service) => {
+    const opened = await open(service);
+    const session = service.requireSession(opened.sessionId);
+    const client = session.client;
+    await service.call("prompt", { sessionId: opened.sessionId, prompt: "one" }, MAIN);
+    await waitForMarker(service, opened.sessionId, "hold:prompt");
+    const mailbox = await fillMailbox(session);
+    await client.request("test/burst", { sessionId: session.acpSessionId, count: SESSION_CRITICAL_QUEUE_RESERVE + 1 });
+    const full = SESSION_QUEUE_LIMIT + SESSION_CRITICAL_QUEUE_RESERVE;
+    assert.equal(session._queue.depth, full);
+
+    await release(client, "prompt");
+    await until(() => session._queue.depth === full + 1, "the turn's end queued past the reserve");
+    client.proc.kill("SIGKILL");
+    await until(() => client.alive === false, "provider exit callback");
+    assert.equal(session._queue.depth, full + 2);
+
+    mailbox.release();
+    await mailbox.drained();
+    await waitForStatus(service, opened.sessionId, "disconnected");
+    assert.equal(eventsOfType(service, opened.sessionId, "turn_end").length, 1);
+    assert.equal(eventsOfType(service, opened.sessionId, "provider_disconnected").length, 1);
   });
 });
 

@@ -416,7 +416,7 @@ function controlTools() {
         type: "object",
         properties: {
           sessionId: { type: "string" },
-          requestId: { type: "integer" },
+          requestId: { oneOf: [{ type: "string" }, { type: "integer" }], description: "The pending request's requestId exactly as the event or inbox row gives it: a string or an integer, whichever the worker chose." },
           optionId: { type: "string" }
         },
         required: ["sessionId", "requestId"]
@@ -429,7 +429,7 @@ function controlTools() {
         type: "object",
         properties: {
           sessionId: { type: "string" },
-          requestId: { type: "integer" },
+          requestId: { oneOf: [{ type: "string" }, { type: "integer" }], description: "The pending question's requestId exactly as the event or inbox row gives it: a string or an integer, whichever the worker chose." },
           action: { type: "string", enum: ["accept", "decline", "cancel"] },
           content: { type: "object" }
         },

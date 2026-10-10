@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +10,7 @@ import { AcpClient } from "../src/acp-client.js";
 import { readNdjson } from "../src/ndjson.js";
 import { GatewayRpcClient } from "../src/socket-rpc.js";
 import { startDaemon, writeMockProviders } from "./helpers/daemon-harness.js";
+import { withTemp } from "./helpers/scratch.js";
 
 const capabilityAgent = fileURLToPath(new URL("./mock-capability-agent.js", import.meta.url));
 
@@ -24,6 +25,75 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   else if (message.method === "session/new") reply(message.id, { sessionId: "hang-1" });
 });
 process.on("SIGTERM", () => {});
+`;
+
+// On the prompt "garbage", writes lines no ACP client can act on in one write,
+// among requests it waits on, then a last read as a fence, and reports every
+// answer it got. Any other prompt ends at once. Reads ok.txt in its cwd.
+const GARBAGE_AGENT = `
+const { createInterface } = require("node:readline");
+const write = (line) => process.stdout.write(line + "\\n");
+const send = (message) => write(JSON.stringify(message));
+const answers = [];
+const waiting = new Map();
+const answered = (id) => new Promise((resolve) => waiting.set(JSON.stringify(id), resolve));
+let cwd = null;
+createInterface({ input: process.stdin }).on("line", async (line) => {
+  const message = JSON.parse(line);
+  if (!Object.hasOwn(message, "method")) {
+    answers.push({ id: message.id, code: message.error?.code ?? null, content: message.result?.content ?? null });
+    waiting.get(JSON.stringify(message.id))?.();
+    return;
+  }
+  if (message.method === "initialize") {
+    send({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: 1, agentCapabilities: {} } });
+  } else if (message.method === "session/new") {
+    cwd = message.params.cwd;
+    send({ jsonrpc: "2.0", id: message.id, result: { sessionId: "garbage-1" } });
+  } else if (message.method === "session/prompt" && message.params.prompt[0].text === "garbage") {
+    const sessionId = message.params.sessionId;
+    const read = (id) => JSON.stringify({ jsonrpc: "2.0", id, method: "fs/read_text_file", params: { sessionId, path: cwd + "/ok.txt" } });
+    const expected = [7, 8, 9, "eleven", 12].map(answered);
+    process.stdout.write([
+      "null", "[]", "5", '"text"',
+      '{"jsonrpc":"2.0","id":7,"method":5}',
+      '{"jsonrpc":"2.0","id":8,"method":"fs/read_text_file","params":null}',
+      '{"jsonrpc":"2.0","id":9,"method":"session/request_permission","params":[1]}',
+      '{"jsonrpc":"2.0","id":{"x":1},"method":"fs/read_text_file","params":{}}',
+      '{"jsonrpc":"2.0","id":1e999,"method":"fs/read_text_file","params":{}}',
+      '{"jsonrpc":"2.0","id":true,"result":{}}',
+      '{"jsonrpc":"2.0","method":"session/update","params":5}',
+      '{"jsonrpc":"2.0","method":"session/update","params":null}',
+      '{"jsonrpc":"2.0","id":10}',
+      JSON.stringify({ jsonrpc: "2.0", id: "eleven", method: "fs/read_text_file", params: { sessionId, path: 5 } }),
+      read(12)
+    ].join("\\n") + "\\n");
+    await Promise.all(expected);
+    const fence = answered(13);
+    write(read(13));
+    await fence;
+    send({ jsonrpc: "2.0", id: message.id, result: { stopReason: JSON.stringify(answers) } });
+  } else if (message.method === "session/prompt") {
+    send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } });
+  }
+});
+`;
+
+// Logs what it receives, in order, to ACP_TEST_LOG, and answers every prompt at
+// once; test/fence answers too, after everything before it was logged.
+const LOGGING_AGENT = `
+const { appendFileSync } = require("node:fs");
+const { createInterface } = require("node:readline");
+const reply = (id, result) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\\n");
+let sessions = 0;
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const message = JSON.parse(line);
+  appendFileSync(process.env.ACP_TEST_LOG, JSON.stringify({ method: message.method ?? null, sessionId: message.params?.sessionId ?? null }) + "\\n");
+  if (message.method === "initialize") reply(message.id, { protocolVersion: 1, agentCapabilities: {} });
+  else if (message.method === "session/new") reply(message.id, { sessionId: "order-" + ++sessions });
+  else if (message.method === "session/prompt") reply(message.id, { stopReason: "end_turn" });
+  else if (message.method === "test/fence") reply(message.id, {});
+});
 `;
 
 const capabilityClient = (directory, options = {}) => new AcpClient(
@@ -124,6 +194,123 @@ test("a response frame over the cap surfaces to the worker as an error", async (
     await client.stop();
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+// I6. Every line a provider writes is read inside its stdout "data" callback,
+// where a throw is an uncaught exception: `null` alone, a method that is not a
+// string, or null params ended the daemon, and every Main's sessions with it.
+// A malformed request with an id is answered with an error, anything else
+// malformed is dropped and noted, and the provider goes on being served. Under
+// the test runner, which catches the throw, the old client's turn never ended:
+// the timeout makes that a failure rather than a hang.
+test("a provider's malformed frames are answered or dropped, and the client goes on serving it", { timeout: 30_000 }, async () => {
+  await withTemp("acp-frames-", async (directory) => {
+    await writeFile(join(directory, "ok.txt"), "ok", "utf8");
+    const client = new AcpClient(
+      { provider: "mock", command: process.execPath, args: ["-e", GARBAGE_AGENT], permissionPolicy: "read_only" },
+      { permissionPolicy: "read_only" }
+    );
+    try {
+      await client.start();
+      const { sessionId } = await client.sessionNew({ cwd: directory, permissionPolicy: "read_only" });
+      const answers = JSON.parse((await client.sessionPrompt({ sessionId, prompt: "garbage" })).stopReason);
+      const byId = new Map(answers.map((answer) => [JSON.stringify(answer.id), answer]));
+      // Only the requests that still had an id to answer on were answered, each
+      // under that id: none under null (1e999), {"x":1} or true.
+      assert.deepEqual([...byId.keys()].sort(), ["\"eleven\"", "12", "13", "7", "8", "9"]);
+      assert.equal(byId.get("7").code, -32600, "a method that is not a string");
+      assert.equal(byId.get("8").code, -32602, "null params");
+      assert.equal(byId.get("9").code, -32602, "params that are an array");
+      assert.equal(byId.get("\"eleven\"").code, -32000, "a well-formed request whose handler fails");
+      assert.equal(byId.get("12").content, "ok", "the valid request among them is served");
+      assert.equal(client.alive, true);
+      assert.equal(client.droppedFrames, 13);
+      assert.match(client.stderr, /\[acp-gateway\] dropped a frame from mock: it is not a JSON-RPC object/);
+      assert.match(client.stderr, /its id is neither a string nor a number/);
+      // Again: the first 16 are noted in the tail, the rest only counted.
+      await client.sessionPrompt({ sessionId, prompt: "garbage" });
+      assert.equal(client.droppedFrames, 26);
+      const notes = client.stderr.split("\n").filter((line) => line.startsWith("[acp-gateway] dropped a frame"));
+      assert.equal(notes.length, 16);
+      assert.match(notes.at(-1), /; any further ones are only counted$/);
+      assert.equal((await client.sessionPrompt({ sessionId, prompt: "hello" })).stopReason, "end_turn");
+    } finally {
+      await client.stop();
+    }
+  });
+});
+
+test("a provider's malformed frames cannot take the daemon down", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-frames-"));
+  await withTemp("acp-frames-work-", async (work) => {
+    await writeFile(join(work, "ok.txt"), "ok", "utf8");
+    const agent = join(directory, "garbage-agent.cjs");
+    await writeFile(agent, GARBAGE_AGENT, "utf8");
+    const providers = await writeMockProviders(directory, { permissionPolicy: "read_only", agent });
+    const daemon = await startDaemon({ directory, env: providers });
+    const client = new GatewayRpcClient({
+      socketPath: daemon.socketPath,
+      token: daemon.token,
+      rootId: daemon.rootId,
+      statePath: daemon.statePath,
+      autoStart: false
+    });
+    try {
+      const { sessionId } = await client.call("session_open", { provider: "mock", cwd: work, permissionPolicy: "read_only" });
+      const garbage = await client.call("run", { sessionId, prompt: "garbage", waitMs: 20_000 });
+      assert.equal(garbage.ok, true);
+      assert.equal(JSON.parse(garbage.result.stopReason).find((answer) => answer.id === 12).content, "ok");
+      assert.equal(daemon.child.exitCode, null, "the daemon is still running");
+      const after = await client.call("run", { sessionId, prompt: "hello", waitMs: 20_000 });
+      assert.equal(after.result.stopReason, "end_turn");
+    } finally {
+      client.close();
+      await daemon.stop({ signal: "SIGKILL" });
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+// I7. A prompt rides the NORMAL lane and its cancel the HIGH one, so behind a
+// provider that has not yet taken its stdin the cancel went out first, found no
+// turn to stop, and the prompt then started the turn Main had cancelled. A
+// prompt still queued is taken back and settles cancelled, and the provider
+// hears of neither; one already written stays ahead of its cancel.
+test("a cancel never overtakes its own prompt: one still queued is taken back and settles cancelled", async () => {
+  await withTemp("acp-cancel-order-", async (directory) => {
+    const log = join(directory, "received.ndjson");
+    const client = new AcpClient(
+      { provider: "mock", command: process.execPath, args: ["-e", LOGGING_AGENT], env: { ACP_TEST_LOG: log }, permissionPolicy: "read_only" },
+      { permissionPolicy: "read_only" }
+    );
+    try {
+      await client.start();
+      const first = (await client.sessionNew({ cwd: directory, permissionPolicy: "read_only" })).sessionId;
+      const second = (await client.sessionNew({ cwd: directory, permissionPolicy: "read_only" })).sessionId;
+      // Over the pipe's and the stream's buffers: the channel is blocked from
+      // this write on, until a drain that is an I/O turn away, so the next
+      // prompt waits in the channel.
+      const written = client.sessionPrompt({ sessionId: first, prompt: "x".repeat(1024 * 1024) });
+      assert.equal(client.channel.blocked, true);
+      const queued = client.sessionPrompt({ sessionId: second, prompt: "queued" });
+      // Awaited below; handled here as well, so an assertion that fails first
+      // is what gets reported, not stop() rejecting these.
+      for (const turn of [written, queued]) turn.catch(() => {});
+      assert.equal(client.channel.snapshot().lanes.normal.frames, 1);
+      client.cancelSession(second);
+      client.cancelSession(first);
+      assert.equal(client.channel.snapshot().lanes.normal.frames, 0, "the queued prompt was taken back");
+      assert.deepEqual(await queued, { stopReason: "cancelled" });
+      assert.equal((await written).stopReason, "end_turn");
+      await client.request("test/fence");
+      const received = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line))
+        .filter((message) => message.method === "session/prompt" || message.method === "session/cancel")
+        .map((message) => `${message.method} ${message.sessionId}`);
+      assert.deepEqual(received, [`session/prompt ${first}`, `session/cancel ${first}`]);
+    } finally {
+      await client.stop();
+    }
+  });
 });
 
 // End to end over a real daemon socket: every existing subscription test drives a

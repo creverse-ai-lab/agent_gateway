@@ -11,6 +11,9 @@ const counters = {};
 const order = [];
 const outgoing = new Map();
 const configValues = new Map();
+// What the gateway answered each request made through test/burst or test/ask,
+// in arrival order (test/answers).
+const answers = [];
 let nextId = 500;
 let sessionCounter = 0;
 
@@ -47,6 +50,24 @@ function holdOrRun(name, sessionId, run) {
   queue.push(run);
   held.set(name, queue);
   marker(sessionId, `hold:${name}`);
+}
+
+// A request whose answer, result or error, goes to test/answers, as the line
+// to write for it.
+function ask(id, method, params) {
+  outgoing.set(id, (result, error) => answers.push({ id, result: result ?? null, error: error ?? null }));
+  return `${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`;
+}
+
+function permissionParams(sessionId, toolCallId) {
+  return {
+    sessionId,
+    toolCall: { toolCallId, title: "Edit file", kind: "edit" },
+    options: [
+      { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+      { optionId: "reject-once", name: "Reject", kind: "reject_once" }
+    ]
+  };
 }
 
 function configOptions(sessionId) {
@@ -110,7 +131,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   if (Object.hasOwn(message, "id") && (Object.hasOwn(message, "result") || message.error)) {
     const resolve = outgoing.get(message.id);
     outgoing.delete(message.id);
-    resolve?.(message.result);
+    resolve?.(message.result, message.error);
     return;
   }
   const { method, params = {} } = message;
@@ -139,6 +160,36 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   if (method === "test/emit") {
     emit(params.sessionId, params.update);
     reply(message.id, { ok: true });
+    return;
+  }
+  // count permission requests in one write, as a worker with parallel tool
+  // calls sends them, all before the reply to this request.
+  if (method === "test/burst") {
+    let frames = "";
+    for (let index = 0; index < params.count; index += 1) {
+      const requestId = nextId++;
+      frames += ask(requestId, "session/request_permission", permissionParams(params.sessionId, `burst-${requestId}`));
+    }
+    process.stdout.write(frames);
+    reply(message.id, { sent: params.count });
+    return;
+  }
+  // One request under the id the test chooses, a string one included: a
+  // permission request, or with question a form elicitation.
+  if (method === "test/ask") {
+    process.stdout.write(params.question
+      ? ask(params.id, "elicitation/create", {
+        sessionId: params.sessionId,
+        mode: "form",
+        message: "Which one?",
+        requestedSchema: { type: "object", properties: { choice: { type: "string" } }, required: ["choice"] }
+      })
+      : ask(params.id, "session/request_permission", permissionParams(params.sessionId, `ask-${params.id}`)));
+    reply(message.id, { ok: true });
+    return;
+  }
+  if (method === "test/answers") {
+    reply(message.id, { answers: [...answers] });
     return;
   }
   // An explicit ordering fence: the reply proves every earlier stdout line has

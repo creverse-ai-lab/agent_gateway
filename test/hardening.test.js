@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { link, mkdir, readFile, realpath, symlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -736,6 +736,65 @@ test("Grok gets a process-wide sandbox profile denying the protected paths", asy
       await service.shutdown();
     }
   });
+});
+
+// I8. The daemon writes the profile, and the daemon may write install.json, while
+// a Worker runs as the same user: a sandbox.toml it made a link to a Gateway
+// file, or a .grok it swapped for a link, had the next Grok start write the
+// profile into that file.
+test("the Grok profile replaces a linked sandbox.toml without writing where it leads, and refuses linked directories", async () => {
+  await withTemp("acp-grok-links-", async (directory) => {
+    const target = join(directory, "install.json");
+    await writeFile(target, "secret", "utf8");
+    const profileIn = (sandbox) => readFile(join(sandbox, ".grok", "sandbox.toml"), "utf8");
+    const deny = /^deny = \["\/guarded"\]$/m;
+
+    // A symbolic link at sandbox.toml is replaced; its target keeps its bytes.
+    const symlinked = join(directory, "symlinked");
+    await mkdir(join(symlinked, ".grok"), { recursive: true });
+    await symlink(target, join(symlinked, ".grok", "sandbox.toml"));
+    prepareGrokSandbox(["/guarded"], symlinked);
+    assert.equal(await readFile(target, "utf8"), "secret");
+    assert.equal((await lstat(join(symlinked, ".grok", "sandbox.toml"))).isFile(), true);
+    assert.match(await profileIn(symlinked), deny);
+
+    // So is a hard link: the name gets a file of its own, and the linked file
+    // is neither written nor emptied.
+    const hardLinked = join(directory, "hard-linked");
+    await mkdir(join(hardLinked, ".grok"), { recursive: true });
+    await link(target, join(hardLinked, ".grok", "sandbox.toml"));
+    prepareGrokSandbox(["/guarded"], hardLinked);
+    assert.equal(await readFile(target, "utf8"), "secret");
+    assert.equal((await stat(target)).nlink, 1);
+    assert.match(await profileIn(hardLinked), deny);
+
+    // A .grok, or a sandbox directory, that is a link this user could have made
+    // is refused, and nothing is written where it leads.
+    const elsewhere = join(directory, "elsewhere");
+    await mkdir(elsewhere);
+    await writeFile(join(elsewhere, "sandbox.toml"), "secret", "utf8");
+    const linkedGrok = join(directory, "linked-grok");
+    await mkdir(linkedGrok);
+    await symlink(elsewhere, join(linkedGrok, ".grok"));
+    assert.throws(() => prepareGrokSandbox(["/guarded"], linkedGrok), /linked-grok\/\.grok is a symbolic link this user could have made/);
+    const linkedSandbox = join(directory, "linked-sandbox");
+    await symlink(elsewhere, linkedSandbox);
+    assert.throws(() => prepareGrokSandbox(["/guarded"], linkedSandbox), /linked-sandbox is a symbolic link this user could have made/);
+    assert.deepEqual(await readdir(elsewhere), ["sandbox.toml"]);
+    assert.equal(await readFile(join(elsewhere, "sandbox.toml"), "utf8"), "secret");
+    // No temporary file is left behind by a write that went through.
+    assert.deepEqual(await readdir(join(symlinked, ".grok")), ["sandbox.toml"]);
+  });
+  // A link only root could have made is followed, such as /var on macOS, which
+  // the temporary directory is under there, and Grok starts in the real path.
+  const viaSystemLinks = await mkdtemp(join(tmpdir(), "acp-grok-root-links-"));
+  try {
+    const { cwd } = prepareGrokSandbox(["/guarded"], viaSystemLinks);
+    assert.equal(cwd, await realpath(viaSystemLinks));
+    assert.match(await readFile(join(cwd, ".grok", "sandbox.toml"), "utf8"), /^deny = \["\/guarded"\]$/m);
+  } finally {
+    await rm(viaSystemLinks, { recursive: true, force: true });
+  }
 });
 
 test("partial-enforcement alerts carry the exact scope a Main can rely on", () => {
