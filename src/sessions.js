@@ -13,12 +13,14 @@ const deliveredEvents = new WeakSet();
 // can never evict (here), snapshot scheduling (gateway-service) and the
 // transport's non-droppable lane (socket-flow, which imports the re-export).
 // Closed is the DoS property: a worker cannot promote its own chatter into the
-// protected lane by naming it something new.
+// protected lane by naming it something new. main_status enters no ring and is
+// never persisted: it is listed for the lane alone, because it carries no
+// sequence a gap marker could describe, so shed it would be lost unsaid.
 export const DURABLE_EVENT_TYPES = new Set([
   "session_created", "session_restored", "session_restore_start", "session_restore_failed",
   "turn_start", "turn_end", "error", "permission_request", "permission_response",
   "elicitation_request", "elicitation_response", "cancel_requested", "orphan_cancel_requested",
-  "provider_disconnected", "session_closed", "model_changed", "config_changed", "task_status"
+  "provider_disconnected", "session_closed", "model_changed", "config_changed", "task_status", "main_status"
 ]);
 
 // The highest-volume, lowest-value events in the protocol. They keep a lane of

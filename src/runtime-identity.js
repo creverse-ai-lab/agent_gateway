@@ -19,5 +19,9 @@ export const MANAGEMENT_CAPABILITIES = Object.freeze({
   retentionPreview: true, safeShutdown: true, runtimeIdentity: true,
   settingsApply: "restart", replayCompleteness: true, resultRecovery: "task_result",
   // subscribe with taskIds (gateway-service.js).
-  taskSubscriptions: true
+  taskSubscriptions: true,
+  // wait (gateway-service.js), and main_list with the main_status event
+  // (main-status.js).
+  taskWait: true,
+  mainStatus: true
 });

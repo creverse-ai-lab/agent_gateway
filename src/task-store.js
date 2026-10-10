@@ -204,6 +204,12 @@ function normalizeStopOn(stopOn) {
   return new Set(wanted);
 }
 
+function requireWaitTimeout(timeoutMs) {
+  if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw taskError("INVALID_ARGUMENT", "timeoutMs must be a finite number greater than 0");
+  }
+}
+
 export class TaskStore {
   #now;
   #defaultTtlMs;
@@ -538,48 +544,89 @@ export class TaskStore {
     // that matters: a caller blocked on the turn is structurally unable to answer
     // the request that is blocking it, so it has to get control back.
     const stopSet = normalizeStopOn(stopOn);
-    // A deferred terminal record is not releasable yet: its committer has not
-    // finished making the outcome durable, so even a waiter that arrives after
-    // the commit queues until flushWaiters().
-    if (TERMINAL_TASK_STATUSES.has(record.status) && !this.#deferredTerminal.has(record.taskId)) {
-      return snapshot(record);
-    }
-    if (stopSet?.has(record.status)) return snapshot(record);
-    if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-      throw taskError("INVALID_ARGUMENT", "timeoutMs must be a finite number greater than 0");
-    }
+    if (this.#releasable(record) || stopSet?.has(record.status)) return snapshot(record);
+    requireWaitTimeout(timeoutMs);
     if (signal?.aborted) throw taskError("WAIT_ABORTED", `Wait for task ${record.taskId} was aborted`);
-
-    const perTask = this.#waiters.get(record.taskId)?.size ?? 0;
-    if (perTask >= this.#maxWaitersPerTask) {
-      throw taskError("TASK_WAITER_LIMIT", `Task ${record.taskId} already has ${perTask} waiters (max ${this.#maxWaitersPerTask})`);
-    }
-    const perRoot = this.#rootWaiterCount(record.ownerRootId);
-    if (perRoot >= this.#maxWaitersPerRoot) {
-      throw taskError(
-        "TASK_WAITER_LIMIT",
-        `Root ${record.ownerRootId} already has ${perRoot} waiters (max ${this.#maxWaitersPerRoot})`
-      );
-    }
-
+    this.#admitWaiter([record]);
     const taskIdKey = record.taskId;
-    return await new Promise((resolve, reject) => {
-      const waiter = { taskId: taskIdKey, resolve, reject, timer: null, signal, onAbort: null, stopOn: stopSet };
-      let set = this.#waiters.get(taskIdKey);
-      if (!set) {
-        set = new Set();
-        this.#waiters.set(taskIdKey, set);
+    return await this.#addWaiter([taskIdKey], { timeoutMs, signal, stopOn: stopSet }, {
+      timedOut: `Timed out after ${timeoutMs}ms waiting for task ${taskIdKey} to finish`,
+      aborted: `Wait for task ${taskIdKey} was aborted`
+    });
+  }
+
+  // One waiter over several tasks (1.9.0, the gateway's wait): it settles as a
+  // waitForTerminal on each of them would, for whichever reaches a releasable
+  // terminal status or one of stopOn first, and resolves with that record. One
+  // waiter, one timer and one abort listener however many tasks it watches, so
+  // it counts once against the root's budget (and once against each task's).
+  // Like waitForTerminal it rejects when one of them is removed or expires.
+  async waitForAny(taskIds, options = {}) {
+    const { ownerRootId, timeoutMs = 120_000, signal, stopOn = null } = options ?? {};
+    if (!Array.isArray(taskIds) || taskIds.length === 0) {
+      throw taskError("INVALID_ARGUMENT", "taskIds must be a non-empty array");
+    }
+    const records = [...new Set(taskIds)].map((taskId) => this.#requireRecord(taskId, ownerRootId));
+    const stopSet = normalizeStopOn(stopOn);
+    const ready = records.find((record) => this.#releasable(record) || stopSet?.has(record.status));
+    if (ready) return snapshot(ready);
+    requireWaitTimeout(timeoutMs);
+    const named = records.map((record) => record.taskId);
+    if (signal?.aborted) throw taskError("WAIT_ABORTED", `Wait for tasks ${named.join(", ")} was aborted`);
+    this.#admitWaiter(records);
+    return await this.#addWaiter(named, { timeoutMs, signal, stopOn: stopSet }, {
+      timedOut: `Timed out after ${timeoutMs}ms waiting for tasks ${named.join(", ")}`,
+      aborted: `Wait for tasks ${named.join(", ")} was aborted`
+    });
+  }
+
+  // A deferred terminal record is not releasable yet: its committer has not
+  // finished making the outcome durable, so even a waiter that arrives after
+  // the commit queues until flushWaiters().
+  #releasable(record) {
+    return TERMINAL_TASK_STATUSES.has(record.status) && !this.#deferredTerminal.has(record.taskId);
+  }
+
+  // The budgets a new waiter must fit, checked for every task it would join and
+  // for every root they belong to.
+  #admitWaiter(records) {
+    for (const record of records) {
+      const perTask = this.#waiters.get(record.taskId)?.size ?? 0;
+      if (perTask >= this.#maxWaitersPerTask) {
+        throw taskError("TASK_WAITER_LIMIT", `Task ${record.taskId} already has ${perTask} waiters (max ${this.#maxWaitersPerTask})`);
       }
-      set.add(waiter);
+    }
+    for (const ownerRootId of new Set(records.map((record) => record.ownerRootId))) {
+      const perRoot = this.#rootWaiterCount(ownerRootId);
+      if (perRoot >= this.#maxWaitersPerRoot) {
+        throw taskError(
+          "TASK_WAITER_LIMIT",
+          `Root ${ownerRootId} already has ${perRoot} waiters (max ${this.#maxWaitersPerRoot})`
+        );
+      }
+    }
+  }
+
+  #addWaiter(taskIds, { timeoutMs, signal, stopOn }, messages) {
+    return new Promise((resolve, reject) => {
+      const waiter = { taskIds, resolve, reject, timer: null, signal, onAbort: null, stopOn };
+      for (const taskId of taskIds) {
+        let set = this.#waiters.get(taskId);
+        if (!set) {
+          set = new Set();
+          this.#waiters.set(taskId, set);
+        }
+        set.add(waiter);
+      }
       // Event-driven only: the timer bounds the wait, nothing polls the record.
       waiter.timer = setTimeout(() => {
         this.#settleWaiter(waiter);
-        reject(taskError("WAIT_TIMEOUT", `Timed out after ${timeoutMs}ms waiting for task ${taskIdKey} to finish`));
+        reject(taskError("WAIT_TIMEOUT", messages.timedOut));
       }, timeoutMs);
       if (signal) {
         waiter.onAbort = () => {
           this.#settleWaiter(waiter);
-          reject(taskError("WAIT_ABORTED", `Wait for task ${taskIdKey} was aborted`));
+          reject(taskError("WAIT_ABORTED", messages.aborted));
         };
         signal.addEventListener("abort", waiter.onAbort, { once: true });
       }
@@ -833,19 +880,23 @@ export class TaskStore {
     };
   }
 
+  // Each waiter once, however many of the root's tasks it watches.
   #rootWaiterCount(ownerRootId) {
-    let total = 0;
+    const waiters = new Set();
     for (const [taskId, set] of this.#waiters) {
-      if (this.#tasks.get(taskId)?.ownerRootId === ownerRootId) total += set.size;
+      if (this.#tasks.get(taskId)?.ownerRootId !== ownerRootId) continue;
+      for (const waiter of set) waiters.add(waiter);
     }
-    return total;
+    return waiters.size;
   }
 
+  // Out of every set it joined, so a waiter one task woke is gone from the rest.
   #settleWaiter(waiter) {
-    const set = this.#waiters.get(waiter.taskId);
-    if (set) {
+    for (const taskId of waiter.taskIds) {
+      const set = this.#waiters.get(taskId);
+      if (!set) continue;
       set.delete(waiter);
-      if (set.size === 0) this.#waiters.delete(waiter.taskId);
+      if (set.size === 0) this.#waiters.delete(taskId);
     }
     if (waiter.timer) clearTimeout(waiter.timer);
     waiter.timer = null;

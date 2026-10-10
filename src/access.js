@@ -15,7 +15,10 @@ export function requireAccess(access = "control") {
 }
 
 export function isReadOnlyCall(method, args = {}) {
-  return ["guide", "poll", "task_get", "task_list", "task_result", "subscribe", "unsubscribe", "request_cancel", "retention_preview"].includes(method)
+  return [
+    "guide", "poll", "task_get", "task_list", "task_result", "subscribe", "unsubscribe", "request_cancel", "retention_preview",
+    "wait", "main_list"
+  ].includes(method)
     || (method === "setup" && !args.provider && !args.refreshAgentUpdates)
     || (method === "session" && ["list", "get", "check"].includes(args.action))
     || (method === "inbox" && ["list", "get", "attention"].includes(args.action ?? "list"))

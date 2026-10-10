@@ -123,6 +123,22 @@ rl.on("line", (line) => {
   if (message.method === "session/prompt") {
     const prompt = message.params.prompt?.[0]?.text;
     if (promptLog) appendFileSync(promptLog, `${JSON.stringify({ prompt, at: Date.now() })}\n`);
+    // A turn that works for <ms> and then finishes on its own, asking nothing:
+    // what a Main asleep in agent_acp_wait waits through.
+    if (typeof prompt === "string" && prompt.startsWith("sleep:")) {
+      setTimeout(() => {
+        send({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId: message.params.sessionId,
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "SLEPT" } }
+          }
+        });
+        send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } });
+      }, Number(prompt.slice("sleep:".length)) || 0);
+      return;
+    }
     if (prompt === "large-result") {
       send({
         jsonrpc: "2.0",

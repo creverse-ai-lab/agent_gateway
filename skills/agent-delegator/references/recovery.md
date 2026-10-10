@@ -10,7 +10,8 @@ If the work is expensive to duplicate and you have no handle yet, pass `idempote
 
 | Symptom | What it means | Do |
 |---|---|---|
-| `status: "working"`, `incomplete: "wait_budget_exceeded"` | the wait ended, the turn did not | `agent_acp_run {taskId}` with a longer `waitMs` |
+| `status: "working"`, `incomplete: "wait_budget_exceeded"` | the wait ended, the turn did not | `agent_acp_wait {}`, or `agent_acp_run {taskId}` with a longer `waitMs` |
+| `agent_acp_wait` fails without a Gateway error code (the socket closed, a timeout) | the wait ended, the tasks did not; the Gateway may have restarted | call `agent_acp_wait {}` again; a task a restart cut short comes back `task_finished` with `interruption` |
 | `SESSION_ACTIVE` | a turn is already running in this session | attach with the existing `taskId`, or poll; never start a second prompt |
 | `PROMPT_TOO_LARGE` | over `limits.maxPromptBytes` from `session_open` | shrink the prompt or pass material by path; no turn was started |
 | `PERSISTENCE_UNHEALTHY` | the Gateway cannot durably record a handle | do not retry in a loop; surface it — the alert is in `setup().alerts` |
@@ -48,7 +49,7 @@ Each Main reaches only the sessions it opened, and a Main is its CLI session (fo
 2. Call `agent_acp_session_restore` with exactly those three. Nothing else hands a session over: not list, get, poll, or a subscription.
 3. It works once the earlier Main is gone, that is when its front door is no longer connected. For Codex that front door serves every thread of the process, so another thread cannot take the session while that Codex process runs. While the earlier Main is there, the answer stays `NOT_SESSION_OWNER`: finish the work there or end that conversation, and do not retry in a loop.
 4. Read the answer. A restored session now carries `openedBy` (you) and `adoptedFrom` (the earlier Main). `INVALID_ARGUMENT` "already registered" with `details.sessionId` means its Worker was still connected: the session is yours now, under that id. `SESSION_ACTIVE` means a turn is still running: poll it.
-5. Its tasks and requests came with it. Call `agent_acp_inbox {action: "attention"}`: it lists the requests waiting on you and the finished runs whose result never reached you; collect each with `agent_acp_run {taskId}`.
+5. Its tasks and requests came with it. Call `agent_acp_inbox {action: "attention"}`: it lists the requests waiting on you and the finished runs whose result never reached you; collect each with `agent_acp_run {taskId}`, or sleep in `agent_acp_wait {}`, which watches them now too.
 
 Repeating the restore is harmless. If the Gateway crashed right after it, the session can be back with the earlier Main; the same restore takes it again.
 

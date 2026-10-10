@@ -7,6 +7,56 @@ const RECONNECT = "reconnect the agent-acp MCP server";
 // unknown method, so pointing a user at it would be a dead end.
 const IDLE_SHUTDOWN_SINCE = "1.5.0";
 
+// How long one agent_acp_wait may sleep for the host on the other end, by the
+// clientInfo name it sent at initialize: the default heartbeat, and the most a
+// requested timeoutMs gets. A tool call the host gives up on loses its answer,
+// so both stay under what the host allows. Measured with a test server whose
+// tool slept 300s, sending notifications/progress every 10s:
+//   Codex 0.162.0 ("codex-mcp-client")    gave up at exactly 300s (its
+//                                          tool_timeout_sec, default 300);
+//                                          progress did not extend it
+//   Claude Code 2.1.287 ("claude-code")   waited the whole 300s; it sends a
+//                                          progressToken and took the progress
+//   any other or unknown client (Grok CLI not measured yet): the usual 60s
+// These are what was measured and may change with the hosts. Codex's limit is
+// the user's to raise (tool_timeout_sec under [mcp_servers.agent-acp] in
+// ~/.codex/config.toml), which no front door can see, so
+// ACP_GATEWAY_WAIT_LIMIT_MS in the agent-acp entry's env replaces both numbers,
+// for any host, never past WAIT_MAX_MS.
+export const WAIT_MAX_MS = 600_000;
+const CLIENT_WAIT_LIMITS = Object.freeze({
+  "codex-mcp-client": Object.freeze({ defaultMs: 270_000, limitMs: 280_000 }),
+  "claude-code": Object.freeze({ defaultMs: 540_000, limitMs: WAIT_MAX_MS })
+});
+const UNKNOWN_CLIENT_WAIT_LIMITS = Object.freeze({ defaultMs: 55_000, limitMs: WAIT_MAX_MS });
+const MIN_WAIT_LIMIT_MS = 1_000;
+
+/** {defaultMs, limitMs} of a wait for the client that named itself clientName. */
+export function waitLimits(clientName, env = process.env) {
+  const configured = Number(env.ACP_GATEWAY_WAIT_LIMIT_MS);
+  if (Number.isInteger(configured) && configured >= MIN_WAIT_LIMIT_MS) {
+    const limitMs = Math.min(configured, WAIT_MAX_MS);
+    return { defaultMs: limitMs, limitMs };
+  }
+  const known = typeof clientName === "string" && Object.hasOwn(CLIENT_WAIT_LIMITS, clientName);
+  return { ...(known ? CLIENT_WAIT_LIMITS[clientName] : UNKNOWN_CLIENT_WAIT_LIMITS) };
+}
+
+// How often agent_acp_wait tells a client that asked for progress (a
+// progressToken) that it is still waiting: often enough for a client that
+// resets its tool timeout on progress, as the usual 60s one is, to let the
+// wait sleep past it.
+export const WAIT_PROGRESS_MS = 20_000;
+const MIN_WAIT_PROGRESS_MS = 100;
+const MAX_WAIT_PROGRESS_MS = 300_000;
+
+/** ACP_GATEWAY_WAIT_PROGRESS_MS, bounded; the default when unset or invalid. */
+export function waitProgressMs(env = process.env) {
+  const value = Number(env.ACP_GATEWAY_WAIT_PROGRESS_MS);
+  if (!Number.isInteger(value) || value < MIN_WAIT_PROGRESS_MS) return WAIT_PROGRESS_MS;
+  return Math.min(value, MAX_WAIT_PROGRESS_MS);
+}
+
 // The version-skew notice attached to setup and session responses, or null
 // when the two sides agree. Which side is older decides the remedy: an older
 // front door is fixed by reconnecting, but reconnecting to an older daemon

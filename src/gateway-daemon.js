@@ -197,7 +197,11 @@ const server = createServer((socket) => {
             // Beside root presence, per Main: the caller of every control
             // request, its subscribe included, is live until this connection
             // closes. An observer's claim is recorded nowhere, here neither.
-            if (access === "control" && caller) callers.bind(socket, caller);
+            // The service lists the same callers (main_list), for display.
+            if (access === "control" && caller) {
+              callers.bind(socket, caller);
+              service.attachCaller(socket, boundRootId, caller);
+            }
           }
           if (request.method === "request_cancel") {
             const requestId = request.args?.requestId;
@@ -282,6 +286,10 @@ const server = createServer((socket) => {
     sender.destroy();
     service.removeSubscriptions(subscriptions.keys());
     callers.release(socket);
+    // A wait the aborts above ended lets go of its Main only a moment after
+    // this, so a Main nothing else holds goes from waiting_tasks to gone
+    // without passing through active.
+    service.detachCaller(socket);
     if (boundRootId && boundAccess === "control") service.detachRoot(boundRootId);
   });
 });

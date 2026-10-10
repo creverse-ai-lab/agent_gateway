@@ -17,7 +17,7 @@ import {
 import { callerForCall, callerFromProcess } from "./caller.js";
 import { controlIdentity } from "./config.js";
 import { errorEnvelope } from "./errors.js";
-import { staleFrontDoorNotice } from "./front-door.js";
+import { staleFrontDoorNotice, waitLimits, waitProgressMs } from "./front-door.js";
 import { GatewayRpcClient } from "./socket-rpc.js";
 import { PERMISSION_POLICIES } from "./acp-client.js";
 import { TaskFollower, taskHeartbeatMs } from "./task-follower.js";
@@ -85,7 +85,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     agent_acp_answer: "answer",
     agent_acp_cancel: "cancel",
     agent_acp_session: "session",
-    agent_acp_inbox: "inbox"
+    agent_acp_inbox: "inbox",
+    agent_acp_wait: "wait"
   };
   const method = methods[request.params.name];
   // A tool whose execution.taskSupport is absent ("forbidden", which is every
@@ -113,6 +114,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     if (task) throw new Error(`Tool ${request.params.name} does not support task execution`);
     const args = request.params.arguments ?? {};
     if (method === "run") return await runTool(args, extra, caller);
+    if (method === "wait") return await waitTool(args, extra, caller);
     const timeoutMs = method === "poll"
       ? Math.max(30_000, Number(args.waitMs ?? 0) + 5_000)
       : method === "setup" && args.refreshAgentUpdates === true
@@ -217,16 +219,78 @@ async function runTool(args, extra, caller) {
       { signal: waitController.signal, caller }
     ),
     extra?.signal,
-    taskId,
+    {
+      ok: true,
+      status: "working",
+      incomplete: "wait_abandoned",
+      taskId,
+      next: { attach: { tool: "agent_acp_run", arguments: { taskId } } }
+    },
     () => waitController.abort()
   );
   return toolResult(envelope, envelope.ok === false, relatedTask(taskId));
 }
 
-// An abort abandons the WAIT, never the turn. The worker keeps working and the
+// agent_acp_wait: the Main sleeps in this call, and the Gateway wakes it by
+// answering once something needs it, so a host that cannot be resumed from
+// outside (Codex's MCP client declares no tasks) still learns that a Worker
+// finished. One rpc call, with run's budget rule. How long it may sleep is the
+// host's to say (waitLimits): the clientInfo the host sent at initialize picks
+// the default and the ceiling, so the answer always arrives before the host
+// gives up on the call.
+async function waitTool(args, extra, caller) {
+  const { defaultMs, limitMs } = waitLimits(server.getClientVersion()?.name);
+  const requested = Number(args.timeoutMs ?? defaultMs);
+  const timeoutMs = Math.min(limitMs, Number.isFinite(requested) ? Math.max(0, requested) : defaultMs);
+  const waitController = new AbortController();
+  const stopProgress = reportProgress(extra, timeoutMs);
+  try {
+    const envelope = await raceAbort(
+      rpc.call("wait", { ...args, timeoutMs }, Math.max(30_000, timeoutMs + 5_000), { signal: waitController.signal, caller }),
+      extra?.signal,
+      {
+        ok: true,
+        incomplete: "wait_abandoned",
+        next: { wait: { tool: "agent_acp_wait", arguments: Array.isArray(args.taskIds) ? { taskIds: args.taskIds } : {} } }
+      },
+      () => waitController.abort()
+    );
+    return toolResult(envelope, envelope.ok === false);
+  } finally {
+    stopProgress();
+  }
+}
+
+// While a wait sleeps, a client that asked for progress (a progressToken) hears
+// that it still does, every waitProgressMs: one that resets its tool timeout on
+// progress can then let the wait run past that timeout. progress is the time
+// waited so far and total the wait's timeoutMs, in milliseconds, so progress
+// only grows. Best effort, as announceTask's.
+function reportProgress(extra, timeoutMs) {
+  const progressToken = extra?._meta?.progressToken;
+  if (progressToken == null || typeof extra?.sendNotification !== "function") return () => {};
+  const startedAt = performance.now();
+  const timer = setInterval(() => {
+    const waitedMs = Math.round(performance.now() - startedAt);
+    extra.sendNotification({
+      method: "notifications/progress",
+      params: {
+        progressToken,
+        progress: waitedMs,
+        total: timeoutMs,
+        message: `agent_acp_wait: still waiting after ${Math.round(waitedMs / 1000)}s`
+      }
+    }).catch(() => {});
+  }, waitProgressMs());
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
+// An abort abandons the WAIT, never the work: the worker keeps working and a
 // handle stays collectable, because "I stopped waiting" and "stop the work" are
-// different instructions and only agent_acp_cancel means the second one.
-function raceAbort(pending, signal, taskId, abandonWait = () => {}) {
+// different instructions and only agent_acp_cancel means the second one. The
+// wait resolves with `abandoned`, the handoff that says where to wait again.
+function raceAbort(pending, signal, abandoned, abandonWait = () => {}) {
   if (!signal) return pending;
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -237,13 +301,7 @@ function raceAbort(pending, signal, taskId, abandonWait = () => {}) {
       callback(value);
     };
     const abandon = () => {
-      finish(resolve, {
-        ok: true,
-        status: "working",
-        incomplete: "wait_abandoned",
-        taskId,
-        next: { attach: { tool: "agent_acp_run", arguments: { taskId } } }
-      });
+      finish(resolve, abandoned);
       // Resolve the user-facing handoff first, then cancel only the outstanding
       // wait RPC. The task and worker turn are untouched.
       queueMicrotask(abandonWait);
@@ -436,6 +494,17 @@ function controlTools() {
       execution: { taskSupport: "optional" }
     },
     {
+      name: "agent_acp_wait",
+      description: "Sleep here instead of polling while your Workers run: start each run with agent_acp_run {waitMs: 0}, then call this. It returns as soon as something needs you - reason task_finished (a task you started finished; its result comes as outcome, the same object agent_acp_run {taskId} returns, or as a next.collect pointer), needs_input (a Worker asks a permission or a question: answer pending with the tool in next.answer), or nothing_pending (nothing left to wait for). After timeoutMs it returns reason heartbeat with what is still running: call it again. tasks lists each task with its status; next says what to call. Cancelling this call ends only the wait, never a task.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          taskIds: { type: "array", items: { type: "string", minLength: 1 }, minItems: 1, maxItems: 100, uniqueItems: true, description: "Watch only these tasks. Default: every task you started that is still running or whose result has not reached you." },
+          timeoutMs: { type: "integer", minimum: 0, maximum: 600000, description: "How long to sleep before a heartbeat answer. Leave it out: the default is the longest sleep your host is known to allow a tool call (55000 when the Gateway does not know your host), and a longer request is cut to that." }
+        }
+      }
+    },
+    {
       name: "agent_acp_poll",
       description: "Poll status and final results with minimal token use; opt into progress evidence only when needed.",
       inputSchema: {
@@ -512,7 +581,7 @@ function controlTools() {
     },
     {
       name: "agent_acp_inbox",
-      description: "List or inspect durable worker permission requests and questions owned by this Main. attention (read-only) returns what needs you, oldest first: needsMain (pending requests in summary form, with ageMs and stale) and updates (finished tasks you started, or took over with their session, whose result has not reached you), with counts and nextCursor. A result you take with agent_acp_run, tasks/result or a terminal poll is marked seen; ack {taskIds} marks the rest.",
+      description: "List or inspect durable worker permission requests and questions owned by this Main. attention (read-only) returns what needs you, oldest first: needsMain (pending requests in summary form, with ageMs and stale) and updates (finished tasks you started, or took over with their session, whose result has not reached you), with counts and nextCursor. A result you take with agent_acp_run, agent_acp_wait, tasks/result or a terminal poll is marked seen; ack {taskIds} marks the rest.",
       inputSchema: {
         type: "object",
         properties: {

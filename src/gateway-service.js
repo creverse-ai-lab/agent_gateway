@@ -37,6 +37,7 @@ import {
   updateKey
 } from "./attention.js";
 import { CONTROL_IDENTITY_ENV, normalizeCaller } from "./caller.js";
+import { MainRegistry } from "./main-status.js";
 import { MANAGEMENT_CAPABILITIES, RUNTIME_IDENTITY } from "./runtime-identity.js";
 import { validateSetting } from "./settings.js";
 
@@ -102,8 +103,19 @@ const DEFAULT_POLL_EVENT_TYPES = new Set(["permission_request", "elicitation_req
 const EVENT_PAYLOAD_CAP_BYTES = 4000;
 // Bounds the setup alert; count still carries the total.
 const MAX_STALL_ALERT_SESSION_IDS = 16;
-// How many tasks one subscription may follow by id (subscribe taskIds).
-const MAX_SUBSCRIBED_TASKS = 100;
+// How many tasks one subscription may follow, or one wait watch, by id.
+const MAX_NAMED_TASKS = 100;
+// agent_acp_wait's heartbeat: the run tool's default wait and ceiling, for the
+// same reason (55s answers below the usual 60s host tool timeout).
+const WAIT_DEFAULT_MS = 55_000;
+const WAIT_MAX_MS = 600_000;
+// What one wait answer carries inline: the results it delivers, measured as
+// sent, and how many finished tasks it lists. The first finished task always
+// comes whole, so every answer that has one delivers at least one; past the
+// budget the rest come with a pointer to collect them, and past the row limit
+// they stay unseen for the next wait.
+const WAIT_RESULT_BUDGET_BYTES = 65_536;
+const WAIT_MAX_FINISHED_ROWS = 50;
 const CLOSED_STATUSES = new Set(["closed"]);
 // A live client is not enough to start work in these states: the record is
 // known to be out of sync with the worker, so it has to be resumed first.
@@ -330,6 +342,10 @@ export class GatewayService {
     // What the last shutdown could not finish in time, and why (set by shutdown).
     this.shutdownReport = null;
     this.now = now;
+    // The Mains the daemon's control connections named, and whether a wait of
+    // theirs blocks (main_list, main_status). Fed by the daemon (attachCaller)
+    // and by waitTasks; an embedded service only ever sees the waits.
+    this.mains = new MainRegistry({ now, onChange: (rootId, main) => this.#publishMainStatus(rootId, main) });
     // Task semantics (TTL from createdAt, budgets, waiters, keyset pagination)
     // live in the store. Budgets stay module defaults on purpose: they are a
     // safety valve, not a per-deployment knob, so they are not on the wire.
@@ -553,6 +569,17 @@ export class GatewayService {
     this.schedulePersist();
   }
 
+  // Beside root presence, per Main and for display only (main_list): the daemon
+  // reports every caller a control connection names, as it tells its
+  // CallerPresence, and the connection's close. Nothing here decides access.
+  attachCaller(connection, rootId, caller) {
+    this.mains.attach(connection, rootId, caller);
+  }
+
+  detachCaller(connection) {
+    this.mains.detach(connection);
+  }
+
   // The mailbox is created on first use: sessions built straight through the
   // store (restore-from-disk, tests) must not need to know about it.
   #queueFor(session) {
@@ -669,7 +696,9 @@ export class GatewayService {
       task_list: () => this.taskList(args, context),
       task_result: () => this.taskResult(args, context),
       task_cancel: () => this.taskCancel(args, context),
-      inbox: () => this.inboxManage(args, context)
+      inbox: () => this.inboxManage(args, context),
+      wait: () => this.waitTasks(args, context),
+      main_list: () => this.mainList(context)
     };
     const handler = Object.hasOwn(handlers, method) ? handlers[method] : null;
     if (!handler) {
@@ -753,7 +782,7 @@ export class GatewayService {
     if (args.taskIds != null && requested?.length) {
       throw new GatewayError(ERROR_CODES.INVALID_ARGUMENT, "taskIds follows tasks instead of sessions: sessionIds must be empty");
     }
-    const tasks = args.taskIds == null ? [] : this.#subscribedTasks(args.taskIds, context);
+    const tasks = args.taskIds == null ? [] : this.#namedTasks(args.taskIds, context);
     const requester = requesterOf(context);
     const watchAll = requested == null && args.taskIds == null;
     const sessions = watchAll
@@ -831,14 +860,14 @@ export class GatewayService {
     };
   }
 
-  // The tasks a subscription follows by id: each one a task the caller may
-  // read, decided as task_get decides it.
-  #subscribedTasks(taskIds, context) {
-    if (!Array.isArray(taskIds) || taskIds.length === 0 || taskIds.length > MAX_SUBSCRIBED_TASKS
+  // The tasks a subscription follows, or a wait watches, by id: each one a task
+  // the caller may read, decided as task_get decides it.
+  #namedTasks(taskIds, context) {
+    if (!Array.isArray(taskIds) || taskIds.length === 0 || taskIds.length > MAX_NAMED_TASKS
       || !taskIds.every((taskId) => typeof taskId === "string" && taskId !== "")) {
       throw new GatewayError(
         ERROR_CODES.INVALID_ARGUMENT,
-        `taskIds must be an array of 1 to ${MAX_SUBSCRIBED_TASKS} task ids`
+        `taskIds must be an array of 1 to ${MAX_NAMED_TASKS} task ids`
       );
     }
     return [...new Set(taskIds)].map((taskId) => this.#requireTask(taskId, context));
@@ -2508,11 +2537,21 @@ export class GatewayService {
     // Again after the wait: a task whose session record went away meanwhile
     // now answers to the Main that created it.
     this.#requireTask(task.taskId, context);
-    const delivered = this.#storeCall(() => {
+    const delivered = this.#terminalEnvelope(task, ownerRootId);
+    // agent_acp_run (start and attach) and tasks/result all end here. After the
+    // envelope is built, so the bookkeeping cannot change what is delivered.
+    this.#markDelivered(task.taskId, context);
+    return delivered;
+  }
+
+  // The object a terminal task's reader receives: agent_acp_run, tasks/result
+  // and a wait that carries the result all hand out this one.
+  #terminalEnvelope(task, ownerRootId) {
+    return this.#storeCall(() => {
       // The store hands back the stored payload as-is, possibly null, so it never
       // invents an envelope. The legacy fallback is the caller's, and it stays
-      // here: agent_acp_run reuses this method, not a second copy.
-      const stored = this.taskStore.result(args.taskId, { ownerRootId });
+      // here: every reader reuses this method, not a second copy.
+      const stored = this.taskStore.result(task.taskId, { ownerRootId });
       if (stored == null) {
         return { ok: false, taskId: task.taskId, error: task.statusMessage ?? "Task completed without a result" };
       }
@@ -2525,10 +2564,178 @@ export class GatewayService {
       const durability = this.#resultDurability(task.taskId);
       return durability ? { ...named, durability } : named;
     });
-    // agent_acp_run (start and attach) and tasks/result all end here. After the
-    // envelope is built, so the bookkeeping cannot change what is delivered.
-    this.#markDelivered(task.taskId, context);
-    return delivered;
+  }
+
+  // agent_acp_wait (1.9.0). A Main sleeps in this call instead of polling, and
+  // the Gateway wakes it by answering as soon as something needs it: a watched
+  // task finished without its result reaching this Main (or finished during
+  // the wait), one needs an answer (input_required), or none is left to wait
+  // for. Otherwise the answer comes after timeoutMs, a heartbeat that lists what
+  // still runs. It watches the tasks named, else what attention would report to
+  // this caller once they finish; another Main's tasks never. A blocked wait is
+  // one TaskStore waiter (waitForAny), so it is bounded like a run attach, and
+  // the request's signal ends it at once, as a long poll's does: WAIT_ABORTED,
+  // and no answer is built, so no result counts as delivered. Ending the wait
+  // ends nothing else.
+  async waitTasks(args, context) {
+    const rootId = requireRoot(context);
+    const requester = requesterOf(context);
+    const timeoutMs = Math.min(WAIT_MAX_MS, requireNonNegativeNumber(args.timeoutMs, "timeoutMs", WAIT_DEFAULT_MS));
+    const named = args.taskIds != null;
+    const watched = named
+      ? this.#namedTasks(args.taskIds, context).map((task) => task.taskId)
+      : this.#defaultWaitTasks(rootId, requester);
+    // What is still running now: one of these that finishes during the wait is
+    // news, even to a requester its result is not for.
+    const running = new Set(watched.filter((taskId) => !TERMINAL_TASK_STATUSES.has(this.taskStore.find(taskId)?.status)));
+    // Waiting on a session's work is its owner at work, as a run attach is.
+    if (context.access !== "observer") {
+      for (const taskId of watched) this.touchOwnerActivity({ taskId }, context);
+    }
+    const deadline = performance.now() + timeoutMs;
+    let blocked = null;
+    try {
+      for (;;) {
+        const view = this.#waitView(watched, running, context);
+        const reason = waitReason(view);
+        // Timers do not fire early, but a fraction of a millisecond left is no
+        // wait worth registering.
+        if (reason || deadline - performance.now() < 1) return this.#waitAnswer(reason ?? "heartbeat", view, named, context);
+        if (context.signal?.aborted) throw waitAborted();
+        const pending = view.working.map((task) => task.taskId);
+        // Only a wait that blocks makes its Main waiting_tasks, and only a
+        // front-door Main has a status to make.
+        if (blocked) this.mains.updateWait(blocked, pending);
+        else if (requester) blocked = this.mains.startWait(rootId, requester, pending);
+        try {
+          await this.taskStore.waitForAny(pending, {
+            ownerRootId: rootId,
+            timeoutMs: deadline - performance.now(),
+            signal: context.signal,
+            // As a run attach: a request the caller must answer gives control back.
+            stopOn: ["input_required"]
+          });
+        } catch (error) {
+          if (error?.code === "WAIT_ABORTED") throw waitAborted();
+          // The time ran out, or a watched task went away (its TTL): look again.
+          if (!["WAIT_TIMEOUT", "UNKNOWN_TASK", "TASK_TTL_EXPIRED"].includes(error?.code)) throw storeError(error);
+        }
+      }
+    } finally {
+      if (blocked) this.mains.endWait(blocked);
+    }
+  }
+
+  // What a wait without taskIds watches, oldest first: what attention reports to
+  // this requester once it finishes, so the tasks it started (or took over with
+  // their session) that still run, and those that finished without their result
+  // reaching it. Management and observers receive no result, so they watch every
+  // task of the root that still runs.
+  #defaultWaitTasks(rootId, requester) {
+    this.taskStore.expireSweep();
+    return [...this.taskStore.records.values()]
+      .filter((task) => task.ownerRootId === rootId
+        && (requester == null
+          || (isTaskCreator(this.#resultOwner(task), requester) && isVisibleTo(this.#taskOwner(task), requester)))
+        && (!TERMINAL_TASK_STATUSES.has(task.status) || this.#awaitsDelivery(task, requester)))
+      .sort((left, right) => compareAttentionKeys([left.createdAt, left.taskId], [right.createdAt, right.taskId]))
+      .map((task) => task.taskId);
+  }
+
+  // A finished task whose result is this requester's to receive and has not
+  // reached it: what the seen mark of #markDelivered means.
+  #awaitsDelivery(task, requester) {
+    return requester != null && TERMINAL_TASK_STATUSES.has(task.status) && !task.seenAt
+      && isTaskCreator(this.#resultOwner(task), requester);
+  }
+
+  // Where each watched task stands for this requester. A task gone from the
+  // store (its TTL ran out), or no longer this requester's to read, is gone.
+  #waitView(watched, running, context) {
+    const rootId = requireRoot(context);
+    const requester = requesterOf(context);
+    const view = { finished: [], needsInput: [], working: [], done: [], gone: [] };
+    for (const taskId of watched) {
+      const task = this.taskStore.find(taskId);
+      if (!task || task.ownerRootId !== rootId || !isVisibleTo(this.#taskOwner(task), requester)) {
+        view.gone.push(taskId);
+      } else if (TERMINAL_TASK_STATUSES.has(task.status)) {
+        (running.has(taskId) || this.#awaitsDelivery(task, requester) ? view.finished : view.done).push(task);
+      } else {
+        (task.status === "input_required" ? view.needsInput : view.working).push(task);
+      }
+    }
+    return view;
+  }
+
+  // The answer. A finished task carries its result (outcome, the envelope a run
+  // attach returns, marked seen as that delivery would be) while the answer's
+  // budget lasts, the first one always; past it, next.collect points at it and
+  // it stays unseen. A task waiting on the Main carries its newest pending
+  // request, as a run's input_required handoff does.
+  #waitAnswer(reason, view, named, context) {
+    // As a long poll: nobody is left to read it, so none is built.
+    if (context.signal?.aborted) throw waitAborted();
+    const rootId = requireRoot(context);
+    const row = (task) => ({
+      taskId: task.taskId,
+      sessionId: task.sessionId,
+      provider: this.store.get(task.sessionId)?.provider ?? null,
+      status: task.status,
+      statusMessage: task.statusMessage,
+      ...(task.interruption ? { interruption: task.interruption } : {})
+    });
+    const tasks = [];
+    const collect = [];
+    const answer = [];
+    let budget = WAIT_RESULT_BUDGET_BYTES;
+    for (const task of view.finished.slice(0, WAIT_MAX_FINISHED_ROWS)) {
+      const outcome = this.#terminalEnvelope(task, rootId);
+      const bytes = Buffer.byteLength(JSON.stringify(outcome));
+      if (tasks.length > 0 && bytes > budget) {
+        tasks.push(row(task));
+        collect.push({ tool: "agent_acp_run", arguments: { taskId: task.taskId } });
+        continue;
+      }
+      budget -= Math.min(budget, bytes);
+      tasks.push({ ...row(task), outcome });
+      this.#markDelivered(task.taskId, context);
+    }
+    for (const task of view.needsInput) {
+      const pending = this.#pendingInboxRecord(task.sessionId);
+      tasks.push({ ...row(task), ...(pending ? { pending } : {}) });
+      if (pending) {
+        answer.push({
+          tool: pending.type === "worker_question" ? "agent_acp_answer" : "agent_acp_permission",
+          arguments: { sessionId: task.sessionId, requestId: pending.requestId }
+        });
+      }
+    }
+    for (const task of [...view.working, ...view.done]) tasks.push(row(task));
+    // Waiting again is worth it while a task runs, or a finished one is still
+    // to be delivered (pointed at, or past the row limit).
+    const delivered = new Set(tasks.filter((entry) => Object.hasOwn(entry, "outcome")).map((entry) => entry.taskId));
+    const again = [...view.finished.filter((task) => !delivered.has(task.taskId)), ...view.needsInput, ...view.working]
+      .map((task) => task.taskId);
+    return {
+      ok: true,
+      reason,
+      tasks,
+      counts: { finished: view.finished.length, needsInput: view.needsInput.length, working: view.working.length },
+      ...(view.gone.length ? { gone: view.gone } : {}),
+      next: {
+        ...(collect.length ? { collect } : {}),
+        ...(answer.length ? { answer } : {}),
+        ...(again.length ? { wait: { tool: "agent_acp_wait", arguments: named ? { taskIds: again } : {} } } : {})
+      }
+    };
+  }
+
+  // Read-only (1.9.0): the Mains connected to this root, each with whether a
+  // wait of its blocks. Every one for management and observers, as their other
+  // reads cover the whole root; a front-door Main's own for a front door.
+  mainList(context) {
+    return { ok: true, mains: this.mains.list(requireRoot(context), requesterOf(context)) };
   }
 
   // What a result says of its own durability while only its preview is in the
@@ -3807,6 +4014,23 @@ export class GatewayService {
       if (task.ownerRootId !== subscription.rootId || !isVisibleTo(this.#taskOwner(task), subscription.requester)) continue;
       try {
         subscription.emit(taskStatusEvent(this.publicTask(task, subscription.requester)));
+      } catch {
+        this.subscriptions.delete(subscription.subscriptionId);
+      }
+    }
+  }
+
+  // main_status (1.9.0): a Main's entry as main_list reads it, or its going, to
+  // each watch-all subscription of its root that main_list would show it to.
+  // No sequence and no replay: a subscriber reads main_list for where things
+  // stand and keeps the higher revision per Main.
+  #publishMainStatus(rootId, main) {
+    const event = { type: "main_status", ...main };
+    for (const subscription of this.subscriptions.values()) {
+      if (!subscription.watchAll || subscription.rootId !== rootId) continue;
+      if (subscription.requester && !isSameCaller(main.caller, subscription.requester)) continue;
+      try {
+        subscription.emit(event);
       } catch {
         this.subscriptions.delete(subscription.subscriptionId);
       }
@@ -5121,6 +5345,20 @@ function publicEvent(session, event) {
 // moves past it.
 function taskStatusEvent(task) {
   return { type: "task_status", ...task };
+}
+
+// Why a wait answers now, or null to keep waiting. When several hold, the
+// first: a Worker blocked on the Main outranks a result, which outranks
+// having nothing left to wait for.
+function waitReason(view) {
+  if (view.needsInput.length) return "needs_input";
+  if (view.finished.length) return "task_finished";
+  if (!view.working.length) return "nothing_pending";
+  return null;
+}
+
+function waitAborted() {
+  return new GatewayError(ERROR_CODES.WAIT_ABORTED, "Wait was aborted");
 }
 
 // Oldest first, by when the row stopped being an obligation.
