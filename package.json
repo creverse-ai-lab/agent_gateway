@@ -80,7 +80,7 @@
   "dependencies": {
     "@agentclientprotocol/claude-agent-acp": "0.64.2",
     "@anthropic-ai/sdk": "0.115.0",
-    "@modelcontextprotocol/sdk": "1.30.0"
+    "@modelcontextprotocol/sdk": "1.32.2"
   },
   "bundleDependencies": [
     "@agentclientprotocol/claude-agent-acp",
